@@ -7,9 +7,9 @@ no Visual Studio required.
 Two supported ways to produce `directgate.exe` and `dgcli.exe`:
 
 1. **Cross-compile from Linux/macOS** with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw)
-   — what the maintainers use; you never need a Windows machine to build.
+   - what the maintainers use; you never need a Windows machine to build.
 2. **Native build on Windows** with [MSYS2](https://www.msys2.org/)
-   — a pacman-based POSIX-like shell, familiar if you come from Linux.
+   - a pacman-based POSIX-like shell, familiar if you come from Linux.
 
 Both are exercised by CI (`.github/workflows/windows.yml`).
 
@@ -57,7 +57,7 @@ cmake -B build-win64 -G Ninja \
 cmake --build build-win64 -j"$(nproc)"
 ```
 
-Result: `build-win64/directgate.exe` and `build-win64/dgcli.exe` —
+Result: `build-win64/directgate.exe` and `build-win64/dgcli.exe` -
 self-contained binaries you can copy to any Windows x64 machine (or VM).
 
 If the toolchain is not in `PATH`, point the toolchain file at it with
@@ -122,7 +122,7 @@ sc.exe start directgate-agent
 Notes:
 
 - `obj=` sets the account the service runs as. The agent **refuses to
-  start** unless `shell.user` in the config matches that account — the
+  start** unless `shell.user` in the config matches that account - the
   Windows counterpart of the POSIX privilege-drop policy: terminal and
   file-manager sessions can never run under an unexpected identity.
 - A service stop (`sc.exe stop directgate-agent`) triggers the same clean
@@ -139,7 +139,7 @@ interactive shell with colors, resizing, and arrow keys. The shell is
 ### File manager
 
 The virtual root `/` lists the mounted drives (`C:/`, `D:/`, ...); paths
-travel with forward slashes. Owner/group columns show the agent account —
+travel with forward slashes. Owner/group columns show the agent account -
 Windows keeps ownership in ACLs, which do not map onto the POSIX
 `user:group` model.
 
@@ -148,7 +148,7 @@ Windows keeps ownership in ACLs, which do not map onto the POSIX
 ## Security notes specific to Windows
 
 - Private files (config, enrollment keys) are written with a **protected
-  DACL** restricted to `SYSTEM`, `Administrators`, and the file owner — the
+  DACL** restricted to `SYSTEM`, `Administrators`, and the file owner - the
   ACL equivalent of `0600`, with no inheritance from the parent directory.
 - Atomic config updates use `MoveFileEx(MOVEFILE_REPLACE_EXISTING |
   MOVEFILE_WRITE_THROUGH)`; targets that are reparse points (symlinks /

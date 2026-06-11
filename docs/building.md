@@ -4,7 +4,7 @@
 
 If your platform is not covered by the [package repositories](../README.md#installation), or you want to audit and build the agent yourself, build it from source. The dependency set is small and the project builds on most Unix-like systems.
 
-> **Windows:** see [Building for Windows](windows.md) — MinGW-w64
+> **Windows:** see [Building for Windows](windows.md) - MinGW-w64
 > cross-compilation from Linux/macOS or a native MSYS2 build, plus service
 > installation and Windows-specific notes.
 
