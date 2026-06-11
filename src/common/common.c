@@ -449,21 +449,40 @@ xbool_t DirectGate_WritePrivateFile(const char *pPath, const uint8_t *pData, siz
 #endif /* _WIN32 */
 
 
+void DirectGate_PathToSlash(char *pPath)
+{
+#ifdef _WIN32
+    XCHECK_VOID((pPath != NULL));
+    for (; *pPath != XSTR_NUL; pPath++)
+        if (*pPath == '\\') *pPath = '/';
+#else
+    (void)pPath;
+#endif
+}
+
 size_t DirectGate_GetHomeDir(char *pBuf, size_t nSize)
 {
     XCHECK((pBuf != NULL && nSize > 0), XSTDNON);
     pBuf[0] = XSTR_NUL;
 
 #ifdef _WIN32
+    /* Forward slashes keep the value JSON-safe when it lands in a
+       generated config (the JSON writer does not escape backslashes) */
+    size_t nLen = XSTDNON;
+
     const char *pHomeDir = getenv("USERPROFILE");
-    if (xstrused(pHomeDir)) return xstrncpy(pBuf, nSize, pHomeDir);
+    if (xstrused(pHomeDir)) nLen = xstrncpy(pBuf, nSize, pHomeDir);
 
-    const char *pDrive = getenv("HOMEDRIVE");
-    const char *pPath = getenv("HOMEPATH");
-    if (xstrused(pDrive) && xstrused(pPath))
-        return xstrncpyf(pBuf, nSize, "%s%s", pDrive, pPath);
+    if (!nLen)
+    {
+        const char *pDrive = getenv("HOMEDRIVE");
+        const char *pPath = getenv("HOMEPATH");
+        if (xstrused(pDrive) && xstrused(pPath))
+            nLen = xstrncpyf(pBuf, nSize, "%s%s", pDrive, pPath);
+    }
 
-    return XSTDNON;
+    DirectGate_PathToSlash(pBuf);
+    return nLen;
 #else
     const char *pHomeDir = getenv("HOME");
     if (xstrused(pHomeDir)) return xstrncpy(pBuf, nSize, pHomeDir);

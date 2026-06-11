@@ -145,6 +145,15 @@ if(WIN32)
     # WIN32_LEAN_AND_MEAN keeps windows.h from dragging in winsock.h, which
     # conflicts with the winsock2.h used by libxutils and libdatachannel.
     add_compile_definitions(_WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
+
+    if(NOT MSVC)
+        # Self-contained binaries: statically link the MinGW runtime
+        # (libc++/libstdc++, libunwind/libgcc, winpthread). Without this the
+        # executable imports toolchain DLLs that exist only on the build
+        # machine, and on a clean Windows host the loader kills the process
+        # before main() with STATUS_DLL_NOT_FOUND - no output, no error.
+        add_link_options(-static)
+    endif()
 endif()
 
 if(DIRECTGATE_DEBUG)

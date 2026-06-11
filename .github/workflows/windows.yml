@@ -33,10 +33,25 @@ jobs:
           mingw-w64-ucrt-x86_64-openssl
 
     - name: Configure
-      run: cmake -B build -G Ninja
+      # Static OpenSSL so the artifact has no DLL dependencies beyond the
+      # OS; the MinGW runtime is already linked statically by the project.
+      run: cmake -B build -G Ninja -DOPENSSL_USE_STATIC_LIBS=TRUE
 
     - name: Build
       run: cmake --build build -j4
+
+    - name: Verify artifact is self-contained
+      # A missing toolchain DLL kills the process before main() with no
+      # output at all, so fail the build if any non-system import sneaks in.
+      run: |
+        objdump -p build/directgate.exe | grep "DLL Name" | tee imports.txt
+        ! grep -iE "libstdc|libgcc|libwinpthread|libc\+\+|libunwind|libssl|libcrypto" imports.txt
+
+    - name: Smoke run
+      shell: pwsh
+      run: |
+        & .\build\directgate.exe -h
+        if ($LASTEXITCODE -ne 0) { exit 1 }
 
     - name: Upload binaries
       uses: actions/upload-artifact@v4

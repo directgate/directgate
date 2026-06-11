@@ -37,6 +37,12 @@ xbool_t DirectGate_IsAPIEndpointAllowed(const char *pUrl);
 xbool_t DirectGate_EnsurePrivateFileParent(const char *pPath);
 xbool_t DirectGate_WritePrivateFile(const char *pPath, const uint8_t *pData, size_t nSize);
 
+/* Convert backslash separators to forward slashes in place (Windows
+   only, no-op elsewhere). Every Windows API accepts forward slashes,
+   while raw backslashes inside generated JSON configs are invalid
+   escape sequences - so every path the agent produces must use '/'. */
+void DirectGate_PathToSlash(char *pPath);
+
 /* Home directory and account name of the current user
    (POSIX: $HOME / passwd db, Windows: %USERPROFILE% / GetUserName) */
 size_t DirectGate_GetHomeDir(char *pBuf, size_t nSize);

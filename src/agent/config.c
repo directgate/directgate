@@ -74,12 +74,15 @@ void DirectGate_DisplayUsage(const char *pName)
 static void DirectGate_SetDefaultConfigPath(directgate_cfg_t *pCfg)
 {
 #ifdef _WIN32
-    /* Windows convention: per-user roaming application data */
+    /* Windows convention: per-user roaming application data. Forward
+       slashes keep the path JSON-safe wherever it gets serialized. */
     const char *pAppData = getenv("APPDATA");
     if (xstrused(pAppData))
     {
         xstrncpyf(pCfg->sCfgPath, sizeof(pCfg->sCfgPath),
-            "%s\\directgate\\agent.json", pAppData);
+            "%s/directgate/agent.json", pAppData);
+
+        DirectGate_PathToSlash(pCfg->sCfgPath);
         return;
     }
 #endif
