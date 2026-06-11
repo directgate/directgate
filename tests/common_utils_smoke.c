@@ -52,6 +52,12 @@ static int has_entry_prefix(const char *pDirPath, const char *pPrefix)
 int main(void)
 {
     char sValue[32];
+    CHECK(DirectGate_GetQueryValue(NULL, "rk", sValue, sizeof(sValue)) == 0,
+        "NULL URI");
+    CHECK(DirectGate_GetQueryValue("/websock?rk=abc", NULL, sValue, sizeof(sValue)) == 0,
+        "NULL query key");
+    CHECK(DirectGate_GetQueryValue("/websock?rk=abc", "rk", sValue, 0) == 0,
+        "zero output size");
     CHECK(DirectGate_GetQueryValue("/websock?rk=abc&token=xyz", "rk",
         sValue, sizeof(sValue)) == 3, "query value length");
     CHECK(strcmp(sValue, "abc") == 0, "query value content");
@@ -61,6 +67,16 @@ int main(void)
     CHECK(DirectGate_GetQueryValue("/websock", "rk", sValue, sizeof(sValue)) == 0,
         "missing query must return zero");
     CHECK(sValue[0] == '\0', "missing query must clear output");
+    CHECK(DirectGate_GetQueryValue("/websock?&&rk=abc&&rk=last", "rk",
+        sValue, sizeof(sValue)) == 3 && strcmp(sValue, "abc") == 0,
+        "query skips repeated separators and uses first match");
+    char sTiny[3];
+    CHECK(DirectGate_GetQueryValue("/websock?rk=abcdef", "rk",
+        sTiny, sizeof(sTiny)) == 2 && strcmp(sTiny, "ab") == 0,
+        "query output truncation");
+    CHECK(DirectGate_GetQueryValue("/websock?rk=&x=y", "rk",
+        sValue, sizeof(sValue)) == 0 && sValue[0] == '\0',
+        "empty query value");
 
     char sLine1[] = "hello\r\n";
     size_t nLine1 = strlen(sLine1);
@@ -71,6 +87,15 @@ int main(void)
     size_t nLine2 = strlen(sLine2);
     CHECK(DirectGate_RemoveNewLine(sLine2, &nLine2) == 5, "LF length");
     CHECK(nLine2 == 5 && strcmp(sLine2, "hello") == 0, "LF removal");
+    char sLine3[] = "hello\r";
+    size_t nLine3 = strlen(sLine3);
+    CHECK(DirectGate_RemoveNewLine(sLine3, &nLine3) == 5 &&
+          strcmp(sLine3, "hello") == 0, "CR removal");
+    char sLine4[] = "hello";
+    size_t nLine4 = strlen(sLine4);
+    CHECK(DirectGate_RemoveNewLine(sLine4, &nLine4) == 5 &&
+          strcmp(sLine4, "hello") == 0, "no newline unchanged");
+    CHECK(DirectGate_RemoveNewLine(NULL, &nLine4) == -1, "NULL newline input");
 
     const uint8_t sBytes[] = { 'a', '\r', '\n', 'b' };
     size_t nOffset = 99;
@@ -78,6 +103,9 @@ int main(void)
     CHECK(nOffset == 1, "CRLF offset");
     CHECK(!DirectGate_FindCRLF((const uint8_t*)"abc\r", 4, NULL),
         "partial CRLF must not match");
+    CHECK(DirectGate_FindCRLF((const uint8_t*)"\r\n", 2, &nOffset) && nOffset == 0,
+        "CRLF at beginning");
+    CHECK(!DirectGate_FindCRLF(NULL, 0, &nOffset), "NULL CRLF input");
 
     int64_t nValue = 0;
     CHECK(DirectGate_ParseI64((const uint8_t*)"-42", 3, &nValue),
@@ -85,6 +113,17 @@ int main(void)
     CHECK(nValue == -42, "negative int64 value");
     CHECK(!DirectGate_ParseI64((const uint8_t*)"42x", 3, &nValue),
         "invalid int64 must fail");
+    CHECK(DirectGate_ParseI64((const uint8_t*)"9223372036854775807", 19, &nValue) &&
+          nValue == INT64_MAX, "parse int64 max");
+    CHECK(DirectGate_ParseI64((const uint8_t*)"-9223372036854775808", 20, &nValue) &&
+          nValue == INT64_MIN, "parse int64 min");
+    CHECK(!DirectGate_ParseI64((const uint8_t*)"9223372036854775808", 19, &nValue),
+        "reject positive int64 overflow");
+    CHECK(!DirectGate_ParseI64((const uint8_t*)"-9223372036854775809", 20, &nValue),
+        "reject negative int64 overflow");
+    CHECK(!DirectGate_ParseI64((const uint8_t*)"+", 1, &nValue),
+        "reject sign without digits");
+    CHECK(!DirectGate_ParseI64((const uint8_t*)"", 0, &nValue), "reject empty int64");
 
     CHECK(DirectGate_IsAPIEndpointAllowed("https://api.example.test"),
         "HTTPS API endpoint should be allowed");
@@ -103,8 +142,15 @@ int main(void)
     char sTrim[] = "abc \t\r\n";
     DirectGate_TrimStringRight(sTrim);
     CHECK(strcmp(sTrim, "abc") == 0, "right trim");
+    char sAllSpace[] = " \t\r\n";
+    DirectGate_TrimStringRight(sAllSpace);
+    CHECK(sAllSpace[0] == '\0', "right trim all whitespace");
     CHECK(*DirectGate_JumpWiteSpace(" \tvalue") == 'v', "jump whitespace");
+    CHECK(*DirectGate_JumpWiteSpace(" \t") == '\0', "jump all whitespace");
     CHECK(*DirectGate_SkipToken("value rest") == ' ', "skip token");
+    CHECK(*DirectGate_SkipToken("") == '\0', "skip empty token");
+    CHECK(DirectGate_JumpWiteSpace(NULL) == NULL && DirectGate_SkipToken(NULL) == NULL,
+        "token helpers reject NULL");
 
     char sRoot[] = "/tmp/directgate_common_private.XXXXXX";
     CHECK(mkdtemp(sRoot) != NULL, "mkdtemp private root");
@@ -115,6 +161,12 @@ int main(void)
     snprintf(sPrivateFile, sizeof(sPrivateFile), "%s/private/config.json", sRoot);
 
     const uint8_t sSecret[] = "secret";
+    CHECK(!DirectGate_WritePrivateFile(NULL, sSecret, sizeof(sSecret) - 1),
+        "private writer rejects NULL path");
+    CHECK(!DirectGate_WritePrivateFile(sPrivateFile, NULL, sizeof(sSecret) - 1),
+        "private writer rejects NULL data");
+    CHECK(!DirectGate_WritePrivateFile(sPrivateFile, sSecret, 0),
+        "private writer rejects empty data");
     CHECK(DirectGate_WritePrivateFile(sPrivateFile, sSecret, sizeof(sSecret) - 1),
         "write private file");
 

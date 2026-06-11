@@ -48,6 +48,7 @@ int main(void)
     CHECK(XJSON_GetInt(XJSON_GetObject(pRoot, "version")) == 1, "int field");
     CHECK(XJSON_GetBool(XJSON_GetObject(pRoot, "force")) == 1, "true field");
     CHECK(XJSON_GetBool(XJSON_GetObject(pRoot, "cancel")) == 0, "false field");
+    CHECK(XJSON_GetFloat(XJSON_GetObject(pRoot, "ratio")) == 0.5, "float field");
     CHECK(XJSON_GetU32(XJSON_GetObject(pRoot, "big")) == 4294967295U, "u32 max");
     CHECK(XJSON_GetObject(pRoot, "no-such-key") == NULL, "missing key is NULL");
 
@@ -88,6 +89,19 @@ int main(void)
     CHECK(XJSON_AddString(pBuilt, "k", "v") == XJSON_ERR_NONE, "add string");
     CHECK(XJSON_AddU32(pBuilt, "n", 7) == XJSON_ERR_NONE, "add u32");
     CHECK(XJSON_AddBool(pBuilt, "b", 1) == XJSON_ERR_NONE, "add bool");
+    CHECK(XJSON_AddNull(pBuilt, "nil") == XJSON_ERR_NONE, "add null");
+    CHECK(XJSON_AddFloat(pBuilt, "f", 1.25) == XJSON_ERR_NONE, "add float");
+    CHECK(XJSON_AddString(pBuilt, "k", "replacement") == XJSON_ERR_EXITS,
+        "duplicate rejected when updates disabled");
+
+    xjson_obj_t *pArray = XJSON_GetOrCreateArray(pBuilt, "items", XFALSE);
+    CHECK(pArray != NULL, "create array");
+    CHECK(XJSON_AddObject(pArray, XJSON_NewInt(pArray->pPool, NULL, -7)) == XJSON_ERR_NONE,
+        "add array item");
+    CHECK(XJSON_GetArrayLength(pArray) == 1 &&
+          XJSON_GetInt(XJSON_GetArrayItem(pArray, 0)) == -7, "array item value");
+    CHECK(XJSON_RemoveArrayItem(pArray, 0) == XARRAY_SUCCESS &&
+          XJSON_GetArrayLength(pArray) == 0, "remove array item");
 
     pDump = XJSON_DumpObj(pBuilt, 0, &nDumpLen);
     CHECK(pDump != NULL, "dump built");
@@ -110,6 +124,20 @@ int main(void)
     CHECK(!parse_ok("nonsense"), "bare garbage");
     CHECK(!parse_ok("{\"a\":\"unterminated}"), "unterminated string");
     CHECK(!parse_ok("[1,2"), "unterminated array");
+    CHECK(!parse_ok("{} trailing"), "trailing garbage");
+    CHECK(!parse_ok("{\"a\":01}"), "leading-zero number");
+    CHECK(!parse_ok("{\"a\":1.}"), "missing fractional digits");
+    CHECK(!parse_ok("{\"a\":.1}"), "missing integer digits");
+    CHECK(!parse_ok("{\"a\":1e}"), "missing exponent digits");
+    CHECK(!parse_ok("{\"a\":true false}"), "adjacent values");
+    CHECK(!parse_ok("{\"a\":\"bad\nstring\"}"), "raw newline in string");
+    CHECK(!parse_ok("{\"a\":\"bad\\qescape\"}"), "invalid string escape");
+    CHECK(!parse_ok("{\"a\":\"bad\\u12xz\"}"), "invalid unicode escape");
+    CHECK(parse_ok("{\"a\":-1.25e+3,\"b\":0,\"c\":1E-2}"),
+        "valid JSON number grammar");
+    CHECK(parse_ok("{\"a\":\"quote: \\\" slash: \\\\ unicode: \\u0041\"}"),
+        "valid JSON string escapes");
+    CHECK(parse_ok("{\r\n\t\"a\" : 1\r\n}"), "valid JSON whitespace");
 
     /* Truncations of a valid document at every byte must never crash */
     for (size_t i = 1; i + 1 < strlen(pDoc); i++)

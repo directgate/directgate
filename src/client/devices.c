@@ -114,7 +114,7 @@ xbool_t DirectGate_Devices_Load(xmap_t *pMap, const char *pPath)
     XCHECK_NL((XPath_Exists(pPath)), XFALSE);
 
     xfile_t file;
-    XCHECK_NL((XFile_Open(&file, pPath, "r", NULL) > 0),
+    XCHECK_NL((XFile_Open(&file, pPath, "r", NULL) >= 0),
         xthrowr(XFALSE, "Failed to open device list: %s (%s)", pPath, XSTRERR));
 
     char sLine[XLINE_MAX];
@@ -158,7 +158,7 @@ xbool_t DirectGate_Devices_Write(xmap_t *pMap, const char *pPath)
     XCHECK_NL((pMap->nCount > 0), XFALSE);
 
     xfile_t file;
-    XCHECK((XFile_Open(&file, pPath, "w", NULL) > 0),
+    XCHECK((XFile_Open(&file, pPath, "cwt", NULL) >= 0),
         xthrowr(XFALSE, "Failed to open device list for writing: %s (%s)", pPath, XSTRERR));
 
     XMap_Iterate(pMap, DirectGate_Devices_WriteIt, &file);

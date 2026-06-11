@@ -33,6 +33,7 @@ int main(void)
 
     CHECK(xstrncpy(sSmall, sizeof(sSmall), "") == 0, "xstrncpy empty");
     CHECK(sSmall[0] == '\0', "xstrncpy empty terminates");
+    CHECK(xstrncpy(NULL, 0, "x") == 0, "xstrncpy NULL destination");
 
     nLen = xstrncpyf(sSmall, sizeof(sSmall), "%s-%d", "abc", 42);
     CHECK(nLen == 6 && strcmp(sSmall, "abc-42") == 0, "xstrncpyf format");
@@ -57,6 +58,7 @@ int main(void)
     /* ---- substring search ---- */
     CHECK(xstrsrc("wss://relay.example/ws?x=1", "?") == 22, "xstrsrc offset");
     CHECK(xstrsrc("plain", "?") < 0, "xstrsrc missing");
+    CHECK(xstrsrc("aaaa", "aa") == 0, "xstrsrc first match");
 
     /* ---- tokenizer ---- */
     char sTok[32];
@@ -74,15 +76,33 @@ int main(void)
     xbyte_buffer_t buf;
     CHECK(XByteBuffer_Init(&buf, XSTDNON, XFALSE) >= 0, "buffer init");
     CHECK(buf.nUsed == 0, "fresh buffer empty");
+    CHECK(!XByteBuffer_HasData(&buf), "fresh buffer has no data");
+    CHECK(XByteBuffer_Add(&buf, NULL, 1) == 0, "buffer rejects NULL add");
+    CHECK(XByteBuffer_Add(&buf, (const uint8_t*)"x", 0) == 0,
+        "buffer rejects empty add");
 
     CHECK(XByteBuffer_Add(&buf, (const uint8_t*)"hello", 5) > 0, "buffer add");
     CHECK(buf.nUsed == 5, "buffer used");
     CHECK(XByteBuffer_AddByte(&buf, '!') > 0, "buffer add byte");
     CHECK(buf.nUsed == 6 && memcmp(buf.pData, "hello!", 6) == 0, "buffer content");
+    CHECK(XByteBuffer_GetByte(&buf, 0) == 'h' &&
+          XByteBuffer_GetByte(&buf, 99) == 0, "buffer byte access");
+    CHECK(XByteBuffer_Insert(&buf, 5, (const uint8_t*)", world", 7) > 0,
+        "buffer insert");
+    CHECK(buf.nUsed == 13 && memcmp(buf.pData, "hello, world!", 13) == 0,
+        "buffer inserted content");
+    CHECK(XByteBuffer_Remove(&buf, 5, 7) == 7 &&
+          memcmp(buf.pData, "hello!", 6) == 0, "buffer remove middle");
+    CHECK(XByteBuffer_Remove(&buf, 99, 1) == 0, "buffer remove out of range");
+    CHECK(XByteBuffer_Terminate(&buf, 5) == XSTDOK &&
+          buf.nUsed == 5 && strcmp((char*)buf.pData, "hello") == 0,
+        "buffer terminate");
+    CHECK(XByteBuffer_AddFmt(&buf, "-%d", 42) > 0 &&
+          strcmp((char*)buf.pData, "hello-42") == 0, "buffer add format");
 
     /* Advance models partial PTY writes: drops consumed bytes from the head */
     CHECK(XByteBuffer_Advance(&buf, 2) > 0, "buffer advance");
-    CHECK(buf.nUsed == 4 && memcmp(buf.pData, "llo!", 4) == 0, "advance content");
+    CHECK(buf.nUsed == 6 && memcmp(buf.pData, "llo-42", 6) == 0, "advance content");
 
     /* Advancing everything empties without invalidating the buffer */
     XByteBuffer_Advance(&buf, buf.nUsed);
@@ -96,6 +116,19 @@ int main(void)
     CHECK(XByteBuffer_Add(&buf, (const uint8_t*)"x", 1) > 0, "add after reset");
     XByteBuffer_Clear(&buf);
     CHECK(buf.pData == NULL && buf.nUsed == 0, "clear releases");
+
+    xbyte_buffer_t *pHeap = XByteBuffer_New(4, XTRUE);
+    CHECK(pHeap != NULL, "heap buffer new");
+    CHECK(XByteBuffer_Add(pHeap, (const uint8_t*)"owned", 5) > 0,
+        "heap buffer add");
+    XByteBuffer_Free(&pHeap);
+    CHECK(pHeap == NULL, "heap buffer free clears pointer");
+
+    uint8_t *pDup = XByteData_Dup((const uint8_t*)"abc", 3);
+    CHECK(pDup != NULL && strcmp((char*)pDup, "abc") == 0, "byte data duplicate");
+    free(pDup);
+    CHECK(XByteData_Dup(NULL, 3) == NULL && XByteData_Dup((const uint8_t*)"x", 0) == NULL,
+        "byte data duplicate invalid inputs");
 
     /* Growth: stream 256 KB through in odd-sized chunks, verify content */
     CHECK(XByteBuffer_Init(&buf, XSTDNON, XFALSE) >= 0, "growth buffer init");
@@ -124,6 +157,17 @@ int main(void)
     CHECK(buf.nUsed == sizeof(binary) && memcmp(buf.pData, binary, sizeof(binary)) == 0,
         "binary bytes intact");
     XByteBuffer_Clear(&buf);
+
+    xbyte_buffer_t src;
+    xbyte_buffer_t dst;
+    CHECK(XByteBuffer_Init(&src, 0, XFALSE) >= 0 &&
+          XByteBuffer_Init(&dst, 0, XFALSE) >= 0, "ownership buffers init");
+    CHECK(XByteBuffer_Add(&src, (const uint8_t*)"move", 4) > 0, "ownership source add");
+    CHECK(XByteBuffer_Own(&dst, &src) > 0, "buffer ownership move");
+    CHECK(src.pData == NULL && dst.nUsed == 4 &&
+          memcmp(dst.pData, "move", 4) == 0, "buffer ownership state");
+    XByteBuffer_Clear(&src);
+    XByteBuffer_Clear(&dst);
 
     puts("str_buf_smoke: OK");
     return 0;

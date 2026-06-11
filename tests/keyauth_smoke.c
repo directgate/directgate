@@ -28,6 +28,33 @@ static void hex_encode(const uint8_t *pBytes, size_t nLen,
 
 int main(void)
 {
+    CHECK(strcmp(DirectGate_KeyAuth_StateName(DIRECTGATE_KEYAUTH_STATE_IDLE), "IDLE") == 0,
+        "idle state name");
+    CHECK(strcmp(DirectGate_KeyAuth_StateName(DIRECTGATE_KEYAUTH_STATE_AUTHENTICATED),
+        "AUTHENTICATED") == 0, "authenticated state name");
+    CHECK(strcmp(DirectGate_KeyAuth_StateName((directgate_keyauth_state_t)99), "UNKNOWN") == 0,
+        "unknown state name");
+
+    uint8_t hexBytes[4];
+    size_t nHexLen = 0;
+    CHECK(DirectGate_KeyAuth_HexToBytes("00aF10ff", hexBytes, sizeof(hexBytes), &nHexLen),
+        "mixed-case hex decode");
+    CHECK(nHexLen == sizeof(hexBytes) && hexBytes[0] == 0 && hexBytes[1] == 0xaf &&
+          hexBytes[2] == 0x10 && hexBytes[3] == 0xff, "hex decoded bytes");
+    char hexOut[9];
+    CHECK(DirectGate_KeyAuth_BytesToHex(hexBytes, sizeof(hexBytes), hexOut, sizeof(hexOut)) &&
+          strcmp(hexOut, "00af10ff") == 0, "hex encode");
+    CHECK(!DirectGate_KeyAuth_HexToBytes("", hexBytes, sizeof(hexBytes), &nHexLen),
+        "reject empty hex");
+    CHECK(!DirectGate_KeyAuth_HexToBytes("abc", hexBytes, sizeof(hexBytes), &nHexLen),
+        "reject odd hex");
+    CHECK(!DirectGate_KeyAuth_HexToBytes("zz", hexBytes, sizeof(hexBytes), &nHexLen),
+        "reject non-hex");
+    CHECK(!DirectGate_KeyAuth_HexToBytes("0011", hexBytes, 1, &nHexLen),
+        "reject oversized hex");
+    CHECK(!DirectGate_KeyAuth_BytesToHex(hexBytes, sizeof(hexBytes), hexOut, 8),
+        "reject small hex output");
+
     uint8_t trailingZero[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
     uint8_t trailingZeroDecoded[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
     char trailingZeroB64[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
@@ -57,24 +84,63 @@ int main(void)
     CHECK(nTrailingZeroSigLen == sizeof(trailingZeroSig), "trailing-zero sig decode length");
     CHECK(memcmp(trailingZeroSigDecoded, trailingZeroSig, sizeof(trailingZeroSig)) == 0,
         "trailing-zero sig decode bytes");
+    CHECK(!DirectGate_KeyAuth_Base64Encode(trailingZero, sizeof(trailingZero),
+        trailingZeroB64, 4), "reject small base64 output");
+    CHECK(!DirectGate_KeyAuth_Base64Decode("", trailingZeroDecoded,
+        sizeof(trailingZeroDecoded), &nTrailingZeroLen), "reject empty base64");
+    CHECK(!DirectGate_KeyAuth_Base64Decode("!!!!", trailingZeroDecoded,
+        sizeof(trailingZeroDecoded), &nTrailingZeroLen), "reject invalid base64");
+    CHECK(!DirectGate_KeyAuth_Base64Decode(trailingZeroB64, trailingZeroDecoded,
+        sizeof(trailingZeroDecoded) - 1, &nTrailingZeroLen), "reject small decoded output");
 
     /* --- Agent identity (Ed25519 long-term) --- */
     uint8_t agentIdentityPub[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
     uint8_t agentIdentitySeed[DIRECTGATE_KEYAUTH_ED25519_SEED_SIZE];
     CHECK(DirectGate_KeyAuth_Ed25519Generate(agentIdentityPub, agentIdentitySeed),
         "agent identity keygen");
+    uint8_t derivedAgentPub[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
+    CHECK(DirectGate_KeyAuth_Ed25519DerivePub(agentIdentitySeed, derivedAgentPub),
+        "derive agent public key");
+    CHECK(memcmp(derivedAgentPub, agentIdentityPub, sizeof(derivedAgentPub)) == 0,
+        "derived agent public key matches");
+    CHECK(!DirectGate_KeyAuth_Ed25519Generate(NULL, agentIdentitySeed),
+        "keygen rejects NULL output");
 
     /* --- Client identity (Ed25519 long-term) --- */
     uint8_t clientPub[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
     uint8_t clientSeed[DIRECTGATE_KEYAUTH_ED25519_SEED_SIZE];
     CHECK(DirectGate_KeyAuth_Ed25519Generate(clientPub, clientSeed),
         "client identity keygen");
+    const uint8_t sMessage[] = "keyauth primitive message";
+    uint8_t primitiveSig[DIRECTGATE_KEYAUTH_ED25519_SIG_SIZE];
+    CHECK(DirectGate_KeyAuth_Ed25519Sign(clientSeed, sMessage, sizeof(sMessage), primitiveSig),
+        "primitive sign");
+    CHECK(DirectGate_KeyAuth_Ed25519Verify(clientPub, sMessage, sizeof(sMessage), primitiveSig),
+        "primitive verify");
+    primitiveSig[0] ^= 1;
+    CHECK(!DirectGate_KeyAuth_Ed25519Verify(clientPub, sMessage, sizeof(sMessage), primitiveSig),
+        "primitive signature tamper");
+    primitiveSig[0] ^= 1;
+    CHECK(!DirectGate_KeyAuth_Ed25519Sign(NULL, sMessage, sizeof(sMessage), primitiveSig),
+        "sign rejects NULL seed");
 
     /* --- Client session: ephemeral X25519 + nonce --- */
     uint8_t clientEphPub[DIRECTGATE_KEYAUTH_X25519_PUB_SIZE];
     uint8_t clientEphPriv[DIRECTGATE_KEYAUTH_X25519_PRIV_SIZE];
     CHECK(DirectGate_KeyAuth_X25519Generate(clientEphPub, clientEphPriv),
         "client x25519 keygen");
+    uint8_t peerEphPub[DIRECTGATE_KEYAUTH_X25519_PUB_SIZE];
+    uint8_t peerEphPriv[DIRECTGATE_KEYAUTH_X25519_PRIV_SIZE];
+    uint8_t clientPrimitiveShared[DIRECTGATE_KEYAUTH_X25519_SHARED_SIZE];
+    uint8_t peerPrimitiveShared[DIRECTGATE_KEYAUTH_X25519_SHARED_SIZE];
+    CHECK(DirectGate_KeyAuth_X25519Generate(peerEphPub, peerEphPriv), "peer x25519 keygen");
+    CHECK(DirectGate_KeyAuth_X25519Derive(clientEphPriv, peerEphPub, clientPrimitiveShared) &&
+          DirectGate_KeyAuth_X25519Derive(peerEphPriv, clientEphPub, peerPrimitiveShared),
+        "x25519 two-way derive");
+    CHECK(memcmp(clientPrimitiveShared, peerPrimitiveShared,
+        sizeof(clientPrimitiveShared)) == 0, "x25519 shared secret symmetry");
+    CHECK(!DirectGate_KeyAuth_X25519Derive(NULL, peerEphPub, clientPrimitiveShared),
+        "x25519 rejects NULL private key");
 
     uint8_t clientNonce[DIRECTGATE_KEYAUTH_NONCE_SIZE];
     for (size_t i = 0; i < sizeof(clientNonce); i++) clientNonce[i] = (uint8_t)(0x10 + i);
@@ -87,6 +153,13 @@ int main(void)
     CHECK(DirectGate_KeyAuth_Base64Encode(clientEphPub, sizeof(clientEphPub),
         clientEphB64, sizeof(clientEphB64)), "encode clientEph");
     hex_encode(clientNonce, sizeof(clientNonce), clientNonceHex, sizeof(clientNonceHex));
+    const char *authorized[] = { "invalid-base64", clientPubB64, trailingZeroB64 };
+    CHECK(DirectGate_KeyAuth_IsClientAuthorized(clientPub, authorized, 3),
+        "authorized key lookup");
+    CHECK(!DirectGate_KeyAuth_IsClientAuthorized(agentIdentityPub, authorized, 2),
+        "unauthorized key lookup");
+    CHECK(!DirectGate_KeyAuth_IsClientAuthorized(NULL, authorized, 3),
+        "authorized lookup rejects NULL key");
 
     /* --- Agent state machine: hello --> challenge --- */
     directgate_keyauth_t agentAuth;
@@ -138,6 +211,12 @@ int main(void)
 
     xbyte_buffer_t agentTranscript;
     XByteBuffer_Init(&agentTranscript, XSTDNON, XFALSE);
+    CHECK(!DirectGate_KeyAuth_BuildTranscript(&agentTranscript, 'x', pDeviceId,
+        clientPub, agentIdentityPub, challenge, clientNonce, agentNonce,
+        clientEphPub, agentEph), "reject invalid transcript tag");
+    CHECK(!DirectGate_KeyAuth_BuildTranscript(NULL, 'h', pDeviceId,
+        clientPub, agentIdentityPub, challenge, clientNonce, agentNonce,
+        clientEphPub, agentEph), "reject NULL transcript output");
     CHECK(DirectGate_KeyAuth_BuildTranscript(&agentTranscript, 'h', pDeviceId,
         clientPub, agentIdentityPub, challenge, clientNonce, agentNonce,
         clientEphPub, agentEph), "build agent transcript");

@@ -416,6 +416,7 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
             return XSTDNON;
         }
 
+        XMap_Destroy(&deviceMap);
         return XSTDNON;
     }
 

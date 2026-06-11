@@ -24,10 +24,10 @@
 
 size_t DirectGate_GetQueryValue(const char *pUri, const char *pKey, char *pBuffer, size_t nSize)
 {
-    XCHECK((pBuffer != NULL), XSTDNON);
+    XCHECK((pBuffer != NULL && nSize > 0), XSTDNON);
     pBuffer[0] = XSTR_NUL;
 
-    XCHECK_NL((xstrused(pUri) && xstrused(pKey) && nSize > 0), XSTDNON);
+    XCHECK_NL((xstrused(pUri) && xstrused(pKey)), XSTDNON);
     int nQueryPos = xstrsrc(pUri, "?");
     XCHECK_NL((nQueryPos >= 0), XSTDNON);
 
@@ -129,9 +129,10 @@ xbool_t DirectGate_ParseI64(const uint8_t *pData, size_t nLength, int64_t *pValu
     char sNumber[64];
     xstrncpys(sNumber, sizeof(sNumber), (const char*)pData, nLength);
 
+    errno = 0;
     char *pEnd = NULL;
     long long nParsed = strtoll(sNumber, &pEnd, 10);
-    XCHECK_NL((pEnd != NULL && *pEnd == XSTR_NUL), XFALSE);
+    XCHECK_NL((errno != ERANGE && pEnd != NULL && pEnd != sNumber && *pEnd == XSTR_NUL), XFALSE);
 
     *pValue = (int64_t)nParsed;
     return XTRUE;

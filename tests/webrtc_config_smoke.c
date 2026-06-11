@@ -13,6 +13,13 @@
 
 int main(void)
 {
+    directgate_ice_server_t invalidServers[DIRECTGATE_MAX_ICE_SERVERS];
+    uint8_t nInvalidCount = 99;
+    CHECK(!DirectGate_WebRTC_LoadIceServers(NULL, &nInvalidCount, NULL),
+        "load ICE rejects NULL servers");
+    CHECK(!DirectGate_WebRTC_LoadIceServers(invalidServers, NULL, NULL),
+        "load ICE rejects NULL count");
+
     const char *pCustomJson =
         "{"
             "\"iceServers\":["
@@ -72,6 +79,20 @@ int main(void)
         "set ICE first entry");
     CHECK(strcmp(rtc.sIceServers[1], "stun:configured.example.test") == 0,
         "set ICE second entry");
+
+    directgate_ice_server_t tcpConfigured[2];
+    memset(tcpConfigured, 0, sizeof(tcpConfigured));
+    xstrncpy(tcpConfigured[0], sizeof(tcpConfigured[0]),
+        "turn:relay.example.test:3478?transport=tcp");
+    xstrncpy(tcpConfigured[1], sizeof(tcpConfigured[1]),
+        "turn:relay.example.test:3478?transport=udp");
+    DirectGate_WebRTC_SetIceServers(&rtc, tcpConfigured, 2);
+    CHECK(rtc.nIceSrvCount == 1 &&
+          strcmp(rtc.sIceServers[0], tcpConfigured[1]) == 0,
+        "TCP ICE filtered by default");
+    rtc.bAllowTCP = XTRUE;
+    DirectGate_WebRTC_SetIceServers(&rtc, tcpConfigured, 2);
+    CHECK(rtc.nIceSrvCount == 2, "TCP ICE allowed when configured");
     DirectGate_WebRTC_Clear(&rtc);
 
     // BYO-shape URLs: longer creds, turns:, ?transport=tcp, plus stun colocation.

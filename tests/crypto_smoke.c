@@ -62,6 +62,24 @@ int main(void)
         "HKDF RFC5869 OKM");
     CHECK(!DirectGate_HKDF_Expand(prk, sizeof(prk), "too-long", okm,
         (size_t)255 * XHKDF_SHA256_LEN + 1), "HKDF max output guard");
+    CHECK(!DirectGate_HKDF_Extract(NULL, 0, NULL, 0, prk), "HKDF extract NULL IKM");
+    CHECK(!DirectGate_HKDF_Extract(NULL, 0, ikm, 0, prk), "HKDF extract empty IKM");
+    CHECK(!DirectGate_HKDF_Extract(NULL, 0, ikm, sizeof(ikm), NULL),
+        "HKDF extract NULL output");
+    uint8_t noSaltPrk[XHKDF_SHA256_LEN];
+    uint8_t noInfoOkm[XHKDF_SHA256_LEN];
+    CHECK(DirectGate_HKDF_Extract(NULL, 0, ikm, sizeof(ikm), noSaltPrk),
+        "HKDF zero salt");
+    CHECK(DirectGate_HKDF_Expand(noSaltPrk, sizeof(noSaltPrk), NULL,
+        noInfoOkm, sizeof(noInfoOkm)), "HKDF no info");
+    CHECK(!DirectGate_HKDF_Expand(NULL, sizeof(prk), NULL, okm, sizeof(okm)),
+        "HKDF expand NULL PRK");
+    CHECK(!DirectGate_HKDF_Expand(prk, 0, NULL, okm, sizeof(okm)),
+        "HKDF expand empty PRK");
+    CHECK(!DirectGate_HKDF_Expand(prk, sizeof(prk), NULL, NULL, sizeof(okm)),
+        "HKDF expand NULL output");
+    CHECK(!DirectGate_HKDF_Expand(prk, sizeof(prk), NULL, okm, 0),
+        "HKDF expand empty output");
 
     uint8_t secret[32];
     uint8_t agentNonce[32];
@@ -77,7 +95,20 @@ int main(void)
     DirectGate_E2E_Init(&keyE2E2);
     DirectGate_E2E_Init(&srpE2E);
 
+    CHECK(!DirectGate_E2E_IsInitialized(NULL), "NULL E2E is uninitialized");
     CHECK(!DirectGate_E2E_IsInitialized(&keyE2E), "E2E starts uninitialized");
+    CHECK(!DirectGate_E2E_DeriveFromKey(NULL, secret, sizeof(secret),
+        agentNonce, clientNonce, sizeof(agentNonce), "dev-crypto", 1),
+        "derive rejects NULL context");
+    CHECK(!DirectGate_E2E_DeriveFromKey(&keyE2E, NULL, sizeof(secret),
+        agentNonce, clientNonce, sizeof(agentNonce), "dev-crypto", 1),
+        "derive rejects NULL secret");
+    CHECK(!DirectGate_E2E_DeriveFromKey(&keyE2E, secret, sizeof(secret),
+        agentNonce, clientNonce, sizeof(agentNonce), "", 1),
+        "derive rejects empty device");
+    CHECK(!DirectGate_E2E_DeriveFromKey(&keyE2E, secret, sizeof(secret),
+        agentNonce, clientNonce, sizeof(agentNonce) + 1, "dev-crypto", 1),
+        "derive rejects oversized nonce");
     /* keyE2E is the agent side, keyE2E2 the client side of the same channel. */
     CHECK(DirectGate_E2E_DeriveFromKey(&keyE2E, secret, sizeof(secret),
         agentNonce, clientNonce, sizeof(agentNonce), "dev-crypto", 1),
@@ -110,6 +141,16 @@ int main(void)
 
     const uint8_t plaintext[] = "directgate encrypted payload";
     size_t nEncLen = 0;
+    CHECK(DirectGate_E2E_Encrypt(NULL, plaintext, sizeof(plaintext), &nEncLen) == NULL,
+        "encrypt rejects NULL context");
+    CHECK(DirectGate_E2E_Encrypt(&keyE2E, NULL, sizeof(plaintext), &nEncLen) == NULL,
+        "encrypt rejects NULL data");
+    CHECK(DirectGate_E2E_Encrypt(&keyE2E, plaintext, 0, &nEncLen) == NULL,
+        "encrypt rejects empty data");
+    CHECK(DirectGate_E2E_Encrypt(&keyE2E, plaintext, sizeof(plaintext), NULL) == NULL,
+        "encrypt rejects NULL output length");
+    CHECK(DirectGate_E2E_Decrypt(&keyE2E2, plaintext, sizeof(plaintext), &nEncLen) == NULL,
+        "decrypt rejects short packet");
     uint8_t *pEncrypted = DirectGate_E2E_Encrypt(&keyE2E, plaintext,
         sizeof(plaintext), &nEncLen);
     /* Wire layout is nonce(16) || siv_tag(16) || ciphertext, i.e. 32 bytes of
@@ -150,6 +191,8 @@ int main(void)
 
     DirectGate_E2E_Clear(&keyE2E);
     CHECK(!DirectGate_E2E_IsInitialized(&keyE2E), "E2E clear");
+    for (size_t i = 0; i < sizeof(keyE2E.txCmacKey); i++)
+        CHECK(keyE2E.txCmacKey[i] == 0, "E2E clear zeroes key material");
 
     puts("crypto_smoke: OK");
     return 0;
