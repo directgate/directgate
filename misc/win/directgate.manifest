@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Application manifest for the Windows builds.
+
+  activeCodePage UTF-8 (Windows 10 1903+) switches every ANSI ("A") Win32
+  and CRT call in the process to UTF-8, so file names and terminal payloads
+  in any language round-trip losslessly without a wide-character port.
+-->
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity type="win32" name="io.directgate.agent" version="1.0.0.0"/>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings xmlns:ws2019="http://schemas.microsoft.com/SMI/2019/WindowsSettings">
+      <ws2019:activeCodePage>UTF-8</ws2019:activeCodePage>
+    </windowsSettings>
+  </application>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>

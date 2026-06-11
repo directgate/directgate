@@ -25,6 +25,20 @@
 #include "xstd.h"
 #include "xver.h"
 
+#ifdef _WIN32
+#include <sddl.h>    /* SDDL security descriptors for private files */
+#include <getopt.h>  /* MinGW-w64 ships a getopt implementation */
+
+/* Terminal geometry compatibility: mirrors struct winsize from
+   <sys/ioctl.h> so shared protocol code stays platform-free. */
+struct winsize {
+    unsigned short ws_row;
+    unsigned short ws_col;
+    unsigned short ws_xpixel;
+    unsigned short ws_ypixel;
+};
+#endif
+
 #include "sys/log.h"
 #include "sys/sig.h"
 #include "sys/xfs.h"

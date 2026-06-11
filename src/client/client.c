@@ -30,12 +30,42 @@
 #include "srp.h"
 
 static xbool_t g_bFinish = XFALSE;
-static volatile sig_atomic_t g_bWinch = 0;
 
+#ifndef _WIN32
+static volatile sig_atomic_t g_bWinch = 0;
+#endif
+
+#ifdef _WIN32
+/* Console fds for the CRT write()/read() compatibility calls */
+#ifndef STDIN_FILENO
+#define STDIN_FILENO  0
+#endif
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
+
+/*
+    WSAPoll (the Windows event engine in libxutils) handles only sockets,
+    so console input cannot sit in the event loop directly. A pump thread
+    blocks on the console and forwards every chunk into a private socket
+    pair; the event loop polls the other end like a regular socket.
+    [0]=event loop (non-blocking), [1]=pump thread (blocking).
+*/
+static XSOCKET g_nStdinBridge[2] = { XSOCK_INVALID, XSOCK_INVALID };
+
+typedef struct directgate_client_io_ {
+    DWORD nSavedInMode;
+    DWORD nSavedOutMode;
+    xbool_t bSavedIn;
+    xbool_t bSavedOut;
+    xbool_t bRaw;
+} directgate_client_io_t;
+#else
 typedef struct directgate_client_io_ {
     struct termios saved;
     xbool_t bRaw;
 } directgate_client_io_t;
+#endif
 
 typedef struct directgate_client_ctx_ {
     const directgate_cfg_t *pCfg;
@@ -66,6 +96,7 @@ static int DirectGate_Client_HandleMessage(directgate_ctx_t *pCli, const uint8_t
 
 static void DirectGate_Client_SignalCallback(int sig)
 {
+#ifndef _WIN32
     if (sig == SIGWINCH)
     {
         g_bWinch = 1;
@@ -73,6 +104,8 @@ static void DirectGate_Client_SignalCallback(int sig)
     }
 
     if (sig == SIGPIPE) return;
+#endif
+    (void)sig;
     g_bFinish = XTRUE;
 }
 
@@ -127,6 +160,92 @@ void DirectGate_Client_Init(directgate_ctx_t *pClient)
     DirectGate_Transfer_Init(&pClient->transfer);
 }
 
+#ifdef _WIN32
+static DWORD WINAPI DirectGate_Client_StdinPump(LPVOID pArg)
+{
+    (void)pArg;
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    char sBuffer[XSTR_BIG];
+    DWORD nRead = 0;
+
+    while (ReadFile(hStdin, sBuffer, sizeof(sBuffer), &nRead, NULL) && nRead > 0)
+    {
+        size_t nSent = 0;
+        while (nSent < (size_t)nRead)
+        {
+            int nRet = send(g_nStdinBridge[1], sBuffer + nSent, (int)(nRead - nSent), 0);
+            if (nRet <= 0) return 0;
+            nSent += (size_t)nRet;
+        }
+    }
+
+    /* Console EOF (Ctrl-Z + Enter or closed input): recv reports 0 */
+    shutdown(g_nStdinBridge[1], SD_SEND);
+    return 0;
+}
+
+static XSTATUS DirectGate_Client_EnableRawIO(directgate_client_io_t *pIO)
+{
+    XCHECK((pIO != NULL), XSTDINV);
+    if (pIO->bRaw) return XSTDOK;
+
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+
+    if (!GetConsoleMode(hStdin, &pIO->nSavedInMode))
+    {
+        xloge("Failed to read console input mode: error(%lu)", GetLastError());
+        return XSTDERR;
+    }
+    pIO->bSavedIn = XTRUE;
+
+    if (!GetConsoleMode(hStdout, &pIO->nSavedOutMode))
+    {
+        xloge("Failed to read console output mode: error(%lu)", GetLastError());
+        return XSTDERR;
+    }
+    pIO->bSavedOut = XTRUE;
+
+    /*
+        Raw mode, SSH-like: no line buffering, no local echo and no local
+        Ctrl-C handling - VT input mode turns every key (including arrows
+        and Ctrl sequences) into bytes the remote PTY understands.
+    */
+    if (!SetConsoleMode(hStdin, ENABLE_VIRTUAL_TERMINAL_INPUT))
+    {
+        xloge("Failed to set console raw input mode: error(%lu)", GetLastError());
+        return XSTDERR;
+    }
+
+    /* VT output processing renders the remote escape sequences */
+    DWORD nOutMode = pIO->nSavedOutMode |
+        ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+
+    if (!SetConsoleMode(hStdout, nOutMode))
+    {
+        SetConsoleMode(hStdin, pIO->nSavedInMode);
+        xloge("Failed to set console VT output mode: error(%lu)", GetLastError());
+        return XSTDERR;
+    }
+
+    /* The remote PTY speaks UTF-8 in both directions */
+    SetConsoleCP(CP_UTF8);
+    SetConsoleOutputCP(CP_UTF8);
+
+    pIO->bRaw = XTRUE;
+    return XSTDOK;
+}
+
+static void DirectGate_Client_RestoreIO(directgate_client_io_t *pIO)
+{
+    XCHECK_VOID((pIO != NULL));
+    XCHECK_VOID_NL(pIO->bRaw);
+
+    if (pIO->bSavedIn) SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), pIO->nSavedInMode);
+    if (pIO->bSavedOut) SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), pIO->nSavedOutMode);
+    pIO->bRaw = XFALSE;
+}
+#else
 static XSTATUS DirectGate_Client_SetNonBlock(int nFd, xbool_t bNonblock)
 {
     int nFlags = fcntl(nFd, F_GETFL, 0);
@@ -189,6 +308,7 @@ static void DirectGate_Client_RestoreIO(directgate_client_io_t *pIO)
     DirectGate_Client_SetNonBlock(STDIN_FILENO, XFALSE);
     pIO->bRaw = XFALSE;
 }
+#endif /* _WIN32 */
 
 static ssize_t DirectGate_Client_WriteAll(int nFd, const void *pBuff, size_t nSize)
 {
@@ -814,8 +934,18 @@ static int DirectGate_Client_SendResize(directgate_ctx_t *pCli)
     if (!pCli->pWsSession->bHandshakeDone) return XAPI_CONTINUE;
 
     struct winsize size;
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO bufInfo;
+    XCHECK(GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &bufInfo),
+        xthrowr(XAPI_CONTINUE, "Failed to get terminal size: error(%lu)", GetLastError()));
+
+    memset(&size, 0, sizeof(size));
+    size.ws_col = (unsigned short)(bufInfo.srWindow.Right - bufInfo.srWindow.Left + 1);
+    size.ws_row = (unsigned short)(bufInfo.srWindow.Bottom - bufInfo.srWindow.Top + 1);
+#else
     XCHECK((!ioctl(STDOUT_FILENO, TIOCGWINSZ, &size)),
         xthrowr(XAPI_CONTINUE, "Failed to get terminal size: errno(%d)", errno));
+#endif
 
     XCHECK((size.ws_row > 0 || size.ws_col > 0),
         xthrowr(XAPI_CONTINUE, "Invalid terminal size: (%d), cols(%d)", size.ws_row, size.ws_col));
@@ -1015,7 +1145,11 @@ static int DirectGate_Client_HandleStdin(xapi_session_t *pSession)
     uint8_t sBuffer[XSTR_BIG];
     for (;;)
     {
+#ifdef _WIN32
+        int nRead = recv(g_nStdinBridge[0], (char*)sBuffer, (int)sizeof(sBuffer), 0);
+#else
         ssize_t nRead = read(STDIN_FILENO, sBuffer, sizeof(sBuffer));
+#endif
         if (nRead > 0)
         {
             if (!pCli->pWsSession->bHandshakeDone) continue;
@@ -1046,8 +1180,14 @@ static int DirectGate_Client_HandleStdin(xapi_session_t *pSession)
             return XAPI_CONTINUE;
         }
 
+#ifdef _WIN32
+        int nError = WSAGetLastError();
+        if (nError == WSAEINTR) continue;
+        if (nError == WSAEWOULDBLOCK) break;
+#else
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+#endif
 
         return XAPI_DISCONNECT;
     }
@@ -1183,12 +1323,16 @@ static int DirectGate_Client_Interrupt(xapi_ctx_t *pCtx)
 {
     directgate_ctx_t *pCli = (directgate_ctx_t*)pCtx->pApi->pUserCtx;
 
+#ifndef _WIN32
     if (g_bWinch && pCli != NULL)
     {
         g_bWinch = 0;
         int nResize = DirectGate_Client_SendResize(pCli);
         if (nResize < 0) return nResize;
     }
+#else
+    (void)pCli;
+#endif
 
     if (g_bFinish) return XAPI_DISCONNECT;
     return XAPI_CONTINUE;
@@ -1203,6 +1347,16 @@ static int DirectGate_Client_Tick(xapi_ctx_t *pCtx)
         xlogt("Tick event: advancing active file transfer");
         DirectGate_Transfer_SendNext(&pCli->transfer, DirectGate_Client_Transfer_SendCb, pCli);
     }
+
+#ifdef _WIN32
+    /* No SIGWINCH on Windows: poll the console geometry on the loop tick.
+       SendResize only transmits when the size actually changed. */
+    if (pCli != NULL && pCli->io.bRaw)
+    {
+        int nResize = DirectGate_Client_SendResize(pCli);
+        if (nResize < 0) return nResize;
+    }
+#endif
 
     if (g_bFinish) return XAPI_DISCONNECT;
     return XAPI_CONTINUE;
@@ -1265,8 +1419,14 @@ int main(int argc, char* argv[])
     xlog_indent(XTRUE);
     xlog_setfl(XLOG_FATAL | XLOG_ERROR | XLOG_WARN);
 
+#ifdef _WIN32
+    /* No SIGPIPE/SIGWINCH on Windows: resize is polled on the loop tick */
+    int nSignals[2] = { SIGTERM, SIGINT };
+    XSig_Register(nSignals, 2, DirectGate_Client_SignalCallback);
+#else
     int nSignals[4] = { SIGTERM, SIGINT, SIGPIPE, SIGWINCH };
     XSig_Register(nSignals, 4, DirectGate_Client_SignalCallback);
+#endif
 
     directgate_ctx_t client;
     memset(&client, 0, sizeof(client));
@@ -1345,10 +1505,36 @@ int main(int argc, char* argv[])
 
     stdinEndpt.eType = XAPI_EVENT;
     stdinEndpt.eRole = XAPI_CUSTOM;
-    stdinEndpt.nFD = STDIN_FILENO;
     stdinEndpt.nEvents = XPOLLIN;
     stdinEndpt.bUnix = XTRUE;
     stdinEndpt.pSessionData = &client;
+
+#ifdef _WIN32
+    if (XSock_CreatePair(g_nStdinBridge) != XSTDOK)
+    {
+        xloge("Failed to create stdin bridge socket pair: error(%d)", WSAGetLastError());
+        XAPI_Destroy(&api);
+        XLog_Destroy();
+        return XSTDERR;
+    }
+
+    u_long nNonBlock = 1;
+    ioctlsocket(g_nStdinBridge[0], FIONBIO, &nNonBlock);
+
+    HANDLE hStdinPump = CreateThread(NULL, 0, DirectGate_Client_StdinPump, NULL, 0, NULL);
+    if (hStdinPump == NULL)
+    {
+        xloge("Failed to start stdin pump thread: error(%lu)", GetLastError());
+        XAPI_Destroy(&api);
+        XLog_Destroy();
+        return XSTDERR;
+    }
+    CloseHandle(hStdinPump);
+
+    stdinEndpt.nFD = g_nStdinBridge[0];
+#else
+    stdinEndpt.nFD = STDIN_FILENO;
+#endif
 
     if (XAPI_AddEndpoint(&api, &stdinEndpt) < 0)
     {

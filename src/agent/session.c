@@ -25,8 +25,8 @@
 
 static int DirectGate_Session_GetWsFd(const directgate_session_t *pSession)
 {
-    XCHECK_NL((pSession != NULL), XSOCK_INVALID);
-    XCHECK_NL((pSession->pWsSession != NULL), XSOCK_INVALID);
+    XCHECK_NL((pSession != NULL), (int)XSOCK_INVALID);
+    XCHECK_NL((pSession->pWsSession != NULL), (int)XSOCK_INVALID);
     return (int)pSession->pWsSession->sock.nFD;
 }
 
@@ -294,7 +294,7 @@ directgate_session_t* DirectGate_SessionMgr_GetOrCreate(directgate_session_mgr_t
     {
         if (!DirectGate_SRP_Init(&pSession->srp))
         {
-            int nWsFd = pApiSession != NULL ? (int)pApiSession->sock.nFD : XSOCK_INVALID;
+            int nWsFd = pApiSession != NULL ? (int)pApiSession->sock.nFD : (int)XSOCK_INVALID;
             xloge("Failed to initialize SRP state: sid(%u), wsfd(%d)", nSessionId, nWsFd);
 
             DirectGate_SessionMgr_Remove(pMgr, pSession);
@@ -305,7 +305,7 @@ directgate_session_t* DirectGate_SessionMgr_GetOrCreate(directgate_session_mgr_t
         if (!DirectGate_AuthSaltHexToBytes(pCfg->auth.sSaltHex, salt, sizeof(salt)) ||
             !DirectGate_SRP_LoadVerifier(&pSession->srp, salt, sizeof(salt), pCfg->auth.sVerifierHex))
         {
-            int nWsFd = pApiSession != NULL ? (int)pApiSession->sock.nFD : XSOCK_INVALID;
+            int nWsFd = pApiSession != NULL ? (int)pApiSession->sock.nFD : (int)XSOCK_INVALID;
             xloge("Failed to load SRP verifier: sid(%u), wsfd(%d)", nSessionId, nWsFd);
 
             DirectGate_SessionMgr_Remove(pMgr, pSession);

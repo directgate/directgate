@@ -55,7 +55,11 @@ typedef struct directgate_search_ {
     xbool_t bPending;
     xvolatile_t nCancelRequested;
     xvolatile_t nInterrupted;
-    int nPipeFds[2];
+
+    /* [0]=read (main loop), [1]=write (worker thread).
+       POSIX: a pipe (XSOCKET == int there). Windows: a private socket
+       pair from XSock_CreatePair(), since WSAPoll only polls sockets. */
+    XSOCKET nPipeFds[2];
     char sRootPath[XPATH_MAX];
     char sFileName[XPATH_MAX];
     char sText[XSTR_BIG];

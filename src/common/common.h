@@ -37,6 +37,11 @@ xbool_t DirectGate_IsAPIEndpointAllowed(const char *pUrl);
 xbool_t DirectGate_EnsurePrivateFileParent(const char *pPath);
 xbool_t DirectGate_WritePrivateFile(const char *pPath, const uint8_t *pData, size_t nSize);
 
+/* Home directory and account name of the current user
+   (POSIX: $HOME / passwd db, Windows: %USERPROFILE% / GetUserName) */
+size_t DirectGate_GetHomeDir(char *pBuf, size_t nSize);
+size_t DirectGate_GetUserName(char *pBuf, size_t nSize);
+
 xbool_t DirectGate_PromptBool(const char *pLabel, xbool_t *pValue);
 xbool_t DirectGate_PromptU16(const char *pLabel, uint16_t *pValue);
 xbool_t DirectGate_PromptU32(const char *pLabel, uint32_t *pValue);

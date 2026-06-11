@@ -161,6 +161,171 @@ xbool_t DirectGate_IsAPIEndpointAllowed(const char *pUrl)
 #endif
 }
 
+#ifdef _WIN32
+/*
+    Windows counterpart of the POSIX 0600/0700 private-file model.
+
+    The DACL is built from SDDL and is protected (P), so nothing is
+    inherited from the parent directory. Access is granted only to:
+      SY - LocalSystem (the agent may run as a service)
+      BA - builtin Administrators (they can take ownership anyway,
+           granting it openly keeps the ACL honest)
+      OW - the object owner, i.e. the creating user
+    Directories add OICI so files created inside them inherit the
+    same private ACL even when written by other tooling.
+*/
+static xbool_t DirectGate_BuildPrivateSecAttrs(SECURITY_ATTRIBUTES *pSecAttrs,
+                                               PSECURITY_DESCRIPTOR *ppDescriptor,
+                                               xbool_t bDirectory)
+{
+    XCHECK_NL((pSecAttrs != NULL && ppDescriptor != NULL), XFALSE);
+
+    const char *pSDDL = bDirectory ?
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)" :
+        "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)";
+
+    *ppDescriptor = NULL;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            pSDDL, SDDL_REVISION_1, ppDescriptor, NULL))
+    {
+        xloge("Failed to build private security descriptor: error(%lu)", GetLastError());
+        return XFALSE;
+    }
+
+    pSecAttrs->nLength = sizeof(SECURITY_ATTRIBUTES);
+    pSecAttrs->lpSecurityDescriptor = *ppDescriptor;
+    pSecAttrs->bInheritHandle = FALSE;
+    return XTRUE;
+}
+
+xbool_t DirectGate_EnsurePrivateFileParent(const char *pPath)
+{
+    XCHECK((xstrused(pPath)), XFALSE);
+
+    char sDir[XPATH_MAX];
+    xstrncpy(sDir, sizeof(sDir), pPath);
+
+    char *pSlash = strrchr(sDir, '/');
+    char *pBackSlash = strrchr(sDir, '\\');
+    if (pBackSlash != NULL && (pSlash == NULL || pBackSlash > pSlash)) pSlash = pBackSlash;
+    XCHECK_NL((pSlash != NULL), XTRUE);
+
+    if (pSlash == sDir)
+        return XTRUE;
+
+    *pSlash = XSTR_NUL;
+    if (!xstrused(sDir) || xstrcmp(sDir, "."))
+        return XTRUE;
+
+    /* Drive root like "C:" needs no creation or tightening */
+    size_t nDirLen = strlen(sDir);
+    if (nDirLen == 2 && sDir[1] == ':')
+        return XTRUE;
+
+    DWORD nAttrs = GetFileAttributesA(sDir);
+    if (nAttrs != INVALID_FILE_ATTRIBUTES)
+        return (nAttrs & FILE_ATTRIBUTE_DIRECTORY) ? XTRUE : XFALSE;
+
+    SECURITY_ATTRIBUTES secAttrs;
+    PSECURITY_DESCRIPTOR pDescriptor = NULL;
+    if (!DirectGate_BuildPrivateSecAttrs(&secAttrs, &pDescriptor, XTRUE))
+        return XFALSE;
+
+    BOOL bCreated = CreateDirectoryA(sDir, &secAttrs);
+    DWORD nError = bCreated ? 0 : GetLastError();
+    LocalFree(pDescriptor);
+
+    if (!bCreated && nError != ERROR_ALREADY_EXISTS)
+    {
+        xloge("Failed to create private directory: dir(%s), error(%lu)", sDir, nError);
+        return XFALSE;
+    }
+
+    return XTRUE;
+}
+
+xbool_t DirectGate_WritePrivateFile(const char *pPath, const uint8_t *pData, size_t nSize)
+{
+    XCHECK((xstrused(pPath)), XFALSE);
+    XCHECK((pData != NULL), XFALSE);
+    XCHECK((nSize > 0), XFALSE);
+
+    /* Refuse to follow links: writing through a planted reparse point
+       would let an attacker redirect private data to a path they chose. */
+    DWORD nAttrs = GetFileAttributesA(pPath);
+    if (nAttrs != INVALID_FILE_ATTRIBUTES && (nAttrs & FILE_ATTRIBUTE_REPARSE_POINT))
+        return XFALSE;
+
+    if (!DirectGate_EnsurePrivateFileParent(pPath))
+        return XFALSE;
+
+    SECURITY_ATTRIBUTES secAttrs;
+    PSECURITY_DESCRIPTOR pDescriptor = NULL;
+    if (!DirectGate_BuildPrivateSecAttrs(&secAttrs, &pDescriptor, XFALSE))
+        return XFALSE;
+
+    /* mkstemp equivalent: random suffix + CREATE_NEW (O_EXCL semantics),
+       created with the private DACL and no sharing from the first byte */
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    char sTempPath[XPATH_MAX];
+    int nAttempt = 0;
+
+    for (nAttempt = 0; nAttempt < 16 && hFile == INVALID_HANDLE_VALUE; nAttempt++)
+    {
+        uint8_t nRandom[6];
+        if (RAND_bytes(nRandom, sizeof(nRandom)) != 1) break;
+
+        int nTempLen = snprintf(sTempPath, sizeof(sTempPath), "%s.tmp.%02x%02x%02x%02x%02x%02x",
+            pPath, nRandom[0], nRandom[1], nRandom[2], nRandom[3], nRandom[4], nRandom[5]);
+
+        if (nTempLen < 0 || (size_t)nTempLen >= sizeof(sTempPath)) break;
+
+        hFile = CreateFileA(sTempPath, GENERIC_WRITE, 0, &secAttrs,
+            CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+
+        if (hFile == INVALID_HANDLE_VALUE && GetLastError() != ERROR_FILE_EXISTS) break;
+    }
+
+    LocalFree(pDescriptor);
+    if (hFile == INVALID_HANDLE_VALUE) return XFALSE;
+
+    size_t nWritten = 0;
+    while (nWritten < nSize)
+    {
+        DWORD nChunk = (DWORD)XSTD_MIN(nSize - nWritten, (size_t)UINT32_MAX);
+        DWORD nDone = 0;
+
+        if (!WriteFile(hFile, pData + nWritten, nChunk, &nDone, NULL) || nDone == 0)
+        {
+            CloseHandle(hFile);
+            DeleteFileA(sTempPath);
+            return XFALSE;
+        }
+
+        nWritten += (size_t)nDone;
+    }
+
+    /* fsync equivalent before the atomic swap */
+    if (!FlushFileBuffers(hFile))
+    {
+        CloseHandle(hFile);
+        DeleteFileA(sTempPath);
+        return XFALSE;
+    }
+
+    CloseHandle(hFile);
+
+    /* rename() refuses existing targets on Windows; MoveFileEx with
+       REPLACE_EXISTING is the documented atomic replace on NTFS */
+    if (!MoveFileExA(sTempPath, pPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        DeleteFileA(sTempPath);
+        return XFALSE;
+    }
+
+    return XTRUE;
+}
+#else
 xbool_t DirectGate_EnsurePrivateFileParent(const char *pPath)
 {
     XCHECK((xstrused(pPath)), XFALSE);
@@ -280,7 +445,62 @@ xbool_t DirectGate_WritePrivateFile(const char *pPath, const uint8_t *pData, siz
 
     return XTRUE;
 }
+#endif /* _WIN32 */
 
+
+size_t DirectGate_GetHomeDir(char *pBuf, size_t nSize)
+{
+    XCHECK((pBuf != NULL && nSize > 0), XSTDNON);
+    pBuf[0] = XSTR_NUL;
+
+#ifdef _WIN32
+    const char *pHomeDir = getenv("USERPROFILE");
+    if (xstrused(pHomeDir)) return xstrncpy(pBuf, nSize, pHomeDir);
+
+    const char *pDrive = getenv("HOMEDRIVE");
+    const char *pPath = getenv("HOMEPATH");
+    if (xstrused(pDrive) && xstrused(pPath))
+        return xstrncpyf(pBuf, nSize, "%s%s", pDrive, pPath);
+
+    return XSTDNON;
+#else
+    const char *pHomeDir = getenv("HOME");
+    if (xstrused(pHomeDir)) return xstrncpy(pBuf, nSize, pHomeDir);
+
+    struct passwd *pUser = getpwuid(getuid());
+    if (pUser != NULL && xstrused(pUser->pw_dir))
+        return xstrncpy(pBuf, nSize, pUser->pw_dir);
+
+    return XSTDNON;
+#endif
+}
+
+size_t DirectGate_GetUserName(char *pBuf, size_t nSize)
+{
+    XCHECK((pBuf != NULL && nSize > 0), XSTDNON);
+    pBuf[0] = XSTR_NUL;
+
+#ifdef _WIN32
+    char sName[256];
+    DWORD nNameLen = (DWORD)sizeof(sName);
+    if (GetUserNameA(sName, &nNameLen) && xstrused(sName))
+        return xstrncpy(pBuf, nSize, sName);
+
+    const char *pUserEnv = getenv("USERNAME");
+    if (xstrused(pUserEnv)) return xstrncpy(pBuf, nSize, pUserEnv);
+
+    return XSTDNON;
+#else
+    struct passwd *pUser = getpwuid(getuid());
+    if (pUser != NULL && xstrused(pUser->pw_name))
+        return xstrncpy(pBuf, nSize, pUser->pw_name);
+
+    const char *pUserEnv = getenv("USER");
+    if (xstrused(pUserEnv)) return xstrncpy(pBuf, nSize, pUserEnv);
+
+    return XSTDNON;
+#endif
+}
 
 xbool_t DirectGate_PromptString(const char *pLabel, char *pOut, size_t nSize,
                                 const char *pDefault, xbool_t bRequired)

@@ -33,8 +33,8 @@ typedef struct directgate_search_build_ {
 
 static int DirectGate_Search_GetWsFd(const directgate_session_t *pSession)
 {
-    XCHECK_NL((pSession != NULL), XSOCK_INVALID);
-    XCHECK_NL((pSession->pWsSession != NULL), XSOCK_INVALID);
+    XCHECK_NL((pSession != NULL), (int)XSOCK_INVALID);
+    XCHECK_NL((pSession->pWsSession != NULL), (int)XSOCK_INVALID);
     return (int)pSession->pWsSession->sock.nFD;
 }
 
@@ -99,10 +99,14 @@ static void DirectGate_Search_NormalizePath(char *pOutput, size_t nSize, const c
 static void DirectGate_Search_DrainPipe(directgate_search_t *pSearch)
 {
     XCHECK_VOID_NL((pSearch != NULL));
-    if (pSearch->nPipeFds[0] < 0) return;
+    if (pSearch->nPipeFds[0] == XSOCK_INVALID) return;
 
     char sBuf[64];
+#ifdef _WIN32
+    while (recv(pSearch->nPipeFds[0], sBuf, sizeof(sBuf), 0) > 0) {}
+#else
     while (read(pSearch->nPipeFds[0], sBuf, sizeof(sBuf)) > 0) {}
+#endif
 }
 
 static void DirectGate_Search_JoinWorker(directgate_search_t *pSearch)
@@ -119,15 +123,24 @@ static void DirectGate_Search_JoinWorker(directgate_search_t *pSearch)
 static int DirectGate_Search_Notify(directgate_search_t *pSearch)
 {
     XCHECK((pSearch != NULL), XSTDERR);
-    if (pSearch->nPipeFds[1] < 0) return XSTDERR;
+    if (pSearch->nPipeFds[1] == XSOCK_INVALID) return XSTDERR;
 
     const char cValue = 1;
+#ifdef _WIN32
+    if (send(pSearch->nPipeFds[1], &cValue, sizeof(cValue), 0) < 0 &&
+        WSAGetLastError() != WSAEWOULDBLOCK)
+    {
+        xlogw("Failed to notify search pipe: error(%d)", WSAGetLastError());
+        return XSTDERR;
+    }
+#else
     if (write(pSearch->nPipeFds[1], &cValue, sizeof(cValue)) < 0 &&
         errno != EAGAIN && errno != EWOULDBLOCK)
     {
         xlogw("Failed to notify search pipe: errno(%d)", errno);
         return XSTDERR;
     }
+#endif
 
     return XSTDOK;
 }
@@ -502,7 +515,36 @@ static void* DirectGate_Search_Worker(void *pArg)
         return NULL;
     }
 
+#ifdef _WIN32
+    int nStatus = XSTDOK;
+
+    /* The virtual root "/" spans every mounted drive on Windows */
+    if (!strcmp(pSearch->sRootPath, "/"))
+    {
+        DWORD nDrives = GetLogicalDrives();
+        char cLetter;
+
+        for (cLetter = 'A'; cLetter <= 'Z' && nStatus >= 0; cLetter++)
+        {
+            if (!(nDrives & (1U << (cLetter - 'A')))) continue;
+            if (XSYNC_ATOMIC_GET(&pSearch->nCancelRequested)) break;
+
+            char sDrivePath[8];
+            snprintf(sDrivePath, sizeof(sDrivePath), "%c:/", cLetter);
+
+            UINT nType = GetDriveTypeA(sDrivePath);
+            if (nType == DRIVE_NO_ROOT_DIR || nType == DRIVE_UNKNOWN) continue;
+
+            nStatus = XSearch(&searchCtx, sDrivePath);
+        }
+    }
+    else
+    {
+        nStatus = XSearch(&searchCtx, pSearch->sRootPath);
+    }
+#else
     int nStatus = XSearch(&searchCtx, pSearch->sRootPath);
+#endif
     xbool_t bCancelRequested = XSYNC_ATOMIC_GET(&pSearch->nCancelRequested);
     XSearch_Destroy(&searchCtx);
 
@@ -557,10 +599,26 @@ void DirectGate_Search_Init(directgate_search_t *pSearch)
     XSync_Init(&pSearch->lock);
     pSearch->bLockInit = XTRUE;
 
-    pSearch->nPipeFds[0] = -1;
-    pSearch->nPipeFds[1] = -1;
+    pSearch->nPipeFds[0] = XSOCK_INVALID;
+    pSearch->nPipeFds[1] = XSOCK_INVALID;
     pSearch->bRecursive = XTRUE;
 
+#ifdef _WIN32
+    /* WSAPoll handles only sockets, so the notification channel is a
+       private loopback socket pair instead of an anonymous pipe */
+    if (XSock_CreatePair(pSearch->nPipeFds) == XSTDOK)
+    {
+        u_long nNonBlock = 1;
+        ioctlsocket(pSearch->nPipeFds[0], FIONBIO, &nNonBlock);
+        ioctlsocket(pSearch->nPipeFds[1], FIONBIO, &nNonBlock);
+    }
+    else
+    {
+        xloge("Failed to create search socket pair: error(%d)", WSAGetLastError());
+        pSearch->nPipeFds[0] = XSOCK_INVALID;
+        pSearch->nPipeFds[1] = XSOCK_INVALID;
+    }
+#else
     if (pipe(pSearch->nPipeFds) == 0)
     {
         fcntl(pSearch->nPipeFds[0], F_SETFL, O_NONBLOCK);
@@ -572,6 +630,7 @@ void DirectGate_Search_Init(directgate_search_t *pSearch)
         pSearch->nPipeFds[0] = -1;
         pSearch->nPipeFds[1] = -1;
     }
+#endif
 }
 
 void DirectGate_Search_Clear(directgate_search_t *pSearch)
@@ -592,23 +651,25 @@ void DirectGate_Search_Clear(directgate_search_t *pSearch)
         pSearch->bLockInit = XFALSE;
     }
 
-    if (pSearch->nPipeFds[0] >= 0)
+    if (pSearch->nPipeFds[0] != XSOCK_INVALID)
     {
-        close(pSearch->nPipeFds[0]);
-        pSearch->nPipeFds[0] = -1;
+        xclosesock(pSearch->nPipeFds[0]);
+        pSearch->nPipeFds[0] = XSOCK_INVALID;
     }
 
-    if (pSearch->nPipeFds[1] >= 0)
+    if (pSearch->nPipeFds[1] != XSOCK_INVALID)
     {
-        close(pSearch->nPipeFds[1]);
-        pSearch->nPipeFds[1] = -1;
+        xclosesock(pSearch->nPipeFds[1]);
+        pSearch->nPipeFds[1] = XSOCK_INVALID;
     }
 }
 
 int DirectGate_Search_GetPipeFd(const directgate_search_t *pSearch)
 {
     XCHECK_NL((pSearch != NULL), XSTDERR);
-    return pSearch->nPipeFds[0];
+    /* SOCKET values fit in 32 bits (WinAPI interop guarantee) and
+       INVALID_SOCKET casts to -1, matching the POSIX convention */
+    return (int)pSearch->nPipeFds[0];
 }
 
 int DirectGate_Search_Start(directgate_search_t *pSearch, const directgate_pkg_manager_t *pMgrPkg)

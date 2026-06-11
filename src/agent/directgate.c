@@ -25,6 +25,7 @@
 
 #include "directgate.h"
 #include "version.h"
+#include "common.h"
 #include "protocol.h"
 #include "transfer.h"
 #include "websock.h"
@@ -66,7 +67,7 @@ static int DirectGate_HandleTransportMessage(xapi_session_t *pApiSession,
 static int DirectGate_Conn_GetFD(const directgate_conn_t *pConn, xapi_session_t *pApiSession)
 {
     if (pApiSession == NULL && pConn != NULL) pApiSession = pConn->pWsSession;
-    return pApiSession != NULL ? (int)pApiSession->sock.nFD : XSOCK_INVALID;
+    return pApiSession != NULL ? (int)pApiSession->sock.nFD : (int)XSOCK_INVALID;
 }
 
 static uint32_t DirectGate_Conn_GetID(const directgate_conn_t *pConn, xapi_session_t *pApiSession)
@@ -93,8 +94,8 @@ static uint16_t DirectGate_Conn_GetPort(const directgate_conn_t *pConn, xapi_ses
 
 static int DirectGate_Session_GetWsFd(const directgate_session_t *pSession)
 {
-    XCHECK_NL((pSession != NULL), XSOCK_INVALID);
-    XCHECK_NL((pSession->pWsSession != NULL), XSOCK_INVALID);
+    XCHECK_NL((pSession != NULL), (int)XSOCK_INVALID);
+    XCHECK_NL((pSession->pWsSession != NULL), (int)XSOCK_INVALID);
     return (int)pSession->pWsSession->sock.nFD;
 }
 
@@ -465,8 +466,10 @@ static void DirectGate_Connection_Init(directgate_conn_t *pConn, directgate_cfg_
 
 void DirectGate_SignalCallback(int sig)
 {
+#ifndef _WIN32
     if (sig == SIGPIPE) return;
-    else if (sig == SIGINT) printf("\n");
+#endif
+    if (sig == SIGINT) printf("\n");
     g_bFinish = XTRUE;
 }
 
@@ -628,11 +631,11 @@ static int DirectGate_HandleClosed(xapi_session_t *pApiSession)
 
     if ((int)pApiSession->sock.nFD == nSearchFd)
     {
-        pSession->search.nPipeFds[0] = -1;
-        if (pSession->search.nPipeFds[1] >= 0)
+        pSession->search.nPipeFds[0] = XSOCK_INVALID;
+        if (pSession->search.nPipeFds[1] != XSOCK_INVALID)
         {
-            close(pSession->search.nPipeFds[1]);
-            pSession->search.nPipeFds[1] = -1;
+            xclosesock(pSession->search.nPipeFds[1]);
+            pSession->search.nPipeFds[1] = XSOCK_INVALID;
         }
 
         pSession->pSearchSession = NULL;
@@ -1007,6 +1010,13 @@ static int DirectGate_HandleCmd(xapi_session_t *pApiSession, directgate_pkg_t *p
             char sCwd[XPATH_MAX];
             if (DirectGate_Term_GetCwd(&pSession->term, sCwd, sizeof(sCwd)) >= 0)
             {
+#ifdef _WIN32
+                /* File-manager paths travel with forward slashes */
+                char *pSep = sCwd;
+                for (; *pSep != '\0'; pSep++)
+                    if (*pSep == '\\') *pSep = '/';
+#endif
+
                 xlogi("Terminal CWD query: sid(%u), wsfd(%d), cwd(%s)",
                     pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), sCwd);
 
@@ -2361,6 +2371,52 @@ static void DirectGate_RunService(xapi_t *pApi, xapi_endpoint_t *pEndpt, directg
     }
 }
 
+#ifdef _WIN32
+static xbool_t DirectGate_DropPrivileges(const directgate_cfg_t *pCfg)
+{
+    XCHECK((pCfg != NULL), XFALSE);
+
+    if (!xstrused(pCfg->sShellUser))
+    {
+        /* Same policy as POSIX: no silent identity fallback. The operator
+           must state explicitly which account owns the sessions. */
+        xloge("shell.user is not configured, refusing to start: set shell.user "
+              "to the account that should own terminal and file-manager sessions");
+
+        return XFALSE;
+    }
+
+    /*
+        Windows has no setuid(): process identity is fixed by whoever
+        started the agent (the service account). Mirroring the POSIX
+        builds, identity is verified instead of silently adjusted - if
+        the configured shell.user is not the account the agent already
+        runs as, startup is refused so sessions can never run under an
+        unexpected identity. Account names compare case-insensitively.
+    */
+    char sCurrentUser[XSTR_MID] = {0};
+    DirectGate_GetUserName(sCurrentUser, sizeof(sCurrentUser));
+
+    if (!xstrused(sCurrentUser))
+    {
+        xloge("Failed to resolve the agent account, refusing to start: error(%lu)", GetLastError());
+        return XFALSE;
+    }
+
+    if (_stricmp(sCurrentUser, pCfg->sShellUser) != 0)
+    {
+        xloge("Configured shell.user does not match the agent account and user "
+              "switching is not supported on Windows, refusing to start: "
+              "shell.user(%s), agent(%s). Run the agent service as shell.user instead.",
+            pCfg->sShellUser, sCurrentUser);
+
+        return XFALSE;
+    }
+
+    xlogd("Agent already runs as the configured shell user: user(%s)", sCurrentUser);
+    return XTRUE;
+}
+#else
 static void DirectGate_ChownToUser(const char *pPath, uid_t nUid, gid_t nGid)
 {
     if (!xstrused(pPath)) return;
@@ -2479,17 +2535,24 @@ static xbool_t DirectGate_DropPrivileges(const directgate_cfg_t *pCfg)
 
     return XTRUE;
 }
+#endif /* _WIN32 */
 
 #ifndef DIRECTGATE_TESTING
-int main(int argc, char* argv[])
+static int DirectGate_RunAgent(int argc, char* argv[])
 {
     xlog_defaults();
     xlog_coloring(XFALSE);
     xlog_timing(XLOG_DATE);
     xlog_indent(XTRUE);
 
+#ifdef _WIN32
+    /* No SIGPIPE on Windows; socket errors surface through WSA codes */
+    int nSignals[2] = { SIGTERM, SIGINT };
+    XSig_Register(nSignals, 2, DirectGate_SignalCallback);
+#else
     int nSignals[3] = { SIGTERM, SIGINT, SIGPIPE };
     XSig_Register(nSignals, 3, DirectGate_SignalCallback);
+#endif
 
     directgate_cfg_t args;
     if (!DirectGate_ParseArgs(&args, argc, argv))
@@ -2545,5 +2608,126 @@ int main(int argc, char* argv[])
     XLog_Destroy();
 
     return 0;
+}
+
+#ifdef _WIN32
+/*
+    Windows Service Control Manager integration: the systemd/launchd
+    counterpart on Windows. The SCM kills any service process that does
+    not register a control handler, so the agent cannot simply run its
+    console main under the SCM. Installed as:
+
+      sc.exe create directgate-agent binPath= "C:\path\directgate.exe --win-service" \
+             start= auto obj= ".\<user>" password= <password>
+
+    A STOP/SHUTDOWN control sets the same g_bFinish flag as SIGTERM, so
+    the shutdown path is byte-for-byte the console one.
+*/
+#define DIRECTGATE_WIN_SERVICE_NAME "directgate-agent"
+#define DIRECTGATE_WIN_SERVICE_FLAG "--win-service"
+
+static SERVICE_STATUS_HANDLE g_hSvcStatusHandle = NULL;
+static int g_nSvcArgc = 0;
+static char **g_pSvcArgv = NULL;
+
+static void DirectGate_SvcReportState(DWORD nState, DWORD nExitCode)
+{
+    if (g_hSvcStatusHandle == NULL) return;
+
+    SERVICE_STATUS status;
+    memset(&status, 0, sizeof(status));
+
+    status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    status.dwCurrentState = nState;
+    status.dwWin32ExitCode = nExitCode;
+    status.dwControlsAccepted = (nState == SERVICE_RUNNING) ?
+        (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN) : 0;
+
+    SetServiceStatus(g_hSvcStatusHandle, &status);
+}
+
+static void WINAPI DirectGate_SvcCtrlHandler(DWORD nControl)
+{
+    switch (nControl)
+    {
+        case SERVICE_CONTROL_STOP:
+        case SERVICE_CONTROL_SHUTDOWN:
+            DirectGate_SvcReportState(SERVICE_STOP_PENDING, NO_ERROR);
+            g_bFinish = XTRUE;
+            break;
+        default:
+            break;
+    }
+}
+
+static void WINAPI DirectGate_SvcMain(DWORD nArgc, LPSTR *pArgv)
+{
+    /* SCM start parameters are ignored: the agent arguments come from
+       the binPath command line captured before the dispatcher started */
+    (void)nArgc;
+    (void)pArgv;
+
+    g_hSvcStatusHandle = RegisterServiceCtrlHandlerA(
+        DIRECTGATE_WIN_SERVICE_NAME, DirectGate_SvcCtrlHandler);
+
+    if (g_hSvcStatusHandle == NULL) return;
+
+    DirectGate_SvcReportState(SERVICE_RUNNING, NO_ERROR);
+    int nStatus = DirectGate_RunAgent(g_nSvcArgc, g_pSvcArgv);
+
+    DirectGate_SvcReportState(SERVICE_STOPPED,
+        nStatus < 0 ? ERROR_SERVICE_SPECIFIC_ERROR : NO_ERROR);
+}
+#endif /* _WIN32 */
+
+int main(int argc, char* argv[])
+{
+#ifdef _WIN32
+    /* Strip the dispatcher flag so the regular argument parser never
+       sees it, whether the service mode is requested or not */
+    static char *pFilteredArgv[64];
+    xbool_t bWinService = XFALSE;
+    int i, nFiltered = 0;
+
+    for (i = 0; i < argc && nFiltered < (int)XARR_SIZE(pFilteredArgv) - 1; i++)
+    {
+        if (strcmp(argv[i], DIRECTGATE_WIN_SERVICE_FLAG) == 0)
+        {
+            bWinService = XTRUE;
+            continue;
+        }
+
+        pFilteredArgv[nFiltered++] = argv[i];
+    }
+
+    pFilteredArgv[nFiltered] = NULL;
+
+    if (bWinService)
+    {
+        g_nSvcArgc = nFiltered;
+        g_pSvcArgv = pFilteredArgv;
+
+        SERVICE_TABLE_ENTRYA svcTable[] = {
+            { (LPSTR)DIRECTGATE_WIN_SERVICE_NAME, DirectGate_SvcMain },
+            { NULL, NULL }
+        };
+
+        /* Blocks until the service is stopped */
+        if (!StartServiceCtrlDispatcherA(svcTable))
+        {
+            fprintf(stderr, "Failed to connect to the service control manager "
+                "(error %lu): %s is only valid when the agent is started as a "
+                "Windows service\n", GetLastError(), DIRECTGATE_WIN_SERVICE_FLAG);
+
+            return XSTDERR;
+        }
+
+        return 0;
+    }
+
+    return DirectGate_RunAgent(nFiltered, pFilteredArgv);
+#else
+    return DirectGate_RunAgent(argc, argv);
+#endif
 }
 #endif

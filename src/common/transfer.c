@@ -27,6 +27,30 @@ static FILE* DirectGate_Transfer_OpenDestination(const char *pPath)
 {
     XCHECK((xstrused(pPath)), NULL);
 
+#ifdef _WIN32
+    /* O_NOFOLLOW analog: refuse a destination that is a reparse point so
+       the transfer cannot be redirected through a planted link. O_EXCL
+       below still rejects any pre-existing regular file. */
+    DWORD nAttrs = GetFileAttributesA(pPath);
+    if (nAttrs != INVALID_FILE_ATTRIBUTES && (nAttrs & FILE_ATTRIBUTE_REPARSE_POINT))
+        return NULL;
+
+    /* _O_NOINHERIT = FD_CLOEXEC analog, _O_BINARY keeps payload bytes exact */
+    int nFlags = _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY | _O_NOINHERIT;
+
+    int nFd = -1;
+    if (_sopen_s(&nFd, pPath, nFlags, _SH_DENYWR, _S_IREAD | _S_IWRITE) != 0 || nFd < 0)
+        return NULL;
+
+    FILE *pFile = _fdopen(nFd, "wb");
+    if (pFile == NULL)
+    {
+        _close(nFd);
+        return NULL;
+    }
+
+    return pFile;
+#else
     int nFlags = O_WRONLY | O_CREAT | O_EXCL;
 #ifdef O_CLOEXEC
     nFlags |= O_CLOEXEC;
@@ -51,6 +75,7 @@ static FILE* DirectGate_Transfer_OpenDestination(const char *pPath)
     }
 
     return pFile;
+#endif
 }
 
 static const char* DirectGate_Transfer_StateToString(directgate_transfer_state_t eState)

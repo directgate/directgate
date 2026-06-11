@@ -1,0 +1,104 @@
+name: Windows
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # Native Windows build with the MinGW-w64 (UCRT) toolchain from MSYS2.
+  # This is the supported Windows toolchain: CLI only, no Visual Studio.
+  build-native:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up MSYS2 (UCRT64)
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        install: >-
+          mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-cmake
+          mingw-w64-ucrt-x86_64-ninja
+          mingw-w64-ucrt-x86_64-openssl
+
+    - name: Configure
+      run: cmake -B build -G Ninja
+
+    - name: Build
+      run: cmake --build build -j4
+
+    - name: Upload binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: directgate-windows-x64
+        path: |
+          build/directgate.exe
+          build/dgcli.exe
+
+  # Cross-compilation from Linux with llvm-mingw: mirrors the local
+  # development setup, catches Windows breakage without a Windows runner.
+  build-cross:
+    runs-on: ubuntu-latest
+
+    env:
+      LLVM_MINGW_VERSION: "20260602"
+      OPENSSL_VERSION: "3.5.7"
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Cache toolchain and OpenSSL
+      id: cache-toolchain
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/llvm-mingw
+          ~/win64-prefix
+        key: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}-openssl-${{ env.OPENSSL_VERSION }}
+
+    - name: Install llvm-mingw
+      if: steps.cache-toolchain.outputs.cache-hit != 'true'
+      run: |
+        curl -sL -o llvm-mingw.tar.xz \
+          "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64.tar.xz"
+        tar xf llvm-mingw.tar.xz
+        mv "llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64" ~/llvm-mingw
+
+    - name: Cross-compile OpenSSL
+      if: steps.cache-toolchain.outputs.cache-hit != 'true'
+      run: |
+        export PATH="$HOME/llvm-mingw/bin:$PATH"
+        curl -sL -o openssl.tar.gz \
+          "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+        tar xzf openssl.tar.gz
+        cd "openssl-${OPENSSL_VERSION}"
+        ./Configure mingw64 no-shared no-tests no-apps no-docs \
+          --prefix="$HOME/win64-prefix" \
+          --cross-compile-prefix=x86_64-w64-mingw32-
+        make -j"$(nproc)"
+        make install_sw
+
+    - name: Configure
+      run: |
+        export PATH="$HOME/llvm-mingw/bin:$PATH"
+        cmake -B build-win64 -G Ninja \
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-mingw-w64.cmake \
+          -DCMAKE_PREFIX_PATH="$HOME/win64-prefix"
+
+    - name: Build
+      run: |
+        export PATH="$HOME/llvm-mingw/bin:$PATH"
+        cmake --build build-win64 -j"$(nproc)"

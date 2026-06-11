@@ -26,7 +26,9 @@
 extern "C" {
 #endif
 
+#ifndef _WIN32
 #include <sys/ioctl.h>
+#endif
 
 #include "includes.h"
 #include "webrtc.h"
@@ -73,8 +75,30 @@ typedef struct directgate_term_ {
     char sShellUser[XSTR_MID];
 
     uint32_t nSessionId;
+
+    /*
+    * POSIX: nMasterFd is the PTY master returned by openpty().
+    *
+    * Windows: the shell runs attached to a ConPTY pseudo console. ConPTY
+    * exposes plain pipe HANDLEs, which WSAPoll (the Windows event engine
+    * in libxutils) cannot poll, so two pump threads bridge the ConPTY
+    * pipes to a private socket pair from XSock_CreatePair(). nMasterFd is
+    * the event-loop side of that bridge and behaves like the PTY master:
+    * readable when the shell produces output, writable for input, EOF
+    * when the shell exits.
+    */
     int nMasterFd;
     pid_t nPid;
+
+#ifdef _WIN32
+    HPCON hPC;               /* Pseudo console */
+    HANDLE hProcess;         /* Shell process */
+    HANDLE hConInWrite;      /* Agent -> ConPTY input pipe */
+    HANDLE hConOutRead;      /* ConPTY output pipe -> agent */
+    HANDLE hOutPump;         /* ConPTY output -> bridge socket thread */
+    HANDLE hInPump;          /* Bridge socket -> ConPTY input thread */
+    XSOCKET nBridgeSock;     /* Pump-side end of the bridge pair */
+#endif
 } directgate_term_t;
 
 void DirectGate_Term_Init(directgate_term_t *pTerm);

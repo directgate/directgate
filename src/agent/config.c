@@ -73,15 +73,22 @@ void DirectGate_DisplayUsage(const char *pName)
 
 static void DirectGate_SetDefaultConfigPath(directgate_cfg_t *pCfg)
 {
-    const char *pHomeDir = getenv("HOME");
-    if (!xstrused(pHomeDir))
+#ifdef _WIN32
+    /* Windows convention: per-user roaming application data */
+    const char *pAppData = getenv("APPDATA");
+    if (xstrused(pAppData))
     {
-        struct passwd *pUser = getpwuid(getuid());
-        if (pUser != NULL && xstrused(pUser->pw_dir)) pHomeDir = pUser->pw_dir;
+        xstrncpyf(pCfg->sCfgPath, sizeof(pCfg->sCfgPath),
+            "%s\\directgate\\agent.json", pAppData);
+        return;
     }
+#endif
 
-    if (!xstrused(pHomeDir)) xstrncpy(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), "./agent.json");
-    else xstrncpyf(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), "%s/%s", pHomeDir, DIRECTGATE_AGENT_CONFIG);
+    char sHomeDir[XPATH_MAX];
+    DirectGate_GetHomeDir(sHomeDir, sizeof(sHomeDir));
+
+    if (!xstrused(sHomeDir)) xstrncpy(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), "./agent.json");
+    else xstrncpyf(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), "%s/%s", sHomeDir, DIRECTGATE_AGENT_CONFIG);
 }
 
 static xbool_t DirectGate_PromptAPIUrl(directgate_cfg_t *pCfg)
@@ -685,6 +692,10 @@ void DirectGate_InitConfig(directgate_cfg_t *pCfg)
     pCfg->enroll.nRefreshSkewSec = DIRECTGATE_JWT_REFRESH_SKEW_SEC;
     pCfg->enroll.bEnrolled = XFALSE;
 
+#ifdef _WIN32
+    DirectGate_GetUserName(pCfg->sShellUser, sizeof(pCfg->sShellUser));
+    DirectGate_GetHomeDir(pCfg->sShellHome, sizeof(pCfg->sShellHome));
+#else
     struct passwd *pUser = getpwuid(getuid());
     if (pUser != NULL)
     {
@@ -701,6 +712,7 @@ void DirectGate_InitConfig(directgate_cfg_t *pCfg)
         if (xstrused(pHomeDir))
             xstrncpy(pCfg->sShellHome, sizeof(pCfg->sShellHome), pHomeDir);
     }
+#endif
 
     DirectGate_SetDefaultConfigPath(pCfg);
 }

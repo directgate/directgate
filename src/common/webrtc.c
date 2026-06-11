@@ -46,7 +46,9 @@ static int DirectGate_WebRTC_GetDC(const directgate_webrtc_t *pRTC)
 static int DirectGate_WebRTC_GetPipe(const directgate_webrtc_t *pRTC)
 {
     XCHECK_NL((pRTC != NULL), XSTDERR);
-    return pRTC->nPipeFds[0];
+    /* SOCKET values fit in 32 bits (WinAPI interop guarantee) and
+       INVALID_SOCKET casts to -1, matching the POSIX convention */
+    return (int)pRTC->nPipeFds[0];
 }
 
 /* Unescape JSON string sequences (\r \n \t \\ \") in place.
@@ -119,14 +121,24 @@ static int DirectGate_WebRTC_NotifyPipe(directgate_webrtc_t *pRTC)
 {
     XCHECK((pRTC != NULL), XSTDERR);
     char cValue = 1; // Send notification byte
+
+#ifdef _WIN32
+    return (int)send(pRTC->nPipeFds[1], &cValue, 1, 0);
+#else
     return (int)write(pRTC->nPipeFds[1], &cValue, 1);
+#endif
 }
 
 static void DirectGate_WebRTC_DrainPipe(directgate_webrtc_t *pRTC)
 {
     XCHECK_VOID((pRTC != NULL));
     char buf[64]; /* Drain notification bytes from pipe */
+
+#ifdef _WIN32
+    while (recv(pRTC->nPipeFds[0], buf, sizeof(buf), 0) > 0){}
+#else
     while (read(pRTC->nPipeFds[0], buf, sizeof(buf)) > 0){}
+#endif
 }
 
 static directgate_webrtc_event_t* XSell_WebRTC_DetachQueue(directgate_webrtc_t *pRTC)
@@ -329,6 +341,23 @@ void DirectGate_WebRTC_Init(directgate_webrtc_t *pRTC)
     pRTC->bAllowTCP = XFALSE;
     XSync_Init(&pRTC->queueLock);
 
+#ifdef _WIN32
+    /* WSAPoll handles only sockets, so the notification channel is a
+       private loopback socket pair instead of an anonymous pipe */
+    if (XSock_CreatePair(pRTC->nPipeFds) < 0)
+    {
+        xloge("Failed to create WebRTC notification socket pair: pc(%d), dc(%d), error(%d)",
+            DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC), WSAGetLastError());
+
+        pRTC->nPipeFds[0] = XSOCK_INVALID;
+        pRTC->nPipeFds[1] = XSOCK_INVALID;
+        return;
+    }
+
+    u_long nNonBlock = 1;
+    ioctlsocket(pRTC->nPipeFds[0], FIONBIO, &nNonBlock);
+    ioctlsocket(pRTC->nPipeFds[1], FIONBIO, &nNonBlock);
+#else
     if (pipe(pRTC->nPipeFds) < 0)
     {
         xloge("Failed to create WebRTC notification pipe: pc(%d), dc(%d), errno(%d)",
@@ -341,6 +370,7 @@ void DirectGate_WebRTC_Init(directgate_webrtc_t *pRTC)
 
     fcntl(pRTC->nPipeFds[0], F_SETFL, O_NONBLOCK);
     fcntl(pRTC->nPipeFds[1], F_SETFL, O_NONBLOCK);
+#endif
 }
 
 xbool_t DirectGate_WebRTC_LoadIceServers(directgate_ice_server_t *pServers, uint8_t *pCount, xjson_obj_t *pRoot)
@@ -439,16 +469,16 @@ void DirectGate_WebRTC_Clear(directgate_webrtc_t *pRTC)
     XCHECK_VOID_NL((pRTC != NULL));
     DirectGate_WebRTC_Destroy(pRTC);
 
-    if (pRTC->nPipeFds[0] >= 0)
+    if (pRTC->nPipeFds[0] != XSOCK_INVALID)
     {
-        close(pRTC->nPipeFds[0]);
-        pRTC->nPipeFds[0] = -1;
+        xclosesock(pRTC->nPipeFds[0]);
+        pRTC->nPipeFds[0] = XSOCK_INVALID;
     }
 
-    if (pRTC->nPipeFds[1] >= 0)
+    if (pRTC->nPipeFds[1] != XSOCK_INVALID)
     {
-        close(pRTC->nPipeFds[1]);
-        pRTC->nPipeFds[1] = -1;
+        xclosesock(pRTC->nPipeFds[1]);
+        pRTC->nPipeFds[1] = XSOCK_INVALID;
     }
 
     XSync_Destroy(&pRTC->queueLock);
@@ -1046,5 +1076,5 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
 int DirectGate_WebRTC_GetPipeFd(const directgate_webrtc_t *pRTC)
 {
     XCHECK_NL((pRTC != NULL), XSTDERR);
-    return pRTC->nPipeFds[0];
+    return (int)pRTC->nPipeFds[0];
 }

@@ -23,12 +23,19 @@
 #include "includes.h"
 #include "protocol.h"
 #include "websock.h"
+#include "common.h"
 #include "term.h"
 
+#ifndef _WIN32
 #ifdef _XOS_UNIX_LIKE
 #include <util.h>
 #else
 #include <pty.h>
+#endif
+#endif
+
+#ifdef _WIN32
+#include <winternl.h>   /* NtQueryInformationProcess for the shell cwd */
 #endif
 
 #ifdef __APPLE__
@@ -39,11 +46,20 @@
 
 static int DirectGate_Term_GetWsFd(const directgate_term_t *pTerm)
 {
-    XCHECK_NL((pTerm != NULL), XSOCK_INVALID);
-    XCHECK_NL((pTerm->pWsSession != NULL), XSOCK_INVALID);
+    XCHECK_NL((pTerm != NULL), (int)XSOCK_INVALID);
+    XCHECK_NL((pTerm->pWsSession != NULL), (int)XSOCK_INVALID);
     return (int)pTerm->pWsSession->sock.nFD;
 }
 
+#ifdef _WIN32
+static XSTATUS DirectGate_Term_SetNonBlock(int nFd, xbool_t bNonblock)
+{
+    u_long nMode = bNonblock ? 1 : 0;
+    int nStatus = ioctlsocket((XSOCKET)nFd, FIONBIO, &nMode);
+    XCHECK((nStatus == 0), xthrow("Failed to set bridge socket mode: error(%d)", WSAGetLastError()));
+    return XSTDOK;
+}
+#else
 static XSTATUS DirectGate_Term_SetNonBlock(int nFd, xbool_t bNonblock)
 {
     int nFlags = fcntl(nFd, F_GETFL, 0);
@@ -57,7 +73,9 @@ static XSTATUS DirectGate_Term_SetNonBlock(int nFd, xbool_t bNonblock)
 
     return XSTDOK;
 }
+#endif
 
+#ifndef _WIN32
 static XSTATUS DirectGate_Term_ApplyShell(const directgate_term_t *pTerm)
 {
     const char *pHome = NULL;
@@ -277,7 +295,351 @@ static XSTATUS DirectGate_Term_Spawn(directgate_term_t *pTerm)
 
     return XSTDOK;
 }
+#endif /* !_WIN32 */
 
+#ifdef _WIN32
+/*
+    ConPTY terminal backend.
+
+    The shell is attached to a pseudo console (CreatePseudoConsole). Two
+    pump threads bridge the ConPTY pipes to a private socket pair so the
+    WSAPoll-based event loop can treat the terminal like any other socket:
+
+        shell -> ConPTY out pipe -> OutPump -> bridge -> event loop
+        event loop -> bridge -> InPump -> ConPTY in pipe -> shell
+
+    The pumps run blocking I/O and exit on their own when either side
+    goes away: closing the pseudo console breaks the pipes, shutting
+    down the bridge socket breaks the socket calls.
+*/
+
+static void DirectGate_Term_KillChild(directgate_term_t *pTerm);
+
+static DWORD WINAPI DirectGate_Term_OutPump(LPVOID pArg)
+{
+    directgate_term_t *pTerm = (directgate_term_t*)pArg;
+    uint8_t sBuffer[DIRECTGATE_TERM_BUF_SIZE];
+    DWORD nRead = 0;
+
+    while (ReadFile(pTerm->hConOutRead, sBuffer, sizeof(sBuffer), &nRead, NULL) && nRead > 0)
+    {
+        size_t nSent = 0;
+        while (nSent < (size_t)nRead)
+        {
+            int nRet = send(pTerm->nBridgeSock, (const char*)sBuffer + nSent, (int)(nRead - nSent), 0);
+            if (nRet <= 0) return 0;
+            nSent += (size_t)nRet;
+        }
+    }
+
+    /* Shell side is gone: signal EOF to the event loop (recv returns 0) */
+    shutdown(pTerm->nBridgeSock, SD_SEND);
+    return 0;
+}
+
+static DWORD WINAPI DirectGate_Term_InPump(LPVOID pArg)
+{
+    directgate_term_t *pTerm = (directgate_term_t*)pArg;
+    char sBuffer[DIRECTGATE_TERM_BUF_SIZE];
+
+    for (;;)
+    {
+        int nRecv = recv(pTerm->nBridgeSock, sBuffer, sizeof(sBuffer), 0);
+        if (nRecv <= 0) return 0;
+
+        size_t nWritten = 0;
+        while (nWritten < (size_t)nRecv)
+        {
+            DWORD nDone = 0;
+            if (!WriteFile(pTerm->hConInWrite, sBuffer + nWritten, (DWORD)(nRecv - nWritten), &nDone, NULL))
+                return 0;
+
+            nWritten += (size_t)nDone;
+        }
+    }
+}
+
+static XSTATUS DirectGate_Term_ValidateShellUser(const directgate_term_t *pTerm)
+{
+    XCHECK_NL((pTerm != NULL), XSTDOK);
+    XCHECK_NL(xstrused(pTerm->sShellUser), XSTDOK);
+
+    /*
+        Switching the session to another account needs CreateProcessAsUser
+        with token privileges the agent intentionally does not hold. The
+        POSIX builds refuse silent fallbacks, so the Windows build refuses
+        a shell.user that is not the account already running the agent.
+        Account names are case-insensitive on Windows.
+    */
+    char sCurrentUser[XSTR_MID] = {0};
+    DirectGate_GetUserName(sCurrentUser, sizeof(sCurrentUser));
+
+    if (!xstrused(sCurrentUser) || _stricmp(sCurrentUser, pTerm->sShellUser) != 0)
+    {
+        xloge("Configured shell.user does not match the agent account; "
+              "user switching is not supported on Windows: shell.user(%s), agent(%s)",
+            pTerm->sShellUser, sCurrentUser);
+
+        return XSTDERR;
+    }
+
+    return XSTDOK;
+}
+
+static size_t DirectGate_Term_GetShellCmd(char *pCmd, size_t nSize)
+{
+    /* PowerShell is the expected interactive shell on modern Windows */
+    char sPath[XPATH_MAX];
+    DWORD nLen = SearchPathA(NULL, "powershell.exe", NULL, (DWORD)sizeof(sPath), sPath, NULL);
+    if (nLen > 0 && nLen < sizeof(sPath)) return xstrncpy(pCmd, nSize, sPath);
+
+    const char *pComSpec = getenv("COMSPEC");
+    if (xstrused(pComSpec)) return xstrncpy(pCmd, nSize, pComSpec);
+
+    return xstrncpy(pCmd, nSize, "cmd.exe");
+}
+
+static void DirectGate_Term_CloseWinHandles(directgate_term_t *pTerm)
+{
+    if (pTerm->hConInWrite != NULL)
+    {
+        CloseHandle(pTerm->hConInWrite);
+        pTerm->hConInWrite = NULL;
+    }
+
+    if (pTerm->hConOutRead != NULL)
+    {
+        CloseHandle(pTerm->hConOutRead);
+        pTerm->hConOutRead = NULL;
+    }
+
+    if (pTerm->nBridgeSock != XSOCK_INVALID)
+    {
+        xclosesock(pTerm->nBridgeSock);
+        pTerm->nBridgeSock = XSOCK_INVALID;
+    }
+}
+
+static XSTATUS DirectGate_Term_Spawn(directgate_term_t *pTerm)
+{
+    XCHECK((pTerm != NULL), XSTDINV);
+    XCHECK((DirectGate_Term_ValidateShellUser(pTerm) == XSTDOK), XSTDERR);
+
+    HANDLE hConPtyIn = NULL;   /* ConPTY reads shell input here */
+    HANDLE hConPtyOut = NULL;  /* ConPTY writes shell output here */
+
+    SECURITY_ATTRIBUTES pipeAttrs;
+    memset(&pipeAttrs, 0, sizeof(pipeAttrs));
+    pipeAttrs.nLength = sizeof(pipeAttrs);
+    pipeAttrs.bInheritHandle = FALSE;
+
+    if (!CreatePipe(&hConPtyIn, &pTerm->hConInWrite, &pipeAttrs, 0) ||
+        !CreatePipe(&pTerm->hConOutRead, &hConPtyOut, &pipeAttrs, 0))
+    {
+        xloge("Failed to create ConPTY pipes: sid(%u), wsfd(%d), error(%lu)",
+            pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), GetLastError());
+
+        if (hConPtyIn != NULL) CloseHandle(hConPtyIn);
+        DirectGate_Term_CloseWinHandles(pTerm);
+        return XSTDERR;
+    }
+
+    COORD size;
+    size.X = (SHORT)(pTerm->bHaveWinSize && pTerm->winSize.ws_col ? pTerm->winSize.ws_col : 80);
+    size.Y = (SHORT)(pTerm->bHaveWinSize && pTerm->winSize.ws_row ? pTerm->winSize.ws_row : 24);
+
+    HRESULT hResult = CreatePseudoConsole(size, hConPtyIn, hConPtyOut, 0, &pTerm->hPC);
+
+    /* ConPTY duplicated its pipe ends, ours are no longer needed */
+    CloseHandle(hConPtyIn);
+    CloseHandle(hConPtyOut);
+
+    if (FAILED(hResult))
+    {
+        xloge("Failed to create pseudo console: sid(%u), wsfd(%d), hresult(0x%lx)",
+            pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), (unsigned long)hResult);
+
+        DirectGate_Term_CloseWinHandles(pTerm);
+        return XSTDERR;
+    }
+
+    /* Attach the shell to the pseudo console via the process attribute list */
+    SIZE_T nAttrListSize = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &nAttrListSize);
+
+    STARTUPINFOEXA startInfo;
+    memset(&startInfo, 0, sizeof(startInfo));
+    startInfo.StartupInfo.cb = sizeof(STARTUPINFOEXA);
+    startInfo.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(nAttrListSize);
+
+    if (startInfo.lpAttributeList == NULL ||
+        !InitializeProcThreadAttributeList(startInfo.lpAttributeList, 1, 0, &nAttrListSize) ||
+        !UpdateProcThreadAttribute(startInfo.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+            pTerm->hPC, sizeof(HPCON), NULL, NULL))
+    {
+        xloge("Failed to prepare ConPTY process attributes: sid(%u), wsfd(%d), error(%lu)",
+            pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), GetLastError());
+
+        free(startInfo.lpAttributeList);
+        ClosePseudoConsole(pTerm->hPC);
+        pTerm->hPC = NULL;
+        DirectGate_Term_CloseWinHandles(pTerm);
+        return XSTDERR;
+    }
+
+    char sShellCmd[XPATH_MAX];
+    DirectGate_Term_GetShellCmd(sShellCmd, sizeof(sShellCmd));
+
+    const char *pHome = xstrused(pTerm->sShellHome) ? pTerm->sShellHome : NULL;
+    if (pHome != NULL && GetFileAttributesA(pHome) == INVALID_FILE_ATTRIBUTES)
+    {
+        xlogw("PTY working directory does not exist, using default: home(%s)", pHome);
+        pHome = NULL;
+    }
+
+    PROCESS_INFORMATION procInfo;
+    memset(&procInfo, 0, sizeof(procInfo));
+
+    BOOL bCreated = CreateProcessA(NULL, sShellCmd, NULL, NULL, FALSE,
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+        NULL, pHome, &startInfo.StartupInfo, &procInfo);
+
+    DeleteProcThreadAttributeList(startInfo.lpAttributeList);
+    free(startInfo.lpAttributeList);
+
+    if (!bCreated)
+    {
+        xloge("Failed to spawn PTY shell: sid(%u), wsfd(%d), shell(%s), error(%lu)",
+            pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), sShellCmd, GetLastError());
+
+        ClosePseudoConsole(pTerm->hPC);
+        pTerm->hPC = NULL;
+        DirectGate_Term_CloseWinHandles(pTerm);
+        return XSTDERR;
+    }
+
+    CloseHandle(procInfo.hThread);
+    pTerm->hProcess = procInfo.hProcess;
+    pTerm->nPid = (pid_t)procInfo.dwProcessId;
+
+    /* Bridge the ConPTY pipes to the event loop through a socket pair */
+    XSOCKET aBridge[2] = { XSOCK_INVALID, XSOCK_INVALID };
+    if (XSock_CreatePair(aBridge) != XSTDOK)
+    {
+        xloge("Failed to create PTY bridge socket pair: sid(%u), wsfd(%d), error(%d)",
+            pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), WSAGetLastError());
+
+        DirectGate_Term_KillChild(pTerm);
+        ClosePseudoConsole(pTerm->hPC);
+        pTerm->hPC = NULL;
+        DirectGate_Term_CloseWinHandles(pTerm);
+        return XSTDERR;
+    }
+
+    pTerm->nMasterFd = (int)aBridge[0];
+    pTerm->nBridgeSock = aBridge[1];
+
+    if (DirectGate_Term_SetNonBlock(pTerm->nMasterFd, XTRUE) < 0)
+    {
+        xloge("Failed to set PTY bridge non-blocking mode: sid(%u), wsfd(%d), ptfd(%d)",
+            pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), pTerm->nMasterFd);
+
+        xclosesock((XSOCKET)pTerm->nMasterFd);
+        pTerm->nMasterFd = (int)XSOCK_INVALID;
+
+        DirectGate_Term_KillChild(pTerm);
+        ClosePseudoConsole(pTerm->hPC);
+        pTerm->hPC = NULL;
+        DirectGate_Term_CloseWinHandles(pTerm);
+        return XSTDERR;
+    }
+
+    pTerm->hOutPump = CreateThread(NULL, 0, DirectGate_Term_OutPump, pTerm, 0, NULL);
+    pTerm->hInPump = CreateThread(NULL, 0, DirectGate_Term_InPump, pTerm, 0, NULL);
+
+    if (pTerm->hOutPump == NULL || pTerm->hInPump == NULL)
+    {
+        xloge("Failed to start PTY pump threads: sid(%u), wsfd(%d), error(%lu)",
+            pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), GetLastError());
+
+        DirectGate_Term_KillChild(pTerm);
+        ClosePseudoConsole(pTerm->hPC);
+        pTerm->hPC = NULL;
+
+        /* Unblock and reap whichever pump did start */
+        shutdown(pTerm->nBridgeSock, SD_BOTH);
+
+        if (pTerm->hOutPump != NULL)
+        {
+            WaitForSingleObject(pTerm->hOutPump, 2000);
+            CloseHandle(pTerm->hOutPump);
+            pTerm->hOutPump = NULL;
+        }
+
+        if (pTerm->hInPump != NULL)
+        {
+            WaitForSingleObject(pTerm->hInPump, 2000);
+            CloseHandle(pTerm->hInPump);
+            pTerm->hInPump = NULL;
+        }
+
+        DirectGate_Term_CloseWinHandles(pTerm);
+        xclosesock((XSOCKET)pTerm->nMasterFd);
+        pTerm->nMasterFd = (int)XSOCK_INVALID;
+        return XSTDERR;
+    }
+
+    pTerm->bRunning = XTRUE;
+    return XSTDOK;
+}
+
+static void DirectGate_Term_KillChild(directgate_term_t *pTerm)
+{
+    XCHECK_VOID((pTerm != NULL));
+    XCHECK_VOID((pTerm->hProcess != NULL));
+
+    /*
+        Mirror of the POSIX HUP-then-KILL shutdown: closing the pseudo
+        console asks the attached shell to leave, TerminateProcess is the
+        SIGKILL fallback when it does not exit within the grace period.
+    */
+    if (pTerm->hPC != NULL)
+    {
+        ClosePseudoConsole(pTerm->hPC);
+        pTerm->hPC = NULL;
+    }
+
+    if (WaitForSingleObject(pTerm->hProcess, 500) == WAIT_TIMEOUT)
+    {
+        TerminateProcess(pTerm->hProcess, 127);
+        WaitForSingleObject(pTerm->hProcess, 2000);
+    }
+
+    CloseHandle(pTerm->hProcess);
+    pTerm->hProcess = NULL;
+    pTerm->nPid = -1;
+
+    /* Unblock the pumps and reap them before the handles go away */
+    if (pTerm->nBridgeSock != XSOCK_INVALID)
+        shutdown(pTerm->nBridgeSock, SD_BOTH);
+
+    if (pTerm->hOutPump != NULL)
+    {
+        WaitForSingleObject(pTerm->hOutPump, 2000);
+        CloseHandle(pTerm->hOutPump);
+        pTerm->hOutPump = NULL;
+    }
+
+    if (pTerm->hInPump != NULL)
+    {
+        WaitForSingleObject(pTerm->hInPump, 2000);
+        CloseHandle(pTerm->hInPump);
+        pTerm->hInPump = NULL;
+    }
+
+    DirectGate_Term_CloseWinHandles(pTerm);
+}
+#else
 static void DirectGate_Term_KillChild(directgate_term_t *pTerm)
 {
     XCHECK_VOID((pTerm != NULL));
@@ -322,6 +684,7 @@ static void DirectGate_Term_KillChild(directgate_term_t *pTerm)
     DirectGate_WaitBlocking(pid, &status);
     pTerm->nPid = -1;
 }
+#endif /* _WIN32 */
 
 static XSTATUS DirectGate_Term_SendWs(directgate_term_t *pTerm, const uint8_t *pData, size_t nLength)
 {
@@ -394,6 +757,23 @@ static XSTATUS DirectGate_Term_Flush(directgate_term_t *pTerm)
 
     while (pTerm->txBuffer.nUsed)
     {
+#ifdef _WIN32
+        int nWritten = send((XSOCKET)pTerm->nMasterFd,
+            (const char*)pTerm->txBuffer.pData, (int)pTerm->txBuffer.nUsed, 0);
+
+        if (nWritten > 0)
+        {
+            XByteBuffer_Advance(&pTerm->txBuffer, (size_t)nWritten);
+            continue;
+        }
+
+        int nError = WSAGetLastError();
+        if (nWritten < 0 && nError == WSAEINTR) continue;
+        if (nWritten < 0 && nError == WSAEWOULDBLOCK) return XSTDOK;
+
+        xloge("Failed to write PTY buffer: sid(%u), wsfd(%d), ptfd(%d), error(%d)",
+            pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), pTerm->nMasterFd, nError);
+#else
         ssize_t nWritten = write(pTerm->nMasterFd, pTerm->txBuffer.pData, pTerm->txBuffer.nUsed);
         if (nWritten > 0)
         {
@@ -407,6 +787,7 @@ static XSTATUS DirectGate_Term_Flush(directgate_term_t *pTerm)
 
         xloge("Failed to write PTY buffer: sid(%u), wsfd(%d), ptfd(%d), errno(%d)",
             pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), pTerm->nMasterFd, errno);
+#endif
 
         return XSTDERR;
     }
@@ -420,7 +801,7 @@ void DirectGate_Term_Init(directgate_term_t *pTerm)
     memset(pTerm, 0, sizeof(*pTerm));
 
     XByteBuffer_Init(&pTerm->txBuffer, XSTDNON, XFALSE);
-    pTerm->nMasterFd = XSOCK_INVALID;
+    pTerm->nMasterFd = (int)XSOCK_INVALID;
     pTerm->bHaveWinSize = XFALSE;
     pTerm->bRunning = XFALSE;
     pTerm->bEncrypt = XFALSE;
@@ -430,19 +811,39 @@ void DirectGate_Term_Init(directgate_term_t *pTerm)
     pTerm->pE2E = NULL;
     pTerm->nPid = -1;
     pTerm->nSessionId = 0;
+
+#ifdef _WIN32
+    pTerm->hPC = NULL;
+    pTerm->hProcess = NULL;
+    pTerm->hConInWrite = NULL;
+    pTerm->hConOutRead = NULL;
+    pTerm->hOutPump = NULL;
+    pTerm->hInPump = NULL;
+    pTerm->nBridgeSock = XSOCK_INVALID;
+#endif
 }
 
 void DirectGate_Term_Clear(directgate_term_t *pTerm)
 {
     XCHECK_VOID_NL(pTerm);
     XByteBuffer_Clear(&pTerm->txBuffer);
-    pTerm->nMasterFd = XSOCK_INVALID;
+    pTerm->nMasterFd = (int)XSOCK_INVALID;
     pTerm->bHaveWinSize = XFALSE;
     pTerm->bRunning = XFALSE;
     pTerm->pPTYSession = NULL;
     pTerm->pWsSession = NULL;
     pTerm->pApi = NULL;
     pTerm->nPid = -1;
+
+#ifdef _WIN32
+    pTerm->hPC = NULL;
+    pTerm->hProcess = NULL;
+    pTerm->hConInWrite = NULL;
+    pTerm->hConOutRead = NULL;
+    pTerm->hOutPump = NULL;
+    pTerm->hInPump = NULL;
+    pTerm->nBridgeSock = XSOCK_INVALID;
+#endif
 }
 
 xbool_t DirectGate_Term_IsRunning(const directgate_term_t *pTerm)
@@ -523,17 +924,18 @@ void DirectGate_Term_Shutdown(directgate_term_t *pTerm, xbool_t bCloseFd)
     xlogd("PTY process reaped: sid(%u), wsfd(%d), ptfd(%d)",
         pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), pTerm->nMasterFd);
 
-    if (bCloseFd && pTerm->nMasterFd != XSOCK_INVALID)
+    if (bCloseFd && pTerm->nMasterFd != (int)XSOCK_INVALID)
     {
-        close(pTerm->nMasterFd);
-        pTerm->nMasterFd = XSOCK_INVALID;
+        /* xclosesock: close() on POSIX, closesocket() for the Windows bridge */
+        xclosesock((XSOCKET)pTerm->nMasterFd);
+        pTerm->nMasterFd = (int)XSOCK_INVALID;
     }
     else
     {
         xlogt("Keeping PTY master fd open for async cleanup: sid(%u), wsfd(%d), ptfd(%d)",
             pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), pTerm->nMasterFd);
 
-        pTerm->nMasterFd = XSOCK_INVALID;
+        pTerm->nMasterFd = (int)XSOCK_INVALID;
     }
 
     XByteBuffer_Clear(&pTerm->txBuffer);
@@ -566,6 +968,30 @@ int DirectGate_Term_OnRead(directgate_term_t *pTerm)
     for (;;)
     {
         uint8_t sBuffer[DIRECTGATE_TERM_BUF_SIZE];
+
+#ifdef _WIN32
+        int nRead = recv((XSOCKET)pTerm->nMasterFd, (char*)sBuffer, (int)sizeof(sBuffer), 0);
+
+        if (nRead > 0)
+        {
+            if (DirectGate_Term_SendWs(pTerm, sBuffer, (size_t)nRead) < 0)
+                return XAPI_DISCONNECT;
+
+            continue;
+        }
+
+        /* recv() == 0: out pump signaled EOF, the shell has exited */
+        if (nRead == 0) return XAPI_DISCONNECT;
+
+        int nError = WSAGetLastError();
+        if (nError == WSAEINTR) continue;
+        if (nError == WSAEWOULDBLOCK) break;
+
+        xloge("Failed to read PTY output: sid(%u), wsfd(%d), ptfd(%d), error(%d)",
+            pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), pTerm->nMasterFd, nError);
+
+        return XAPI_DISCONNECT;
+#else
         ssize_t nRead = read(pTerm->nMasterFd, sBuffer, sizeof(sBuffer));
 
         if (nRead > 0)
@@ -585,6 +1011,7 @@ int DirectGate_Term_OnRead(directgate_term_t *pTerm)
             pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), pTerm->nMasterFd, errno);
 
         return XAPI_DISCONNECT;
+#endif
     }
 
     return XAPI_CONTINUE;
@@ -635,6 +1062,23 @@ XSTATUS DirectGate_Term_UpdateWinSize(directgate_term_t *pTerm, const struct win
     pTerm->winSize = *pSize;
     pTerm->bHaveWinSize = XTRUE;
 
+#ifdef _WIN32
+    XCHECK_NL((pTerm->hPC != NULL), XSTDOK);
+
+    COORD size;
+    size.X = (SHORT)pSize->ws_col;
+    size.Y = (SHORT)pSize->ws_row;
+
+    HRESULT hResult = ResizePseudoConsole(pTerm->hPC, size);
+    if (FAILED(hResult))
+    {
+        xloge("Failed to update PTY window size: sid(%u), wsfd(%d), ptfd(%d), rows(%u), cols(%u), hresult(0x%lx)",
+            pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), pTerm->nMasterFd,
+            (unsigned)pSize->ws_row, (unsigned)pSize->ws_col, (unsigned long)hResult);
+
+        return XSTDERR;
+    }
+#else
     if (ioctl(pTerm->nMasterFd, TIOCSWINSZ, pSize) != 0)
     {
         xloge("Failed to update PTY window size: sid(%u), wsfd(%d), ptfd(%d), rows(%u), cols(%u), errno(%d)",
@@ -643,6 +1087,7 @@ XSTATUS DirectGate_Term_UpdateWinSize(directgate_term_t *pTerm, const struct win
 
         return XSTDERR;
     }
+#endif
 
     return XSTDOK;
 }
@@ -664,6 +1109,61 @@ XSTATUS DirectGate_Term_GetCwd(const directgate_term_t *pTerm, char *pBuf, size_
     }
 
     xstrncpy(pBuf, nBufSize, vpi.pvi_cdir.vip_path);
+#elif defined(_WIN32)
+    /*
+        The working directory of the shell lives in the CurrentDirectory
+        field of its RTL_USER_PROCESS_PARAMETERS. winternl.h hides that
+        field behind Reserved2, but the layout is stable on 64-bit
+        Windows: CURDIR sits at offset 0x38. Tracks cmd.exe faithfully;
+        PowerShell keeps Set-Location in managed state without chdir, so
+        the value reflects only its startup directory there.
+    */
+    pBuf[0] = '\0';
+    XCHECK((pTerm->hProcess != NULL), XSTDERR);
+
+    PROCESS_BASIC_INFORMATION basicInfo;
+    memset(&basicInfo, 0, sizeof(basicInfo));
+    ULONG nInfoLen = 0;
+
+    NTSTATUS nStatus = NtQueryInformationProcess(pTerm->hProcess,
+        ProcessBasicInformation, &basicInfo, sizeof(basicInfo), &nInfoLen);
+
+    if (nStatus != 0 || basicInfo.PebBaseAddress == NULL) return XSTDERR;
+
+    PEB peb;
+    SIZE_T nMemRead = 0;
+    if (!ReadProcessMemory(pTerm->hProcess, basicInfo.PebBaseAddress,
+        &peb, sizeof(peb), &nMemRead) || nMemRead != sizeof(peb)) return XSTDERR;
+
+    UNICODE_STRING dosPath;
+    const size_t nCurDirOffset = 0x38; /* CURDIR.DosPath inside process parameters */
+
+    if (!ReadProcessMemory(pTerm->hProcess,
+        (uint8_t*)peb.ProcessParameters + nCurDirOffset,
+        &dosPath, sizeof(dosPath), &nMemRead) || nMemRead != sizeof(dosPath)) return XSTDERR;
+
+    if (dosPath.Buffer == NULL || dosPath.Length == 0 ||
+        dosPath.Length > (XPATH_MAX * sizeof(WCHAR))) return XSTDERR;
+
+    WCHAR wsCwd[XPATH_MAX];
+    size_t nChars = dosPath.Length / sizeof(WCHAR);
+
+    if (!ReadProcessMemory(pTerm->hProcess, dosPath.Buffer,
+        wsCwd, dosPath.Length, &nMemRead) || nMemRead != dosPath.Length) return XSTDERR;
+
+    /* NT keeps a trailing backslash; drop it except for drive roots */
+    if (nChars > 3 && wsCwd[nChars - 1] == L'\\') nChars--;
+
+    int nConverted = WideCharToMultiByte(CP_UTF8, 0, wsCwd, (int)nChars,
+        pBuf, (int)nBufSize - 1, NULL, NULL);
+
+    if (nConverted <= 0)
+    {
+        pBuf[0] = '\0';
+        return XSTDERR;
+    }
+
+    pBuf[nConverted] = '\0';
 #else
     char sProcPath[64];
     snprintf(sProcPath, sizeof(sProcPath), "/proc/%d/cwd", (int)pTerm->nPid);

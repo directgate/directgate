@@ -20,6 +20,7 @@
  */
 
 #include "includes.h"
+#include "common.h"
 #include "transfer.h"
 #include "directgate.h"
 #include "files.h"
@@ -186,6 +187,16 @@ xjson_obj_t* DirectGate_Files_CreateEntryJson(const char *pName, const char *pDi
     snprintf(sFullPerm, sizeof(sFullPerm), "%c%s", cTypeChar, sPerm);
     XJSON_AddString(pEntry, "permissions", sFullPerm);
 
+#ifdef _WIN32
+    /* st_uid/st_gid carry no meaning on Windows: ownership lives in the
+       file ACL. Report the agent account, which is what every entry the
+       session can touch effectively runs as. */
+    char sOwner[XSTR_MID] = {0};
+    DirectGate_GetUserName(sOwner, sizeof(sOwner));
+
+    XJSON_AddString(pEntry, "owner", xstrused(sOwner) ? sOwner : "unknown");
+    XJSON_AddString(pEntry, "group", "none");
+#else
     /* Reentrant lookups: this runs on both the main thread and the async
        search worker thread, so the static buffers behind getpwuid/getgrgid/
        localtime would race. Use the _r variants. */
@@ -199,11 +210,17 @@ xjson_obj_t* DirectGate_Files_CreateEntryJson(const char *pName, const char *pDi
 
     XJSON_AddString(pEntry, "owner", (pw != NULL) ? pw->pw_name : "unknown");
     XJSON_AddString(pEntry, "group", (gr != NULL) ? gr->gr_name : "unknown");
+#endif
     XJSON_AddU64(pEntry, "sizeBytes", (uint64_t)pStat->st_size);
 
     char sTime[32];
     struct tm tmBuf;
+#ifdef _WIN32
+    /* localtime_s is the Windows CRT spelling of localtime_r */
+    struct tm *tm = (localtime_s(&tmBuf, &pStat->st_mtime) == 0) ? &tmBuf : NULL;
+#else
     struct tm *tm = localtime_r(&pStat->st_mtime, &tmBuf);
+#endif
     if (tm == NULL) xstrncpy(sTime, sizeof(sTime), "unknown");
     else strftime(sTime, sizeof(sTime), "%Y-%m-%dT%H:%M:%S", tm);
 
@@ -252,9 +269,82 @@ static XSTATUS DirectGate_Files_RenameNoReplace(const char *pPath, const char *p
     return rename(pPath, pTargetPath) == 0 ? XSTDOK : XSTDERR;
 }
 
+#ifdef _WIN32
+/*
+    Windows has no single filesystem root: the virtual path "/" lists the
+    mounted drives instead. Every other path travels in native form with
+    forward slashes ("C:/Users/..."), which all Windows APIs accept.
+*/
+static xjson_obj_t* DirectGate_Files_ListDrives(void)
+{
+    xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, XFALSE);
+    XCHECK((pRoot != NULL), NULL);
+
+    XJSON_AddString(pRoot, "path", "/");
+
+    xjson_obj_t *pEntries = XJSON_NewArray(NULL, "entries", XFALSE);
+    if (pEntries == NULL)
+    {
+        XJSON_FreeObject(pRoot);
+        return NULL;
+    }
+
+    char sOwner[XSTR_MID] = {0};
+    DirectGate_GetUserName(sOwner, sizeof(sOwner));
+
+    DWORD nDrives = GetLogicalDrives();
+    char cLetter;
+
+    for (cLetter = 'A'; cLetter <= 'Z'; cLetter++)
+    {
+        if (!(nDrives & (1U << (cLetter - 'A')))) continue;
+
+        char sDrivePath[8];
+        snprintf(sDrivePath, sizeof(sDrivePath), "%c:/", cLetter);
+
+        /* Skip media-less removable drives instead of erroring later */
+        UINT nType = GetDriveTypeA(sDrivePath);
+        if (nType == DRIVE_NO_ROOT_DIR || nType == DRIVE_UNKNOWN) continue;
+
+        xjson_obj_t *pEntry = XJSON_NewObject(NULL, NULL, XFALSE);
+        if (pEntry == NULL) continue;
+
+        char sName[4];
+        snprintf(sName, sizeof(sName), "%c:", cLetter);
+
+        XJSON_AddString(pEntry, "name", sName);
+        XJSON_AddString(pEntry, "path", sDrivePath);
+        XJSON_AddString(pEntry, "directoryPath", "/");
+        XJSON_AddString(pEntry, "type", "directory");
+        XJSON_AddString(pEntry, "permissions", "drwxr-xr-x");
+        XJSON_AddString(pEntry, "owner", xstrused(sOwner) ? sOwner : "unknown");
+        XJSON_AddString(pEntry, "group", "none");
+        XJSON_AddU64(pEntry, "sizeBytes", 0);
+        XJSON_AddString(pEntry, "modified", "unknown");
+        XJSON_AddObject(pEntries, pEntry);
+    }
+
+    XJSON_AddObject(pRoot, pEntries);
+    return pRoot;
+}
+#endif
+
 xjson_obj_t* DirectGate_Files_ListDir(const char *pPath)
 {
     XCHECK(xstrused(pPath), xthrowp(NULL, "Path is empty"));
+
+#ifdef _WIN32
+    if (!strcmp(pPath, "/") || !strcmp(pPath, "\\"))
+        return DirectGate_Files_ListDrives();
+
+    /* A bare "X:" means cwd-on-drive in Win32; the drive root is "X:/" */
+    char sDriveFix[4];
+    if (isalpha((unsigned char)pPath[0]) && pPath[1] == ':' && pPath[2] == '\0')
+    {
+        snprintf(sDriveFix, sizeof(sDriveFix), "%s/", pPath);
+        pPath = sDriveFix;
+    }
+#endif
 
     xdir_t dir;
     if (XDir_Open(&dir, pPath) < 0)
@@ -551,7 +641,7 @@ int DirectGate_Files_TransferSendCb(xjson_obj_t *pHeader, const uint8_t *pPayloa
 
     if (!pSession->bAuthenticated)
     {
-        int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : XSOCK_INVALID;
+        int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
         xloge("File transfer rejected, session is not authenticated: sid(%u), wsfd(%d)", pSession->nSessionId, nWsFd);
 
         DirectGate_Session_Close(pSession, "session not authenticated for files action");
@@ -571,7 +661,7 @@ void DirectGate_Files_ProcessTransfer(directgate_session_t *pSession)
         return;
 
     char sTransferId[XFILE_ID_SIZE];
-    int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : XSOCK_INVALID;
+    int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
 
     xstrncpy(sTransferId, sizeof(sTransferId), pSession->transfer.sId);
     xloge("Failed to advance outbound file transfer: sid(%u), wsfd(%d), transferId(%s), chunk(%u)",
@@ -600,7 +690,7 @@ int DirectGate_Files_HandleManager(xapi_session_t *pApiSession, directgate_pkg_t
 
     if (!xstrused(pMgrPkg->pAction))
     {
-        int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : XSOCK_INVALID;
+        int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
         xlogw("Manager message is missing action: sid(%u), wsfd(%d)", pSession->nSessionId, nWsFd);
         return XAPI_CONTINUE;
     }
@@ -655,7 +745,7 @@ int DirectGate_Files_HandleManager(xapi_session_t *pApiSession, directgate_pkg_t
                     "cancelled", DirectGate_Search_GetReason(&pSession->search), pMgrPkg->pPath);
             }
 
-            int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : XSOCK_INVALID;
+            int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
             xlogi("Search cancellation requested: sid(%u), wsfd(%d), path(%s)",
                 pSession->nSessionId, nWsFd, pMgrPkg->pPath);
 
@@ -668,7 +758,7 @@ int DirectGate_Files_HandleManager(xapi_session_t *pApiSession, directgate_pkg_t
                 "failed", DirectGate_Search_GetReason(&pSession->search), pMgrPkg->pPath);
         }
 
-        int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : XSOCK_INVALID;
+        int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
         xlogi("Search started: sid(%u), wsfd(%d), path(%s), pattern(%s)",
             pSession->nSessionId, nWsFd, pMgrPkg->pPath,
             xstrused(pMgrPkg->pFileName) ? pMgrPkg->pFileName : "*");
@@ -844,7 +934,7 @@ int DirectGate_Files_HandleManager(xapi_session_t *pApiSession, directgate_pkg_t
     }
 
     {
-        int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : XSOCK_INVALID;
+        int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
         xlogw("Unknown manager action: sid(%u), wsfd(%d), action(%s)", pSession->nSessionId, nWsFd, pMgrPkg->pAction);
     }
 
@@ -868,7 +958,7 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
 
     if (!xstrused(pFilePkg->pAction))
     {
-        int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : XSOCK_INVALID;
+        int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
         xlogw("File transfer message is missing action: sid(%u), wsfd(%d)", pSession->nSessionId, nWsFd);
         return XAPI_CONTINUE;
     }
@@ -886,7 +976,7 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
             ? DirectGate_Transfer_HandleStartPath(pFT, pPkg, pSavePath) < 0
             : DirectGate_Transfer_HandleStart(pFT, pPkg, ".") < 0)
         {
-            int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : XSOCK_INVALID;
+            int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
             xloge("Failed to start inbound file transfer: sid(%u), wsfd(%d), transferId(%s), path(%s)",
                 pSession->nSessionId, nWsFd, pTransferId, xstrused(pSavePath) ? pSavePath : ".");
 
@@ -898,7 +988,7 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
     {
         if (DirectGate_Transfer_HandleChunk(pFT, pPkg) < 0)
         {
-            int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : XSOCK_INVALID;
+            int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
             xloge("Failed to handle inbound file chunk: sid(%u), wsfd(%d), transferId(%s), chunk(%u)",
                 pSession->nSessionId, nWsFd, pFilePkg->transfer.pTransferId, pFilePkg->transfer.nChunkIndex);
 
@@ -911,7 +1001,7 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
     {
         if (DirectGate_Transfer_HandleEnd(pFT, pPkg, NULL, NULL) < 0)
         {
-            int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : XSOCK_INVALID;
+            int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
             xloge("Failed to finalize inbound file transfer: sid(%u), wsfd(%d), transferId(%s)",
                 pSession->nSessionId, nWsFd, pFilePkg->transfer.pTransferId);
 
@@ -927,7 +1017,7 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
             if (bHasOrigPerms && !pSession->bSaveForce)
             {
                 errno = EEXIST;
-                int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : XSOCK_INVALID;
+                int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
                 xloge("Save target appeared during upload: sid(%u), wsfd(%d), path(%s)", pSession->nSessionId, nWsFd, pSession->sSavePath);
 
                 DirectGate_Files_SendTransferCancel(pSession, pFilePkg->transfer.pTransferId, DirectGate_Files_LastError());
@@ -946,7 +1036,7 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
 
             if (nCommit != XSTDOK)
             {
-                int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : XSOCK_INVALID;
+                int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
                 xloge("Failed to commit uploaded file: sid(%u), wsfd(%d), tmp(%s), dst(%s), errno(%d)",
                     pSession->nSessionId, nWsFd, pSession->sSaveTempPath, pSession->sSavePath, errno);
 
@@ -998,7 +1088,7 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
     }
     else if (xstrcmp(pFilePkg->pAction, "ack"))
     {
-        int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : XSOCK_INVALID;
+        int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
         xlogd("Received file transfer ack: sid(%u), wsfd(%d), transferId(%s), chunk(%u)",
             pSession->nSessionId, nWsFd, pFilePkg->transfer.pTransferId, pFilePkg->transfer.nChunkIndex);
     }

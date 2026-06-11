@@ -16,6 +16,10 @@ project(directgate LANGUAGES C CXX)
 # path is read-only (SIP), so the writable, conventional /usr/local/bin is used.
 if(APPLE)
     set(_directgate_default_bindir "/usr/local/bin")
+elseif(WIN32)
+    # No absolute system path on Windows: install under the chosen prefix
+    # (e.g. C:\Program Files\directgate\bin).
+    set(_directgate_default_bindir "bin")
 else()
     set(_directgate_default_bindir "/usr/bin")
 endif()
@@ -49,7 +53,16 @@ if(DIRECTGATE_ENABLE_HARDENING AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-fstack-protector-strong)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_link_options(-Wl,-z,relro -Wl,-z,now)
+    elseif(WIN32)
+        # PE hardening (MinGW): DEP, ASLR with high entropy on x64.
+        add_link_options(-Wl,--nxcompat -Wl,--dynamicbase -Wl,--high-entropy-va)
     endif()
+endif()
+
+if(DIRECTGATE_ENABLE_HARDENING AND MSVC)
+    # PE hardening (MSVC): stack cookies, Control Flow Guard, DEP, ASLR.
+    add_compile_options(/GS /guard:cf)
+    add_link_options(/GUARD:CF /NXCOMPAT /DYNAMICBASE /HIGHENTROPYVA)
 endif()
 
 if(DIRECTGATE_ENABLE_SANITIZERS)
@@ -82,7 +95,10 @@ endif()
 find_package(OpenSSL REQUIRED)
 
 # libutil provides forkpty()/openpty() used by the agent PTY layer.
-find_library(UTIL_LIBRARY NAMES util)
+# Windows uses ConPTY from kernel32 instead, no extra library needed.
+if(NOT WIN32)
+    find_library(UTIL_LIBRARY NAMES util)
+endif()
 
 # ---- libdatachannel (submodule, WebRTC P2P) -------------------------------
 # Built statically so the installed binaries are self-contained and don't need
@@ -117,8 +133,19 @@ set(DIRECTGATE_INCLUDE_DIRS
     ${LIBXUTILS_DIR}/src/sys)
 
 # ---- Build flags for our own targets --------------------------------------
-add_compile_options(-g -O2 -Wall -Wextra)
+if(MSVC)
+    add_compile_options(/O2 /W3)
+else()
+    add_compile_options(-g -O2 -Wall -Wextra)
+endif()
 add_compile_definitions(_XCHECK_LOG)
+
+if(WIN32)
+    # Target Windows 10 1809+: required for ConPTY (CreatePseudoConsole).
+    # WIN32_LEAN_AND_MEAN keeps windows.h from dragging in winsock.h, which
+    # conflicts with the winsock2.h used by libxutils and libdatachannel.
+    add_compile_definitions(_WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
 
 if(DIRECTGATE_DEBUG)
     add_compile_definitions(DIRECTGATE_DEBUG)
@@ -152,8 +179,15 @@ target_link_libraries(xcommon PUBLIC
     LibDataChannel::LibDataChannel
     OpenSSL::SSL
     OpenSSL::Crypto
-    Threads::Threads
-    m)
+    Threads::Threads)
+
+if(WIN32)
+    # ws2_32/iphlpapi: Winsock and interface enumeration (libxutils, libjuice)
+    # crypt32/bcrypt: certificate store and CNG entropy used by static OpenSSL
+    target_link_libraries(xcommon PUBLIC ws2_32 iphlpapi crypt32 bcrypt)
+else()
+    target_link_libraries(xcommon PUBLIC m)
+endif()
 
 # ---- agent binary: directgate --------------------------------------------------
 add_executable(directgate
@@ -167,6 +201,15 @@ add_executable(directgate
 target_include_directories(directgate PRIVATE ${AGENT_DIR})
 target_link_libraries(directgate PRIVATE xcommon)
 
+if(WIN32)
+    # ntdll: NtQueryInformationProcess used to read the shell cwd (term.c)
+    target_link_libraries(directgate PRIVATE ntdll)
+
+    # Manifest with UTF-8 active code page: ANSI APIs handle any file name
+    enable_language(RC)
+    target_sources(directgate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/misc/win/app.rc")
+endif()
+
 if(UTIL_LIBRARY)
     target_link_libraries(directgate PRIVATE ${UTIL_LIBRARY})
 endif()
@@ -179,6 +222,10 @@ add_executable(dgcli
     ${CLIENT_DIR}/relay.c)
 target_include_directories(dgcli PRIVATE ${CLIENT_DIR})
 target_link_libraries(dgcli PRIVATE xcommon)
+
+if(WIN32)
+    target_sources(dgcli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/misc/win/app.rc")
+endif()
 
 if(UTIL_LIBRARY)
     target_link_libraries(dgcli PRIVATE ${UTIL_LIBRARY})

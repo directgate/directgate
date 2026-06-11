@@ -78,8 +78,10 @@ typedef struct directgate_webrtc_ {
     directgate_webrtc_event_t *pQueueTail;
     xsync_mutex_t queueLock;
 
-    /* [0]=read (main loop), [1]=write (callback) */
-    int nPipeFds[2];
+    /* [0]=read (main loop), [1]=write (callback).
+       POSIX: a pipe (XSOCKET == int there). Windows: a private socket
+       pair from XSock_CreatePair(), since WSAPoll only polls sockets. */
+    XSOCKET nPipeFds[2];
 
     /* Configurable ICE/TURN servers (from config file) */
     directgate_ice_server_t sIceServers[DIRECTGATE_MAX_ICE_SERVERS];
