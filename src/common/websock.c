@@ -32,7 +32,7 @@ int DirectGate_WebSock_Send(xapi_session_t *pSession, const uint8_t *pPkg, size_
     xws_status_t status;
     xws_frame_t frame;
 
-    status = XWebFrame_Create(&frame, pPkg, nLen, XWS_BINARY, XTRUE, bMask);
+    status = XWebFrame_Create(&frame, pPkg, nLen, XWS_BINARY, bMask, XTRUE);
     if (status != XWS_ERR_NONE)
     {
         const char *pAddr = (pSession != NULL && xstrused(pSession->sAddr)) ? pSession->sAddr : "N/A";

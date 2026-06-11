@@ -30,6 +30,15 @@ foreach(test
         api_invalid_role_smoke
         keyauth_smoke
         files_static_smoke
+        auth_logger_smoke
+        hash_vectors_smoke
+        json_smoke
+        proto_crypt_smoke
+        protocol_builders_smoke
+        siv_smoke
+        sockpair_events_smoke
+        str_buf_smoke
+        websock_frame_smoke
         term_priv_smoke)
     directgate_smoke(${test})
 endforeach()
