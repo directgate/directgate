@@ -92,8 +92,7 @@ static void DirectGate_Search_NormalizePath(char *pOutput, size_t nSize, const c
     while (nLen > 1 && pOutput[nLen - 1] == '/')
         pOutput[--nLen] = '\0';
 
-    if (!nLen)
-        xstrncpy(pOutput, nSize, "/");
+    if (!nLen) xstrncpy(pOutput, nSize, "/");
 }
 
 static void DirectGate_Search_DrainPipe(directgate_search_t *pSearch)
@@ -496,6 +495,7 @@ static void* DirectGate_Search_Worker(void *pArg)
     memset(&build, 0, sizeof(build));
     build.pSearch = pSearch;
     build.pEntries = DirectGate_Search_NewEntries();
+
     if (build.pEntries == NULL)
     {
         DirectGate_Search_Finish(pSearch, DIRECTGATE_SEARCH_EVENT_FAILED, NULL, 0, "failed to allocate search payload");
@@ -545,6 +545,7 @@ static void* DirectGate_Search_Worker(void *pArg)
 #else
     int nStatus = XSearch(&searchCtx, pSearch->sRootPath);
 #endif
+
     xbool_t bCancelRequested = XSYNC_ATOMIC_GET(&pSearch->nCancelRequested);
     XSearch_Destroy(&searchCtx);
 
@@ -696,6 +697,7 @@ int DirectGate_Search_Start(directgate_search_t *pSearch, const directgate_pkg_m
     {
         const char *pReason = XSYNC_ATOMIC_GET(&pSearch->nCancelRequested) ?
             "search cancellation in progress" : "search already in progress";
+
         xstrncpy(pSearch->sReason, sizeof(pSearch->sReason), pReason);
         XSync_Unlock(&pSearch->lock);
         return XSTDERR;
