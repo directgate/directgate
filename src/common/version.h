@@ -25,7 +25,7 @@
 #define DIRECTGATE_VERSION_MAJOR 1
 #define DIRECTGATE_VERSION_MINOR 0
 #define DIRECTGATE_VERSION_BUILD 19
-#define DIRECTGATE_VERSION_PKG   4
+#define DIRECTGATE_VERSION_PKG   5
 
 const char* DirectGate_GetVersionShort(void);
 const char* DirectGate_GetVersionLong(void);

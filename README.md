@@ -117,7 +117,7 @@ See [Security model](docs/security.md) for the full design and trust assumptions
 
 The easiest way to install the agent is from the official DirectGate package repositories. Once added, the agent stays up to date through your normal system updates. The debugsource packages are published for every release, so you can rebuild from source and compare against the distributed binaries.
 
-Supported on Linux and macOS across x86, x86_64, ARMHF and ARM64 architectures. Windows support is coming soon.
+Supported on Linux, Windows and macOS across x86, x86_64, ARMHF and ARM64 architectures.
 
 **Debian / Ubuntu / Raspbian (apt)**
 
@@ -162,6 +162,8 @@ sudo dnf install directgate
 brew tap directgate/directgate
 brew install directgate
 ```
+
+Windows installation instructions are coming soon.
 
 **From source** - if your platform isn't listed above, or you want to build and audit the agent yourself, see [Building from source](docs/building.md). The short version:
 
