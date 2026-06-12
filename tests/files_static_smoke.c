@@ -135,6 +135,8 @@ int main(void)
     char sNestedTarget[512];
     char sTempPath[512];
     char sTempPath2[512];
+    char sCommitTemp[512];
+    char sCommitTarget[512];
     char sResolved[512];
     char sRead[64];
 
@@ -148,10 +150,12 @@ int main(void)
     snprintf(sDirCopy, sizeof(sDirCopy), "%s/dir-copy", sRoot);
     snprintf(sDirCopyChild, sizeof(sDirCopyChild), "%s/dir-copy/child.txt", sRoot);
     snprintf(sNestedTarget, sizeof(sNestedTarget), "%s/dir/nested", sRoot);
+    snprintf(sCommitTemp, sizeof(sCommitTemp), "%s/upload.part", sRoot);
+    snprintf(sCommitTarget, sizeof(sCommitTarget), "%s/editor-save.txt", sRoot);
 
     CHECK(write_file(sFile, "report-data"), "write source file");
     CHECK(write_file(sHidden, "secret"), "write hidden file");
-    CHECK(mkdir(sDir, 0755) == 0, "mkdir source dir");
+    CHECK(XDir_Create(sDir, 0755) > 0, "mkdir source dir");
     CHECK(write_file(sDirChild, "child-data"), "write source dir child");
 
     CHECK(DirectGate_Files_ResolvePasteTarget(sResolved, sizeof(sResolved), sFileCopy) == XSTDOK,
@@ -203,6 +207,51 @@ int main(void)
         "build second upload temp path");
     CHECK(strcmp(sTempPath, sTempPath2) != 0,
         "upload temp path should include random material");
+
+    CHECK(write_file(sCommitTemp, "new-data"), "write no-replace commit source");
+    CHECK(write_file(sCommitTarget, "old-data"), "write no-replace commit target");
+    errno = 0;
+    CHECK(DirectGate_Files_RenameNoReplace(sCommitTemp, sCommitTarget) == XSTDERR,
+        "no-replace commit should reject existing target");
+    CHECK(errno == EEXIST, "no-replace commit should report EEXIST");
+    CHECK(read_file(sCommitTemp, sRead, sizeof(sRead)), "read rejected commit source");
+    CHECK(strcmp(sRead, "new-data") == 0, "rejected commit should preserve source");
+    CHECK(read_file(sCommitTarget, sRead, sizeof(sRead)), "read rejected commit target");
+    CHECK(strcmp(sRead, "old-data") == 0, "rejected commit should preserve target");
+
+    CHECK(DirectGate_Files_RenameReplace(sCommitTemp, sCommitTarget) == XSTDOK,
+        "forced editor save should replace existing target");
+    CHECK(access(sCommitTemp, F_OK) != 0, "replace commit should consume source");
+    CHECK(read_file(sCommitTarget, sRead, sizeof(sRead)), "read replaced commit target");
+    CHECK(strcmp(sRead, "new-data") == 0, "replace commit should install source bytes");
+
+    xstat_t commitStat;
+    char sCommitPerm[XPERM_LEN + 1];
+    CHECK(xstat(sCommitTarget, &commitStat) == XSTDOK, "stat replaced commit target");
+    memset(sCommitPerm, '?', sizeof(sCommitPerm));
+    CHECK(XPath_ModeToPerm(sCommitPerm, sizeof(sCommitPerm), commitStat.st_mode) == XPERM_LEN,
+        "format replaced target permissions");
+    CHECK(strlen(sCommitPerm) == XPERM_LEN,
+        "formatted permissions should always be complete");
+    CHECK(strchr(sCommitPerm, '?') == NULL,
+        "formatted permissions should initialize every character");
+    CHECK(XPath_SetPerm(sCommitTarget, sCommitPerm) == XSTDOK,
+        "restore replaced target permissions");
+    CHECK(write_file(sCommitTarget, "second-save"),
+        "restored target should remain writable for repeated editor save");
+
+    xstat_t beforeInvalidPerm;
+    xstat_t afterInvalidPerm;
+    CHECK(xstat(sCommitTarget, &beforeInvalidPerm) == XSTDOK,
+        "stat target before invalid permission");
+    CHECK(XPath_SetPerm(sCommitTarget, "rw") == XSTDERR,
+        "invalid permission string should be rejected");
+    CHECK(xstat(sCommitTarget, &afterInvalidPerm) == XSTDOK,
+        "stat target after invalid permission");
+    CHECK(beforeInvalidPerm.st_mode == afterInvalidPerm.st_mode,
+        "invalid permission string should preserve target mode");
+    CHECK(write_file(sCommitTarget, "third-save"),
+        "invalid permission string should not make target read-only");
 
     CHECK(DirectGate_Files_Delete(sDirCopy, XTRUE) == XSTDOK,
         "cleanup copied directory");

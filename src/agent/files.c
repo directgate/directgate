@@ -270,6 +270,79 @@ static XSTATUS DirectGate_Files_RenameNoReplace(const char *pPath, const char *p
 }
 
 #ifdef _WIN32
+static void DirectGate_Files_SetErrnoFromWin32(DWORD nError)
+{
+    switch (nError)
+    {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+        case ERROR_INVALID_DRIVE:
+            errno = ENOENT;
+            break;
+
+        case ERROR_ACCESS_DENIED:
+        case ERROR_SHARING_VIOLATION:
+        case ERROR_LOCK_VIOLATION:
+        case ERROR_WRITE_PROTECT:
+            errno = EACCES;
+            break;
+
+        case ERROR_FILE_EXISTS:
+        case ERROR_ALREADY_EXISTS:
+            errno = EEXIST;
+            break;
+
+        case ERROR_NOT_SAME_DEVICE:
+            errno = EXDEV;
+            break;
+
+        case ERROR_DISK_FULL:
+        case ERROR_HANDLE_DISK_FULL:
+            errno = ENOSPC;
+            break;
+
+        case ERROR_DIR_NOT_EMPTY:
+            errno = ENOTEMPTY;
+            break;
+
+        case ERROR_FILENAME_EXCED_RANGE:
+        case ERROR_BUFFER_OVERFLOW:
+            errno = ENAMETOOLONG;
+            break;
+
+        case ERROR_DIRECTORY:
+            errno = ENOTDIR;
+            break;
+
+        case ERROR_INVALID_NAME:
+        case ERROR_INVALID_PARAMETER:
+            errno = EINVAL;
+            break;
+
+        default:
+            errno = EIO;
+            break;
+    }
+}
+#endif
+
+static XSTATUS DirectGate_Files_RenameReplace(const char *pPath, const char *pTargetPath)
+{
+    XCHECK((xstrused(pPath)), XSTDERR);
+    XCHECK((xstrused(pTargetPath)), XSTDERR);
+
+#ifdef _WIN32
+    if (MoveFileExA(pPath, pTargetPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return XSTDOK;
+
+    DirectGate_Files_SetErrnoFromWin32(GetLastError());
+    return XSTDERR;
+#else
+    return rename(pPath, pTargetPath) == 0 ? XSTDOK : XSTDERR;
+#endif
+}
+
+#ifdef _WIN32
 /*
     Windows has no single filesystem root: the virtual path "/" lists the
     mounted drives instead. Every other path travels in native form with
@@ -1031,7 +1104,7 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
                this rename cannot be silently overwritten (TOCTOU). Force
                saves intentionally replace the existing target. */
             int nCommit = pSession->bSaveForce
-                ? (rename(pSession->sSaveTempPath, pSession->sSavePath) == 0 ? XSTDOK : XSTDERR)
+                ? DirectGate_Files_RenameReplace(pSession->sSaveTempPath, pSession->sSavePath)
                 : DirectGate_Files_RenameNoReplace(pSession->sSaveTempPath, pSession->sSavePath);
 
             if (nCommit != XSTDOK)
