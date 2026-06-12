@@ -677,7 +677,7 @@ int DirectGate_Search_Start(directgate_search_t *pSearch, const directgate_pkg_m
     XCHECK((pSearch != NULL), XSTDERR);
     XCHECK((pMgrPkg != NULL), XSTDERR);
 
-    if (pSearch->nPipeFds[0] < 0 || pSearch->nPipeFds[1] < 0)
+    if (pSearch->nPipeFds[0] == XSOCK_INVALID || pSearch->nPipeFds[1] == XSOCK_INVALID)
     {
         xstrncpy(pSearch->sReason, sizeof(pSearch->sReason), "search pipe is not available");
         return XSTDERR;
