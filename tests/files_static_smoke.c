@@ -137,6 +137,9 @@ int main(void)
     char sTempPath2[512];
     char sCommitTemp[512];
     char sCommitTarget[512];
+    char sPortableDir[512];
+    char sPortableChild[512];
+    char sPortableFile[512];
     char sResolved[512];
     char sRead[64];
 
@@ -152,6 +155,9 @@ int main(void)
     snprintf(sNestedTarget, sizeof(sNestedTarget), "%s/dir/nested", sRoot);
     snprintf(sCommitTemp, sizeof(sCommitTemp), "%s/upload.part", sRoot);
     snprintf(sCommitTarget, sizeof(sCommitTarget), "%s/editor-save.txt", sRoot);
+    snprintf(sPortableDir, sizeof(sPortableDir), "%s/windows-portable-dir", sRoot);
+    snprintf(sPortableChild, sizeof(sPortableChild), "%s/windows-portable-dir/child.txt", sRoot);
+    snprintf(sPortableFile, sizeof(sPortableFile), "%s/windows-portable-file.txt", sRoot);
 
     CHECK(write_file(sFile, "report-data"), "write source file");
     CHECK(write_file(sHidden, "secret"), "write hidden file");
@@ -252,6 +258,64 @@ int main(void)
         "invalid permission string should preserve target mode");
     CHECK(write_file(sCommitTarget, "third-save"),
         "invalid permission string should not make target read-only");
+
+    CHECK(XDir_Create(sPortableDir, 0755) > 0,
+        "create destination for portable Windows permissions");
+    CHECK(XPath_SetPerm(sPortableDir, "rwx------") == XSTDOK,
+        "apply portable Windows directory permissions");
+    CHECK(write_file(sPortableChild, "portable"),
+        "portable Windows directory permissions should allow child creation");
+    xstat_t portableStat;
+    CHECK(xstat(sPortableDir, &portableStat) == XSTDOK &&
+        (portableStat.st_mode & 0777) == 0700,
+        "portable Windows directory permissions should be 0700");
+    CHECK(write_file(sPortableFile, "portable"),
+        "create portable Windows file destination");
+    CHECK(XPath_SetPerm(sPortableFile, "rw-------") == XSTDOK,
+        "apply portable Windows file permissions");
+    CHECK(xstat(sPortableFile, &portableStat) == XSTDOK &&
+        (portableStat.st_mode & 0777) == 0600,
+        "portable Windows file permissions should be 0600");
+
+#ifdef _WIN32
+    char sWinPerm[XPERM_LEN + 1];
+    char sWinMode[4];
+
+    CHECK(XPath_ModeToPerm(sWinPerm, sizeof(sWinPerm),
+        _S_IFDIR | _S_IREAD | _S_IWRITE) == XPERM_LEN &&
+        strcmp(sWinPerm, "rwx------") == 0,
+        "writable Windows directory should project to portable 0700");
+    CHECK(XPath_ModeToChmod(sWinMode, sizeof(sWinMode),
+        _S_IFDIR | _S_IREAD | _S_IWRITE) == 3 &&
+        strcmp(sWinMode, "700") == 0,
+        "writable Windows directory chmod projection");
+
+    CHECK(XPath_ModeToPerm(sWinPerm, sizeof(sWinPerm),
+        _S_IFREG | _S_IREAD | _S_IWRITE) == XPERM_LEN &&
+        strcmp(sWinPerm, "rw-------") == 0,
+        "writable Windows file should project to portable 0600");
+    CHECK(XPath_ModeToChmod(sWinMode, sizeof(sWinMode),
+        _S_IFREG | _S_IREAD | _S_IWRITE) == 3 &&
+        strcmp(sWinMode, "600") == 0,
+        "writable Windows file chmod projection");
+
+    CHECK(XPath_ModeToPerm(sWinPerm, sizeof(sWinPerm),
+        _S_IFDIR | _S_IREAD) == XPERM_LEN &&
+        strcmp(sWinPerm, "rwx------") == 0,
+        "Windows directory attributes should still project to writable 0700");
+    CHECK(XPath_ModeToChmod(sWinMode, sizeof(sWinMode),
+        _S_IFDIR | _S_IREAD) == 3 &&
+        strcmp(sWinMode, "700") == 0,
+        "Windows directory attributes chmod projection");
+    CHECK(XPath_ModeToPerm(sWinPerm, sizeof(sWinPerm),
+        _S_IFREG | _S_IREAD) == XPERM_LEN &&
+        strcmp(sWinPerm, "r--------") == 0,
+        "read-only Windows file should project to portable 0400");
+    CHECK(XPath_ModeToChmod(sWinMode, sizeof(sWinMode),
+        _S_IFREG | _S_IREAD) == 3 &&
+        strcmp(sWinMode, "400") == 0,
+        "read-only Windows file chmod projection");
+#endif
 
     CHECK(DirectGate_Files_Delete(sDirCopy, XTRUE) == XSTDOK,
         "cleanup copied directory");

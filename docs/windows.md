@@ -94,18 +94,18 @@ The default config path is `%APPDATA%\directgate\agent.json`. Pairing
 
 ### Windows paths inside the config
 
-The config is JSON, and in JSON a raw backslash starts an escape sequence - `"C:\Users\Sandro"` is **invalid** (`\U` is not a JSON escape) and the parser will reject the file. Write Windows paths in one of the two valid forms:
+The config is JSON, and in JSON a raw backslash starts an escape sequence - `"C:\Users\Kala"` is **invalid** (`\U` is not a JSON escape) and the parser will reject the file. Write Windows paths in one of the two valid forms:
 
 ```json
 {
   "shell": {
-    "user": "Sandro",
-    "home": "C:/Users/Sandro"
+    "user": "Kala",
+    "home": "C:/Users/Kala"
   }
 }
 ```
 
-or `"C:\\Users\\Sandro"`. Forward slashes are the recommended form: every Windows API accepts them, and the agent itself always generates paths with forward slashes for exactly this reason.
+or `"C:\\Users\\Kala"`. Forward slashes are the recommended form: every Windows API accepts them, and the agent itself always generates paths with forward slashes for exactly this reason.
 
 ### As a Windows service
 
