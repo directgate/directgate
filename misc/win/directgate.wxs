@@ -66,7 +66,8 @@
         <Feature Id="Main" Title="DirectGate Agent" Level="1">
             <ComponentRef Id="CmpAgentExe" />
             <ComponentRef Id="CmpCliExe" />
-            <ComponentRef Id="CmpDocs" />
+            <ComponentRef Id="CmpReadme" />
+            <ComponentRef Id="CmpLicense" />
             <ComponentRef Id="CmpPath" />
             <ComponentRef Id="CmpDataFolder" />
         </Feature>
@@ -106,9 +107,15 @@
                           KeyPath="yes" />
                 </Component>
 
-                <Component Id="CmpDocs" Bitness="always64">
+                <!-- One file per component: an auto-generated component GUID is
+                     only valid for a multi-file component when its keypath is a
+                     versioned file, which README/LICENSE are not (WIX0367). -->
+                <Component Id="CmpReadme" Bitness="always64">
                     <File Id="FileReadme" Source="$(var.StageDir)/README.md" KeyPath="yes" />
-                    <File Id="FileLicense" Source="$(var.StageDir)/LICENSE" />
+                </Component>
+
+                <Component Id="CmpLicense" Bitness="always64">
+                    <File Id="FileLicense" Source="$(var.StageDir)/LICENSE" KeyPath="yes" />
                 </Component>
 
                 <!-- Add the install directory to the system PATH so directgate /
