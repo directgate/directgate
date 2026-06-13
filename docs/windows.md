@@ -81,6 +81,67 @@ The binaries land in `build/`. The MinGW runtime is linked statically and `OPENS
 
 ---
 
+## Installer (MSI)
+
+The project's Windows CI builds a Windows x64 MSI with the
+[WiX Toolset](https://wixtoolset.org/) - the `build-msi` job in
+`.github/workflows/windows.yml`. WiX runs only on Windows, so the installer is
+produced in CI rather than the Linux release pipeline. The rest of this section
+covers installing and configuring that MSI.
+
+Installing `directgate-<version>-x64.msi` (double-click, or
+`msiexec /i directgate-<version>-x64.msi`):
+
+- installs `directgate.exe` and `dgcli.exe` into `C:\Program Files\DirectGate\`
+  and adds that directory to the system `PATH`;
+- creates `C:\ProgramData\directgate\`, the machine-wide config home used in
+  service mode;
+- registers the `directgate-agent` Windows service (manual start, **not**
+  started by the installer) with the command line
+  `directgate.exe --win-service -c "C:\ProgramData\directgate\agent.json"`.
+
+The installer prompts for the Windows account the service runs as
+(`DOMAIN\User` or `.\User`) and its password. For a silent install, pass them as
+properties instead:
+
+```bat
+msiexec /i directgate-<version>-x64.msi /qn ^
+    SERVICEACCOUNT=.\YourUser SERVICEPASSWORD=YourPassword
+```
+
+Because the agent refuses to start unless `shell.user` matches the run-as
+account (see [As a Windows service](#as-a-windows-service)) and the device must
+be paired first, the service is installed **stopped**. Finish setup after
+installing:
+
+1. Pair into the machine-wide config. Run this **as the service account** so it
+   owns the file and can read it back (the agent writes `agent.json` with a
+   `0600`-equivalent DACL limited to `SYSTEM`, `Administrators`, and the owner):
+
+   ```bat
+   directgate.exe -c C:\ProgramData\directgate\agent.json -sed <device_id> -t <token>
+   ```
+
+2. Set `shell.user` in that config to the service account.
+3. Start it: `sc.exe start directgate-agent` (or `Start-Service directgate-agent`).
+
+Uninstalling stops and removes the service, deletes the files, and removes the
+`PATH` entry.
+
+### Config path: console vs service
+
+The two run modes resolve the config differently, which is why the service
+command line pins `-c` explicitly:
+
+- **Console / interactive:** the default is the per-user
+  `%APPDATA%\directgate\agent.json`.
+- **Service:** a service logon does not have a reliable `%APPDATA%`, so the
+  service must be pointed at a machine-wide path. The installer standardizes on
+  `C:\ProgramData\directgate\agent.json` and passes it with `-c`. Pair into that
+  same path (step 1 above) so the service reads the config you paired.
+
+---
+
 ## Running the agent on Windows
 
 ### Console (foreground)
@@ -108,6 +169,9 @@ The config is JSON, and in JSON a raw backslash starts an escape sequence - `"C:
 or `"C:\\Users\\Kala"`. Forward slashes are the recommended form: every Windows API accepts them, and the agent itself always generates paths with forward slashes for exactly this reason.
 
 ### As a Windows service
+
+The [MSI installer](#installer-msi) registers this service for you; the manual
+`sc.exe` route below is for source builds and custom setups.
 
 The agent has native Service Control Manager support via the
 `--win-service` flag. From an **administrator** prompt:

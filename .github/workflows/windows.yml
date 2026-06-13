@@ -117,3 +117,90 @@ jobs:
       run: |
         export PATH="$HOME/llvm-mingw/bin:$PATH"
         cmake --build build-win64 -j"$(nproc)"
+
+  # Package the agent + CLI into a Windows x64 MSI with the WiX Toolset. WiX only
+  # runs on Windows (it refuses to build MSIs on Linux), so the installer is
+  # produced here in CI rather than in the Linux release pipeline. The MSI design
+  # (service registration, config path) is documented in docs/windows.md and
+  # authored in misc/win/directgate.wxs.
+  build-msi:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up MSYS2 (UCRT64)
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        install: >-
+          mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-cmake
+          mingw-w64-ucrt-x86_64-ninja
+          mingw-w64-ucrt-x86_64-openssl
+
+    - name: Build agent and CLI
+      shell: msys2 {0}
+      # x64_msi build tag stamps the install channel into the agent version, like
+      # the deb/rpm/brew packages do.
+      run: |
+        cmake -B build -G Ninja -DOPENSSL_USE_STATIC_LIBS=TRUE \
+          -DCMAKE_BUILD_TYPE=Release -DDIRECTGATE_BUILD_TAG=x64_msi
+        cmake --build build -j4
+
+    - name: Verify artifacts are self-contained
+      shell: msys2 {0}
+      run: |
+        objdump -p build/directgate.exe | grep "DLL Name" | tee imports.txt
+        ! grep -iE "libstdc|libgcc|libwinpthread|libc\+\+|libunwind|libssl|libcrypto" imports.txt
+
+    - name: Resolve version
+      id: ver
+      shell: pwsh
+      run: |
+        $h = Get-Content src/common/version.h -Raw
+        $maj = [regex]::Match($h, 'DIRECTGATE_VERSION_MAJOR\s+(\d+)').Groups[1].Value
+        $min = [regex]::Match($h, 'DIRECTGATE_VERSION_MINOR\s+(\d+)').Groups[1].Value
+        $bld = [regex]::Match($h, 'DIRECTGATE_VERSION_BUILD\s+(\d+)').Groups[1].Value
+        if (-not ($maj -and $min -and $bld)) { throw "Could not parse version from src/common/version.h" }
+        "version=$maj.$min.$bld" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+    - name: Install WiX Toolset
+      shell: pwsh
+      run: |
+        dotnet tool install --global wix --version 5.0.2
+        "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+        & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.UI.wixext/5.0.2
+
+    - name: Stage payload
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path stage | Out-Null
+        Copy-Item build/directgate.exe stage/
+        Copy-Item build/dgcli.exe stage/
+        Copy-Item README.md stage/
+        Copy-Item LICENSE stage/
+
+    - name: Build MSI
+      shell: pwsh
+      run: |
+        $ver = "${{ steps.ver.outputs.version }}"
+        $msi = "directgate-$ver-x64.msi"
+        wix build -arch x64 `
+          -d Version=$ver `
+          -d StageDir=stage `
+          -d LicenseRtf=misc/win/License.rtf `
+          -ext WixToolset.UI.wixext `
+          -culture en-us `
+          -o $msi `
+          misc/win/directgate.wxs
+        "MSI_PATH=$msi" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+    - name: Upload MSI
+      uses: actions/upload-artifact@v4
+      with:
+        name: directgate-windows-msi
+        path: ${{ env.MSI_PATH }}
