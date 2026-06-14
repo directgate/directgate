@@ -37,7 +37,7 @@
 #include "srp.h"
 
 #ifdef _WIN32
-#include "winpriv/launcher.h"
+#include "launcher.h"
 #endif
 
 #define DIRECTGATE_RECONNECT_BASE_MS        3000U

@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/winpriv/launcher.c
+ * @file directgate-agent/src/agent/launcher.c
  * @brief SYSTEM launcher for the Windows privilege-separation model.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
@@ -17,18 +17,97 @@
  */
 
 #ifdef _WIN32
-
 #include "includes.h"
-#include "config.h"   /* DirectGate_InitConfig / DirectGate_LoadConfig, shell.user */
+#include "config.h"
 #include "launcher.h"
-#include "token.h"
 
-#include <userenv.h>  /* CreateEnvironmentBlock / DestroyEnvironmentBlock */
+#include <windows.h>   /* HANDLE, DWORD, etc. */
+#include <wtsapi32.h>  /* WTSEnumerateSessionsA / WTSQueryUserToken */
+#include <userenv.h>   /* CreateEnvironmentBlock / DestroyEnvironmentBlock */
 
 #define DIRECTGATE_WIN_LAUNCHER_POLL_MS    2000  /* supervisor tick */
 #define DIRECTGATE_WIN_LAUNCHER_RESPAWN_MS 2000  /* min gap between spawn attempts */
 
 static volatile LONG g_nLauncherStop = 0;
+
+/* Resolve an account name (accepts "user", "DOMAIN\user" or ".\user") to a SID
+copied into pSidBuf (SECURITY_MAX_SID_SIZE bytes). */
+static XSTATUS DirectGate_WinLauncher_LookupSid(const char *pShellUser, PSID pSidBuf)
+{
+    const char *pName = pShellUser;
+    if (pName[0] == '.' && pName[1] == '\\') pName += 2;
+
+    DWORD nSidLen = SECURITY_MAX_SID_SIZE;
+    char sDomain[256];
+    DWORD nDomLen = (DWORD)sizeof(sDomain);
+    SID_NAME_USE eUse;
+
+    if (!LookupAccountNameA(NULL, pName, pSidBuf, &nSidLen, sDomain, &nDomLen, &eUse))
+    {
+        xloge("token: failed to resolve shell.user account: user(%s), error(%lu)",
+            pShellUser, GetLastError());
+        return XSTDERR;
+    }
+
+    return XSTDOK;
+}
+
+/* True when the user SID of hToken equals pWantSid. */
+static xbool_t DirectGate_WinLauncher_TokenMatchesUser(HANDLE hToken, PSID pWantSid)
+{
+    uint8_t sUserBuf[256];
+    DWORD nLen = 0;
+
+    if (!GetTokenInformation(hToken, TokenUser, sUserBuf, (DWORD)sizeof(sUserBuf), &nLen))
+        return XFALSE;
+
+    return EqualSid(((TOKEN_USER*)sUserBuf)->User.Sid, pWantSid) ? XTRUE : XFALSE;
+}
+
+XSTATUS DirectGate_WinLauncher_AcquireTokenForUser(const char *pShellUser, HANDLE *phToken)
+{
+    XCHECK((xstrused(pShellUser) && phToken != NULL), XSTDINV);
+    *phToken = NULL;
+
+    uint8_t sWantSid[SECURITY_MAX_SID_SIZE];
+    if (DirectGate_WinLauncher_LookupSid(pShellUser, sWantSid) != XSTDOK) return XSTDERR;
+
+    PWTS_SESSION_INFOA pSessions = NULL;
+    XSTATUS nStatus = XSTDERR;
+    DWORD nCount = 0;
+
+    if (!WTSEnumerateSessionsA(WTS_CURRENT_SERVER_HANDLE, 0, 1, &pSessions, &nCount))
+    {
+        xloge("token: failed to enumerate logon sessions: error(%lu)", GetLastError());
+        return XSTDERR;
+    }
+
+    for (DWORD i = 0; i < nCount; i++)
+    {
+        /* Active = at the console/RDP; Disconnected = still logged on (RDP
+           detached). Both carry a usable user token; other states do not. */
+        if (pSessions[i].State != WTSActive && pSessions[i].State != WTSDisconnected) continue;
+
+        HANDLE hToken = NULL;
+        if (!WTSQueryUserToken(pSessions[i].SessionId, &hToken)) continue;
+
+        if (DirectGate_WinLauncher_TokenMatchesUser(hToken, sWantSid))
+        {
+            *phToken = hToken;
+            nStatus = XSTDOK;
+            break;
+        }
+
+        CloseHandle(hToken);
+    }
+
+    WTSFreeMemory(pSessions);
+
+    if (nStatus != XSTDOK)
+        xlogw("token: shell.user is not logged on, cannot start session: user(%s)", pShellUser);
+
+    return nStatus;
+}
 
 static BOOL WINAPI DirectGate_WinLauncher_CtrlHandler(DWORD nType)
 {
@@ -61,12 +140,11 @@ void DirectGate_WinLauncher_Stop(void)
  * shell.user. The identity comes only from the token the launcher minted for the
  * configured shell.user.
  */
-static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfgPath,
-                                                 HANDLE *phProcess)
+static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfgPath, HANDLE *phProcess)
 {
     *phProcess = NULL;
-
     char sSelf[XPATH_MAX];
+
     DWORD nSelfLen = GetModuleFileNameA(NULL, sSelf, (DWORD)sizeof(sSelf));
     if (nSelfLen == 0 || nSelfLen >= sizeof(sSelf))
     {
@@ -93,7 +171,8 @@ static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfg
     BOOL bOk = CreateProcessAsUserA(hToken, NULL, sCmd, NULL, NULL, FALSE,
         CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, pEnv, NULL, &si, &pi);
 
-    if (pEnv != NULL) DestroyEnvironmentBlock(pEnv);
+    if (pEnv != NULL)
+        DestroyEnvironmentBlock(pEnv);
 
     if (!bOk)
     {
@@ -103,14 +182,13 @@ static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfg
 
     CloseHandle(pi.hThread);
     *phProcess = pi.hProcess;
+
     xlogn("launcher: started agent in shell.user session: pid(%lu)", pi.dwProcessId);
     return XSTDOK;
 }
 
 XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
 {
-    /* The launcher bypasses DirectGate_RunAgent, so set up logging here the same
-       way the agent does. */
     xlog_defaults();
     xlog_coloring(XFALSE);
     xlog_timing(XLOG_DATE);
@@ -126,6 +204,7 @@ XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
        account; it is never derived from anything but config. */
     directgate_cfg_t cfg;
     DirectGate_InitConfig(&cfg);
+
     if (!DirectGate_LoadConfig(&cfg, pCfgPath))
     {
         xloge("launcher: failed to load agent config: path(%s)", pCfgPath);
@@ -160,7 +239,7 @@ XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
             }
 
             HANDLE hToken = NULL;
-            if (DirectGate_WinToken_AcquireForUser(sShellUser, &hToken) != XSTDOK)
+            if (DirectGate_WinLauncher_AcquireTokenForUser(sShellUser, &hToken) != XSTDOK)
             {
                 /* shell.user not logged on: passwordless model waits for a logon. */
                 if (!bWaitingForLogon)
@@ -175,6 +254,7 @@ XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
 
             bWaitingForLogon = XFALSE;
             nLastSpawnMs = nNow;
+
             if (DirectGate_WinLauncher_SpawnAgent(hToken, pCfgPath, &hAgent) != XSTDOK)
                 hAgent = NULL;
 
@@ -209,5 +289,4 @@ XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
     xlogn("launcher: stopped");
     return XSTDOK;
 }
-
 #endif /* _WIN32 */

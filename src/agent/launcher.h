@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/winpriv/launcher.h
+ * @file directgate-agent/src/agent/launcher.h
  * @brief SYSTEM launcher for the Windows privilege-separation model.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
@@ -31,9 +31,8 @@
  * is present and simply waits when they are not - there is no headless mode.
  */
 
-#ifndef __DIRECTGATE_WINPRIV_LAUNCHER_H__
-#define __DIRECTGATE_WINPRIV_LAUNCHER_H__
-
+#ifndef __DIRECTGATE_WIN_LAUNCHER_H__
+#define __DIRECTGATE_WIN_LAUNCHER_H__
 #ifdef _WIN32
 
 #include "xstd.h"
@@ -62,4 +61,4 @@ void DirectGate_WinLauncher_Stop(void);
 #endif
 
 #endif /* _WIN32 */
-#endif /* __DIRECTGATE_WINPRIV_LAUNCHER_H__ */
+#endif /* __DIRECTGATE_WIN_LAUNCHER_H__ */
