@@ -249,6 +249,16 @@ if(WIN32)
     # ntdll: NtQueryInformationProcess used to read the shell cwd (term.c)
     target_link_libraries(directgate PRIVATE ntdll)
 
+    # Privilege-separation launcher (see src/agent/winpriv/): a tiny LocalSystem
+    # supervisor that spawns the agent as shell.user via a logon token. Windows
+    # only; the POSIX setuid model is unchanged.
+    target_sources(directgate PRIVATE
+        ${AGENT_DIR}/winpriv/token.c
+        ${AGENT_DIR}/winpriv/launcher.c)
+    # advapi32: LookupAccountName + token queries. wtsapi32: WTSEnumerateSessions
+    # / WTSQueryUserToken (shell.user logon token). userenv: CreateEnvironmentBlock.
+    target_link_libraries(directgate PRIVATE advapi32 wtsapi32 userenv)
+
     # Manifest with UTF-8 active code page: ANSI APIs handle any file name
     enable_language(RC)
     target_sources(directgate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/misc/win/app.rc")

@@ -13,25 +13,26 @@
       $(var.LicenseRtf) - path to the WixUI license page (misc/win/License.rtf)
 
     What it installs on the target machine:
-      C:\Program Files\DirectGate\directgate.exe   (agent; also the service image)
+      C:\Program Files\DirectGate\directgate.exe   (agent + launcher; one binary)
       C:\Program Files\DirectGate\dgcli.exe        (CLI client)
       C:\Program Files\DirectGate\README.md, LICENSE
       C:\ProgramData\directgate\                    (machine-wide service config home)
     and adds the install dir to the system PATH.
 
-    Service model (see docs/windows.md): the agent has native SCM support via the
-    win-service flag. The service command line pins the config to
-    C:\ProgramData\directgate\agent.json, because %APPDATA% (the interactive
-    default, see src/agent/config.c) is unreliable under a service logon. Console
-    use is unchanged and still defaults to %APPDATA%\directgate\agent.json.
+    Service model (privilege separation, see docs/windows.md). A single service,
+    directgate-agent, runs the LAUNCHER as LocalSystem (binPath uses the
+    win-service + win-launcher flags and -c C:\ProgramData\directgate\agent.json).
 
-    The service is installed Start=demand (manual) and is NOT started by the
-    installer: the agent refuses to start unless shell.user in the config matches
-    the service's run-as account, and the config must be paired first. The run-as
-    account is collected by ServiceCredsDlg (or set on the msiexec command line).
-    An empty account makes the MSI register the service as LocalSystem, which is
-    inert here - the service stays stopped and the agent's identity check would
-    refuse to run it unless shell.user == "SYSTEM".
+    The launcher is a tiny supervisor that does NO untrusted parsing. It reads
+    shell.user from the config, acquires that user's interactive logon token
+    (passwordless, WTSQueryUserToken) and spawns the actual agent inside the
+    user's session - so the agent and everything it does (protocol parsing, PTY,
+    file manager) run AS shell.user, never as SYSTEM, mirroring the POSIX setuid
+    model. No Windows password is ever stored or prompted for.
+
+    Start=demand: the launcher refuses to run until shell.user is configured, so
+    pair/configure first (as shell.user, into the ProgramData config), then start
+    the service. It only serves sessions while shell.user is logged on.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
@@ -50,16 +51,6 @@
         <MajorUpgrade
             AllowSameVersionUpgrades="yes"
             DowngradeErrorMessage="A newer version of DirectGate Agent is already installed." />
-
-        <!--
-            Service run-as account. Collected interactively by ServiceCredsDlg below,
-            or supplied for silent installs:
-              msiexec /i directgate-...-x64.msi SERVICEACCOUNT=.\Alice SERVICEPASSWORD=...
-            Secure=yes so the value survives into the elevated (per-machine) execute
-            sequence; Hidden=yes keeps the password out of the MSI log.
-        -->
-        <Property Id="SERVICEACCOUNT" Secure="yes" />
-        <Property Id="SERVICEPASSWORD" Secure="yes" Hidden="yes" />
 
         <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
 
@@ -80,17 +71,19 @@
                           Source="$(var.StageDir)/directgate.exe"
                           KeyPath="yes" />
 
+                    <!-- One LocalSystem service that runs the launcher. No account
+                         or password is needed: the launcher mints shell.user's
+                         token itself and spawns the agent in the user's session. -->
                     <ServiceInstall
                         Id="AgentSvc"
                         Name="directgate-agent"
                         DisplayName="DirectGate Agent"
-                        Description="DirectGate secure remote agent."
+                        Description="DirectGate agent supervisor (privilege-separated launcher)."
                         Type="ownProcess"
                         Start="demand"
                         ErrorControl="normal"
-                        Account="[SERVICEACCOUNT]"
-                        Password="[SERVICEPASSWORD]"
-                        Arguments=" --win-service -c &quot;C:\ProgramData\directgate\agent.json&quot;"
+                        Account="LocalSystem"
+                        Arguments=" --win-service --win-launcher -c &quot;C:\ProgramData\directgate\agent.json&quot;"
                         Vital="no" />
 
                     <ServiceControl
@@ -143,13 +136,10 @@
         </StandardDirectory>
 
         <!--
-            Machine-wide config home for service mode. We only create the folder and
-            leave the default ProgramData ACL in place: a non-admin can create files
-            here (so pairing as the service account works), but cannot tamper with
-            files owned by others. The agent additionally writes agent.json itself
-            with a protected, 0600-equivalent DACL (see docs/windows.md), so a
-            restrictive folder DACL is intentionally avoided - it would lock the
-            service account out of reading its own config.
+            Machine-wide config home. The launcher (LocalSystem) reads it; the
+            agent runs as shell.user and reads/writes agent.json there (it is
+            written with a protected, 0600-equivalent DACL by the agent itself).
+            Default ProgramData ACL is kept so shell.user can read/pair its config.
         -->
         <StandardDirectory Id="CommonAppDataFolder">
             <Directory Id="DataFolder" Name="directgate">
@@ -168,63 +158,8 @@
             </Directory>
         </StandardDirectory>
 
-        <!-- ============================ UI ============================ -->
-        <!--
-            WixUI_InstallDir flow with one extra dialog (ServiceCredsDlg) spliced in
-            between the install-directory and the confirm pages to collect the service
-            run-as account. The UI authoring is kept in this Package element on
-            purpose: a standalone <Fragment> would be dropped by the linker unless
-            referenced, so embedding here guarantees it is included.
-        -->
+        <!-- Stock WixUI install-dir flow. No service-credentials dialog: the
+             launcher is passwordless, so the installer collects no secrets. -->
         <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
-
-        <UI>
-            <Dialog Id="ServiceCredsDlg" Width="370" Height="270" Title="DirectGate Agent Setup">
-                <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44"
-                         TabSkip="no" Text="WixUI_Bmp_Banner" />
-                <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
-                <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
-
-                <Control Id="Title" Type="Text" X="15" Y="6" Width="280" Height="15"
-                         Transparent="yes" NoPrefix="yes"
-                         Text="{\WixUI_Font_Title}Windows service account" />
-                <Control Id="Description" Type="Text" X="25" Y="23" Width="320" Height="15"
-                         Transparent="yes" NoPrefix="yes"
-                         Text="Choose the account the DirectGate service runs as." />
-
-                <Control Id="Info" Type="Text" X="20" Y="60" Width="335" Height="52" NoPrefix="yes"
-                         Text="The service runs directgate.exe with the config at C:\ProgramData\directgate\agent.json. Enter the Windows account it should run as (for example .\Alice); it must match shell.user in the paired config. Leave both fields blank to configure the service later - it is installed but stays stopped until you start it." />
-
-                <Control Id="AccountLabel" Type="Text" X="20" Y="120" Width="200" Height="13"
-                         NoPrefix="yes" Text="Account (DOMAIN\User or .\User):" />
-                <Control Id="AccountEdit" Type="Edit" X="20" Y="134" Width="330" Height="16"
-                         Property="SERVICEACCOUNT" />
-
-                <Control Id="PasswordLabel" Type="Text" X="20" Y="160" Width="200" Height="13"
-                         NoPrefix="yes" Text="Password:" />
-                <Control Id="PasswordEdit" Type="Edit" X="20" Y="174" Width="330" Height="16"
-                         Property="SERVICEPASSWORD" Password="yes" />
-
-                <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)">
-                    <Publish Event="NewDialog" Value="InstallDirDlg" />
-                </Control>
-                <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)">
-                    <Publish Event="NewDialog" Value="VerifyReadyDlg" />
-                </Control>
-                <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
-                    <Publish Event="SpawnDialog" Value="CancelDlg" />
-                </Control>
-            </Dialog>
-
-            <!--
-                Splice ServiceCredsDlg into the WixUI_InstallDir chain. Adding a
-                higher-Order NewDialog publish overrides the built-in target because
-                MSI applies the last satisfied NewDialog event in Ordering order.
-            -->
-            <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="ServiceCredsDlg"
-                     Order="5" Condition="WIXUI_DONTVALIDATEPATH OR WIXUI_INSTALLDIR_VALID=&quot;1&quot;" />
-            <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="ServiceCredsDlg"
-                     Order="5" Condition="NOT Installed" />
-        </UI>
     </Package>
 </Wix>

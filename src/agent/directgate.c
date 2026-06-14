@@ -36,6 +36,10 @@
 #include "e2e.h"
 #include "srp.h"
 
+#ifdef _WIN32
+#include "winpriv/launcher.h"
+#endif
+
 #define DIRECTGATE_RECONNECT_BASE_MS        3000U
 #define DIRECTGATE_RECONNECT_MAX_MS         120000U
 #define DIRECTGATE_RECONNECT_WAIT_MAX_MS    5000U
@@ -2629,6 +2633,10 @@ static int DirectGate_RunAgent(int argc, char* argv[])
 static SERVICE_STATUS_HANDLE g_hSvcStatusHandle = NULL;
 static int g_nSvcArgc = 0;
 static char **g_pSvcArgv = NULL;
+/* When the service runs the privilege-separation launcher instead of the agent
+   directly: the launcher supervises an agent spawned as shell.user. */
+static xbool_t g_bSvcLauncher = XFALSE;
+static const char *g_pSvcCfgPath = NULL;
 
 static void DirectGate_SvcReportState(DWORD nState, DWORD nExitCode)
 {
@@ -2654,6 +2662,9 @@ static void WINAPI DirectGate_SvcCtrlHandler(DWORD nControl)
         case SERVICE_CONTROL_SHUTDOWN:
             DirectGate_SvcReportState(SERVICE_STOP_PENDING, NO_ERROR);
             g_bFinish = XTRUE;
+            /* Harmless when running the agent directly; breaks the launcher's
+               supervise loop when running in launcher mode. */
+            DirectGate_WinLauncher_Stop();
             break;
         default:
             break;
@@ -2673,7 +2684,12 @@ static void WINAPI DirectGate_SvcMain(DWORD nArgc, LPSTR *pArgv)
     if (g_hSvcStatusHandle == NULL) return;
 
     DirectGate_SvcReportState(SERVICE_RUNNING, NO_ERROR);
-    int nStatus = DirectGate_RunAgent(g_nSvcArgc, g_pSvcArgv);
+
+    int nStatus;
+    if (g_bSvcLauncher)
+        nStatus = (DirectGate_WinLauncher_Run(g_pSvcCfgPath) == XSTDOK) ? 0 : -1;
+    else
+        nStatus = DirectGate_RunAgent(g_nSvcArgc, g_pSvcArgv);
 
     DirectGate_SvcReportState(SERVICE_STOPPED,
         nStatus < 0 ? ERROR_SERVICE_SPECIFIC_ERROR : NO_ERROR);
@@ -2683,20 +2699,28 @@ static void WINAPI DirectGate_SvcMain(DWORD nArgc, LPSTR *pArgv)
 int main(int argc, char* argv[])
 {
 #ifdef _WIN32
-    /* Strip the dispatcher flag so the regular argument parser never
-       sees it, whether the service mode is requested or not */
+    /*
+       Windows roles, all the same executable:
+         (no flag)                 -> agent (runs as the current user)
+         --win-launcher            -> privilege-separation launcher (supervises an
+                                      agent spawned as shell.user); console mode
+         --win-service             -> run the selected role under the SCM
+       The launcher and the service flag combine: the MSI registers the launcher
+       service as `directgate.exe --win-service --win-launcher -c <agent.json>`.
+
+       Strip --win-service / --win-launcher from the argv the agent parser sees,
+       and capture -c for the launcher (which does not use the agent parser). */
     static char *pFilteredArgv[64];
     xbool_t bWinService = XFALSE;
+    xbool_t bWinLauncher = XFALSE;
+    const char *pWinCfg = NULL;
     int i, nFiltered = 0;
 
     for (i = 0; i < argc && nFiltered < (int)XARR_SIZE(pFilteredArgv) - 1; i++)
     {
-        if (strcmp(argv[i], DIRECTGATE_WIN_SERVICE_FLAG) == 0)
-        {
-            bWinService = XTRUE;
-            continue;
-        }
-
+        if (strcmp(argv[i], DIRECTGATE_WIN_SERVICE_FLAG) == 0) { bWinService = XTRUE; continue; }
+        if (strcmp(argv[i], DIRECTGATE_WIN_LAUNCHER_FLAG) == 0) { bWinLauncher = XTRUE; continue; }
+        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) pWinCfg = argv[i + 1];
         pFilteredArgv[nFiltered++] = argv[i];
     }
 
@@ -2704,6 +2728,8 @@ int main(int argc, char* argv[])
 
     if (bWinService)
     {
+        g_bSvcLauncher = bWinLauncher;
+        g_pSvcCfgPath = pWinCfg;
         g_nSvcArgc = nFiltered;
         g_pSvcArgv = pFilteredArgv;
 
@@ -2716,7 +2742,7 @@ int main(int argc, char* argv[])
         if (!StartServiceCtrlDispatcherA(svcTable))
         {
             fprintf(stderr, "Failed to connect to the service control manager "
-                "(error %lu): %s is only valid when the agent is started as a "
+                "(error %lu): %s is only valid when started as a "
                 "Windows service\n", GetLastError(), DIRECTGATE_WIN_SERVICE_FLAG);
 
             return XSTDERR;
@@ -2724,6 +2750,11 @@ int main(int argc, char* argv[])
 
         return 0;
     }
+
+    /* Console launcher (no service): useful for manual testing under an account
+       holding SeTcbPrivilege (e.g. psexec -s). */
+    if (bWinLauncher)
+        return (DirectGate_WinLauncher_Run(pWinCfg) == XSTDOK) ? 0 : 1;
 
     return DirectGate_RunAgent(nFiltered, pFilteredArgv);
 #else
