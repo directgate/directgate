@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>online.directgate.agent</string>
+    <string>io.directgate.agent</string>
     <key>ProgramArguments</key>
     <array>
         <string><exec></string>
