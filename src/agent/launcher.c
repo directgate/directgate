@@ -373,7 +373,7 @@ static void WINAPI DirectGate_WinLauncher_SvcMain(DWORD nArgc, LPSTR *pArgv)
 
 XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[])
 {
-    statiuc char *pFilteredArgv[64];
+    static char *pFilteredArgv[64];
     xbool_t bWinLauncher = XFALSE;
     xbool_t bWinService = XFALSE;
     const char *pWinCfg = NULL;
