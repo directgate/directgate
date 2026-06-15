@@ -55,6 +55,7 @@ static const char *g_pSvcCfgPath = NULL;
 static volatile LONG g_nLauncherStop = 0;
 extern xbool_t g_bFinish;
 
+/* Real agent entrypoint from directgate.c */
 int DirectGate_RunAgent(int argc, char* argv[]);
 
 /* Resolve an account name (accepts "user", "DOMAIN\user" or ".\user") 
@@ -64,9 +65,9 @@ static XSTATUS DirectGate_WinLauncher_LookupSid(const char *pShellUser, PSID pSi
     const char *pName = pShellUser;
     if (pName[0] == '.' && pName[1] == '\\') pName += 2;
 
-    DWORD nSidLen = SECURITY_MAX_SID_SIZE;
     char sDomain[XSTR_TINY];
     DWORD nDomLen = (DWORD)sizeof(sDomain);
+    DWORD nSidLen = SECURITY_MAX_SID_SIZE;
     SID_NAME_USE eUse;
 
     if (!LookupAccountNameA(NULL, pName, pSidBuf, &nSidLen, sDomain, &nDomLen, &eUse))
@@ -156,7 +157,7 @@ static xbool_t DirectGate_WinLauncher_Stopping(void)
     return InterlockedCompareExchange(&g_nLauncherStop, 0, 0) ? XTRUE : XFALSE;
 }
 
-void DirectGate_WinLauncher_Stop(void)
+static void DirectGate_WinLauncher_Stop(void)
 {
     InterlockedExchange(&g_nLauncherStop, 1);
 }
@@ -182,8 +183,8 @@ static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfg
     char sCmd[XPATH_MAX + 256];
     xstrncpyf(sCmd, sizeof(sCmd), "\"%s\" -c \"%s\"", sSelf, pCfgPath);
 
-    /* Run with the user's environment so HOME/USERPROFILE/APPDATA resolve to
-       shell.user, not the launcher's SYSTEM profile. */
+    /* Run with the user's environment so HOME/USERPROFILE/APPDATA
+       resolve to shell.user, not the launcher's SYSTEM profile. */
     LPVOID pEnv = NULL;
     CreateEnvironmentBlock(&pEnv, hToken, FALSE);
 
@@ -341,8 +342,8 @@ static void WINAPI DirectGate_WinLauncher_SvcCtrlHandler(DWORD nControl)
         case SERVICE_CONTROL_SHUTDOWN:
             DirectGate_WinLauncher_SvcReportState(SERVICE_STOP_PENDING, NO_ERROR);
             g_bFinish = XTRUE;
-            /* Harmless when running the agent directly; breaks the launcher's
-               supervise loop when running in launcher mode. */
+            /* Harmless when running the agent directly but breaks the
+               launcher's supervise loop when running in launcher mode. */
             DirectGate_WinLauncher_Stop();
             break;
         default:
@@ -377,12 +378,12 @@ XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[])
     xbool_t bWinLauncher = XFALSE;
     xbool_t bWinService = XFALSE;
     const char *pWinCfg = NULL;
-    int i, nFiltered = 0;
+    int i, nFiltered = XSTDNON;
 
     for (i = 0; i < argc && nFiltered < (int)XARR_SIZE(pFilteredArgv) - 1; i++)
     {
-        if (strcmp(argv[i], DIRECTGATE_WIN_SERVICE_FLAG) == 0) { bWinService = XTRUE; continue; }
         if (strcmp(argv[i], DIRECTGATE_WIN_LAUNCHER_FLAG) == 0) { bWinLauncher = XTRUE; continue; }
+        if (strcmp(argv[i], DIRECTGATE_WIN_SERVICE_FLAG) == 0) { bWinService = XTRUE; continue; }
         if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) pWinCfg = argv[i + 1];
         pFilteredArgv[nFiltered++] = argv[i];
     }
@@ -393,8 +394,8 @@ XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[])
     {
         g_pSvcCfgPath = pWinCfg;
         g_bSvcLauncher = bWinLauncher;
-        g_nSvcArgc = nFiltered;
         g_pSvcArgv = pFilteredArgv;
+        g_nSvcArgc = nFiltered;
 
         SERVICE_TABLE_ENTRYA svcTable[] = {
             { (LPSTR)DIRECTGATE_WIN_SERVICE_NAME, DirectGate_WinLauncher_SvcMain },
@@ -404,9 +405,9 @@ XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[])
         /* Blocks until the service is stopped */
         if (!StartServiceCtrlDispatcherA(svcTable))
         {
-            fprintf(stderr, "Failed to connect to the service control manager "
-                "(error %lu): %s is only valid when started as a "
-                "Windows service\n", GetLastError(), DIRECTGATE_WIN_SERVICE_FLAG);
+            fprintf(stderr, "Failed to connect to the service control manager (error %lu): %s "
+                "is only valid when started as a Windows service\n",
+                GetLastError(), DIRECTGATE_WIN_SERVICE_FLAG);
 
             return XSTDERR;
         }
