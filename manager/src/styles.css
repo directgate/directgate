@@ -1,0 +1,246 @@
+:root {
+  --bg: #f4f5f7;
+  --card-bg: #ffffff;
+  --border: #d7dbe0;
+  --text: #1c2330;
+  --muted: #5b6472;
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --ok: #1a7f37;
+  --ok-bg: #e7f5ec;
+  --err: #b42318;
+  --err-bg: #fdeceb;
+  --running: #1a7f37;
+  --stopped: #b42318;
+  --unknown: #8a6d00;
+  --radius: 10px;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1a1d23;
+    --card-bg: #23272f;
+    --border: #353b45;
+    --text: #e8eaed;
+    --muted: #9aa3b2;
+    --ok-bg: #143523;
+    --err-bg: #3a1816;
+  }
+}
+
+.app {
+  max-width: 420px;
+  margin: 0 auto;
+  padding: 20px 18px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.app__header {
+  text-align: center;
+}
+
+.app__title {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 4px 0 0;
+}
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.card__title {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0;
+  color: var(--text);
+}
+
+/* Ensure the [hidden] attribute always wins over the flex rules below. */
+[hidden] {
+  display: none !important;
+}
+
+/* Keep the form fields / paired view evenly spaced inside the card. */
+#pair-form,
+#paired-view {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.field__label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.field__input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  outline: none;
+  user-select: text;
+}
+
+.field__input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+}
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 500;
+  padding: 8px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.12s ease, opacity 0.12s ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--bg);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn--primary {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+.btn--primary:hover:not(:disabled) {
+  background: var(--primary-hover);
+}
+
+.btn--ghost {
+  border-color: transparent;
+  color: var(--primary);
+  background: transparent;
+  padding: 4px 8px;
+}
+
+.btn--ghost:hover:not(:disabled) {
+  background: rgba(37, 99, 235, 0.1);
+}
+
+.btn--small {
+  font-size: 12px;
+}
+
+.btn-row {
+  display: flex;
+  gap: 10px;
+}
+
+.btn-row .btn {
+  flex: 1;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.status__label {
+  color: var(--muted);
+}
+
+.status__value {
+  font-weight: 600;
+}
+
+.status__value--running {
+  color: var(--running);
+}
+
+.status__value--stopped {
+  color: var(--stopped);
+}
+
+.status__value--unknown,
+.status__value--notinstalled {
+  color: var(--unknown);
+}
+
+.status .btn--ghost {
+  margin-left: auto;
+}
+
+.msg {
+  margin: 0;
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
+
+.msg:empty {
+  display: none;
+}
+
+.msg--ok {
+  color: var(--ok);
+  background: var(--ok-bg);
+  padding: 8px 10px;
+  border-radius: 8px;
+}
+
+.msg--err {
+  color: var(--err);
+  background: var(--err-bg);
+  padding: 8px 10px;
+  border-radius: 8px;
+}
+
+.msg--info {
+  color: var(--muted);
+}
