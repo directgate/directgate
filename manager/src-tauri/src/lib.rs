@@ -370,6 +370,36 @@ fn restart_service() -> Result<String, String> {
     service::restart()
 }
 
+/// Opens an external URL in the user's default browser. Used by the "add a
+/// device" link in the pairing form so the in-app webview never navigates away
+/// from the manager UI.
+///
+/// Restricted to `https://` URLs so the command can never be coerced into
+/// launching a local program or an arbitrary protocol handler.
+#[tauri::command(async)]
+fn open_url(url: String) -> Result<(), String> {
+    let url = url.trim();
+    if !url.starts_with("https://") {
+        return Err("Only https URLs can be opened.".into());
+    }
+
+    // rundll32's FileProtocolHandler opens the URL in the default browser
+    // without going through cmd.exe (no shell metacharacter parsing).
+    #[cfg(target_os = "windows")]
+    let result = hidden_command("rundll32.exe")
+        .arg("url.dll,FileProtocolHandler")
+        .arg(url)
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "linux")]
+    let result = Command::new("xdg-open").arg(url).spawn();
+
+    result
+        .map(|_| ())
+        .map_err(|e| format!("Failed to open the browser: {e}"))
+}
+
 /// Reports whether this device is already enrolled, by reading the agent's
 /// config file (the same default path the agent uses). Returns "Paired",
 /// "Unpaired", or "Unknown".
@@ -458,7 +488,8 @@ pub fn run() {
             get_service_status,
             start_service,
             stop_service,
-            restart_service
+            restart_service,
+            open_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running DirectGate Manager");

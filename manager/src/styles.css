@@ -111,6 +111,22 @@ body {
   color: var(--muted);
 }
 
+.field__hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.link {
+  color: var(--primary);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.link:hover {
+  text-decoration: underline;
+}
+
 .field__input {
   width: 100%;
   padding: 8px 10px;

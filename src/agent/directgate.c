@@ -63,7 +63,7 @@
 
 #define DIRECTGATE_NO_ANSWER                "N/A"
 
-static xbool_t g_bFinish = XFALSE;
+xbool_t g_bFinish = XFALSE;
 
 static int DirectGate_HandleTransportMessage(xapi_session_t *pApiSession,
     const uint8_t *pPayload, size_t nPayload, const char *pTransport);
@@ -2542,7 +2542,7 @@ static xbool_t DirectGate_DropPrivileges(const directgate_cfg_t *pCfg)
 #endif /* _WIN32 */
 
 #ifndef DIRECTGATE_TESTING
-static int DirectGate_RunAgent(int argc, char* argv[])
+int DirectGate_RunAgent(int argc, char* argv[])
 {
     xlog_defaults();
     xlog_coloring(XFALSE);
@@ -2617,13 +2617,7 @@ static int DirectGate_RunAgent(int argc, char* argv[])
 int main(int argc, char* argv[])
 {
 #ifdef _WIN32
-    directgate_win_launcher_t launcher;
-    memset(&launcher, 0, sizeof(directgate_win_launcher_t));
-
-    XSTATUS nStatus = DirectGate_WinLauncher_Main(argc, argv, &launcher);
-    if (nStatus || launcher.bWinLauncher) return nStatus;
-
-    return DirectGate_RunAgent(launcher.nFiltered, launcher.pFilteredArgv);
+    return DirectGate_WinLauncher_Main(argc, argv);
 #else
     return DirectGate_RunAgent(argc, argv);
 #endif

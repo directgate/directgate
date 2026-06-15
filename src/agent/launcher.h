@@ -41,13 +41,7 @@
 extern "C" {
 #endif
 
-typedef struct {
-    char *pFilteredArgv[64];
-    int nFiltered;
-    xbool_t bWinLauncher;
-} directgate_win_launcher_t;
-
-XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[], directgate_win_launcher_t *pLauncher);
+XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[]);
 
 #ifdef __cplusplus
 }

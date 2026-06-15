@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/launcher.c
+ * @file directgate-agent/src/agent/c
  * @brief SYSTEM launcher for the Windows privilege-separation model.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
@@ -45,14 +45,17 @@
 #define DIRECTGATE_WIN_LAUNCHER_FLAG "--win-launcher"
 
 static SERVICE_STATUS_HANDLE g_hSvcStatusHandle = NULL;
-static int g_nSvcArgc = 0;
 static char **g_pSvcArgv = NULL;
+static int g_nSvcArgc = 0;
 
 /* When the service runs the privilege-separation launcher instead of the agent
    directly: the launcher supervises an agent spawned as shell.user. */
 static xbool_t g_bSvcLauncher = XFALSE;
 static const char *g_pSvcCfgPath = NULL;
 static volatile LONG g_nLauncherStop = 0;
+extern xbool_t g_bFinish;
+
+int DirectGate_RunAgent(int argc, char* argv[]);
 
 /* Resolve an account name (accepts "user", "DOMAIN\user" or ".\user") 
    to a SID copied into pSidBuf (SECURITY_MAX_SID_SIZE bytes). */
@@ -88,7 +91,7 @@ static xbool_t DirectGate_WinLauncher_TokenMatchesUser(HANDLE hToken, PSID pWant
     return EqualSid(((TOKEN_USER*)sUserBuf)->User.Sid, pWantSid) ? XTRUE : XFALSE;
 }
 
-XSTATUS DirectGate_WinLauncher_AcquireTokenForUser(const char *pShellUser, HANDLE *phToken)
+static XSTATUS DirectGate_WinLauncher_AcquireTokenForUser(const char *pShellUser, HANDLE *phToken)
 {
     XCHECK((xstrused(pShellUser) && phToken != NULL), XSTDINV);
     *phToken = NULL;
@@ -368,28 +371,30 @@ static void WINAPI DirectGate_WinLauncher_SvcMain(DWORD nArgc, LPSTR *pArgv)
     DirectGate_WinLauncher_SvcReportState(SERVICE_STOPPED, nStatus < 0 ? ERROR_SERVICE_SPECIFIC_ERROR : NO_ERROR);
 }
 
-XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[], directgate_win_launcher_t *pLauncher)
+XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[])
 {
+    statiuc char *pFilteredArgv[64];
+    xbool_t bWinLauncher = XFALSE;
     xbool_t bWinService = XFALSE;
     const char *pWinCfg = NULL;
-    int i;
+    int i, nFiltered = 0;
 
-    for (i = 0; i < argc && pLauncher->nFiltered < (int)XARR_SIZE(pLauncher->pFilteredArgv) - 1; i++)
+    for (i = 0; i < argc && nFiltered < (int)XARR_SIZE(pFilteredArgv) - 1; i++)
     {
         if (strcmp(argv[i], DIRECTGATE_WIN_SERVICE_FLAG) == 0) { bWinService = XTRUE; continue; }
-        if (strcmp(argv[i], DIRECTGATE_WIN_LAUNCHER_FLAG) == 0) { pLauncher->bWinLauncher = XTRUE; continue; }
+        if (strcmp(argv[i], DIRECTGATE_WIN_LAUNCHER_FLAG) == 0) { bWinLauncher = XTRUE; continue; }
         if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) pWinCfg = argv[i + 1];
-        pLauncher->pFilteredArgv[pLauncher->nFiltered++] = argv[i];
+        pFilteredArgv[nFiltered++] = argv[i];
     }
 
-    pLauncher->pFilteredArgv[pLauncher->nFiltered] = NULL;
+    pFilteredArgv[nFiltered] = NULL;
 
     if (bWinService)
     {
-        g_bSvcLauncher = pLauncher->bWinLauncher;
-        g_nSvcArgc = pLauncher->nFiltered;
-        g_pSvcArgv = pLauncher->pFilteredArgv;
         g_pSvcCfgPath = pWinCfg;
+        g_bSvcLauncher = bWinLauncher;
+        g_nSvcArgc = nFiltered;
+        g_pSvcArgv = pFilteredArgv;
 
         SERVICE_TABLE_ENTRYA svcTable[] = {
             { (LPSTR)DIRECTGATE_WIN_SERVICE_NAME, DirectGate_WinLauncher_SvcMain },
@@ -410,8 +415,8 @@ XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[], directgate_win_launc
     }
 
     /* Console launcher (no service): useful for manual testing under an account holding SeTcbPrivilege */
-    if (pLauncher->bWinLauncher) return (DirectGate_WinLauncher_Run(pWinCfg) == XSTDOK) ? XSTDNON : XSTDOK;
+    if (bWinLauncher) return (DirectGate_WinLauncher_Run(pWinCfg) == XSTDOK) ? XSTDNON : XSTDOK;
 
-    return XSTDNON;
+    return DirectGate_RunAgent(nFiltered, pFilteredArgv);
 }
 #endif /* _WIN32 */

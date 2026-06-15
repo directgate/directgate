@@ -35,6 +35,10 @@ function restartService(): Promise<string> {
   return invoke<string>("restart_service");
 }
 
+function openUrl(url: string): Promise<void> {
+  return invoke<void>("open_url", { url });
+}
+
 const NOT_INSTALLED_MSG =
   "DirectGate service is not installed. Please install DirectGate Agent first.";
 
@@ -101,6 +105,7 @@ const $ = <T extends HTMLElement>(id: string): T => {
 const pairedView = $<HTMLDivElement>("paired-view");
 const pairForm = $<HTMLDivElement>("pair-form");
 const repairBtn = $<HTMLButtonElement>("repair-btn");
+const workspaceLink = $<HTMLAnchorElement>("workspace-link");
 const pairCodeEl = $<HTMLInputElement>("pair-code");
 const authEl = $<HTMLInputElement>("auth-password");
 const confirmEl = $<HTMLInputElement>("confirm-password");
@@ -295,6 +300,15 @@ repairBtn.addEventListener("click", () => {
   showPairForm();
   clearMsg(pairMsg);
   pairCodeEl.focus();
+});
+
+// Open the workspace link in the system browser instead of letting the webview
+// navigate away from the manager UI.
+workspaceLink.addEventListener("click", (e) => {
+  e.preventDefault();
+  openUrl(workspaceLink.href).catch((err) => {
+    setMsg(pairMsg, `Could not open the browser: ${err}`, "err");
+  });
 });
 
 refreshBtn.addEventListener("click", refreshStatus);
