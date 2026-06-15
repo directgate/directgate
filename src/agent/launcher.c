@@ -28,17 +28,41 @@
 #define DIRECTGATE_WIN_LAUNCHER_POLL_MS    2000  /* supervisor tick */
 #define DIRECTGATE_WIN_LAUNCHER_RESPAWN_MS 2000  /* min gap between spawn attempts */
 
+/*
+    Windows Service Control Manager integration: the systemd/launchd
+    counterpart on Windows. The SCM kills any service process that does
+    not register a control handler, so the agent cannot simply run its
+    console main under the SCM. Installed as:
+
+      sc.exe create directgate-agent binPath= "C:\path\directgate.exe --win-service" \
+             start= auto obj= ".\<user>" password= <password>
+
+    A STOP/SHUTDOWN control sets the same g_bFinish flag as SIGTERM, so
+    the shutdown path is byte-for-byte the console one.
+*/
+#define DIRECTGATE_WIN_SERVICE_NAME "directgate-agent"
+#define DIRECTGATE_WIN_SERVICE_FLAG "--win-service"
+#define DIRECTGATE_WIN_LAUNCHER_FLAG "--win-launcher"
+
+static SERVICE_STATUS_HANDLE g_hSvcStatusHandle = NULL;
+static int g_nSvcArgc = 0;
+static char **g_pSvcArgv = NULL;
+
+/* When the service runs the privilege-separation launcher instead of the agent
+   directly: the launcher supervises an agent spawned as shell.user. */
+static xbool_t g_bSvcLauncher = XFALSE;
+static const char *g_pSvcCfgPath = NULL;
 static volatile LONG g_nLauncherStop = 0;
 
-/* Resolve an account name (accepts "user", "DOMAIN\user" or ".\user") to a SID
-copied into pSidBuf (SECURITY_MAX_SID_SIZE bytes). */
+/* Resolve an account name (accepts "user", "DOMAIN\user" or ".\user") 
+   to a SID copied into pSidBuf (SECURITY_MAX_SID_SIZE bytes). */
 static XSTATUS DirectGate_WinLauncher_LookupSid(const char *pShellUser, PSID pSidBuf)
 {
     const char *pName = pShellUser;
     if (pName[0] == '.' && pName[1] == '\\') pName += 2;
 
     DWORD nSidLen = SECURITY_MAX_SID_SIZE;
-    char sDomain[256];
+    char sDomain[XSTR_TINY];
     DWORD nDomLen = (DWORD)sizeof(sDomain);
     SID_NAME_USE eUse;
 
@@ -55,7 +79,7 @@ static XSTATUS DirectGate_WinLauncher_LookupSid(const char *pShellUser, PSID pSi
 /* True when the user SID of hToken equals pWantSid. */
 static xbool_t DirectGate_WinLauncher_TokenMatchesUser(HANDLE hToken, PSID pWantSid)
 {
-    uint8_t sUserBuf[256];
+    uint8_t sUserBuf[XSTR_TINY];
     DWORD nLen = 0;
 
     if (!GetTokenInformation(hToken, TokenUser, sUserBuf, (DWORD)sizeof(sUserBuf), &nLen))
@@ -187,7 +211,7 @@ static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfg
     return XSTDOK;
 }
 
-XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
+static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
 {
     xlog_defaults();
     xlog_coloring(XFALSE);
@@ -279,7 +303,7 @@ XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
 
     if (hAgent != NULL)
     {
-        /* TODO(stage 3): graceful stop (console ctrl / signal) instead of kill;
+        /* TODO: graceful stop (console ctrl / signal) instead of kill;
            sessions already tolerate an abrupt agent exit like a logoff. */
         TerminateProcess(hAgent, 0);
         WaitForSingleObject(hAgent, 5000);
@@ -288,5 +312,106 @@ XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
 
     xlogn("launcher: stopped");
     return XSTDOK;
+}
+
+static void DirectGate_WinLauncher_SvcReportState(DWORD nState, DWORD nExitCode)
+{
+    if (g_hSvcStatusHandle == NULL) return;
+
+    SERVICE_STATUS status;
+    memset(&status, 0, sizeof(status));
+
+    status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    status.dwCurrentState = nState;
+    status.dwWin32ExitCode = nExitCode;
+    status.dwControlsAccepted = (nState == SERVICE_RUNNING) ?
+        (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN) : 0;
+
+    SetServiceStatus(g_hSvcStatusHandle, &status);
+}
+
+static void WINAPI DirectGate_WinLauncher_SvcCtrlHandler(DWORD nControl)
+{
+    switch (nControl)
+    {
+        case SERVICE_CONTROL_STOP:
+        case SERVICE_CONTROL_SHUTDOWN:
+            DirectGate_WinLauncher_SvcReportState(SERVICE_STOP_PENDING, NO_ERROR);
+            g_bFinish = XTRUE;
+            /* Harmless when running the agent directly; breaks the launcher's
+               supervise loop when running in launcher mode. */
+            DirectGate_WinLauncher_Stop();
+            break;
+        default:
+            break;
+    }
+}
+
+static void WINAPI DirectGate_WinLauncher_SvcMain(DWORD nArgc, LPSTR *pArgv)
+{
+    /* SCM start parameters are ignored: the agent arguments come from
+       the binPath command line captured before the dispatcher started */
+    (void)nArgc;
+    (void)pArgv;
+    int nStatus;
+
+    g_hSvcStatusHandle = RegisterServiceCtrlHandlerA(
+        DIRECTGATE_WIN_SERVICE_NAME,
+        DirectGate_WinLauncher_SvcCtrlHandler
+    );
+
+    if (g_hSvcStatusHandle == NULL) return;
+
+    DirectGate_WinLauncher_SvcReportState(SERVICE_RUNNING, NO_ERROR);
+    if (!g_bSvcLauncher) nStatus = DirectGate_RunAgent(g_nSvcArgc, g_pSvcArgv);
+    else nStatus = (DirectGate_WinLauncher_Run(g_pSvcCfgPath) == XSTDOK) ? XSTDNON : XSTDERR;
+    DirectGate_WinLauncher_SvcReportState(SERVICE_STOPPED, nStatus < 0 ? ERROR_SERVICE_SPECIFIC_ERROR : NO_ERROR);
+}
+
+XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[], directgate_win_launcher_t *pLauncher)
+{
+    xbool_t bWinService = XFALSE;
+    const char *pWinCfg = NULL;
+    int i;
+
+    for (i = 0; i < argc && pLauncher->nFiltered < (int)XARR_SIZE(pLauncher->pFilteredArgv) - 1; i++)
+    {
+        if (strcmp(argv[i], DIRECTGATE_WIN_SERVICE_FLAG) == 0) { bWinService = XTRUE; continue; }
+        if (strcmp(argv[i], DIRECTGATE_WIN_LAUNCHER_FLAG) == 0) { pLauncher->bWinLauncher = XTRUE; continue; }
+        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) pWinCfg = argv[i + 1];
+        pLauncher->pFilteredArgv[pLauncher->nFiltered++] = argv[i];
+    }
+
+    pLauncher->pFilteredArgv[pLauncher->nFiltered] = NULL;
+
+    if (bWinService)
+    {
+        g_bSvcLauncher = pLauncher->bWinLauncher;
+        g_nSvcArgc = pLauncher->nFiltered;
+        g_pSvcArgv = pLauncher->pFilteredArgv;
+        g_pSvcCfgPath = pWinCfg;
+
+        SERVICE_TABLE_ENTRYA svcTable[] = {
+            { (LPSTR)DIRECTGATE_WIN_SERVICE_NAME, DirectGate_WinLauncher_SvcMain },
+            { NULL, NULL }
+        };
+
+        /* Blocks until the service is stopped */
+        if (!StartServiceCtrlDispatcherA(svcTable))
+        {
+            fprintf(stderr, "Failed to connect to the service control manager "
+                "(error %lu): %s is only valid when started as a "
+                "Windows service\n", GetLastError(), DIRECTGATE_WIN_SERVICE_FLAG);
+
+            return XSTDERR;
+        }
+
+        return XSTDNON;
+    }
+
+    /* Console launcher (no service): useful for manual testing under an account holding SeTcbPrivilege */
+    if (pLauncher->bWinLauncher) return (DirectGate_WinLauncher_Run(pWinCfg) == XSTDOK) ? XSTDNON : XSTDOK;
+
+    return XSTDNON;
 }
 #endif /* _WIN32 */

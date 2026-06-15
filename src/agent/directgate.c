@@ -2614,149 +2614,16 @@ static int DirectGate_RunAgent(int argc, char* argv[])
     return 0;
 }
 
-#ifdef _WIN32
-/*
-    Windows Service Control Manager integration: the systemd/launchd
-    counterpart on Windows. The SCM kills any service process that does
-    not register a control handler, so the agent cannot simply run its
-    console main under the SCM. Installed as:
-
-      sc.exe create directgate-agent binPath= "C:\path\directgate.exe --win-service" \
-             start= auto obj= ".\<user>" password= <password>
-
-    A STOP/SHUTDOWN control sets the same g_bFinish flag as SIGTERM, so
-    the shutdown path is byte-for-byte the console one.
-*/
-#define DIRECTGATE_WIN_SERVICE_NAME "directgate-agent"
-#define DIRECTGATE_WIN_SERVICE_FLAG "--win-service"
-
-static SERVICE_STATUS_HANDLE g_hSvcStatusHandle = NULL;
-static int g_nSvcArgc = 0;
-static char **g_pSvcArgv = NULL;
-/* When the service runs the privilege-separation launcher instead of the agent
-   directly: the launcher supervises an agent spawned as shell.user. */
-static xbool_t g_bSvcLauncher = XFALSE;
-static const char *g_pSvcCfgPath = NULL;
-
-static void DirectGate_SvcReportState(DWORD nState, DWORD nExitCode)
-{
-    if (g_hSvcStatusHandle == NULL) return;
-
-    SERVICE_STATUS status;
-    memset(&status, 0, sizeof(status));
-
-    status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-    status.dwCurrentState = nState;
-    status.dwWin32ExitCode = nExitCode;
-    status.dwControlsAccepted = (nState == SERVICE_RUNNING) ?
-        (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN) : 0;
-
-    SetServiceStatus(g_hSvcStatusHandle, &status);
-}
-
-static void WINAPI DirectGate_SvcCtrlHandler(DWORD nControl)
-{
-    switch (nControl)
-    {
-        case SERVICE_CONTROL_STOP:
-        case SERVICE_CONTROL_SHUTDOWN:
-            DirectGate_SvcReportState(SERVICE_STOP_PENDING, NO_ERROR);
-            g_bFinish = XTRUE;
-            /* Harmless when running the agent directly; breaks the launcher's
-               supervise loop when running in launcher mode. */
-            DirectGate_WinLauncher_Stop();
-            break;
-        default:
-            break;
-    }
-}
-
-static void WINAPI DirectGate_SvcMain(DWORD nArgc, LPSTR *pArgv)
-{
-    /* SCM start parameters are ignored: the agent arguments come from
-       the binPath command line captured before the dispatcher started */
-    (void)nArgc;
-    (void)pArgv;
-
-    g_hSvcStatusHandle = RegisterServiceCtrlHandlerA(
-        DIRECTGATE_WIN_SERVICE_NAME, DirectGate_SvcCtrlHandler);
-
-    if (g_hSvcStatusHandle == NULL) return;
-
-    DirectGate_SvcReportState(SERVICE_RUNNING, NO_ERROR);
-
-    int nStatus;
-    if (g_bSvcLauncher)
-        nStatus = (DirectGate_WinLauncher_Run(g_pSvcCfgPath) == XSTDOK) ? 0 : -1;
-    else
-        nStatus = DirectGate_RunAgent(g_nSvcArgc, g_pSvcArgv);
-
-    DirectGate_SvcReportState(SERVICE_STOPPED,
-        nStatus < 0 ? ERROR_SERVICE_SPECIFIC_ERROR : NO_ERROR);
-}
-#endif /* _WIN32 */
-
 int main(int argc, char* argv[])
 {
 #ifdef _WIN32
-    /*
-       Windows roles, all the same executable:
-         (no flag)                 -> agent (runs as the current user)
-         --win-launcher            -> privilege-separation launcher (supervises an
-                                      agent spawned as shell.user); console mode
-         --win-service             -> run the selected role under the SCM
-       The launcher and the service flag combine: the MSI registers the launcher
-       service as `directgate.exe --win-service --win-launcher -c <agent.json>`.
+    directgate_win_launcher_t launcher;
+    memset(&launcher, 0, sizeof(directgate_win_launcher_t));
 
-       Strip --win-service / --win-launcher from the argv the agent parser sees,
-       and capture -c for the launcher (which does not use the agent parser). */
-    static char *pFilteredArgv[64];
-    xbool_t bWinService = XFALSE;
-    xbool_t bWinLauncher = XFALSE;
-    const char *pWinCfg = NULL;
-    int i, nFiltered = 0;
+    XSTATUS nStatus = DirectGate_WinLauncher_Main(argc, argv, &launcher);
+    if (nStatus || launcher.bWinLauncher) return nStatus;
 
-    for (i = 0; i < argc && nFiltered < (int)XARR_SIZE(pFilteredArgv) - 1; i++)
-    {
-        if (strcmp(argv[i], DIRECTGATE_WIN_SERVICE_FLAG) == 0) { bWinService = XTRUE; continue; }
-        if (strcmp(argv[i], DIRECTGATE_WIN_LAUNCHER_FLAG) == 0) { bWinLauncher = XTRUE; continue; }
-        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) pWinCfg = argv[i + 1];
-        pFilteredArgv[nFiltered++] = argv[i];
-    }
-
-    pFilteredArgv[nFiltered] = NULL;
-
-    if (bWinService)
-    {
-        g_bSvcLauncher = bWinLauncher;
-        g_pSvcCfgPath = pWinCfg;
-        g_nSvcArgc = nFiltered;
-        g_pSvcArgv = pFilteredArgv;
-
-        SERVICE_TABLE_ENTRYA svcTable[] = {
-            { (LPSTR)DIRECTGATE_WIN_SERVICE_NAME, DirectGate_SvcMain },
-            { NULL, NULL }
-        };
-
-        /* Blocks until the service is stopped */
-        if (!StartServiceCtrlDispatcherA(svcTable))
-        {
-            fprintf(stderr, "Failed to connect to the service control manager "
-                "(error %lu): %s is only valid when started as a "
-                "Windows service\n", GetLastError(), DIRECTGATE_WIN_SERVICE_FLAG);
-
-            return XSTDERR;
-        }
-
-        return 0;
-    }
-
-    /* Console launcher (no service): useful for manual testing under an account
-       holding SeTcbPrivilege (e.g. psexec -s). */
-    if (bWinLauncher)
-        return (DirectGate_WinLauncher_Run(pWinCfg) == XSTDOK) ? 0 : 1;
-
-    return DirectGate_RunAgent(nFiltered, pFilteredArgv);
+    return DirectGate_RunAgent(launcher.nFiltered, launcher.pFilteredArgv);
 #else
     return DirectGate_RunAgent(argc, argv);
 #endif

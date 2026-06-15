@@ -41,20 +41,13 @@
 extern "C" {
 #endif
 
-/* Selects the launcher role; the agent is the same executable without it. */
-#define DIRECTGATE_WIN_LAUNCHER_FLAG "--win-launcher"
+typedef struct {
+    char *pFilteredArgv[64];
+    int nFiltered;
+    xbool_t bWinLauncher;
+} directgate_win_launcher_t;
 
-/*
- * Run the launcher: read shell.user from the agent config at pCfgPath, then
- * supervise one agent process - spawn it as shell.user whenever that account is
- * logged on, and respawn it on the next logon after it exits. Blocks until
- * interrupted. Returns XSTDERR if shell.user is not configured.
- */
-XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath);
-
-/* Ask a running launcher loop to stop (called from the service control handler
-   when --win-launcher runs under the SCM). Safe to call from another thread. */
-void DirectGate_WinLauncher_Stop(void);
+XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[], directgate_win_launcher_t *pLauncher);
 
 #ifdef __cplusplus
 }
