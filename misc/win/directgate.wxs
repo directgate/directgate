@@ -8,16 +8,23 @@
     binaries the native build produces, then runs WiX with these values supplied
     as preprocessor variables:
       $(var.Version)    - MSI ProductVersion (MAJOR.MINOR.BUILD from src/common/version.h)
-      $(var.StageDir)   - directory holding directgate.exe / dgcli.exe plus the
-                          staged README.md and LICENSE
+      $(var.StageDir)   - directory holding directgate.exe / dgcli.exe /
+                          directgate-manager.exe plus the staged README.md and
+                          LICENSE
       $(var.LicenseRtf) - path to the WixUI license page (misc/win/License.rtf)
 
     What it installs on the target machine:
-      C:\Program Files\DirectGate\directgate.exe   (agent + launcher; one binary)
-      C:\Program Files\DirectGate\dgcli.exe        (CLI client)
+      C:\Program Files\DirectGate\directgate.exe         (agent + launcher; one binary)
+      C:\Program Files\DirectGate\dgcli.exe              (CLI client)
+      C:\Program Files\DirectGate\directgate-manager.exe (pairing / service GUI)
       C:\Program Files\DirectGate\README.md, LICENSE
-      C:\ProgramData\directgate\                    (machine-wide service config home)
-    and adds the install dir to the system PATH.
+      C:\ProgramData\directgate\                          (machine-wide service config home)
+    a "DirectGate Manager" shortcut on the (all-users) Desktop, and adds the
+    install dir to the system PATH.
+
+    The GUI (directgate-manager.exe) is the Tauri manager from manager/, built
+    for the windows-msvc target, which statically links the WebView2 loader - so
+    it is self-contained and needs no WebView2Loader.dll beside it.
 
     Service model (privilege separation, see docs/windows.md). A single service,
     directgate-agent, runs the LAUNCHER as LocalSystem (binPath uses the
@@ -57,10 +64,12 @@
         <Feature Id="Main" Title="DirectGate Agent" Level="1">
             <ComponentRef Id="CmpAgentExe" />
             <ComponentRef Id="CmpCliExe" />
+            <ComponentRef Id="CmpManagerExe" />
             <ComponentRef Id="CmpReadme" />
             <ComponentRef Id="CmpLicense" />
             <ComponentRef Id="CmpPath" />
             <ComponentRef Id="CmpDataFolder" />
+            <ComponentRef Id="CmpManagerShortcut" />
         </Feature>
 
         <StandardDirectory Id="ProgramFiles64Folder">
@@ -97,6 +106,15 @@
                 <Component Id="CmpCliExe" Bitness="always64">
                     <File Id="FileCliExe"
                           Source="$(var.StageDir)/dgcli.exe"
+                          KeyPath="yes" />
+                </Component>
+
+                <!-- The pairing / service-control GUI (Tauri app from manager/).
+                     Built for windows-msvc, so the WebView2 loader is linked
+                     statically and no extra DLL is required. -->
+                <Component Id="CmpManagerExe" Bitness="always64">
+                    <File Id="FileManagerExe"
+                          Source="$(var.StageDir)/directgate-manager.exe"
                           KeyPath="yes" />
                 </Component>
 
@@ -156,6 +174,31 @@
                     <CreateFolder />
                 </Component>
             </Directory>
+        </StandardDirectory>
+
+        <!--
+            All-users Desktop shortcut to the GUI. The keypath is a registry
+            value (HKMU -> HKLM here, since the package is perMachine) because a
+            shortcut is not a valid component keypath on its own. The shortcut
+            inherits its icon from the manager exe's embedded icon.
+        -->
+        <StandardDirectory Id="DesktopFolder">
+            <Component Id="CmpManagerShortcut"
+                       Guid="30793e19-91a1-4eea-96a1-3c2764c06e12"
+                       Bitness="always64">
+                <Shortcut Id="ManagerDesktopShortcut"
+                          Name="DirectGate Manager"
+                          Description="Pair devices and control the DirectGate agent service"
+                          Target="[INSTALLFOLDER]directgate-manager.exe"
+                          WorkingDirectory="INSTALLFOLDER" />
+                <RegistryValue
+                    Root="HKMU"
+                    Key="Software\DirectGate\Manager"
+                    Name="DesktopShortcut"
+                    Type="integer"
+                    Value="1"
+                    KeyPath="yes" />
+            </Component>
         </StandardDirectory>
 
         <!-- Stock WixUI install-dir flow. No service-credentials dialog: the

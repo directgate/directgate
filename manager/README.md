@@ -98,7 +98,7 @@ limited:** macOS can only be built on a Mac, Linux only on Linux, and Windows
 natively on Windows (a best-effort MinGW cross-build from Linux/macOS is
 attempted if `x86_64-w64-mingw32-gcc` is present). When a target cannot be
 built on the current host, the script stops with a clear message describing
-what is missing — it never silently skips a target.
+what is missing - it never silently skips a target.
 
 The web assets are emitted to `manager/dist-web` so they never collide with the
 final executables in `manager/dist`.
@@ -129,7 +129,7 @@ When you click **Pair Device**, the app:
    token (see [Pairing code format](#pairing-code-format)), and validates that
    the code and **Auth Password** are non-empty and that **Auth Password**
    matches **Confirm Password**.
-2. Locates the `directgate` agent binary — first on `PATH`, then platform
+2. Locates the `directgate` agent binary - first on `PATH`, then platform
    defaults:
    - Windows: `C:\Program Files\DirectGate\directgate.exe`
    - macOS: `/usr/local/bin/directgate`, `/opt/homebrew/bin/directgate`
@@ -145,7 +145,7 @@ When you click **Pair Device**, the app:
    only from a real terminal (`tcgetattr`). So the agent is run inside a
    **pseudo-terminal** and the **Auth Password** is written to its two prompts
    (`Set new auth password:` / `Repeat password:`). This is why the GUI needs an
-   Auth Password field — first-time pairing always sets the SRP password.
+   Auth Password field - first-time pairing always sets the SRP password.
 5. Shows the agent's output, or its error on failure.
 6. On success, switches to the "already paired" view and **restarts the
    service** so it picks up the new enrollment (this restart needs admin
@@ -157,7 +157,7 @@ agent's config file. On Windows this is the machine-wide
 matching the service install in [docs/windows.md](../docs/windows.md); a service
 account cannot read the interactive user's per-user `%APPDATA%`, so pairing
 writes the same machine-wide path via `-c`. Elsewhere it is
-`$HOME/.config/directgate/agent.json` — the same default path the agent uses.
+`$HOME/.config/directgate/agent.json` - the same default path the agent uses.
 
 ## Pairing code format
 
@@ -197,7 +197,7 @@ start/stop/restart do:
   PolicyKit authentication dialog. Status (`systemctl is-active`) runs
   unelevated. Because bare window managers (i3, sway, …) often run no PolicyKit
   agent, start/stop escalate in three layers: (1) `pkexec`; (2) if no agent is
-  running, the app launches a known polkit agent itself — once at startup so it
+  running, the app launches a known polkit agent itself - once at startup so it
   has time to register, and again (with a retry) on demand; (3) as a last resort
   it uses graphical `sudo -A` with an installed SSH askpass program. On full
   desktops (GNOME/KDE/XFCE/MATE/…) an agent already runs, so step 1 just works.

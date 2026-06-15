@@ -5,6 +5,8 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  # Lets the MSI pipeline be run manually on a feature branch before merge.
+  workflow_dispatch:
 
 jobs:
   # Native Windows build with the MinGW-w64 (UCRT) toolchain from MSYS2.
@@ -118,11 +120,15 @@ jobs:
         export PATH="$HOME/llvm-mingw/bin:$PATH"
         cmake --build build-win64 -j"$(nproc)"
 
-  # Package the agent + CLI into a Windows x64 MSI with the WiX Toolset. WiX only
-  # runs on Windows (it refuses to build MSIs on Linux), so the installer is
-  # produced here in CI rather than in the Linux release pipeline. The MSI design
-  # (service registration, config path) is documented in docs/windows.md and
-  # authored in misc/win/directgate.wxs.
+  # Package the agent + CLI + GUI into a Windows x64 MSI with the WiX Toolset.
+  # WiX only runs on Windows (it refuses to build MSIs on Linux), so the
+  # installer is produced here in CI rather than in the Linux release pipeline.
+  # The MSI design (service registration, config path, GUI shortcut) is
+  # documented in docs/windows.md and authored in misc/win/directgate.wxs.
+  #
+  # The DirectGate Manager GUI (Tauri app in manager/) is built here too, with
+  # the x86_64-pc-windows-msvc target. MSVC statically links the WebView2 loader,
+  # so the GUI is self-contained and no WebView2Loader.dll ships beside it.
   build-msi:
     runs-on: windows-latest
 
@@ -157,6 +163,31 @@ jobs:
         objdump -p build/directgate.exe | grep "DLL Name" | tee imports.txt
         ! grep -iE "libstdc|libgcc|libwinpthread|libc\+\+|libunwind|libssl|libcrypto" imports.txt
 
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+
+    - name: Build the manager GUI (MSVC)
+      shell: pwsh
+      working-directory: manager
+      # tauri build runs the frontend (beforeBuildCommand) then compiles the
+      # Rust binary for the MSVC target; --no-bundle skips the NSIS/MSI bundlers
+      # since the WiX installer below packages the exe.
+      run: |
+        rustup target add x86_64-pc-windows-msvc
+        npm ci
+        npm run tauri -- build --no-bundle --target x86_64-pc-windows-msvc
+
+    - name: Verify the manager links WebView2 statically
+      shell: msys2 {0}
+      # MSVC statically links the WebView2 loader; assert the exe carries no
+      # WebView2Loader.dll import so we never ship a GUI that fails to start.
+      run: |
+        objdump -p manager/src-tauri/target/x86_64-pc-windows-msvc/release/directgate-manager.exe \
+          | grep "DLL Name" | tee mgr-imports.txt
+        ! grep -i "WebView2Loader" mgr-imports.txt
+
     - name: Resolve version
       id: ver
       shell: pwsh
@@ -181,6 +212,7 @@ jobs:
         New-Item -ItemType Directory -Force -Path stage | Out-Null
         Copy-Item build/directgate.exe stage/
         Copy-Item build/dgcli.exe stage/
+        Copy-Item manager/src-tauri/target/x86_64-pc-windows-msvc/release/directgate-manager.exe stage/
         Copy-Item README.md stage/
         Copy-Item LICENSE stage/
 
