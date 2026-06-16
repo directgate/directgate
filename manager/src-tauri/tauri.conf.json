@@ -15,9 +15,9 @@
         "label": "main",
         "title": "DirectGate Manager",
         "width": 420,
-        "height": 560,
+        "height": 620,
         "minWidth": 380,
-        "minHeight": 480,
+        "minHeight": 540,
         "resizable": true,
         "fullscreen": false,
         "center": true

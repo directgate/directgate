@@ -106,6 +106,7 @@ const pairedView = $<HTMLDivElement>("paired-view");
 const pairForm = $<HTMLDivElement>("pair-form");
 const repairBtn = $<HTMLButtonElement>("repair-btn");
 const workspaceLink = $<HTMLAnchorElement>("workspace-link");
+const pairedWorkspaceLink = $<HTMLAnchorElement>("paired-workspace-link");
 const pairCodeEl = $<HTMLInputElement>("pair-code");
 const authEl = $<HTMLInputElement>("auth-password");
 const confirmEl = $<HTMLInputElement>("confirm-password");
@@ -302,14 +303,19 @@ repairBtn.addEventListener("click", () => {
   pairCodeEl.focus();
 });
 
-// Open the workspace link in the system browser instead of letting the webview
+// Open external links in the system browser instead of letting the webview
 // navigate away from the manager UI.
-workspaceLink.addEventListener("click", (e) => {
-  e.preventDefault();
-  openUrl(workspaceLink.href).catch((err) => {
-    setMsg(pairMsg, `Could not open the browser: ${err}`, "err");
+function wireExternalLink(link: HTMLAnchorElement): void {
+  link.addEventListener("click", (e) => {
+    e.preventDefault();
+    openUrl(link.href).catch((err) => {
+      setMsg(pairMsg, `Could not open the browser: ${err}`, "err");
+    });
   });
-});
+}
+
+wireExternalLink(workspaceLink);
+wireExternalLink(pairedWorkspaceLink);
 
 refreshBtn.addEventListener("click", refreshStatus);
 
