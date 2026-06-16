@@ -1,0 +1,208 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    DirectGate Agent MSI installer (WiX Toolset v5).
+
+    The WiX Toolset only runs on Windows, so the MSI is built in CI rather than
+    the Linux release pipeline: see the build-msi job in
+    .github/workflows/windows.yml. That job cross-checks the same self-contained
+    binaries the native build produces, then runs WiX with these values supplied
+    as preprocessor variables:
+      $(var.Version)    - MSI ProductVersion (MAJOR.MINOR.BUILD from src/common/version.h)
+      $(var.StageDir)   - directory holding directgate.exe / dgcli.exe /
+                          directgate-manager.exe plus the staged README.md and
+                          LICENSE
+      $(var.LicenseRtf) - path to the WixUI license page (misc/win/License.rtf)
+
+    What it installs on the target machine:
+      C:\Program Files\DirectGate\directgate.exe         (agent + launcher; one binary)
+      C:\Program Files\DirectGate\dgcli.exe              (CLI client)
+      C:\Program Files\DirectGate\directgate-manager.exe (pairing / service GUI)
+      C:\Program Files\DirectGate\README.md, LICENSE
+      C:\ProgramData\directgate\                          (machine-wide service config home)
+    a "DirectGate Manager" shortcut on the (all-users) Desktop, and adds the
+    install dir to the system PATH.
+
+    The GUI (directgate-manager.exe) is the Tauri manager from manager/, built
+    for the windows-msvc target, which statically links the WebView2 loader - so
+    it is self-contained and needs no WebView2Loader.dll beside it.
+
+    Service model (privilege separation, see docs/windows.md). A single service,
+    directgate-agent, runs the LAUNCHER as LocalSystem (binPath uses the
+    win-service + win-launcher flags and -c C:\ProgramData\directgate\agent.json).
+
+    The launcher is a tiny supervisor that does NO untrusted parsing. It reads
+    shell.user from the config, acquires that user's interactive logon token
+    (passwordless, WTSQueryUserToken) and spawns the actual agent inside the
+    user's session - so the agent and everything it does (protocol parsing, PTY,
+    file manager) run AS shell.user, never as SYSTEM, mirroring the POSIX setuid
+    model. No Windows password is ever stored or prompted for.
+
+    Start=demand: the launcher refuses to run until shell.user is configured, so
+    pair/configure first (as shell.user, into the ProgramData config), then start
+    the service. It only serves sessions while shell.user is logged on.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+    <Package
+        Name="DirectGate Agent"
+        Manufacturer="DirectGate"
+        Version="$(var.Version)"
+        UpgradeCode="aada7223-d00d-4a8f-88ac-d8b48f1ade30"
+        Scope="perMachine"
+        Compressed="yes"
+        Language="1033">
+
+        <MediaTemplate EmbedCab="yes" />
+
+        <MajorUpgrade
+            AllowSameVersionUpgrades="yes"
+            DowngradeErrorMessage="A newer version of DirectGate Agent is already installed." />
+
+        <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+
+        <Feature Id="Main" Title="DirectGate Agent" Level="1">
+            <ComponentRef Id="CmpAgentExe" />
+            <ComponentRef Id="CmpCliExe" />
+            <ComponentRef Id="CmpManagerExe" />
+            <ComponentRef Id="CmpReadme" />
+            <ComponentRef Id="CmpLicense" />
+            <ComponentRef Id="CmpPath" />
+            <ComponentRef Id="CmpDataFolder" />
+            <ComponentRef Id="CmpManagerShortcut" />
+        </Feature>
+
+        <StandardDirectory Id="ProgramFiles64Folder">
+            <Directory Id="INSTALLFOLDER" Name="DirectGate">
+
+                <Component Id="CmpAgentExe" Bitness="always64">
+                    <File Id="FileAgentExe"
+                          Source="$(var.StageDir)/directgate.exe"
+                          KeyPath="yes" />
+
+                    <!-- One LocalSystem service that runs the launcher. No account
+                         or password is needed: the launcher mints shell.user's
+                         token itself and spawns the agent in the user's session. -->
+                    <ServiceInstall
+                        Id="AgentSvc"
+                        Name="directgate-agent"
+                        DisplayName="DirectGate Agent"
+                        Description="DirectGate agent supervisor (privilege-separated launcher)."
+                        Type="ownProcess"
+                        Start="demand"
+                        ErrorControl="normal"
+                        Account="LocalSystem"
+                        Arguments=" --win-service --win-launcher -c &quot;C:\ProgramData\directgate\agent.json&quot;"
+                        Vital="no" />
+
+                    <ServiceControl
+                        Id="AgentSvcCtl"
+                        Name="directgate-agent"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+                </Component>
+
+                <Component Id="CmpCliExe" Bitness="always64">
+                    <File Id="FileCliExe"
+                          Source="$(var.StageDir)/dgcli.exe"
+                          KeyPath="yes" />
+                </Component>
+
+                <!-- The pairing / service-control GUI (Tauri app from manager/).
+                     Built for windows-msvc, so the WebView2 loader is linked
+                     statically and no extra DLL is required. -->
+                <Component Id="CmpManagerExe" Bitness="always64">
+                    <File Id="FileManagerExe"
+                          Source="$(var.StageDir)/directgate-manager.exe"
+                          KeyPath="yes" />
+                </Component>
+
+                <!-- One file per component: an auto-generated component GUID is
+                     only valid for a multi-file component when its keypath is a
+                     versioned file, which README/LICENSE are not (WIX0367). -->
+                <Component Id="CmpReadme" Bitness="always64">
+                    <File Id="FileReadme" Source="$(var.StageDir)/README.md" KeyPath="yes" />
+                </Component>
+
+                <Component Id="CmpLicense" Bitness="always64">
+                    <File Id="FileLicense" Source="$(var.StageDir)/LICENSE" KeyPath="yes" />
+                </Component>
+
+                <!-- Add the install directory to the system PATH so directgate /
+                     dgcli resolve from any console. Registry value is the keypath. -->
+                <Component Id="CmpPath"
+                           Guid="0673cbe8-c127-4730-9dc6-7ebe7082e74f"
+                           Bitness="always64">
+                    <Environment
+                        Id="PathEnv"
+                        Name="PATH"
+                        Value="[INSTALLFOLDER]"
+                        Part="last"
+                        Action="set"
+                        System="yes"
+                        Permanent="no" />
+                    <RegistryValue
+                        Root="HKLM"
+                        Key="Software\DirectGate\Agent"
+                        Name="InstallDir"
+                        Type="string"
+                        Value="[INSTALLFOLDER]"
+                        KeyPath="yes" />
+                </Component>
+            </Directory>
+        </StandardDirectory>
+
+        <!--
+            Machine-wide config home. The launcher (LocalSystem) reads it; the
+            agent runs as shell.user and reads/writes agent.json there (it is
+            written with a protected, 0600-equivalent DACL by the agent itself).
+            Default ProgramData ACL is kept so shell.user can read/pair its config.
+        -->
+        <StandardDirectory Id="CommonAppDataFolder">
+            <Directory Id="DataFolder" Name="directgate">
+                <Component Id="CmpDataFolder"
+                           Guid="fa07c2b9-145b-4d7a-a629-9e21ba66269e"
+                           Bitness="always64">
+                    <RegistryValue
+                        Root="HKLM"
+                        Key="Software\DirectGate\Agent"
+                        Name="DataDir"
+                        Type="string"
+                        Value="[DataFolder]"
+                        KeyPath="yes" />
+                    <CreateFolder />
+                </Component>
+            </Directory>
+        </StandardDirectory>
+
+        <!--
+            All-users Desktop shortcut to the GUI. The keypath is a registry
+            value (HKMU -> HKLM here, since the package is perMachine) because a
+            shortcut is not a valid component keypath on its own. The shortcut
+            inherits its icon from the manager exe's embedded icon.
+        -->
+        <StandardDirectory Id="DesktopFolder">
+            <Component Id="CmpManagerShortcut"
+                       Guid="30793e19-91a1-4eea-96a1-3c2764c06e12"
+                       Bitness="always64">
+                <Shortcut Id="ManagerDesktopShortcut"
+                          Name="DirectGate Manager"
+                          Description="Pair devices and control the DirectGate agent service"
+                          Target="[INSTALLFOLDER]directgate-manager.exe"
+                          WorkingDirectory="INSTALLFOLDER" />
+                <RegistryValue
+                    Root="HKMU"
+                    Key="Software\DirectGate\Manager"
+                    Name="DesktopShortcut"
+                    Type="integer"
+                    Value="1"
+                    KeyPath="yes" />
+            </Component>
+        </StandardDirectory>
+
+        <!-- Stock WixUI install-dir flow. No service-credentials dialog: the
+             launcher is passwordless, so the installer collects no secrets. -->
+        <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    </Package>
+</Wix>

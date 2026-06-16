@@ -1,0 +1,11 @@
+# Node / frontend
+node_modules/
+dist/
+dist-web/
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# Logs
+*.log

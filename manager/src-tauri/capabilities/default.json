@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core capability for the DirectGate Manager main window. Custom commands (pair_device, get_service_status, start_service, stop_service) are registered directly and need no extra permissions.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

@@ -36,6 +36,10 @@
 #include "e2e.h"
 #include "srp.h"
 
+#ifdef _WIN32
+#include "launcher.h"
+#endif
+
 #define DIRECTGATE_RECONNECT_BASE_MS        3000U
 #define DIRECTGATE_RECONNECT_MAX_MS         120000U
 #define DIRECTGATE_RECONNECT_WAIT_MAX_MS    5000U
@@ -59,7 +63,7 @@
 
 #define DIRECTGATE_NO_ANSWER                "N/A"
 
-static xbool_t g_bFinish = XFALSE;
+xbool_t g_bFinish = XFALSE;
 
 static int DirectGate_HandleTransportMessage(xapi_session_t *pApiSession,
     const uint8_t *pPayload, size_t nPayload, const char *pTransport);
@@ -2538,7 +2542,7 @@ static xbool_t DirectGate_DropPrivileges(const directgate_cfg_t *pCfg)
 #endif /* _WIN32 */
 
 #ifndef DIRECTGATE_TESTING
-static int DirectGate_RunAgent(int argc, char* argv[])
+int DirectGate_RunAgent(int argc, char* argv[])
 {
     xlog_defaults();
     xlog_coloring(XFALSE);
@@ -2610,122 +2614,10 @@ static int DirectGate_RunAgent(int argc, char* argv[])
     return 0;
 }
 
-#ifdef _WIN32
-/*
-    Windows Service Control Manager integration: the systemd/launchd
-    counterpart on Windows. The SCM kills any service process that does
-    not register a control handler, so the agent cannot simply run its
-    console main under the SCM. Installed as:
-
-      sc.exe create directgate-agent binPath= "C:\path\directgate.exe --win-service" \
-             start= auto obj= ".\<user>" password= <password>
-
-    A STOP/SHUTDOWN control sets the same g_bFinish flag as SIGTERM, so
-    the shutdown path is byte-for-byte the console one.
-*/
-#define DIRECTGATE_WIN_SERVICE_NAME "directgate-agent"
-#define DIRECTGATE_WIN_SERVICE_FLAG "--win-service"
-
-static SERVICE_STATUS_HANDLE g_hSvcStatusHandle = NULL;
-static int g_nSvcArgc = 0;
-static char **g_pSvcArgv = NULL;
-
-static void DirectGate_SvcReportState(DWORD nState, DWORD nExitCode)
-{
-    if (g_hSvcStatusHandle == NULL) return;
-
-    SERVICE_STATUS status;
-    memset(&status, 0, sizeof(status));
-
-    status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-    status.dwCurrentState = nState;
-    status.dwWin32ExitCode = nExitCode;
-    status.dwControlsAccepted = (nState == SERVICE_RUNNING) ?
-        (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN) : 0;
-
-    SetServiceStatus(g_hSvcStatusHandle, &status);
-}
-
-static void WINAPI DirectGate_SvcCtrlHandler(DWORD nControl)
-{
-    switch (nControl)
-    {
-        case SERVICE_CONTROL_STOP:
-        case SERVICE_CONTROL_SHUTDOWN:
-            DirectGate_SvcReportState(SERVICE_STOP_PENDING, NO_ERROR);
-            g_bFinish = XTRUE;
-            break;
-        default:
-            break;
-    }
-}
-
-static void WINAPI DirectGate_SvcMain(DWORD nArgc, LPSTR *pArgv)
-{
-    /* SCM start parameters are ignored: the agent arguments come from
-       the binPath command line captured before the dispatcher started */
-    (void)nArgc;
-    (void)pArgv;
-
-    g_hSvcStatusHandle = RegisterServiceCtrlHandlerA(
-        DIRECTGATE_WIN_SERVICE_NAME, DirectGate_SvcCtrlHandler);
-
-    if (g_hSvcStatusHandle == NULL) return;
-
-    DirectGate_SvcReportState(SERVICE_RUNNING, NO_ERROR);
-    int nStatus = DirectGate_RunAgent(g_nSvcArgc, g_pSvcArgv);
-
-    DirectGate_SvcReportState(SERVICE_STOPPED,
-        nStatus < 0 ? ERROR_SERVICE_SPECIFIC_ERROR : NO_ERROR);
-}
-#endif /* _WIN32 */
-
 int main(int argc, char* argv[])
 {
 #ifdef _WIN32
-    /* Strip the dispatcher flag so the regular argument parser never
-       sees it, whether the service mode is requested or not */
-    static char *pFilteredArgv[64];
-    xbool_t bWinService = XFALSE;
-    int i, nFiltered = 0;
-
-    for (i = 0; i < argc && nFiltered < (int)XARR_SIZE(pFilteredArgv) - 1; i++)
-    {
-        if (strcmp(argv[i], DIRECTGATE_WIN_SERVICE_FLAG) == 0)
-        {
-            bWinService = XTRUE;
-            continue;
-        }
-
-        pFilteredArgv[nFiltered++] = argv[i];
-    }
-
-    pFilteredArgv[nFiltered] = NULL;
-
-    if (bWinService)
-    {
-        g_nSvcArgc = nFiltered;
-        g_pSvcArgv = pFilteredArgv;
-
-        SERVICE_TABLE_ENTRYA svcTable[] = {
-            { (LPSTR)DIRECTGATE_WIN_SERVICE_NAME, DirectGate_SvcMain },
-            { NULL, NULL }
-        };
-
-        /* Blocks until the service is stopped */
-        if (!StartServiceCtrlDispatcherA(svcTable))
-        {
-            fprintf(stderr, "Failed to connect to the service control manager "
-                "(error %lu): %s is only valid when the agent is started as a "
-                "Windows service\n", GetLastError(), DIRECTGATE_WIN_SERVICE_FLAG);
-
-            return XSTDERR;
-        }
-
-        return 0;
-    }
-
-    return DirectGate_RunAgent(nFiltered, pFilteredArgv);
+    return DirectGate_WinLauncher_Main(argc, argv);
 #else
     return DirectGate_RunAgent(argc, argv);
 #endif

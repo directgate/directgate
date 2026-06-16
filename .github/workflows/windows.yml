@@ -5,6 +5,8 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  # Lets the MSI pipeline be run manually on a feature branch before merge.
+  workflow_dispatch:
 
 jobs:
   # Native Windows build with the MinGW-w64 (UCRT) toolchain from MSYS2.
@@ -117,3 +119,120 @@ jobs:
       run: |
         export PATH="$HOME/llvm-mingw/bin:$PATH"
         cmake --build build-win64 -j"$(nproc)"
+
+  # Package the agent + CLI + GUI into a Windows x64 MSI with the WiX Toolset.
+  # WiX only runs on Windows (it refuses to build MSIs on Linux), so the
+  # installer is produced here in CI rather than in the Linux release pipeline.
+  # The MSI design (service registration, config path, GUI shortcut) is
+  # documented in docs/windows.md and authored in misc/win/directgate.wxs.
+  #
+  # The DirectGate Manager GUI (Tauri app in manager/) is built here too, with
+  # the x86_64-pc-windows-msvc target. MSVC statically links the WebView2 loader,
+  # so the GUI is self-contained and no WebView2Loader.dll ships beside it.
+  build-msi:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up MSYS2 (UCRT64)
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        install: >-
+          mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-cmake
+          mingw-w64-ucrt-x86_64-ninja
+          mingw-w64-ucrt-x86_64-openssl
+
+    - name: Build agent and CLI
+      shell: msys2 {0}
+      # x64_msi build tag stamps the install channel into the agent version, like
+      # the deb/rpm/brew packages do.
+      run: |
+        cmake -B build -G Ninja -DOPENSSL_USE_STATIC_LIBS=TRUE \
+          -DCMAKE_BUILD_TYPE=Release -DDIRECTGATE_BUILD_TAG=x64_msi
+        cmake --build build -j4
+
+    - name: Verify artifacts are self-contained
+      shell: msys2 {0}
+      run: |
+        objdump -p build/directgate.exe | grep "DLL Name" | tee imports.txt
+        ! grep -iE "libstdc|libgcc|libwinpthread|libc\+\+|libunwind|libssl|libcrypto" imports.txt
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+
+    - name: Build the manager GUI (MSVC)
+      shell: pwsh
+      working-directory: manager
+      # tauri build runs the frontend (beforeBuildCommand) then compiles the
+      # Rust binary for the MSVC target; --no-bundle skips the NSIS/MSI bundlers
+      # since the WiX installer below packages the exe.
+      run: |
+        rustup target add x86_64-pc-windows-msvc
+        npm ci
+        npm run tauri -- build --no-bundle --target x86_64-pc-windows-msvc
+
+    - name: Verify the manager links WebView2 statically
+      shell: msys2 {0}
+      # MSVC statically links the WebView2 loader; assert the exe carries no
+      # WebView2Loader.dll import so we never ship a GUI that fails to start.
+      run: |
+        objdump -p manager/src-tauri/target/x86_64-pc-windows-msvc/release/directgate-manager.exe \
+          | grep "DLL Name" | tee mgr-imports.txt
+        ! grep -i "WebView2Loader" mgr-imports.txt
+
+    - name: Resolve version
+      id: ver
+      shell: pwsh
+      run: |
+        $h = Get-Content src/common/version.h -Raw
+        $maj = [regex]::Match($h, 'DIRECTGATE_VERSION_MAJOR\s+(\d+)').Groups[1].Value
+        $min = [regex]::Match($h, 'DIRECTGATE_VERSION_MINOR\s+(\d+)').Groups[1].Value
+        $bld = [regex]::Match($h, 'DIRECTGATE_VERSION_BUILD\s+(\d+)').Groups[1].Value
+        if (-not ($maj -and $min -and $bld)) { throw "Could not parse version from src/common/version.h" }
+        "version=$maj.$min.$bld" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+    - name: Install WiX Toolset
+      shell: pwsh
+      run: |
+        dotnet tool install --global wix --version 5.0.2
+        "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+        & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.UI.wixext/5.0.2
+
+    - name: Stage payload
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path stage | Out-Null
+        Copy-Item build/directgate.exe stage/
+        Copy-Item build/dgcli.exe stage/
+        Copy-Item manager/src-tauri/target/x86_64-pc-windows-msvc/release/directgate-manager.exe stage/
+        Copy-Item README.md stage/
+        Copy-Item LICENSE stage/
+
+    - name: Build MSI
+      shell: pwsh
+      run: |
+        $ver = "${{ steps.ver.outputs.version }}"
+        $msi = "directgate-$ver-x64.msi"
+        wix build -arch x64 `
+          -d Version=$ver `
+          -d StageDir=stage `
+          -d LicenseRtf=misc/win/License.rtf `
+          -ext WixToolset.UI.wixext `
+          -culture en-us `
+          -o $msi `
+          misc/win/directgate.wxs
+        "MSI_PATH=$msi" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+    - name: Upload MSI
+      uses: actions/upload-artifact@v4
+      with:
+        name: directgate-windows-msi
+        path: ${{ env.MSI_PATH }}

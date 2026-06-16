@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DirectGate Manager</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="app__header">
+        <h1 class="app__title">DirectGate Manager</h1>
+      </header>
+
+      <!-- Pair Device -->
+      <section class="card" aria-labelledby="pair-heading">
+        <h2 id="pair-heading" class="card__title">Pair Device</h2>
+
+        <!-- Shown when the device is already enrolled -->
+        <div id="paired-view" hidden>
+          <p class="msg msg--ok">Device is paired. You can now access it remotely at <a id="paired-workspace-link" class="link" href="https://directgate.io/workspace">directgate.io/workspace</a>.</p>
+          <button id="repair-btn" class="btn" type="button">Re-Pair</button>
+        </div>
+
+        <!-- Pairing form -->
+        <div id="pair-form">
+          <p class="field__hint">
+            Add a device at
+            <a id="workspace-link" class="link"
+               href="https://directgate.io/workspace">directgate.io/workspace</a>
+            to get a pairing code.
+          </p>
+
+          <label class="field">
+            <span class="field__label">Pairing Code</span>
+            <input id="pair-code" class="field__input" type="text"
+                   autocomplete="off" spellcheck="false"
+                   placeholder="paste the dg1_… code from directgate.io" />
+          </label>
+
+          <label class="field">
+            <span class="field__label">Auth Password</span>
+            <input id="auth-password" class="field__input" type="password"
+                   autocomplete="off" spellcheck="false"
+                   placeholder="set a device auth password" />
+          </label>
+
+          <label class="field">
+            <span class="field__label">Confirm Password</span>
+            <input id="confirm-password" class="field__input" type="password"
+                   autocomplete="off" spellcheck="false"
+                   placeholder="re-enter auth password" />
+          </label>
+
+          <button id="pair-btn" class="btn btn--primary" type="button">
+            Pair Device
+          </button>
+        </div>
+
+        <p id="pair-msg" class="msg" role="status" aria-live="polite"></p>
+      </section>
+
+      <!-- Service -->
+      <section class="card" aria-labelledby="service-heading">
+        <h2 id="service-heading" class="card__title">Service</h2>
+
+        <div class="status">
+          <span class="status__label">Status:</span>
+          <span id="status-value" class="status__value status__value--unknown">
+            Unknown
+          </span>
+          <button id="refresh-btn" class="btn btn--ghost btn--small" type="button"
+                  title="Refresh status">Refresh</button>
+        </div>
+
+        <div class="btn-row">
+          <button id="action-btn" class="btn" type="button">Start Service</button>
+          <button id="stop-btn" class="btn" type="button">Stop Service</button>
+        </div>
+
+        <p id="service-msg" class="msg" role="status" aria-live="polite"></p>
+      </section>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

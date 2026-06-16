@@ -81,6 +81,61 @@ The binaries land in `build/`. The MinGW runtime is linked statically and `OPENS
 
 ---
 
+## Installer (MSI)
+
+The project's Windows CI builds a Windows x64 MSI with the
+[WiX Toolset](https://wixtoolset.org/) - the `build-msi` job in
+`.github/workflows/windows.yml`. WiX runs only on Windows, so the installer is
+produced in CI rather than the Linux release pipeline. The rest of this section
+covers installing and configuring that MSI.
+
+Installing `directgate-<version>-x64.msi` (double-click, or
+`msiexec /i directgate-<version>-x64.msi`, add `/qn` for silent):
+
+- installs `directgate.exe` and `dgcli.exe` into `C:\Program Files\DirectGate\`
+  and adds that directory to the system `PATH`;
+- creates `C:\ProgramData\directgate\`, the machine-wide config home;
+- registers one Windows service, `directgate-agent`, running as **LocalSystem**
+  (manual start, not started by the installer) with the command line
+  `directgate.exe --win-service --win-launcher -c "C:\ProgramData\directgate\agent.json"`.
+
+**No account or password is requested.** The service runs the
+privilege-separation *launcher* (see [As a Windows service](#as-a-windows-service)):
+a tiny LocalSystem supervisor that acquires `shell.user`'s logon token and runs
+the actual agent as `shell.user`. No Windows password is ever stored or prompted.
+
+Finish setup after installing:
+
+1. Configure/pair the machine-wide config. Do this **as `shell.user`** so that
+   account owns its config (the agent writes `agent.json` with a `0600`-equivalent
+   DACL limited to `SYSTEM`, `Administrators`, and the owner):
+
+   ```bat
+   directgate.exe -c C:\ProgramData\directgate\agent.json -sed <device_id> -t <token>
+   ```
+
+2. Set `shell.user` in that config to the account whose sessions the agent should
+   own (the logged-on user).
+3. Start it: `sc.exe start directgate-agent` (or `Start-Service directgate-agent`).
+
+The launcher serves sessions only while `shell.user` is logged on (console/RDP);
+when they are not it waits and starts the agent on the next logon. There is no
+headless mode — that is the deliberate cost of never storing a password.
+
+Uninstalling stops and removes the service, deletes the files, and removes the
+`PATH` entry.
+
+### Config path: console vs service
+
+- **Console / interactive:** the default is the per-user
+  `%APPDATA%\directgate\agent.json`.
+- **Service (launcher):** the launcher (LocalSystem) reads `shell.user` from the
+  machine-wide `C:\ProgramData\directgate\agent.json` (passed with `-c`), and the
+  agent it spawns reads the same file. Pair into that path (step 1) so the agent
+  loads the config you paired.
+
+---
+
 ## Running the agent on Windows
 
 ### Console (foreground)
@@ -109,14 +164,22 @@ or `"C:\\Users\\Kala"`. Forward slashes are the recommended form: every Windows 
 
 ### As a Windows service
 
-The agent has native Service Control Manager support via the
-`--win-service` flag. From an **administrator** prompt:
+The [MSI installer](#installer-msi) registers this service for you; the manual
+`sc.exe` route below is for source builds and custom setups.
+
+DirectGate uses **privilege separation** on Windows. A single service runs a small
+**launcher** as LocalSystem; the launcher acquires `shell.user`'s logon token
+(passwordless, via `WTSQueryUserToken`) and spawns the agent inside that user's
+session, so the agent - including all protocol parsing, the PTY and the file
+manager - runs as `shell.user`, never as SYSTEM. This mirrors the POSIX model
+where the agent `setuid`s to `shell.user`: the untrusted parser is never SYSTEM.
+From an **administrator** prompt:
 
 ```bat
 sc.exe create directgate-agent ^
-    binPath= "C:\Program Files\directgate\directgate.exe --win-service -c C:\ProgramData\directgate\agent.json" ^
+    binPath= "C:\Program Files\DirectGate\directgate.exe --win-service --win-launcher -c C:\ProgramData\directgate\agent.json" ^
     start= auto ^
-    obj= ".\YourUser" password= YourPassword ^
+    obj= LocalSystem ^
     DisplayName= "DirectGate Agent"
 
 sc.exe start directgate-agent
@@ -124,10 +187,18 @@ sc.exe start directgate-agent
 
 Notes:
 
-- `obj=` sets the account the service runs as. The agent **refuses to start** unless `shell.user` in the config matches that account - the Windows counterpart of the POSIX privilege-drop policy: terminal and file-manager sessions can never run under an unexpected identity.
-
-- A service stop (`sc.exe stop directgate-agent`) triggers the same clean shutdown path as `SIGTERM` on Linux.
-- Logs go to the file configured under `log` in `agent.json`; there is no Windows Event Log integration.
+- **No password.** The service is LocalSystem; only the launcher (which holds
+  `SeTcbPrivilege`) can mint `shell.user`'s token. `shell.user` must be set in the
+  config and **logged on** for sessions to run: the launcher refuses to start when
+  `shell.user` is unset, and waits for a logon when it is set but not present.
+- The launcher pins the spawn identity to the configured `shell.user` and never
+  takes it from anything else, so terminal and file-manager sessions can never run
+  under an unexpected identity - the Windows counterpart of the POSIX
+  privilege-drop policy.
+- A service stop (`sc.exe stop directgate-agent`) stops the launcher, which
+  terminates the supervised agent.
+- Logs go to the file configured under `log` in `agent.json`; there is no Windows
+  Event Log integration.
 
 ### Terminal sessions
 

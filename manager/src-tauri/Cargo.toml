@@ -1,0 +1,36 @@
+[package]
+name = "directgate-manager"
+version = "1.0.0"
+description = "DirectGate Manager"
+authors = ["DirectGate"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+# The shared library name. `_lib` suffix avoids a name clash with the binary
+# on Windows and is required for the mobile entry point.
+name = "directgate_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Drives the agent through a pseudo-terminal so its interactive SRP password
+# prompts (which require a real TTY) can be answered non-interactively.
+portable-pty = "0.9"
+
+# Windows-only: request elevation (UAC) for service start/stop via
+# ShellExecuteW with the "runas" verb.
+[target.'cfg(windows)'.dependencies]
+runas = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

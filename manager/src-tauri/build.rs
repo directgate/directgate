@@ -1,6 +1,6 @@
-/*!
- * @file directgate-agent/src/common/version.h
- * @brief Common version definitions.
+/*
+ * @file directgate-manager/src-tauri/build.rs
+ * @brief Tauri build script.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
  *  Author: Sandro Kalatozishvili (sandro@directgate.io)
@@ -19,15 +19,6 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#ifndef __DIRECTGATE_VERSION_H__
-#define __DIRECTGATE_VERSION_H__
-
-#define DIRECTGATE_VERSION_MAJOR 1
-#define DIRECTGATE_VERSION_MINOR 0
-#define DIRECTGATE_VERSION_BUILD 19
-#define DIRECTGATE_VERSION_PKG   6
-
-const char* DirectGate_GetVersionShort(void);
-const char* DirectGate_GetVersionLong(void);
-
-#endif
+fn main() {
+    tauri_build::build()
+}

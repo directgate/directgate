@@ -1,6 +1,6 @@
-/*!
- * @file directgate-agent/src/common/version.h
- * @brief Common version definitions.
+/*
+ * @file directgate-manager/src-tauri/src/main.rs
+ * @brief DirectGate Manager executable entry point.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
  *  Author: Sandro Kalatozishvili (sandro@directgate.io)
@@ -19,15 +19,9 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#ifndef __DIRECTGATE_VERSION_H__
-#define __DIRECTGATE_VERSION_H__
+// Prevents an extra console window on Windows in release builds. DO NOT REMOVE!!
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-#define DIRECTGATE_VERSION_MAJOR 1
-#define DIRECTGATE_VERSION_MINOR 0
-#define DIRECTGATE_VERSION_BUILD 19
-#define DIRECTGATE_VERSION_PKG   6
-
-const char* DirectGate_GetVersionShort(void);
-const char* DirectGate_GetVersionLong(void);
-
-#endif
+fn main() {
+    directgate_manager_lib::run()
+}
