@@ -229,12 +229,3 @@ exec --no-startup-id /usr/libexec/polkit-mate-authentication-agent-1
 ```
 
 (Use whichever agent is installed: `polkit-gnome`, `polkit-kde`, `lxqt-policykit-agent`, ….)
-
-## Regenerating icons
-
-The icon set under `src-tauri/icons` is produced by a small script:
-
-```sh
-cd src-tauri/icons
-python3 gen_icons.py   # requires Pillow
-```
