@@ -39,6 +39,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(windows)]
+use std::ffi::c_void;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
 // The pseudo-terminal path is only used off Windows: on Linux/macOS the agent
 // reads the password via `tcgetattr`, which requires a real TTY. On Windows it
 // reads stdin with plain `fgets`, so a normal pipe works (see
@@ -261,7 +266,10 @@ fn run_agent_with_password(
     } else {
         // On failure the transcript is useful for diagnosis, but redact the
         // password in case the terminal echoed it.
-        let text = redact(&sanitize_output(&String::from_utf8_lossy(&raw)), auth_password);
+        let text = redact(
+            &sanitize_output(&String::from_utf8_lossy(&raw)),
+            auth_password,
+        );
         Err(if text.is_empty() {
             format!("{op_label} failed (exit {}).", status.exit_code())
         } else {
@@ -378,9 +386,8 @@ fn sanitize_output(raw: &str) -> String {
     out.trim().to_string()
 }
 
-// `status` shells out to `sc.exe`/`systemctl`; start/stop/restart block on an
-// elevation (UAC) prompt. All run off the main thread (`async`) so the window
-// stays responsive while they wait.
+// Service checks and control may block on system APIs or an elevation prompt.
+// All run off the main thread (`async`) so the window stays responsive.
 #[tauri::command(async)]
 fn get_service_status() -> Result<String, String> {
     Ok(service::status().label().to_string())
@@ -414,21 +421,72 @@ fn open_url(url: String) -> Result<(), String> {
         return Err("Only https URLs can be opened.".into());
     }
 
-    // rundll32's FileProtocolHandler opens the URL in the default browser
-    // without going through cmd.exe (no shell metacharacter parsing).
-    #[cfg(target_os = "windows")]
-    let result = hidden_command("rundll32.exe")
-        .arg("url.dll,FileProtocolHandler")
-        .arg(url)
-        .spawn();
-    #[cfg(target_os = "macos")]
-    let result = Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "linux")]
-    let result = Command::new("xdg-open").arg(url).spawn();
+    open_browser_url(url)
+}
 
-    result
+#[cfg(windows)]
+fn open_browser_url(url: &str) -> Result<(), String> {
+    const SW_SHOWNORMAL: i32 = 1;
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show_cmd: i32,
+        ) -> *mut c_void;
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    let operation = wide("open");
+    let file = wide(url);
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+
+    if result <= 32 {
+        return Err(format!(
+            "Failed to open the browser (ShellExecuteW error {result})."
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_browser_url(url: &str) -> Result<(), String> {
+    Command::new("open")
+        .arg(url)
+        .spawn()
         .map(|_| ())
         .map_err(|e| format!("Failed to open the browser: {e}"))
+}
+
+#[cfg(target_os = "linux")]
+fn open_browser_url(url: &str) -> Result<(), String> {
+    Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to open the browser: {e}"))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn open_browser_url(_url: &str) -> Result<(), String> {
+    Err("Opening a browser is not supported on this platform.".into())
 }
 
 /// Reports whether this device is already enrolled, by reading the agent's
@@ -495,6 +553,10 @@ fn agent_config_path() -> Option<PathBuf> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Some(code) = service::run_elevated_action_if_requested() {
+        std::process::exit(code);
+    }
+
     // On some Linux GPU/driver combinations (and many VMs) WebKitGTK's DMABUF
     // renderer fails to allocate a GBM buffer — the window opens blank/gray and
     // the log shows "Failed to create GBM buffer ... Invalid argument".

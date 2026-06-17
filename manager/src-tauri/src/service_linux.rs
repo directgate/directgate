@@ -118,7 +118,10 @@ pub fn status() -> ServiceStatus {
 
 /// `systemctl status <unit>` exits with code 4 when the unit does not exist.
 fn is_installed() -> bool {
-    match hidden_command("systemctl").args(["status", SERVICE]).output() {
+    match hidden_command("systemctl")
+        .args(["status", SERVICE])
+        .output()
+    {
         Ok(out) => out.status.code() != Some(4),
         // Could not run the probe; assume installed rather than mislead the user.
         Err(_) => true,
@@ -136,6 +139,10 @@ pub fn prepare() {
     if try_launch_agent() {
         AGENT_LAUNCH_TRIED.store(true, Ordering::SeqCst);
     }
+}
+
+pub fn run_elevated_action_if_requested() -> Option<i32> {
+    None
 }
 
 pub fn start() -> Result<String, String> {

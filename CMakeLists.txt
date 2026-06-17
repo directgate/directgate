@@ -246,9 +246,6 @@ target_include_directories(directgate PRIVATE ${AGENT_DIR})
 target_link_libraries(directgate PRIVATE xcommon)
 
 if(WIN32)
-    # ntdll: NtQueryInformationProcess used to read the shell cwd (term.c)
-    target_link_libraries(directgate PRIVATE ntdll)
-
     # Privilege-separation launcher (see src/agent/launcher.c): a tiny LocalSystem
     # supervisor that spawns the agent as shell.user via a logon token. Windows
     # only; the POSIX setuid model is unchanged.

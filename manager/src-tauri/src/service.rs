@@ -70,6 +70,9 @@ mod platform;
 mod platform {
     use super::ServiceStatus;
     pub fn prepare() {}
+    pub fn run_elevated_action_if_requested() -> Option<i32> {
+        None
+    }
     pub fn status() -> ServiceStatus {
         ServiceStatus::Unknown
     }
@@ -88,6 +91,10 @@ mod platform {
 /// PolicyKit agent on bare window managers); other platforms are a no-op.
 pub fn prepare() {
     platform::prepare();
+}
+
+pub fn run_elevated_action_if_requested() -> Option<i32> {
+    platform::run_elevated_action_if_requested()
 }
 
 pub fn status() -> ServiceStatus {
