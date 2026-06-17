@@ -1,67 +1,50 @@
 #!/usr/bin/env python3
-"""Generate the DirectGate Manager icon set used by Tauri.
+"""Generate the DirectGate Manager icon set used by Tauri from a source logo.
 
-Produces a small, flat "gateway" mark: a rounded blue tile with a white
-chevron pointing through a vertical gate bar. Run from this directory:
+Takes a (transparent) source PNG, trims its empty margins, centers it on a
+square canvas with consistent padding, and exports every size Tauri bundles.
+Run from this directory:
 
-    python3 gen_icons.py
+    python3 gen_icons.py                       # uses input.png
+    python3 gen_icons.py path/to/other.png     # use a different source
 
 Output: 32x32.png, 128x128.png, 128x128@2x.png, icon.png, icon.ico, icon.icns
 """
 
-from PIL import Image, ImageDraw
+import sys
+
+from PIL import Image
 
 BASE = 1024
-BG_TOP = (37, 99, 235)      # #2563eb
-BG_BOTTOM = (29, 64, 175)   # #1d40af
-FG = (255, 255, 255)
+# Fraction of the canvas left empty on each side, so the mark is not edge-to-edge.
+PAD = 0.06
+DEFAULT_SOURCE = "input.png"
 
 
-def vertical_gradient(size, top, bottom):
-    img = Image.new("RGB", (size, size), top)
-    px = img.load()
-    for y in range(size):
-        t = y / (size - 1)
-        r = int(top[0] + (bottom[0] - top[0]) * t)
-        g = int(top[1] + (bottom[1] - top[1]) * t)
-        b = int(top[2] + (bottom[2] - top[2]) * t)
-        for x in range(size):
-            px[x, y] = (r, g, b)
-    return img
+def load_square_logo(path, size=BASE, pad=PAD):
+    """Return a `size`x`size` RGBA image with the trimmed logo centered."""
+    logo = Image.open(path).convert("RGBA")
 
+    # Trim fully-transparent margins so every source frames the same way.
+    bbox = logo.split()[-1].getbbox()
+    if bbox:
+        logo = logo.crop(bbox)
 
-def rounded_mask(size, radius):
-    mask = Image.new("L", (size, size), 0)
-    d = ImageDraw.Draw(mask)
-    d.rounded_rectangle([0, 0, size - 1, size - 1], radius=radius, fill=255)
-    return mask
+    # Scale to fit inside the padded box, preserving aspect ratio.
+    box = int(size * (1 - 2 * pad))
+    scale = min(box / logo.width, box / logo.height)
+    new_w = max(1, round(logo.width * scale))
+    new_h = max(1, round(logo.height * scale))
+    logo = logo.resize((new_w, new_h), Image.LANCZOS)
 
-
-def render(size):
-    grad = vertical_gradient(size, BG_TOP, BG_BOTTOM)
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    img.paste(grad, (0, 0), rounded_mask(size, int(size * 0.22)))
-
-    d = ImageDraw.Draw(img)
-    s = size / 1024.0
-    lw = int(80 * s)
-
-    # vertical "gate" bar
-    bar_x = int(360 * s)
-    d.line([(bar_x, int(300 * s)), (bar_x, int(724 * s))], fill=FG, width=lw)
-
-    # chevron pointing right (traffic passing through the gate)
-    d.line(
-        [(int(520 * s), int(330 * s)),
-         (int(720 * s), int(512 * s)),
-         (int(520 * s), int(694 * s))],
-        fill=FG, width=lw, joint="curve",
-    )
-    return img
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    canvas.paste(logo, ((size - new_w) // 2, (size - new_h) // 2), logo)
+    return canvas
 
 
 def main():
-    base = render(BASE)
+    source = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SOURCE
+    base = load_square_logo(source)
 
     base.resize((32, 32), Image.LANCZOS).save("32x32.png")
     base.resize((128, 128), Image.LANCZOS).save("128x128.png")
@@ -73,7 +56,7 @@ def main():
         sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
     )
     base.save("icon.icns")
-    print("icons generated")
+    print(f"icons generated from {source}")
 
 
 if __name__ == "__main__":
