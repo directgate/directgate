@@ -124,6 +124,7 @@ static directgate_pkg_type_t DirectGate_Proto_TypeFromStr(const char *pType)
     if (xstrcmp(pType, "verify")) return DIRECTGATE_PKG_VERIFY;
     if (xstrcmp(pType, "webrtc")) return DIRECTGATE_PKG_WEBRTC;
     if (xstrcmp(pType, "admin")) return DIRECTGATE_PKG_ADMIN;
+    if (xstrcmp(pType, "desktop")) return DIRECTGATE_PKG_DESKTOP;
     return DIRECTGATE_PKG_NONE;
 }
 
@@ -145,6 +146,7 @@ static size_t DirectGate_Proto_PackageSize(directgate_pkg_type_t eType)
         case DIRECTGATE_PKG_VERIFY: return sizeof(directgate_pkg_verify_t);
         case DIRECTGATE_PKG_WEBRTC: return sizeof(directgate_pkg_webrtc_t);
         case DIRECTGATE_PKG_ADMIN: return sizeof(directgate_pkg_admin_t);
+        case DIRECTGATE_PKG_DESKTOP: return sizeof(directgate_pkg_desktop_t);
         default: return 0;
     }
 }
@@ -230,6 +232,21 @@ static void DirectGate_Package_ParseAdminPkg(directgate_pkg_admin_t *pPkg, xjson
     pPkg->pClientPub = XJSON_GetString(XJSON_GetObject(pHdr, "clientPub"));
     pPkg->pStatus = XJSON_GetString(XJSON_GetObject(pHdr, "status"));
     pPkg->pReason = XJSON_GetString(XJSON_GetObject(pHdr, "reason"));
+}
+
+static void DirectGate_Package_ParseDesktopPkg(directgate_pkg_desktop_t *pPkg, xjson_obj_t *pHdr)
+{
+    pPkg->pAction = XJSON_GetString(XJSON_GetObject(pHdr, "action"));
+    pPkg->pMonitorId = XJSON_GetString(XJSON_GetObject(pHdr, "monitorId"));
+    pPkg->pPreset = XJSON_GetString(XJSON_GetObject(pHdr, "preset"));
+    pPkg->pInputType = XJSON_GetString(XJSON_GetObject(pHdr, "inputType"));
+    pPkg->nX = (int32_t)XJSON_GetU32(XJSON_GetObject(pHdr, "x"));
+    pPkg->nY = (int32_t)XJSON_GetU32(XJSON_GetObject(pHdr, "y"));
+    pPkg->nButton = (int32_t)XJSON_GetU32(XJSON_GetObject(pHdr, "button"));
+    pPkg->nDeltaX = (int32_t)XJSON_GetU32(XJSON_GetObject(pHdr, "deltaX"));
+    pPkg->nDeltaY = (int32_t)XJSON_GetU32(XJSON_GetObject(pHdr, "deltaY"));
+    pPkg->nKeyCode = XJSON_GetU32(XJSON_GetObject(pHdr, "keyCode"));
+    pPkg->nModifiers = XJSON_GetU32(XJSON_GetObject(pHdr, "modifiers"));
 }
 
 static void DirectGate_Package_ParseManagerPkg(directgate_pkg_manager_t *pPkg, xjson_obj_t *pHdr)
@@ -389,6 +406,9 @@ static xbool_t DirectGate_Package_ParsePackage(directgate_pkg_t *pPkg, const uin
             break;
         case DIRECTGATE_PKG_ADMIN:
             DirectGate_Package_ParseAdminPkg((directgate_pkg_admin_t*)pPkg->pPackage, pHdr);
+            break;
+        case DIRECTGATE_PKG_DESKTOP:
+            DirectGate_Package_ParseDesktopPkg((directgate_pkg_desktop_t*)pPkg->pPackage, pHdr);
             break;
         default:
             break;

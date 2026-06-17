@@ -236,6 +236,7 @@ endif()
 # ---- agent binary: directgate --------------------------------------------------
 add_executable(directgate
     ${AGENT_DIR}/config.c
+    ${AGENT_DIR}/desktop.c
     ${AGENT_DIR}/enroll.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
@@ -260,6 +261,15 @@ if(WIN32)
     # Manifest with UTF-8 active code page: ANSI APIs handle any file name
     enable_language(RC)
     target_sources(directgate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/misc/win/app.rc")
+    target_sources(directgate PRIVATE ${AGENT_DIR}/desktop_win.c)
+    target_link_libraries(directgate PRIVATE user32)
+elseif(APPLE)
+    target_sources(directgate PRIVATE ${AGENT_DIR}/desktop_macos.c)
+    target_link_libraries(directgate PRIVATE
+        "-framework ApplicationServices"
+        "-framework CoreFoundation")
+else()
+    target_sources(directgate PRIVATE ${AGENT_DIR}/desktop_linux.c)
 endif()
 
 if(UTIL_LIBRARY)
