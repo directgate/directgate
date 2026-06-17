@@ -165,7 +165,7 @@ brew install directgate
 
 **Windows**
 
-The Windows installer is coming soon. Until then, see [Building for Windows](docs/windows.md) for building the agent from source, plus service installation and Windows-specific notes.
+Download the latest Windows installer from the [official install page](https://directgate.io/install).
 
 **From source**
 
