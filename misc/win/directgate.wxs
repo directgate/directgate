@@ -37,9 +37,13 @@
     file manager) run AS shell.user, never as SYSTEM, mirroring the POSIX setuid
     model. No Windows password is ever stored or prompted for.
 
-    Start=demand: the launcher refuses to run until shell.user is configured, so
-    pair/configure first (as shell.user, into the ProgramData config), then start
-    the service. It only serves sessions while shell.user is logged on.
+    Start=auto: the service starts at boot so it survives reboots with no manual
+    intervention. The launcher tolerates "not paired / not logged on yet" - it
+    waits in a poll loop for shell.user to log on, then spawns the agent (and
+    respawns it on each later logon). The only no-op case is the very first boot
+    after install, before pairing: with no shell.user in the config the launcher
+    exits and the service simply stays stopped until the first pairing. It only
+    serves sessions while shell.user is logged on.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
@@ -89,7 +93,7 @@
                         DisplayName="DirectGate Agent"
                         Description="DirectGate agent supervisor (privilege-separated launcher)."
                         Type="ownProcess"
-                        Start="demand"
+                        Start="auto"
                         ErrorControl="normal"
                         Account="LocalSystem"
                         Arguments=" --win-service --win-launcher -c &quot;C:\ProgramData\directgate\agent.json&quot;"
