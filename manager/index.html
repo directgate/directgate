@@ -19,7 +19,35 @@
         <!-- Shown when the device is already enrolled -->
         <div id="paired-view" hidden>
           <p class="msg msg--ok">Device is paired. You can now access it remotely at <a id="paired-workspace-link" class="link" href="https://directgate.io/workspace">directgate.io/workspace</a>.</p>
-          <button id="repair-btn" class="btn" type="button">Re-Pair</button>
+
+          <div class="btn-row">
+            <button id="repair-btn" class="btn" type="button">Re-Pair</button>
+            <button id="change-srp-btn" class="btn" type="button">Change SRP Password</button>
+          </div>
+
+          <!-- Revealed by "Change SRP Password" -->
+          <div id="srp-form" hidden>
+            <label class="field">
+              <span class="field__label">New Auth Password</span>
+              <input id="srp-password" class="field__input" type="password"
+                     autocomplete="off" spellcheck="false"
+                     placeholder="set a new device auth password" />
+            </label>
+
+            <label class="field">
+              <span class="field__label">Confirm Password</span>
+              <input id="srp-confirm" class="field__input" type="password"
+                     autocomplete="off" spellcheck="false"
+                     placeholder="re-enter new auth password" />
+            </label>
+
+            <div class="btn-row">
+              <button id="srp-submit-btn" class="btn btn--primary" type="button">
+                Update Password
+              </button>
+              <button id="srp-cancel-btn" class="btn" type="button">Cancel</button>
+            </div>
+          </div>
         </div>
 
         <!-- Pairing form -->
@@ -52,9 +80,13 @@
                    placeholder="re-enter auth password" />
           </label>
 
-          <button id="pair-btn" class="btn btn--primary" type="button">
-            Pair Device
-          </button>
+          <div class="btn-row">
+            <button id="pair-btn" class="btn btn--primary" type="button">
+              Pair Device
+            </button>
+            <!-- Only shown when the form was opened via Re-Pair (already paired). -->
+            <button id="pair-back-btn" class="btn" type="button" hidden>Back</button>
+          </div>
         </div>
 
         <p id="pair-msg" class="msg" role="status" aria-live="polite"></p>

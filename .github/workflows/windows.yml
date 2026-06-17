@@ -205,6 +205,9 @@ jobs:
         dotnet tool install --global wix --version 5.0.2
         "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
         & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.UI.wixext/5.0.2
+        # Util extension provides WixShellExec, used to launch the GUI from the
+        # installer's final page.
+        & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.Util.wixext/5.0.2
 
     - name: Stage payload
       shell: pwsh
@@ -226,6 +229,7 @@ jobs:
           -d StageDir=stage `
           -d LicenseRtf=misc/win/License.rtf `
           -ext WixToolset.UI.wixext `
+          -ext WixToolset.Util.wixext `
           -culture en-us `
           -o $msi `
           misc/win/directgate.wxs

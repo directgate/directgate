@@ -46,7 +46,8 @@
     serves sessions while shell.user is logged on.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
 
     <Package
         Name="DirectGate Agent"
@@ -208,5 +209,29 @@
         <!-- Stock WixUI install-dir flow. No service-credentials dialog: the
              launcher is passwordless, so the installer collects no secrets. -->
         <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+
+        <!--
+            Final page: an optional "Launch DirectGate Manager" checkbox, ticked
+            by default. On Finish (fresh install only) it ShellExecutes the GUI
+            via the Util extension's WixShellExec, which launches it as the
+            interactive user rather than the elevated installer.
+        -->
+        <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch DirectGate Manager" />
+        <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+        <Property Id="WixShellExecTarget" Value="[#FileManagerExe]" />
+
+        <CustomAction Id="LaunchApplication"
+                      BinaryRef="Wix4UtilCA_X86"
+                      DllEntry="WixShellExec"
+                      Impersonate="yes"
+                      Return="ignore" />
+
+        <UI>
+            <Publish Dialog="ExitDialog"
+                     Control="Finish"
+                     Event="DoAction"
+                     Value="LaunchApplication"
+                     Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+        </UI>
     </Package>
 </Wix>

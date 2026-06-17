@@ -94,7 +94,8 @@ body {
 
 /* Keep the form fields / paired view evenly spaced inside the card. */
 #pair-form,
-#paired-view {
+#paired-view,
+#srp-form {
   display: flex;
   flex-direction: column;
   gap: 12px;

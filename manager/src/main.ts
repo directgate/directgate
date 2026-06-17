@@ -39,6 +39,10 @@ function openUrl(url: string): Promise<void> {
   return invoke<void>("open_url", { url });
 }
 
+function changeSrpPassword(authPassword: string): Promise<string> {
+  return invoke<string>("change_srp_password", { authPassword });
+}
+
 const NOT_INSTALLED_MSG =
   "DirectGate service is not installed. Please install DirectGate Agent first.";
 
@@ -111,7 +115,15 @@ const pairCodeEl = $<HTMLInputElement>("pair-code");
 const authEl = $<HTMLInputElement>("auth-password");
 const confirmEl = $<HTMLInputElement>("confirm-password");
 const pairBtn = $<HTMLButtonElement>("pair-btn");
+const pairBackBtn = $<HTMLButtonElement>("pair-back-btn");
 const pairMsg = $<HTMLParagraphElement>("pair-msg");
+
+const changeSrpBtn = $<HTMLButtonElement>("change-srp-btn");
+const srpForm = $<HTMLDivElement>("srp-form");
+const srpPasswordEl = $<HTMLInputElement>("srp-password");
+const srpConfirmEl = $<HTMLInputElement>("srp-confirm");
+const srpSubmitBtn = $<HTMLButtonElement>("srp-submit-btn");
+const srpCancelBtn = $<HTMLButtonElement>("srp-cancel-btn");
 
 const statusValue = $<HTMLSpanElement>("status-value");
 const actionBtn = $<HTMLButtonElement>("action-btn");
@@ -141,14 +153,25 @@ function setStatusLabel(text: string, variant: string): void {
 }
 
 // --- pairing state -----------------------------------------------------------
+// Collapses the "change SRP password" sub-form and clears its inputs.
+function hideSrpForm(): void {
+  srpForm.hidden = true;
+  srpPasswordEl.value = "";
+  srpConfirmEl.value = "";
+}
+
 function showPairedView(): void {
   pairedView.hidden = false;
   pairForm.hidden = true;
+  // Nothing to go "back" to from the paired view; reset the form's Back button.
+  pairBackBtn.hidden = true;
+  hideSrpForm();
 }
 
 function showPairForm(): void {
   pairedView.hidden = true;
   pairForm.hidden = false;
+  hideSrpForm();
 }
 
 async function refreshPairing(): Promise<void> {
@@ -277,6 +300,47 @@ async function onPair(): Promise<void> {
   }
 }
 
+// Changes the SRP auth password on the already-paired device.
+async function onChangeSrp(): Promise<void> {
+  const newPassword = srpPasswordEl.value;
+  const confirmPassword = srpConfirmEl.value;
+
+  if (!newPassword.trim()) {
+    setMsg(pairMsg, "New auth password is required.", "err");
+    srpPasswordEl.focus();
+    return;
+  }
+  if (newPassword !== confirmPassword) {
+    setMsg(pairMsg, "Passwords do not match.", "err");
+    srpConfirmEl.focus();
+    return;
+  }
+
+  srpSubmitBtn.disabled = true;
+  setMsg(pairMsg, "Changing password…", "info");
+  try {
+    await changeSrpPassword(newPassword);
+    // The agent loads the SRP verifier at startup, so restart the service for
+    // the new password to take effect.
+    setMsg(pairMsg, "Password changed. Restarting service…", "info");
+    try {
+      const restarted = await restartService();
+      setMsg(pairMsg, `Password changed. ${restarted}`, "ok");
+    } catch (e) {
+      setMsg(pairMsg, `Password changed, but service restart failed: ${e}`, "err");
+    }
+    hideSrpForm();
+    await refreshStatus();
+  } catch (err) {
+    setMsg(pairMsg, String(err), "err");
+  } finally {
+    // Never keep the new password around once the request is done.
+    srpPasswordEl.value = "";
+    srpConfirmEl.value = "";
+    srpSubmitBtn.disabled = false;
+  }
+}
+
 async function runServiceAction(
   action: () => Promise<string>,
   pending: string,
@@ -299,8 +363,39 @@ pairBtn.addEventListener("click", onPair);
 
 repairBtn.addEventListener("click", () => {
   showPairForm();
+  // Re-Pair was reached from the paired view, so offer a way back to it.
+  pairBackBtn.hidden = false;
   clearMsg(pairMsg);
   pairCodeEl.focus();
+});
+
+// Return from the (Re-Pair) form to the paired view without re-pairing.
+pairBackBtn.addEventListener("click", () => {
+  showPairedView();
+  clearMsg(pairMsg);
+});
+
+// Toggle the "change SRP password" sub-form (acts as Cancel when already open).
+changeSrpBtn.addEventListener("click", () => {
+  if (srpForm.hidden) {
+    srpForm.hidden = false;
+    clearMsg(pairMsg);
+    srpPasswordEl.focus();
+  } else {
+    hideSrpForm();
+  }
+});
+
+srpSubmitBtn.addEventListener("click", onChangeSrp);
+
+// Collapse the SRP sub-form and return to the plain paired view.
+srpCancelBtn.addEventListener("click", () => {
+  hideSrpForm();
+  clearMsg(pairMsg);
+});
+
+srpConfirmEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") onChangeSrp();
 });
 
 // Open external links in the system browser instead of letting the webview

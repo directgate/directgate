@@ -41,7 +41,8 @@ use std::process::Command;
 
 // The pseudo-terminal path is only used off Windows: on Linux/macOS the agent
 // reads the password via `tcgetattr`, which requires a real TTY. On Windows it
-// reads stdin with plain `fgets`, so a normal pipe works (see `run_pairing`).
+// reads stdin with plain `fgets`, so a normal pipe works (see
+// `run_agent_with_password`).
 #[cfg(not(windows))]
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 #[cfg(not(windows))]
@@ -144,20 +145,52 @@ fn pair_device(
             .to_string()
     })?;
 
-    run_pairing(&agent, device_id, pairing_token, &auth_password)
+    run_agent_with_password(
+        &agent,
+        &["-sed", device_id, "-t", pairing_token],
+        &auth_password,
+        "Pairing",
+    )?;
+    Ok("Device paired successfully.".to_string())
 }
 
-/// Runs the agent inside a pseudo-terminal and answers its SRP password prompts.
+/// Changes the SRP auth password on an already-paired device by invoking
+/// `directgate -s` (plus `-c <config>` on Windows). The agent prompts for the
+/// new password twice; both prompts are answered with `auth_password`. The
+/// device must already be paired — the agent reads its existing config.
+///
+/// `async` for the same reason as `pair_device` (blocking child I/O off the
+/// main thread).
+#[tauri::command(async)]
+fn change_srp_password(auth_password: String) -> Result<String, String> {
+    if auth_password.trim().is_empty() {
+        return Err("Auth password is required.".into());
+    }
+
+    let agent = find_agent().ok_or_else(|| {
+        "DirectGate agent binary was not found. Install the DirectGate Agent or \
+         add 'directgate' to your PATH."
+            .to_string()
+    })?;
+
+    run_agent_with_password(&agent, &["-s"], &auth_password, "Password change")?;
+    Ok("Auth password changed.".to_string())
+}
+
+/// Runs the agent with `args` inside a pseudo-terminal and answers its two SRP
+/// password prompts ("Set new auth password:" / "Repeat password:"), feeding
+/// `auth_password` to both. Used by pairing and by the password change.
 ///
 /// Used on Linux/macOS, where the agent reads the password through `tcgetattr`
 /// and therefore requires a real terminal. Windows uses a plain-pipe variant.
+/// `op_label` names the operation in error messages (e.g. "Pairing").
 #[cfg(not(windows))]
-fn run_pairing(
+fn run_agent_with_password(
     agent: &Path,
-    device_id: &str,
-    pairing_token: &str,
+    args: &[&str],
     auth_password: &str,
-) -> Result<String, String> {
+    op_label: &str,
+) -> Result<(), String> {
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize {
@@ -168,14 +201,12 @@ fn run_pairing(
         })
         .map_err(|e| format!("Failed to allocate a pseudo-terminal: {e}"))?;
 
-    // Argument array (no shell): -sed bundles -s -e -d <id>, then -t <token>.
-    // CommandBuilder inherits this process's environment (HOME, etc.) so the
-    // agent resolves its config path correctly.
+    // No shell: arguments are passed verbatim. CommandBuilder inherits this
+    // process's environment (HOME, etc.) so the agent resolves its config path.
     let mut cmd = CommandBuilder::new(agent);
-    cmd.arg("-sed");
-    cmd.arg(device_id);
-    cmd.arg("-t");
-    cmd.arg(pairing_token);
+    for arg in args {
+        cmd.arg(arg);
+    }
 
     let mut child = pair
         .slave
@@ -225,16 +256,16 @@ fn run_pairing(
 
     if status.success() {
         // The agent's transcript can contain the password echoed back by the
-        // pty before echo was disabled, so never surface it on success.
-        Ok("Device paired successfully.".to_string())
+        // pty before echo was disabled, so never surface it.
+        Ok(())
     } else {
         // On failure the transcript is useful for diagnosis, but redact the
         // password in case the terminal echoed it.
         let text = redact(&sanitize_output(&String::from_utf8_lossy(&raw)), auth_password);
         Err(if text.is_empty() {
-            format!("Pairing failed (exit {}).", status.exit_code())
+            format!("{op_label} failed (exit {}).", status.exit_code())
         } else {
-            format!("Pairing failed: {text}")
+            format!("{op_label} failed: {text}")
         })
     }
 }
@@ -244,34 +275,34 @@ fn run_pairing(
 /// On Windows the agent reads the password with `fgets(stdin)` — no terminal is
 /// required — so a normal stdin pipe is both sufficient and far more reliable
 /// than a pseudo-console (ConPTY's terminal emulation can hang the read).
+///
+/// `-c <config>` is prepended so the agent reads/writes the machine-wide config
+/// the service uses; the per-user `%APPDATA%` is invisible to the service account.
 #[cfg(windows)]
-fn run_pairing(
+fn run_agent_with_password(
     agent: &Path,
-    device_id: &str,
-    pairing_token: &str,
+    args: &[&str],
     auth_password: &str,
-) -> Result<String, String> {
+    op_label: &str,
+) -> Result<(), String> {
     use std::process::Stdio;
 
-    // Pair into the machine-wide config the service reads (see
-    // `agent_config_path`). Without `-c`, the agent would write to the
-    // per-user %APPDATA%, which the service account cannot read.
     let config_path = agent_config_path()
         .ok_or_else(|| "Could not determine the agent config path.".to_string())?;
 
-    // -sed bundles -s -e -d <id>, then -t <token>. `hidden_command` sets
-    // CREATE_NO_WINDOW so no console window flashes. Stdio is piped so we can
-    // feed the password and capture the transcript.
-    let mut child = hidden_command(agent)
-        .arg("-c")
-        .arg(&config_path)
-        .arg("-sed")
-        .arg(device_id)
-        .arg("-t")
-        .arg(pairing_token)
+    // `hidden_command` sets CREATE_NO_WINDOW so no console window flashes; stdio
+    // is piped so we can feed the password and capture the transcript.
+    let mut command = hidden_command(agent);
+    command.arg("-c").arg(&config_path);
+    for arg in args {
+        command.arg(arg);
+    }
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to run the DirectGate agent: {e}"))?;
 
@@ -294,7 +325,7 @@ fn run_pairing(
         .map_err(|e| format!("Failed to wait for the DirectGate agent: {e}"))?;
 
     if output.status.success() {
-        Ok("Device paired successfully.".to_string())
+        Ok(())
     } else {
         // Combine stdout+stderr for diagnostics, then redact the password in
         // case it was echoed anywhere.
@@ -303,11 +334,11 @@ fn run_pairing(
         let text = redact(&sanitize_output(&combined), auth_password);
         Err(if text.is_empty() {
             match output.status.code() {
-                Some(code) => format!("Pairing failed (exit {code})."),
-                None => "Pairing failed.".to_string(),
+                Some(code) => format!("{op_label} failed (exit {code})."),
+                None => format!("{op_label} failed."),
             }
         } else {
-            format!("Pairing failed: {text}")
+            format!("{op_label} failed: {text}")
         })
     }
 }
@@ -484,6 +515,7 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             pair_device,
+            change_srp_password,
             get_pairing_status,
             get_service_status,
             start_service,
