@@ -107,11 +107,11 @@ final executables in `manager/dist`.
 
 The app controls an **already-installed** service. It looks for:
 
-| Platform | Identifier                                   | Tooling             |
-| -------- | -------------------------------------------- | ------------------- |
+| Platform | Identifier                                   | Tooling               |
+| -------- | -------------------------------------------- | --------------------- |
 | Linux    | systemd unit `directgate-agent`              | `systemctl`, `pkexec` |
-| Windows  | service `directgate-agent`                   | `sc.exe`            |
-| macOS    | launchd label `io.directgate.agent`          | `launchctl`         |
+| Windows  | service `directgate-agent`                   | SCM APIs + UAC        |
+| macOS    | launchd label `io.directgate.agent`          | `launchctl`           |
 
 On macOS a per-user **LaunchAgent** (`gui/<uid>/io.directgate.agent`) is
 preferred; if a system **LaunchDaemon** (`system/io.directgate.agent`) is
@@ -189,10 +189,12 @@ Starting, stopping and restarting a system service is a privileged operation,
 so the OS must authorize it. Pairing and status checks need no elevation; only
 start/stop/restart do:
 
-- **Windows:** `sc.exe start|stop` is launched with `ShellExecuteW` + the
-  `runas` verb (via the `runas` crate), which triggers the standard **UAC**
-  consent prompt; restart uses one elevated `Restart-Service` PowerShell call.
-  Status (`sc.exe query`) runs unelevated.
+- **Windows:** status is read with Service Control Manager APIs. Start, stop and
+  restart relaunch this same manager executable in a tiny elevated helper mode
+  using `ShellExecuteW` + the `runas` verb (via the `runas` crate), which
+  triggers the standard **UAC** consent prompt. The helper calls
+  `StartServiceW` / `ControlService` directly and exits before the Tauri UI
+  starts.
 - **Linux:** `pkexec systemctl start|stop|restart directgate-agent` triggers the
   PolicyKit authentication dialog. Status (`systemctl is-active`) runs
   unelevated. Because bare window managers (i3, sway, …) often run no PolicyKit

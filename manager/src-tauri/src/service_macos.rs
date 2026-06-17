@@ -99,6 +99,10 @@ fn is_running(print_output: &Output) -> bool {
 /// No startup preparation needed on macOS (launchd is always present).
 pub fn prepare() {}
 
+pub fn run_elevated_action_if_requested() -> Option<i32> {
+    None
+}
+
 pub fn status() -> ServiceStatus {
     match detect() {
         None => ServiceStatus::NotInstalled,

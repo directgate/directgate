@@ -34,10 +34,6 @@
 #endif
 #endif
 
-#ifdef _WIN32
-#include <winternl.h>   /* NtQueryInformationProcess for the shell cwd */
-#endif
-
 #ifdef __APPLE__
 #include <libproc.h>
 #endif
@@ -388,11 +384,6 @@ static XSTATUS DirectGate_Term_ValidateShellUser(const directgate_term_t *pTerm)
 
 static size_t DirectGate_Term_GetShellCmd(char *pCmd, size_t nSize)
 {
-    /* PowerShell is the expected interactive shell on modern Windows */
-    char sPath[XPATH_MAX];
-    DWORD nLen = SearchPathA(NULL, "powershell.exe", NULL, (DWORD)sizeof(sPath), sPath, NULL);
-    if (nLen > 0 && nLen < sizeof(sPath)) return xstrncpy(pCmd, nSize, sPath);
-
     const char *pComSpec = getenv("COMSPEC");
     if (xstrused(pComSpec)) return xstrncpy(pCmd, nSize, pComSpec);
 
@@ -1111,59 +1102,13 @@ XSTATUS DirectGate_Term_GetCwd(const directgate_term_t *pTerm, char *pBuf, size_
     xstrncpy(pBuf, nBufSize, vpi.pvi_cdir.vip_path);
 #elif defined(_WIN32)
     /*
-        The working directory of the shell lives in the CurrentDirectory
-        field of its RTL_USER_PROCESS_PARAMETERS. winternl.h hides that
-        field behind Reserved2, but the layout is stable on 64-bit
-        Windows: CURDIR sits at offset 0x38. Tracks cmd.exe faithfully;
-        PowerShell keeps Set-Location in managed state without chdir, so
-        the value reflects only its startup directory there.
+        Windows exposes no stable public API for reading another process'
+        current directory. Avoid cross-process memory inspection here: this is
+        only a UI convenience feature, and failing closed is safer for AV/EDR
+        trust than carrying process-inspection imports.
     */
     pBuf[0] = '\0';
-    XCHECK((pTerm->hProcess != NULL), XSTDERR);
-
-    PROCESS_BASIC_INFORMATION basicInfo;
-    memset(&basicInfo, 0, sizeof(basicInfo));
-    ULONG nInfoLen = 0;
-
-    NTSTATUS nStatus = NtQueryInformationProcess(pTerm->hProcess,
-        ProcessBasicInformation, &basicInfo, sizeof(basicInfo), &nInfoLen);
-
-    if (nStatus != 0 || basicInfo.PebBaseAddress == NULL) return XSTDERR;
-
-    PEB peb;
-    SIZE_T nMemRead = 0;
-    if (!ReadProcessMemory(pTerm->hProcess, basicInfo.PebBaseAddress,
-        &peb, sizeof(peb), &nMemRead) || nMemRead != sizeof(peb)) return XSTDERR;
-
-    UNICODE_STRING dosPath;
-    const size_t nCurDirOffset = 0x38; /* CURDIR.DosPath inside process parameters */
-
-    if (!ReadProcessMemory(pTerm->hProcess,
-        (uint8_t*)peb.ProcessParameters + nCurDirOffset,
-        &dosPath, sizeof(dosPath), &nMemRead) || nMemRead != sizeof(dosPath)) return XSTDERR;
-
-    if (dosPath.Buffer == NULL || dosPath.Length == 0 ||
-        dosPath.Length > (XPATH_MAX * sizeof(WCHAR))) return XSTDERR;
-
-    WCHAR wsCwd[XPATH_MAX];
-    size_t nChars = dosPath.Length / sizeof(WCHAR);
-
-    if (!ReadProcessMemory(pTerm->hProcess, dosPath.Buffer,
-        wsCwd, dosPath.Length, &nMemRead) || nMemRead != dosPath.Length) return XSTDERR;
-
-    /* NT keeps a trailing backslash; drop it except for drive roots */
-    if (nChars > 3 && wsCwd[nChars - 1] == L'\\') nChars--;
-
-    int nConverted = WideCharToMultiByte(CP_UTF8, 0, wsCwd, (int)nChars,
-        pBuf, (int)nBufSize - 1, NULL, NULL);
-
-    if (nConverted <= 0)
-    {
-        pBuf[0] = '\0';
-        return XSTDERR;
-    }
-
-    pBuf[nConverted] = '\0';
+    return XSTDERR;
 #else
     char sProcPath[64];
     snprintf(sProcPath, sizeof(sProcPath), "/proc/%d/cwd", (int)pTerm->nPid);

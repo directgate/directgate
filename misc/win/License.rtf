@@ -2,6 +2,12 @@
 \viewkind4\uc1\pard\f0\fs18
 DirectGate Agent\par
 \par
+Operational disclosure\par
+\par
+This installer registers one auto-start Windows service named directgate-agent. The service runs only a small privilege-separation launcher as LocalSystem. The launcher reads the machine-wide config, obtains the configured shell.user's logged-on user token, and starts the actual DirectGate agent in that user's session. Terminal sessions, file-manager operations, protocol parsing, and network session handling run as shell.user, not as LocalSystem.\par
+\par
+Remote access is not available until the device is explicitly paired with a DirectGate account and authenticated. DirectGate uses SRP authentication and encrypted post-authentication sessions; the installed service does not grant anonymous remote access.\par
+\par
 Copyright (C) DirectGate.\par
 \par
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version (GPL-3.0-or-later).\par

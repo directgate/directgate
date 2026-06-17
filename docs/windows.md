@@ -96,13 +96,17 @@ Installing `directgate-<version>-x64.msi` (double-click, or
   and adds that directory to the system `PATH`;
 - creates `C:\ProgramData\directgate\`, the machine-wide config home;
 - registers one Windows service, `directgate-agent`, running as **LocalSystem**
-  (manual start, not started by the installer) with the command line
+  and configured to start automatically at boot with the command line
   `directgate.exe --win-service --win-launcher -c "C:\ProgramData\directgate\agent.json"`.
 
-**No account or password is requested.** The service runs the
+**Operational disclosure.** The service runs only the
 privilege-separation *launcher* (see [As a Windows service](#as-a-windows-service)):
 a tiny LocalSystem supervisor that acquires `shell.user`'s logon token and runs
-the actual agent as `shell.user`. No Windows password is ever stored or prompted.
+the actual agent as `shell.user`. Terminal sessions, file-manager operations,
+protocol parsing and network session handling run as `shell.user`, not as
+LocalSystem. Remote access is unavailable until the device is explicitly paired
+and the client authenticates; the installed service does not grant anonymous
+remote access. No Windows password is ever stored or prompted.
 
 Finish setup after installing:
 
@@ -173,6 +177,9 @@ DirectGate uses **privilege separation** on Windows. A single service runs a sma
 session, so the agent - including all protocol parsing, the PTY and the file
 manager - runs as `shell.user`, never as SYSTEM. This mirrors the POSIX model
 where the agent `setuid`s to `shell.user`: the untrusted parser is never SYSTEM.
+Remote access is available only after explicit pairing and client
+authentication; installing or starting the service alone does not expose an
+anonymous remote shell or file manager.
 From an **administrator** prompt:
 
 ```bat
@@ -202,7 +209,9 @@ Notes:
 
 ### Terminal sessions
 
-Terminals use **ConPTY** (`CreatePseudoConsole`), so you get a real interactive shell with colors, resizing, and arrow keys. The shell is `powershell.exe` when available, otherwise `%COMSPEC%` (cmd.exe).
+Terminals use **ConPTY** (`CreatePseudoConsole`), so you get a real interactive
+shell with colors, resizing, and arrow keys. The shell is `%COMSPEC%` when set,
+otherwise `cmd.exe`; users can launch PowerShell from that shell if they need it.
 
 ### File manager
 
