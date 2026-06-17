@@ -257,9 +257,9 @@ if(WIN32)
     # / WTSQueryUserToken (shell.user logon token). userenv: CreateEnvironmentBlock.
     target_link_libraries(directgate PRIVATE advapi32 wtsapi32 userenv)
 
-    # Manifest with UTF-8 active code page: ANSI APIs handle any file name
+    # App manifest (UTF-8 active code page) + version / company metadata.
     enable_language(RC)
-    target_sources(directgate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/misc/win/app.rc")
+    target_sources(directgate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/misc/win/directgate.rc")
 endif()
 
 if(UTIL_LIBRARY)
@@ -276,7 +276,8 @@ target_include_directories(dgcli PRIVATE ${CLIENT_DIR})
 target_link_libraries(dgcli PRIVATE xcommon)
 
 if(WIN32)
-    target_sources(dgcli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/misc/win/app.rc")
+    enable_language(RC)
+    target_sources(dgcli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/misc/win/dgcli.rc")
 endif()
 
 if(UTIL_LIBRARY)

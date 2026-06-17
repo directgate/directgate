@@ -60,6 +60,10 @@
 
         <MediaTemplate EmbedCab="yes" />
 
+        <!-- MSI Summary Information stream (file Properties -> Details). The
+             Author/Publisher comes from the Package Manufacturer above. -->
+        <SummaryInformation Description="DirectGate Agent installer" />
+
         <MajorUpgrade
             AllowSameVersionUpgrades="yes"
             DowngradeErrorMessage="A newer version of DirectGate Agent is already installed." />

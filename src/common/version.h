@@ -27,7 +27,12 @@
 #define DIRECTGATE_VERSION_BUILD 19
 #define DIRECTGATE_VERSION_PKG   6
 
+/* The Windows resource compiler (windres / rc.exe) defines RC_INVOKED and only
+   understands the numeric macros above; hide the C declarations from it so the
+   .rc files can #include this header for the version numbers. */
+#ifndef RC_INVOKED
 const char* DirectGate_GetVersionShort(void);
 const char* DirectGate_GetVersionLong(void);
+#endif
 
 #endif

@@ -58,7 +58,7 @@ manager/
 
 ## Prerequisites
 
-- **Node.js 18+** and **npm**
+- **Node.js 20.19+** and **npm** (required by Vite 7)
 - **Rust toolchain** (`cargo`, install via <https://rustup.rs>)
 - Platform Tauri dependencies:
   - **Linux:** WebKitGTK 4.1 + GTK 3 dev packages and `pkg-config`
