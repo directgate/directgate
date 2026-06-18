@@ -78,6 +78,83 @@ static FILE* DirectGate_Transfer_OpenDestination(const char *pPath)
 #endif
 }
 
+static FILE* DirectGate_Transfer_OpenSource(const char *pPath, uint64_t *pSize)
+{
+    XCHECK((xstrused(pPath)), NULL);
+
+#ifdef _WIN32
+    /* O_NOFOLLOW analog: refuse a source that is a reparse point so the
+       transfer cannot be redirected through a planted link between this
+       open and the reads that follow. */
+    DWORD nAttrs = GetFileAttributesA(pPath);
+    if (nAttrs != INVALID_FILE_ATTRIBUTES && (nAttrs & FILE_ATTRIBUTE_REPARSE_POINT))
+        return NULL;
+
+    /* _O_NOINHERIT = FD_CLOEXEC analog, _O_BINARY keeps payload bytes exact */
+    int nFlags = _O_RDONLY | _O_BINARY | _O_NOINHERIT;
+
+    int nFd = -1;
+    if (_sopen_s(&nFd, pPath, nFlags, _SH_DENYNO, _S_IREAD) != 0 || nFd < 0)
+        return NULL;
+
+    /* Validate the object behind the descriptor we just opened, not the path:
+       fstat() on the fd closes the stat()/open() TOCTOU race because the check
+       and the subsequent reads operate on the very same inode. */
+    struct stat st;
+    if (fstat(nFd, &st) != 0 || !S_ISREG(st.st_mode))
+    {
+        _close(nFd);
+        return NULL;
+    }
+
+    FILE *pFile = _fdopen(nFd, "rb");
+    if (pFile == NULL)
+    {
+        _close(nFd);
+        return NULL;
+    }
+
+    if (pSize != NULL) *pSize = (uint64_t)st.st_size;
+    return pFile;
+#else
+    int nFlags = O_RDONLY;
+#ifdef O_CLOEXEC
+    nFlags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    nFlags |= O_NOFOLLOW;
+#endif
+
+    int nFd = open(pPath, nFlags);
+    if (nFd < 0) return NULL;
+
+#ifndef O_CLOEXEC
+    int nFdFlags = fcntl(nFd, F_GETFD);
+    if (nFdFlags >= 0) (void)fcntl(nFd, F_SETFD, nFdFlags | FD_CLOEXEC);
+#endif
+
+    /* Validate the object behind the descriptor we just opened, not the path:
+       fstat() on the fd closes the stat()/open() TOCTOU race because the check
+       and the subsequent reads operate on the very same inode. */
+    struct stat st;
+    if (fstat(nFd, &st) != 0 || !S_ISREG(st.st_mode))
+    {
+        close(nFd);
+        return NULL;
+    }
+
+    FILE *pFile = fdopen(nFd, "rb");
+    if (pFile == NULL)
+    {
+        close(nFd);
+        return NULL;
+    }
+
+    if (pSize != NULL) *pSize = (uint64_t)st.st_size;
+    return pFile;
+#endif
+}
+
 static const char* DirectGate_Transfer_StateToString(directgate_transfer_state_t eState)
 {
     switch (eState)
@@ -211,30 +288,16 @@ XSTATUS DirectGate_Transfer_Send(directgate_transfer_t *pFT, const char *pPath,
     XCHECK((pPath != NULL), XSTDERR);
     XCHECK((sendFn != NULL), XSTDERR);
 
-    /* Get file size */
-    struct stat st;
-    if (stat(pPath, &st) != 0)
-    {
-        xloge("Failed to stat transfer source: id(%s), path(%s), errno(%d)",
-            DirectGate_Transfer_GetId(pFT), pPath, errno);
-
-        pFT->eState = XTRANSFER_STATE_ERROR;
-        return XSTDERR;
-    }
-
-    if (!S_ISREG(st.st_mode))
-    {
-        xloge("Transfer source is not a regular file: id(%s), path(%s)",
-            DirectGate_Transfer_GetId(pFT), pPath);
-
-        pFT->eState = XTRANSFER_STATE_ERROR;
-        return XSTDERR;
-    }
-
-    pFT->pFile = fopen(pPath, "rb");
+    /* Open the source and validate it via fstat() on the resulting descriptor.
+       Opening first, then checking the fd (rather than stat()'ing the path and
+       re-opening it by name) closes the TOCTOU race where the path could be
+       swapped for a symlink, FIFO or another file between the check and the use.
+       fstat() also yields the size of exactly the object we will read. */
+    uint64_t nSize = 0;
+    pFT->pFile = DirectGate_Transfer_OpenSource(pPath, &nSize);
     if (pFT->pFile == NULL)
     {
-        xloge("Failed to open transfer source for reading: id(%s), path(%s), errno(%d)",
+        xloge("Failed to open transfer source as a regular file: id(%s), path(%s), errno(%d)",
             DirectGate_Transfer_GetId(pFT), pPath, errno);
 
         pFT->eState = XTRANSFER_STATE_ERROR;
@@ -245,7 +308,7 @@ XSTATUS DirectGate_Transfer_Send(directgate_transfer_t *pFT, const char *pPath,
     const char *pName = strrchr(pPath, '/');
     pName = pName ? pName + 1 : pPath;
 
-    pFT->nSize = (uint64_t)st.st_size;
+    pFT->nSize = nSize;
     pFT->nChunkSize = XFILE_CHUNK_SIZE;
     pFT->nTotalChunks = (uint32_t)((pFT->nSize + pFT->nChunkSize - 1) / pFT->nChunkSize);
 
