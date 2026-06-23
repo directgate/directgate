@@ -1282,7 +1282,7 @@ XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSd
     if (pRTC->bVideoEnabled)
         (void)DirectGate_WebRTC_AddDesktopVideoTrack(pRTC, pUnescaped);
 
-    /* Set the remote description (offer from client) — this triggers answer generation */
+    /* Set the remote description (offer from client) - this triggers answer generation */
     int nRet = rtcSetRemoteDescription(pRTC->nPeerConnectionID, pUnescaped, "offer");
     free(pUnescaped);
 
