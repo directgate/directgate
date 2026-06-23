@@ -33,6 +33,7 @@
 #include "enroll.h"
 #include "files.h"
 #include "term.h"
+#include "desktop.h"
 #include "e2e.h"
 #include "srp.h"
 
@@ -559,6 +560,7 @@ static int DirectGate_HandleCustomRead(xapi_session_t *pApiSession)
 
     int nPipeFd = DirectGate_WebRTC_GetPipeFd(&pSession->webrtc);
     int nSearchFd = DirectGate_Search_GetPipeFd(&pSession->search);
+    int nDesktopFd = DirectGate_Desktop_GetTimerFd(&pSession->desktop);
 
     if ((int)pApiSession->sock.nFD == nPipeFd)
     {
@@ -568,6 +570,9 @@ static int DirectGate_HandleCustomRead(xapi_session_t *pApiSession)
 
     if ((int)pApiSession->sock.nFD == nSearchFd)
         return DirectGate_Search_Process(pSession);
+
+    if ((int)pApiSession->sock.nFD == nDesktopFd)
+        return DirectGate_Desktop_Process(pSession);
 
     XCHECK(DirectGate_Term_IsRunning(&pSession->term), XAPI_DISCONNECT);
     return DirectGate_Term_OnRead(&pSession->term);
@@ -582,7 +587,9 @@ static int DirectGate_HandleCustomWrite(xapi_session_t *pApiSession)
     XCHECK_NL((!pSession->bClosing), XAPI_DISCONNECT);
 
     int nPipeFd = DirectGate_WebRTC_GetPipeFd(&pSession->webrtc);
+    int nDesktopFd = DirectGate_Desktop_GetTimerFd(&pSession->desktop);
     if ((int)pApiSession->sock.nFD == nPipeFd) return XAPI_CONTINUE;
+    if ((int)pApiSession->sock.nFD == nDesktopFd) return XAPI_CONTINUE;
 
     XCHECK(DirectGate_Term_IsRunning(&pSession->term), XAPI_DISCONNECT);
     return DirectGate_Term_OnWrite(&pSession->term);
@@ -599,6 +606,7 @@ static int DirectGate_HandleRegistered(xapi_session_t *pApiSession)
 
     int nPipeFd = DirectGate_WebRTC_GetPipeFd(&pSession->webrtc);
     int nSearchFd = DirectGate_Search_GetPipeFd(&pSession->search);
+    int nDesktopFd = DirectGate_Desktop_GetTimerFd(&pSession->desktop);
 
     if ((int)pApiSession->sock.nFD == nPipeFd)
     {
@@ -609,6 +617,12 @@ static int DirectGate_HandleRegistered(xapi_session_t *pApiSession)
     if ((int)pApiSession->sock.nFD == nSearchFd)
     {
         pSession->pSearchSession = pApiSession;
+        return XAPI_CONTINUE;
+    }
+
+    if ((int)pApiSession->sock.nFD == nDesktopFd)
+    {
+        pSession->pDesktopSession = pApiSession;
         return XAPI_CONTINUE;
     }
 
@@ -626,6 +640,7 @@ static int DirectGate_HandleClosed(xapi_session_t *pApiSession)
 
     int nPipeFd = DirectGate_WebRTC_GetPipeFd(&pSession->webrtc);
     int nSearchFd = DirectGate_Search_GetPipeFd(&pSession->search);
+    int nDesktopFd = DirectGate_Desktop_GetTimerFd(&pSession->desktop);
     if ((int)pApiSession->sock.nFD == nPipeFd)
     {
         pSession->webrtc.nPipeFds[0] = -1;
@@ -643,6 +658,15 @@ static int DirectGate_HandleClosed(xapi_session_t *pApiSession)
         }
 
         pSession->pSearchSession = NULL;
+        return XAPI_NO_ACTION;
+    }
+
+    if ((int)pApiSession->sock.nFD == nDesktopFd)
+    {
+        pSession->pDesktopSession = NULL;
+        DirectGate_Desktop_DetachEvent(&pSession->desktop);
+        if (!pSession->bClosing)
+            DirectGate_Session_Close(pSession, "desktop stopped");
         return XAPI_NO_ACTION;
     }
 
@@ -993,8 +1017,12 @@ static int DirectGate_HandleCmd(xapi_session_t *pApiSession, directgate_pkg_t *p
         directgate_session_t *pSession = DirectGate_SessionMgr_Find(&pConn->mgr, pPkg->header.nSessionId);
         if (pSession != NULL)
         {
-            xlogi("Stopping session terminal: sid(%u), wsfd(%d)",
-                pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
+            xlogi("Stopping session: sid(%u), wsfd(%d), mode(%s)",
+                pSession->nSessionId, DirectGate_Session_GetWsFd(pSession),
+                DirectGate_SessionMode_ToString(pSession->eActiveMode));
+
+            if (pSession->eActiveMode == DIRECTGATE_SESSION_MODE_DESKTOP)
+                return DirectGate_Session_Close(pSession, "desktop stopped");
 
             DirectGate_Term_RequestStop(&pSession->term);
             pSession->eActiveMode = DIRECTGATE_SESSION_MODE_NONE;
@@ -1154,6 +1182,21 @@ static int DirectGate_HandleData(xapi_session_t *pApiSession, directgate_pkg_t *
     directgate_session_t *pSession = DirectGate_SessionMgr_Find(&pConn->mgr, pPkg->header.nSessionId);
     XCHECK_NL((pSession != NULL), XAPI_CONTINUE);
 
+    if (pSession->eActiveMode == DIRECTGATE_SESSION_MODE_DESKTOP)
+    {
+        if (!pDataPkg->pPayloadType) return XAPI_CONTINUE;
+
+        if (xstrcmp(pDataPkg->pPayloadType, "desktop-control/json"))
+            return DirectGate_Desktop_HandleControl(pSession,
+                pDataPkg->pPayload, pDataPkg->nPayloadLength);
+
+        if (!xstrcmp(pDataPkg->pPayloadType, "desktop-input/json"))
+            return XAPI_CONTINUE;
+
+        return DirectGate_Desktop_HandleInput(pSession,
+            pDataPkg->pPayload, pDataPkg->nPayloadLength);
+    }
+
     if (DirectGate_Session_EnsureMode(pSession, DIRECTGATE_SESSION_MODE_TERMINAL,
         "terminal session not started") != XSTDOK) return XAPI_CONTINUE;
 
@@ -1301,6 +1344,9 @@ static int DirectGate_HandleWebRTC(xapi_session_t *pApiSession, directgate_pkg_t
 
         xlogi("Received WebRTC offer: sid(%u), wsfd(%d)", pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
         xlogd("WebRTC offer SDP: sid(%u), wsfd(%d), sdp(%s)", pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), pSdp);
+
+        DirectGate_WebRTC_SetVideoEnabled(pRTC,
+            pSession->eActiveMode == DIRECTGATE_SESSION_MODE_DESKTOP ? XTRUE : XFALSE);
 
         if (DirectGate_WebRTC_HandleOffer(pRTC, pSdp) < 0)
         {

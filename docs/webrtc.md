@@ -49,6 +49,42 @@ The connection degrades gracefully through three tiers, and the client always sh
 
 The terminal session stays fully functional on every tier, and traffic remains end-to-end encrypted regardless of which one is in use - so you always know whether the connection is direct, TURN-relayed, or on the WebSocket relay.
 
+## Desktop video track
+
+Desktop sessions reuse the same authenticated WebRTC connection but add a
+send-only H.264 **media track** (host -> browser) on top of the `directgate`
+DataChannel. Negotiation happens only after SRP/key-auth succeeds and the
+browser starts a `desktop` session. The browser offer carries:
+
+- the existing ordered `directgate` DataChannel (encrypted DirectGate binary protocol)
+- a recv-only video transceiver that advertises H.264
+
+When the active session mode is `desktop`, the agent answers with an H.264
+send-only track. The capture backend emits Annex-B H.264 access units
+(VideoToolbox on macOS), and the agent packetizes them as RTP and sends them
+through libdatachannel's Track API (`rtcAddTrackEx` / `rtcSendMessage`). The
+browser renders the remote `MediaStreamTrack` in a `<video>` element. Linux
+hosts capture the X11 root window and fall back to the raw-RGBA pipeline.
+
+The pipeline degrades in this order, and the desktop status payload reports
+which one is active:
+
+1. `webrtc-video` - preferred H.264 RTP over the WebRTC media track, encrypted by DTLS-SRTP
+2. `h264-datachannel` - `desktop-frame-encoded` H.264 chunks over the AES-SIV-encrypted DataChannel
+3. `raw-rgba` - `desktop-frame-chunk` raw frames (debug / legacy fallback)
+
+Desktop input, control, status, terminal, file-manager, and file-transfer
+messages all stay on the encrypted DirectGate protocol over the DataChannel.
+TURN relays forward only encrypted WebRTC media/DataChannel packets - they
+never see plaintext desktop video or control messages.
+
+Desktop status is a `type: "data"` packet with `payloadType: "desktop-status"`
+and a JSON payload; key fields are `status`, `pipeline`
+(`webrtc-video` / `h264-datachannel` / `raw-rgba`), `codec`, `preset`
+(`quality` / `balanced` / `low-latency`), `fps`, `bitrateKbps`, `transport`
+(`dtls-srtp` for the media track, `aes-siv-datachannel` for DataChannel
+fallbacks), and an optional `fallbackReason`.
+
 ## See also
 
 - [Architecture](architecture.md) - how the agent, relay, and client fit together

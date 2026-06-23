@@ -108,6 +108,28 @@ int DirectGate_WebRTC_GetPipeFd(const directgate_webrtc_t *pRTC)
     return pRTC != NULL ? pRTC->nPipeFds[0] : XSTDERR;
 }
 
+void DirectGate_Desktop_Init(directgate_desktop_t *pDesktop)
+{
+    if (pDesktop != NULL) memset(pDesktop, 0, sizeof(*pDesktop));
+}
+
+void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
+{
+    (void)pDesktop;
+}
+
+int DirectGate_Desktop_GetTimerFd(const directgate_desktop_t *pDesktop)
+{
+    (void)pDesktop;
+    return XSOCK_INVALID;
+}
+
+int DirectGate_Desktop_Start(directgate_session_t *pSession)
+{
+    (void)pSession;
+    return XSTDERR;
+}
+
 int DirectGate_WebSock_Send(xapi_session_t *pSession, const uint8_t *pPkg, size_t nLen)
 {
     (void)pSession;

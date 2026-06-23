@@ -140,9 +140,12 @@ endif()
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
 set(NO_TESTS ON CACHE BOOL "" FORCE)
-# Data channels only (no RTP/SRTP or WebSocket). Matches build.sh / pkg install_libdatachannel
-# and avoids CMake 3.21+ required by bundled libsrtp when NO_MEDIA is off.
-set(NO_MEDIA ON CACHE BOOL "" FORCE)
+# Media transport (RTP/SRTP) is enabled so the desktop streaming pipeline can
+# push H.264 over a negotiated WebRTC video track (see desktop.c / webrtc.c
+# DirectGate_WebRTC_SendH264AnnexB). The bundled deps/libsrtp needs CMake >= 3.21,
+# which this project's minimum (3.16) does not guarantee on its own — but every
+# supported toolchain in CI ships a newer CMake. WebSocket stays off (unused).
+set(NO_MEDIA OFF CACHE BOOL "" FORCE)
 set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
 add_subdirectory(${DATACHANNEL_DIR} EXCLUDE_FROM_ALL)
 
@@ -234,8 +237,12 @@ else()
 endif()
 
 # ---- agent binary: directgate --------------------------------------------------
+# desktop.c is cross-platform: it carries the X11 (Linux) and a no-op fallback
+# path inline behind #if guards, while the macOS ScreenCaptureKit/VideoToolbox
+# backend lives in desktop_mac.m (added below for Apple only).
 add_executable(directgate
     ${AGENT_DIR}/config.c
+    ${AGENT_DIR}/desktop.c
     ${AGENT_DIR}/enroll.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
@@ -244,6 +251,33 @@ add_executable(directgate
     ${AGENT_DIR}/directgate.c)
 target_include_directories(directgate PRIVATE ${AGENT_DIR})
 target_link_libraries(directgate PRIVATE xcommon)
+
+# ---- desktop streaming backends (platform specific) -----------------------
+if(APPLE)
+    # macOS screen capture + VideoToolbox H.264 encoder. Compiled with ARC.
+    target_sources(directgate PRIVATE ${AGENT_DIR}/desktop_mac.m)
+    set_source_files_properties(${AGENT_DIR}/desktop_mac.m
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(directgate PRIVATE
+        "-framework ApplicationServices"
+        "-framework Carbon"
+        "-framework Foundation"
+        "-framework CoreMedia"
+        "-framework CoreVideo"
+        "-framework CoreGraphics"
+        "-framework VideoToolbox"
+        "-framework ScreenCaptureKit")
+elseif(UNIX)
+    # Linux X11 capture + XTest input (XTest is dlopen'd at runtime, hence dl).
+    find_package(X11 REQUIRED)
+    target_include_directories(directgate PRIVATE ${X11_INCLUDE_DIR})
+    target_link_libraries(directgate PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
+    if(X11_Xrandr_FOUND)
+        target_link_libraries(directgate PRIVATE ${X11_Xrandr_LIB})
+    else()
+        target_link_libraries(directgate PRIVATE Xrandr)
+    endif()
+endif()
 
 if(WIN32)
     # Privilege-separation launcher (see src/agent/launcher.c): a tiny LocalSystem

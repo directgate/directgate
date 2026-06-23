@@ -18,6 +18,29 @@ function(directgate_smoke name)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+# Targets that compile session.c / directgate.c pull in the desktop module,
+# which needs the same platform sources and libraries as the agent binary
+# (see the matching block in the top-level CMakeLists).
+function(directgate_smoke_desktop name)
+    if(APPLE)
+        target_sources(${name} PRIVATE ${AGENT_DIR}/desktop_mac.m)
+        set_source_files_properties(${AGENT_DIR}/desktop_mac.m
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_link_libraries(${name} PRIVATE
+            "-framework ApplicationServices"
+            "-framework Carbon"
+            "-framework Foundation"
+            "-framework CoreMedia"
+            "-framework CoreVideo"
+            "-framework CoreGraphics"
+            "-framework VideoToolbox"
+            "-framework ScreenCaptureKit")
+    elseif(UNIX)
+        target_include_directories(${name} PRIVATE ${X11_INCLUDE_DIR})
+        target_link_libraries(${name} PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS} Xrandr)
+    endif()
+endfunction()
+
 # Tests that only need libxcommon.
 foreach(test
         base64_smoke
@@ -69,12 +92,14 @@ directgate_smoke(client_relay_smoke   ${CLIENT_DIR}/relay.c)
 
 directgate_smoke(connection_lifecycle_smoke
     ${AGENT_DIR}/config.c
+    ${AGENT_DIR}/desktop.c
     ${AGENT_DIR}/enroll.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
     ${AGENT_DIR}/term.c
     ${AGENT_DIR}/directgate.c)
+directgate_smoke_desktop(connection_lifecycle_smoke)
 target_compile_definitions(connection_lifecycle_smoke PRIVATE DIRECTGATE_TESTING)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(connection_lifecycle_smoke PRIVATE -Wno-unused-function)

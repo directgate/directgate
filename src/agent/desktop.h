@@ -1,0 +1,187 @@
+/*!
+ * @file directgate-agent/src/agent/desktop.h
+ * @brief Agent-side desktop streaming and input control.
+ *
+ *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
+ *  Author: Sandro Kalatozishvili (sandro@directgate.io)
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#ifndef __DIRECTGATE_DESKTOP_H__
+#define __DIRECTGATE_DESKTOP_H__
+
+#include "includes.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define DIRECTGATE_DESKTOP_BACKEND_LEN 16
+#define DIRECTGATE_DESKTOP_REASON_LEN  160
+#define DIRECTGATE_DESKTOP_DISPLAY_LEN 128
+#define DIRECTGATE_DESKTOP_MONITOR_ID_LEN   32
+#define DIRECTGATE_DESKTOP_MONITOR_NAME_LEN 96
+#define DIRECTGATE_DESKTOP_MAX_MONITORS     16
+#define DIRECTGATE_DESKTOP_CODEC_LEN        16
+#define DIRECTGATE_DESKTOP_PRESET_LEN       16
+#define DIRECTGATE_DESKTOP_PIPELINE_LEN     24
+#define DIRECTGATE_DESKTOP_TRANSPORT_LEN    32
+
+/* Encoded desktop frame transport (cross-platform).
+ * Chunk size matches the raw-RGBA path so the relay/WebRTC fragments stay
+ * predictable. Each chunk goes through DirectGate_Session_Send and therefore
+ * benefits from the standard AES-SIV E2E wrapping. */
+/* 64 KB balances libdatachannel SCTP throughput against the cost of the
+ * per-chunk JSON+AES-SIV+send round-trip the main loop pays. Going below
+ * ~32 KB starts adding noticeable encoder-to-wire latency on IDR-sized
+ * frames; going above ~128 KB starts head-of-line-blocking smaller
+ * messages on the data channel. */
+#define DIRECTGATE_DESKTOP_CHUNK_BYTES      (64U * 1024U)
+
+typedef enum {
+    DIRECTGATE_DESKTOP_PIPELINE_RAW = 0,    /* legacy raw RGBA fallback/debug */
+    DIRECTGATE_DESKTOP_PIPELINE_H264_DC,    /* H.264 chunks over encrypted DataChannel */
+    DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO/* H.264 RTP over WebRTC media track */
+} directgate_desktop_pipeline_t;
+
+typedef enum {
+    DIRECTGATE_DESKTOP_PRESET_BALANCED = 0, /* 1080p 30fps 8 Mbps (default) */
+    DIRECTGATE_DESKTOP_PRESET_QUALITY,      /* 1080p 30fps 12 Mbps */
+    DIRECTGATE_DESKTOP_PRESET_LOW_LATENCY   /*  720p 30fps 4 Mbps */
+} directgate_desktop_preset_t;
+
+typedef struct directgate_desktop_quality_ {
+    directgate_desktop_preset_t ePreset;
+    uint32_t nMaxEdge;       /* longest edge of encoded output, e.g. 1920 */
+    uint32_t nFps;           /* target capture/encode FPS */
+    uint32_t nBitrateKbps;   /* hardware encoder bitrate target */
+    uint32_t nKeyframeFrames;/* GOP length, in frames */
+    xbool_t bRealtime;       /* enables low-latency encoder hints */
+} directgate_desktop_quality_t;
+
+typedef struct directgate_session_ directgate_session_t;
+
+typedef struct directgate_desktop_monitor_ {
+    char sId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
+    char sName[DIRECTGATE_DESKTOP_MONITOR_NAME_LEN];
+    int32_t nX;
+    int32_t nY;
+    uint32_t nWidth;
+    uint32_t nHeight;
+    xbool_t bPrimary;
+} directgate_desktop_monitor_t;
+
+typedef struct directgate_desktop_ {
+    xbool_t bRunning;
+    xbool_t bInputReady;
+    xbool_t bCaptureReady;
+    int nTimerFd;
+    uint32_t nSessionId;
+    uint32_t nScreenWidth;
+    uint32_t nScreenHeight;
+    int32_t nCaptureX;
+    int32_t nCaptureY;
+    uint32_t nCaptureWidth;
+    uint32_t nCaptureHeight;
+    uint32_t nFrameWidth;
+    uint32_t nFrameHeight;
+    uint32_t nFps;
+    uint32_t nPointerButtons;
+    uint64_t nFrameId;
+    uint32_t nMonitorCount;
+    directgate_desktop_monitor_t monitors[DIRECTGATE_DESKTOP_MAX_MONITORS];
+    char sBackend[DIRECTGATE_DESKTOP_BACKEND_LEN];
+    char sReason[DIRECTGATE_DESKTOP_REASON_LEN];
+    char sDisplay[DIRECTGATE_DESKTOP_DISPLAY_LEN];
+    char sSelectedMonitor[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
+    void *pDisplay;
+    void *pXtst;
+    void *pFakeMotion;
+    void *pFakeButton;
+    void *pFakeKey;
+    /* Encoded pipeline state */
+    directgate_desktop_pipeline_t ePipeline;
+    directgate_desktop_quality_t quality;
+    char sCodec[DIRECTGATE_DESKTOP_CODEC_LEN];
+    char sFallbackReason[DIRECTGATE_DESKTOP_REASON_LEN];
+    xbool_t bForceRaw;       /* true when fallback raw RGBA path is forced */
+    xbool_t bRequestKeyframe;/* set by preset change / drop recovery */
+    xbool_t bWebRTCVideoFailed; /* avoid oscillating after media send failure */
+    /* macOS-only encoder state (opaque to cross-platform code) */
+    void *pMacEncoder;
+#if defined(__APPLE__)
+    int nTimerWriteFd;
+    xbool_t bTimerThreadRunning;
+    pthread_t timerThread;
+#endif
+} directgate_desktop_t;
+
+void DirectGate_Desktop_Init(directgate_desktop_t *pDesktop);
+void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop);
+void DirectGate_Desktop_DetachEvent(directgate_desktop_t *pDesktop);
+
+int DirectGate_Desktop_Start(directgate_session_t *pSession);
+int DirectGate_Desktop_Process(directgate_session_t *pSession);
+int DirectGate_Desktop_HandleInput(directgate_session_t *pSession,
+                               const uint8_t *pPayload,
+                               size_t nPayloadLength);
+int DirectGate_Desktop_HandleControl(directgate_session_t *pSession,
+                                 const uint8_t *pPayload,
+                                 size_t nPayloadLength);
+
+int DirectGate_Desktop_GetTimerFd(const directgate_desktop_t *pDesktop);
+xbool_t DirectGate_Desktop_IsRunning(const directgate_desktop_t *pDesktop);
+const char* DirectGate_Desktop_GetReason(const directgate_desktop_t *pDesktop);
+
+/* Cross-platform encoded-frame send. The encoded payload is split into
+ * DIRECTGATE_DESKTOP_CHUNK_BYTES-sized chunks; each chunk goes through the
+ * standard DirectGate_Session_Send path (E2E-encrypted, WebRTC-preferred). */
+int DirectGate_Desktop_SendEncodedFrame(directgate_session_t *pSession,
+                                    const uint8_t *pPayload,
+                                    size_t nPayloadLength,
+                                    uint32_t nWidth,
+                                    uint32_t nHeight,
+                                    xbool_t bKeyframe,
+                                    uint64_t nPtsUs);
+
+/* Preset helpers (shared by macOS encoder + control message handler). */
+void DirectGate_Desktop_ApplyPreset(directgate_desktop_t *pDesktop, directgate_desktop_preset_t ePreset);
+const char* DirectGate_Desktop_PresetName(directgate_desktop_preset_t ePreset);
+const char* DirectGate_Desktop_PipelineName(directgate_desktop_pipeline_t ePipeline);
+
+#if defined(__APPLE__)
+/* ScreenCaptureKit + VideoToolbox encoder lifecycle. Implemented in
+ * desktop_mac.m and only called by desktop.c on Darwin. */
+int DirectGate_Desktop_MacEncoder_Start(directgate_session_t *pSession,
+                                    int32_t nX, int32_t nY,
+                                    uint32_t nWidth, uint32_t nHeight);
+int DirectGate_Desktop_MacEncoder_UpdateRect(directgate_session_t *pSession,
+                                        int32_t nX, int32_t nY,
+                                        uint32_t nWidth, uint32_t nHeight);
+void DirectGate_Desktop_MacEncoder_ApplyQuality(directgate_session_t *pSession);
+void DirectGate_Desktop_MacEncoder_RequestKeyframe(directgate_session_t *pSession);
+void DirectGate_Desktop_MacEncoder_Stop(directgate_session_t *pSession);
+const char* DirectGate_Desktop_MacEncoder_LastError(const directgate_session_t *pSession);
+
+/* Drains the encoder mailbox on the main loop. Called from
+ * DirectGate_Desktop_Process after the timer pipe wakes the loop. */
+int DirectGate_Desktop_MacEncoder_DrainMain(directgate_session_t *pSession);
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

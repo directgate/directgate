@@ -79,6 +79,14 @@ static void DirectGate_Session_Destroy(directgate_session_t *pSession)
         XAPI_Disconnect(pApiSession);
     }
 
+    if (pSession->pDesktopSession != NULL)
+    {
+        xapi_session_t *pApiSession = pSession->pDesktopSession;
+        pSession->pDesktopSession = NULL;
+        XAPI_Disconnect(pApiSession);
+    }
+
+    DirectGate_Desktop_Clear(&pSession->desktop);
     DirectGate_WebRTC_Clear(&pSession->webrtc);
     DirectGate_Search_Clear(&pSession->search);
     DirectGate_Session_CleanupPendingUpload(pSession);
@@ -214,6 +222,7 @@ directgate_session_t* DirectGate_SessionMgr_Create(directgate_session_mgr_t *pMg
     DirectGate_E2E_Init(&pSession->e2e);
     DirectGate_WebRTC_Init(&pSession->webrtc);
     DirectGate_Search_Init(&pSession->search);
+    DirectGate_Desktop_Init(&pSession->desktop);
     DirectGate_Transfer_Init(&pSession->transfer);
     DirectGate_KeyAuth_Init(&pSession->keyauth);
 
@@ -229,6 +238,7 @@ directgate_session_t* DirectGate_SessionMgr_Create(directgate_session_mgr_t *pMg
     pSession->bSaveForce = XFALSE;
     pSession->bClosing = XFALSE;
     pSession->pSearchSession = NULL;
+    pSession->pDesktopSession = NULL;
     pSession->pPipeSession = NULL;
     pSession->pWsSession = NULL;
     pSession->nSessionId = nSessionId;
@@ -487,6 +497,9 @@ directgate_session_mode_t DirectGate_SessionMode_FromString(const char *pMode)
     if (xstrused(pMode) && xstrcmp(pMode, "file-manager"))
         return DIRECTGATE_SESSION_MODE_FILE_MANAGER;
 
+    if (xstrused(pMode) && xstrcmp(pMode, "desktop"))
+        return DIRECTGATE_SESSION_MODE_DESKTOP;
+
     return DIRECTGATE_SESSION_MODE_NONE;
 }
 
@@ -494,6 +507,7 @@ const char* DirectGate_SessionMode_ToString(directgate_session_mode_t eMode)
 {
     if (eMode == DIRECTGATE_SESSION_MODE_TERMINAL) return "terminal";
     if (eMode == DIRECTGATE_SESSION_MODE_FILE_MANAGER) return "file-manager";
+    if (eMode == DIRECTGATE_SESSION_MODE_DESKTOP) return "desktop";
     return "none";
 }
 
@@ -665,6 +679,36 @@ static int DirectGate_Session_AddSearchPipeEndpoint(directgate_session_t *pSessi
     return XAPI_CONTINUE;
 }
 
+static int DirectGate_Session_AddDesktopEndpoint(directgate_session_t *pSession)
+{
+    XCHECK((pSession != NULL), XAPI_DISCONNECT);
+    XCHECK((pSession->pWsSession != NULL), XAPI_DISCONNECT);
+    if (pSession->pDesktopSession != NULL) return XAPI_CONTINUE;
+
+    int nTimerFd = DirectGate_Desktop_GetTimerFd(&pSession->desktop);
+    if (nTimerFd < 0) return XAPI_CONTINUE;
+
+    xapi_endpoint_t timerEp;
+    XAPI_InitEndpoint(&timerEp);
+
+    timerEp.eType = XAPI_EVENT;
+    timerEp.eRole = XAPI_CUSTOM;
+    timerEp.nEvents = XPOLLIN;
+    timerEp.bUnix = XTRUE;
+    timerEp.nFD = nTimerFd;
+    timerEp.pSessionData = pSession;
+
+    if (XAPI_AddEndpoint(pSession->pWsSession->pApi, &timerEp) < 0)
+    {
+        xloge("Failed to register desktop timer endpoint: sid(%u), wsfd(%d), timerfd(%d)",
+            pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), nTimerFd);
+
+        return DirectGate_Session_Close(pSession, "desktop endpoint registration failed");
+    }
+
+    return XAPI_CONTINUE;
+}
+
 int DirectGate_Session_StartTerminal(directgate_session_t *pSession)
 {
     XCHECK((pSession != NULL), XAPI_DISCONNECT);
@@ -750,6 +794,16 @@ int DirectGate_Session_StartMode(directgate_session_t *pSession, directgate_sess
         xlogi("File manager mode activated: sid(%u), wsfd(%d)",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
 
+        return XAPI_CONTINUE;
+    }
+
+    if (eMode == DIRECTGATE_SESSION_MODE_DESKTOP)
+    {
+        if (DirectGate_Session_AddRTCPipeEndpoint(pSession) < 0) return XAPI_DISCONNECT;
+        if (DirectGate_Desktop_Start(pSession) < 0) return XAPI_CONTINUE;
+        if (DirectGate_Session_AddDesktopEndpoint(pSession) < 0) return XAPI_DISCONNECT;
+
+        pSession->eActiveMode = DIRECTGATE_SESSION_MODE_DESKTOP;
         return XAPI_CONTINUE;
     }
 

@@ -29,6 +29,7 @@
 #include "webrtc.h"
 #include "term.h"
 #include "search.h"
+#include "desktop.h"
 #include "e2e.h"
 #include "srp.h"
 #include "keyauth.h"
@@ -49,6 +50,7 @@ typedef enum directgate_session_mode_ {
     DIRECTGATE_SESSION_MODE_NONE = 0,
     DIRECTGATE_SESSION_MODE_TERMINAL,
     DIRECTGATE_SESSION_MODE_FILE_MANAGER,
+    DIRECTGATE_SESSION_MODE_DESKTOP,
 } directgate_session_mode_t;
 
 typedef struct directgate_session_ {
@@ -58,9 +60,11 @@ typedef struct directgate_session_ {
     const directgate_cfg_t *pCfg;
     xapi_session_t *pPipeSession;
     xapi_session_t *pSearchSession;
+    xapi_session_t *pDesktopSession;
     xapi_session_t *pWsSession;
     directgate_transfer_t transfer;
     directgate_search_t search;
+    directgate_desktop_t desktop;
     directgate_webrtc_t webrtc;
     directgate_term_t term;
     directgate_e2e_t e2e;

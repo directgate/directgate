@@ -22,7 +22,18 @@
 #include "webrtc.h"
 #include "protocol.h"
 
+#include <openssl/rand.h>
+#include <strings.h>
+#include <time.h>
+
 #define DIRECTGATE_RTC_DEFAULT_MID  "0"
+#define DIRECTGATE_RTC_VIDEO_CLOCK_RATE 90000U
+#define DIRECTGATE_RTC_H264_PAYLOAD_TYPE 102U
+#define DIRECTGATE_RTC_RTP_HEADER_BYTES 12U
+#define DIRECTGATE_RTC_RTP_MAX_PAYLOAD 1188U
+#define DIRECTGATE_RTC_H264_FU_A 28U
+#define DIRECTGATE_RTC_H264_START 0x80U
+#define DIRECTGATE_RTC_H264_END 0x40U
 
 static const char *g_pIceServers[] = {
     "stun:stun.cloudflare.com:3478",
@@ -41,6 +52,12 @@ static int DirectGate_WebRTC_GetDC(const directgate_webrtc_t *pRTC)
 {
     XCHECK_NL((pRTC != NULL), XSTDERR);
     return pRTC->nDataChannelID;
+}
+
+static int DirectGate_WebRTC_GetVideoTrack(const directgate_webrtc_t *pRTC)
+{
+    XCHECK_NL((pRTC != NULL), XSTDERR);
+    return pRTC->nVideoTrackID;
 }
 
 static int DirectGate_WebRTC_GetPipe(const directgate_webrtc_t *pRTC)
@@ -115,6 +132,155 @@ static char *DirectGate_JSON_Escape(const char *pSrc)
 
     pDst[j] = '\0';
     return pDst;
+}
+
+static uint32_t DirectGate_WebRTC_RandomU32(uint32_t nFallback)
+{
+    uint32_t nValue = 0;
+    if (RAND_bytes((uint8_t*)&nValue, sizeof(nValue)) != 1 || nValue == 0)
+        nValue = nFallback ? nFallback : (uint32_t)time(NULL);
+
+    return nValue;
+}
+
+static void DirectGate_WebRTC_CopySdpLine(char *pDst, size_t nDstSize,
+                                      const char *pLine, size_t nLineLen)
+{
+    XCHECK_VOID_NL((pDst != NULL && nDstSize > 0));
+    if (pLine == NULL)
+    {
+        pDst[0] = '\0';
+        return;
+    }
+
+    if (nLineLen >= nDstSize)
+        nLineLen = nDstSize - 1U;
+
+    memcpy(pDst, pLine, nLineLen);
+    pDst[nLineLen] = '\0';
+}
+
+static xbool_t DirectGate_WebRTC_ParseRemoteH264(const char *pSdp,
+                                             uint8_t *pPayloadType,
+                                             char *pMid,
+                                             size_t nMidSize,
+                                             char *pProfile,
+                                             size_t nProfileSize)
+{
+    XCHECK_NL(xstrused(pSdp), XFALSE);
+    XCHECK_NL((pPayloadType != NULL), XFALSE);
+    XCHECK_NL((pMid != NULL && nMidSize > 0), XFALSE);
+    XCHECK_NL((pProfile != NULL && nProfileSize > 0), XFALSE);
+
+    xbool_t bInVideo = XFALSE;
+    xbool_t bFound = XFALSE;
+    uint32_t nPayload = 0;
+    pMid[0] = '\0';
+    pProfile[0] = '\0';
+
+    const char *p = pSdp;
+    while (*p)
+    {
+        const char *pLine = p;
+        while (*p && *p != '\r' && *p != '\n') p++;
+        size_t nLineLen = (size_t)(p - pLine);
+        while (*p == '\r' || *p == '\n') p++;
+
+        if (nLineLen >= 2 && !strncmp(pLine, "m=", 2))
+        {
+            bInVideo = (nLineLen >= 8 && !strncmp(pLine, "m=video", 7)) ? XTRUE : XFALSE;
+            continue;
+        }
+
+        if (!bInVideo) continue;
+
+        if (nLineLen > 6 && !strncmp(pLine, "a=mid:", 6))
+        {
+            DirectGate_WebRTC_CopySdpLine(pMid, nMidSize, pLine + 6, nLineLen - 6);
+            continue;
+        }
+
+        if (!bFound && nLineLen > 9 && !strncmp(pLine, "a=rtpmap:", 9))
+        {
+            const char *pCodec = memchr(pLine, ' ', nLineLen);
+            if (pCodec == NULL) continue;
+
+            size_t nCodecLen = nLineLen - (size_t)(pCodec - pLine) - 1U;
+            if (nCodecLen >= 10 && !strncasecmp(pCodec + 1, "H264/90000", 10))
+            {
+                nPayload = (uint32_t)atoi(pLine + 9);
+                if (nPayload > 0 && nPayload <= 127U)
+                    bFound = XTRUE;
+            }
+
+            continue;
+        }
+
+        if (bFound && nLineLen > 7 && !strncmp(pLine, "a=fmtp:", 7))
+        {
+            uint32_t nFmtpPayload = (uint32_t)atoi(pLine + 7);
+            if (nFmtpPayload != nPayload) continue;
+
+            const char *pSpace = memchr(pLine, ' ', nLineLen);
+            if (pSpace != NULL)
+            {
+                size_t nProfileLen = nLineLen - (size_t)(pSpace - pLine) - 1U;
+                DirectGate_WebRTC_CopySdpLine(pProfile, nProfileSize, pSpace + 1, nProfileLen);
+            }
+        }
+    }
+
+    if (!bFound) return XFALSE;
+    *pPayloadType = (uint8_t)nPayload;
+    if (!xstrused(pMid))
+        xstrncpy(pMid, nMidSize, DIRECTGATE_RTC_DEFAULT_MID);
+
+    return XTRUE;
+}
+
+static const uint8_t *DirectGate_WebRTC_FindStartCode(const uint8_t *pData,
+                                                  const uint8_t *pEnd,
+                                                  size_t *pStartLen)
+{
+    const uint8_t *p = pData;
+    while (p + 3 <= pEnd)
+    {
+        if (p[0] == 0 && p[1] == 0 && p[2] == 1)
+        {
+            if (pStartLen != NULL) *pStartLen = 3U;
+            return p;
+        }
+
+        if (p + 4 <= pEnd && p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1)
+        {
+            if (pStartLen != NULL) *pStartLen = 4U;
+            return p;
+        }
+
+        p++;
+    }
+
+    return NULL;
+}
+
+static void DirectGate_WebRTC_WriteRtpHeader(uint8_t *pPacket,
+                                         const directgate_webrtc_t *pRTC,
+                                         uint16_t nSeq,
+                                         uint32_t nTimestamp,
+                                         xbool_t bMarker)
+{
+    pPacket[0] = 0x80;
+    pPacket[1] = (uint8_t)((bMarker ? 0x80U : 0U) | pRTC->nVideoPayloadType);
+    pPacket[2] = (uint8_t)(nSeq >> 8);
+    pPacket[3] = (uint8_t)(nSeq & 0xFFU);
+    pPacket[4] = (uint8_t)(nTimestamp >> 24);
+    pPacket[5] = (uint8_t)(nTimestamp >> 16);
+    pPacket[6] = (uint8_t)(nTimestamp >> 8);
+    pPacket[7] = (uint8_t)(nTimestamp & 0xFFU);
+    pPacket[8] = (uint8_t)(pRTC->nVideoSsrc >> 24);
+    pPacket[9] = (uint8_t)(pRTC->nVideoSsrc >> 16);
+    pPacket[10] = (uint8_t)(pRTC->nVideoSsrc >> 8);
+    pPacket[11] = (uint8_t)(pRTC->nVideoSsrc & 0xFFU);
 }
 
 static int DirectGate_WebRTC_NotifyPipe(directgate_webrtc_t *pRTC)
@@ -212,6 +378,24 @@ static void DirectGate_WebRTC_CloseDataChannel(int nDC)
     DirectGate_WebRTC_DetachDataChannel(nDC);
     rtcClose(nDC);
     rtcDelete(nDC);
+}
+
+static void DirectGate_WebRTC_DetachVideoTrack(int nTrack)
+{
+    if (nTrack < 0) return;
+    rtcSetUserPointer(nTrack, NULL);
+    rtcSetOpenCallback(nTrack, NULL);
+    rtcSetClosedCallback(nTrack, NULL);
+    rtcSetErrorCallback(nTrack, NULL);
+    rtcSetMessageCallback(nTrack, NULL);
+}
+
+static void DirectGate_WebRTC_CloseVideoTrack(int nTrack)
+{
+    if (nTrack < 0) return;
+    DirectGate_WebRTC_DetachVideoTrack(nTrack);
+    rtcClose(nTrack);
+    rtcDeleteTrack(nTrack);
 }
 
 static void DirectGate_WebRTC_DrainQueue(directgate_webrtc_t *pRTC)
@@ -332,8 +516,19 @@ void DirectGate_WebRTC_Init(directgate_webrtc_t *pRTC)
     pRTC->logLevel = RTC_LOG_ERROR;
     pRTC->nPeerConnectionID = -1;
     pRTC->nDataChannelID = -1;
+    pRTC->nVideoTrackID = -1;
     pRTC->nIceSrvCount = 0;
     pRTC->bConnected = XFALSE;
+    pRTC->bVideoEnabled = XFALSE;
+    pRTC->bVideoTrackOpen = XFALSE;
+    pRTC->bVideoKeyframeRequested = XFALSE;
+    pRTC->nVideoPayloadType = DIRECTGATE_RTC_H264_PAYLOAD_TYPE;
+    pRTC->nVideoSeq = (uint16_t)(DirectGate_WebRTC_RandomU32(1U) & 0xFFFFU);
+    pRTC->nVideoSsrc = DirectGate_WebRTC_RandomU32(0x58485348U);
+    pRTC->nVideoTimestamp = DirectGate_WebRTC_RandomU32(0x44534b54U);
+    pRTC->nVideoLastPtsUs = 0;
+    pRTC->bVideoHasTimestamp = XFALSE;
+    pRTC->sVideoMid[0] = '\0';
 
     pRTC->pQueueHead = NULL;
     pRTC->pQueueTail = NULL;
@@ -452,6 +647,12 @@ void DirectGate_WebRTC_Destroy(directgate_webrtc_t *pRTC)
         pRTC->nDataChannelID = -1;
     }
 
+    if (pRTC->nVideoTrackID >= 0)
+    {
+        DirectGate_WebRTC_CloseVideoTrack(pRTC->nVideoTrackID);
+        pRTC->nVideoTrackID = -1;
+    }
+
     if (pRTC->nPeerConnectionID >= 0)
     {
         rtcClosePeerConnection(pRTC->nPeerConnectionID);
@@ -460,6 +661,10 @@ void DirectGate_WebRTC_Destroy(directgate_webrtc_t *pRTC)
     }
 
     pRTC->bConnected = XFALSE;
+    pRTC->bVideoTrackOpen = XFALSE;
+    pRTC->bVideoKeyframeRequested = XFALSE;
+    pRTC->bVideoHasTimestamp = XFALSE;
+    pRTC->sVideoMid[0] = '\0';
     DirectGate_WebRTC_DrainQueue(pRTC);
     DirectGate_WebRTC_ClearPendingIce(pRTC);
 }
@@ -750,6 +955,167 @@ static void DirectGate_WebRTC_OnDataChannel(int nPC, int nDC, void *pPtr)
     rtcSetMessageCallback(nDC, DirectGate_WebRTC_OnDataChannelMessage);
 }
 
+static xbool_t DirectGate_WebRTC_IsRtcpKeyframeRequest(const char *pMessage, int nSize)
+{
+    XCHECK_NL((pMessage != NULL && nSize >= 12), XFALSE);
+    const uint8_t *p = (const uint8_t*)pMessage;
+    uint8_t nFmt = p[0] & 0x1FU;
+    uint8_t nType = p[1];
+
+    /* PLI: PT=PSFB(206), FMT=1. FIR: PT=PSFB(206), FMT=4.
+     * Some legacy stacks still emit FIR as PT=192. */
+    if (nType == 206 && (nFmt == 1 || nFmt == 4)) return XTRUE;
+    if (nType == 192) return XTRUE;
+    return XFALSE;
+}
+
+static void DirectGate_WebRTC_OnVideoTrackOpen(int nTrack, void *pPtr)
+{
+    directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
+    XCHECK_VOID((pRTC != NULL));
+
+    if (pRTC->nVideoTrackID != nTrack)
+    {
+        xlogd("Ignoring stale WebRTC video track open: pc(%d), track(%d), current(%d)",
+            DirectGate_WebRTC_GetPC(pRTC), nTrack, DirectGate_WebRTC_GetVideoTrack(pRTC));
+
+        return;
+    }
+
+    xlogn("WebRTC video track opened: pc(%d), track(%d), pt(%u), ssrc(%u), mid(%s)",
+        DirectGate_WebRTC_GetPC(pRTC), nTrack, pRTC->nVideoPayloadType,
+        pRTC->nVideoSsrc, pRTC->sVideoMid);
+
+    DirectGate_WebRTC_Enqueue(pRTC, DIRECTGATE_WEBRTC_VIDEO_OPEN, nTrack, NULL, 0);
+}
+
+static void DirectGate_WebRTC_OnVideoTrackClosed(int nTrack, void *pPtr)
+{
+    directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
+    XCHECK_VOID((pRTC != NULL));
+
+    if (pRTC->nVideoTrackID != nTrack)
+    {
+        xlogd("Ignoring stale WebRTC video track close: pc(%d), track(%d), current(%d)",
+            DirectGate_WebRTC_GetPC(pRTC), nTrack, DirectGate_WebRTC_GetVideoTrack(pRTC));
+
+        return;
+    }
+
+    xlogn("WebRTC video track closed: pc(%d), track(%d)",
+        DirectGate_WebRTC_GetPC(pRTC), nTrack);
+
+    DirectGate_WebRTC_Enqueue(pRTC, DIRECTGATE_WEBRTC_VIDEO_CLOSED, nTrack, NULL, 0);
+}
+
+static void DirectGate_WebRTC_OnVideoTrackError(int nTrack, const char *pError, void *pPtr)
+{
+    directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
+    XCHECK_VOID((pRTC != NULL));
+
+    if (pRTC->nVideoTrackID != nTrack)
+    {
+        xlogd("Ignoring stale WebRTC video track error: pc(%d), track(%d), current(%d), error(%s)",
+            DirectGate_WebRTC_GetPC(pRTC), nTrack, DirectGate_WebRTC_GetVideoTrack(pRTC),
+            pError ? pError : "unknown");
+
+        return;
+    }
+
+    xloge("WebRTC video track error: pc(%d), track(%d), error(%s)",
+        DirectGate_WebRTC_GetPC(pRTC), nTrack, pError ? pError : "unknown");
+}
+
+static void DirectGate_WebRTC_OnVideoTrackMessage(int nTrack, const char *pMessage, int nSize, void *pPtr)
+{
+    directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
+    XCHECK_VOID((pRTC != NULL));
+    XCHECK_VOID((pMessage != NULL));
+    XCHECK_VOID((nSize > 0));
+
+    if (pRTC->nVideoTrackID != nTrack)
+    {
+        xlogd("Ignoring stale WebRTC video track message: pc(%d), track(%d), current(%d), bytes(%d)",
+            DirectGate_WebRTC_GetPC(pRTC), nTrack, DirectGate_WebRTC_GetVideoTrack(pRTC), nSize);
+
+        return;
+    }
+
+    if (DirectGate_WebRTC_IsRtcpKeyframeRequest(pMessage, nSize))
+    {
+        xlogd("Received RTCP keyframe request: pc(%d), track(%d), bytes(%d)",
+            DirectGate_WebRTC_GetPC(pRTC), nTrack, nSize);
+
+        DirectGate_WebRTC_Enqueue(pRTC, DIRECTGATE_WEBRTC_VIDEO_KEYFRAME, nTrack, NULL, 0);
+    }
+}
+
+static XSTATUS DirectGate_WebRTC_AddDesktopVideoTrack(directgate_webrtc_t *pRTC, const char *pRemoteSdp)
+{
+    XCHECK((pRTC != NULL), XSTDERR);
+    XCHECK((pRTC->nPeerConnectionID >= 0), XSTDERR);
+    XCHECK_NL(pRTC->bVideoEnabled, XSTDERR);
+
+    uint8_t nPayloadType = DIRECTGATE_RTC_H264_PAYLOAD_TYPE;
+    char sMid[DIRECTGATE_RTC_VIDEO_MID_SIZE];
+    char sProfile[256];
+    memset(sMid, 0, sizeof(sMid));
+    memset(sProfile, 0, sizeof(sProfile));
+
+    if (!DirectGate_WebRTC_ParseRemoteH264(pRemoteSdp, &nPayloadType,
+        sMid, sizeof(sMid), sProfile, sizeof(sProfile)))
+    {
+        xlogw("Remote WebRTC offer does not advertise H.264 video; media track disabled: pc(%d), dc(%d)",
+            DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC));
+
+        return XSTDERR;
+    }
+
+    rtcTrackInit init;
+    memset(&init, 0, sizeof(init));
+    init.direction = RTC_DIRECTION_SENDONLY;
+    init.codec = RTC_CODEC_H264;
+    init.payloadType = nPayloadType;
+    init.ssrc = DirectGate_WebRTC_RandomU32(0x58485348U);
+    init.mid = sMid;
+    init.name = "desktop";
+    init.msid = "directgate-desktop";
+    init.trackId = "desktop-video";
+    init.profile = xstrused(sProfile) ? sProfile : NULL;
+
+    int nTrack = rtcAddTrackEx(pRTC->nPeerConnectionID, &init);
+    if (nTrack < 0)
+    {
+        xlogw("Failed to add WebRTC H.264 video track: pc(%d), dc(%d), ret(%d)",
+            DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC), nTrack);
+
+        return XSTDERR;
+    }
+
+    pRTC->nVideoTrackID = nTrack;
+    pRTC->bVideoTrackOpen = XFALSE;
+    pRTC->bVideoKeyframeRequested = XFALSE;
+    pRTC->nVideoPayloadType = nPayloadType;
+    pRTC->nVideoSsrc = init.ssrc;
+    pRTC->nVideoSeq = (uint16_t)(DirectGate_WebRTC_RandomU32(1U) & 0xFFFFU);
+    pRTC->nVideoTimestamp = DirectGate_WebRTC_RandomU32(0x44534b54U);
+    pRTC->nVideoLastPtsUs = 0;
+    pRTC->bVideoHasTimestamp = XFALSE;
+    xstrncpy(pRTC->sVideoMid, sizeof(pRTC->sVideoMid), sMid);
+
+    rtcSetUserPointer(nTrack, pRTC);
+    rtcSetOpenCallback(nTrack, DirectGate_WebRTC_OnVideoTrackOpen);
+    rtcSetClosedCallback(nTrack, DirectGate_WebRTC_OnVideoTrackClosed);
+    rtcSetErrorCallback(nTrack, DirectGate_WebRTC_OnVideoTrackError);
+    rtcSetMessageCallback(nTrack, DirectGate_WebRTC_OnVideoTrackMessage);
+
+    xlogi("Added WebRTC H.264 video track: pc(%d), track(%d), pt(%u), ssrc(%u), mid(%s)",
+        DirectGate_WebRTC_GetPC(pRTC), nTrack, pRTC->nVideoPayloadType,
+        pRTC->nVideoSsrc, pRTC->sVideoMid);
+
+    return XSTDOK;
+}
+
 XSTATUS DirectGate_WebRTC_CreateOffer(directgate_webrtc_t *pRTC)
 {
     XCHECK((pRTC != NULL), XSTDERR);
@@ -913,7 +1279,10 @@ XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSd
         return XSTDERR;
     }
 
-    /* Set the remote description (offer from client) - this triggers answer generation */
+    if (pRTC->bVideoEnabled)
+        (void)DirectGate_WebRTC_AddDesktopVideoTrack(pRTC, pUnescaped);
+
+    /* Set the remote description (offer from client) — this triggers answer generation */
     int nRet = rtcSetRemoteDescription(pRTC->nPeerConnectionID, pUnescaped, "offer");
     free(pUnescaped);
 
@@ -987,6 +1356,175 @@ int DirectGate_WebRTC_GetBufferedAmount(const directgate_webrtc_t *pRTC)
     return rtcGetBufferedAmount(pRTC->nDataChannelID);
 }
 
+void DirectGate_WebRTC_SetVideoEnabled(directgate_webrtc_t *pRTC, xbool_t bEnabled)
+{
+    XCHECK_VOID_NL((pRTC != NULL));
+    pRTC->bVideoEnabled = bEnabled ? XTRUE : XFALSE;
+}
+
+xbool_t DirectGate_WebRTC_HasVideoTrack(const directgate_webrtc_t *pRTC)
+{
+    XCHECK_NL((pRTC != NULL), XFALSE);
+    return pRTC->nVideoTrackID >= 0 ? XTRUE : XFALSE;
+}
+
+xbool_t DirectGate_WebRTC_IsVideoOpen(const directgate_webrtc_t *pRTC)
+{
+    XCHECK_NL((pRTC != NULL), XFALSE);
+    if (pRTC->nVideoTrackID < 0) return XFALSE;
+    if (pRTC->bVideoTrackOpen) return XTRUE;
+    return rtcIsOpen(pRTC->nVideoTrackID) ? XTRUE : XFALSE;
+}
+
+xbool_t DirectGate_WebRTC_TakeVideoKeyframeRequest(directgate_webrtc_t *pRTC)
+{
+    XCHECK_NL((pRTC != NULL), XFALSE);
+    if (!pRTC->bVideoKeyframeRequested) return XFALSE;
+    pRTC->bVideoKeyframeRequested = XFALSE;
+    return XTRUE;
+}
+
+static uint32_t DirectGate_WebRTC_NextVideoTimestamp(directgate_webrtc_t *pRTC, uint64_t nPtsUs)
+{
+    XCHECK((pRTC != NULL), 0);
+
+    if (!pRTC->bVideoHasTimestamp)
+    {
+        pRTC->bVideoHasTimestamp = XTRUE;
+        pRTC->nVideoLastPtsUs = nPtsUs;
+        return pRTC->nVideoTimestamp;
+    }
+
+    uint32_t nDelta = DIRECTGATE_RTC_VIDEO_CLOCK_RATE / 30U;
+    if (nPtsUs > pRTC->nVideoLastPtsUs)
+    {
+        uint64_t nPtsDelta = nPtsUs - pRTC->nVideoLastPtsUs;
+        uint64_t nRtpDelta = (nPtsDelta * DIRECTGATE_RTC_VIDEO_CLOCK_RATE) / 1000000ULL;
+        if (nRtpDelta > 0 && nRtpDelta < UINT32_MAX)
+            nDelta = (uint32_t)nRtpDelta;
+    }
+
+    pRTC->nVideoTimestamp += nDelta;
+    pRTC->nVideoLastPtsUs = nPtsUs;
+    return pRTC->nVideoTimestamp;
+}
+
+static XSTATUS DirectGate_WebRTC_SendRtpPacket(directgate_webrtc_t *pRTC,
+                                           const uint8_t *pPayload,
+                                           size_t nPayloadLen,
+                                           uint32_t nTimestamp,
+                                           xbool_t bMarker)
+{
+    XCHECK((pRTC != NULL), XSTDERR);
+    XCHECK((pPayload != NULL && nPayloadLen > 0), XSTDERR);
+    XCHECK((nPayloadLen <= DIRECTGATE_RTC_RTP_MAX_PAYLOAD), XSTDERR);
+    XCHECK_NL((pRTC->nVideoTrackID >= 0), XSTDERR);
+    XCHECK_NL(DirectGate_WebRTC_IsVideoOpen(pRTC), XSTDERR);
+
+    uint8_t packet[DIRECTGATE_RTC_RTP_HEADER_BYTES + DIRECTGATE_RTC_RTP_MAX_PAYLOAD];
+    uint16_t nSeq = pRTC->nVideoSeq++;
+    DirectGate_WebRTC_WriteRtpHeader(packet, pRTC, nSeq, nTimestamp, bMarker);
+    memcpy(packet + DIRECTGATE_RTC_RTP_HEADER_BYTES, pPayload, nPayloadLen);
+
+    int nRet = rtcSendMessage(pRTC->nVideoTrackID, (const char*)packet,
+        (int)(DIRECTGATE_RTC_RTP_HEADER_BYTES + nPayloadLen));
+
+    return (nRet >= 0) ? XSTDOK : XSTDERR;
+}
+
+static XSTATUS DirectGate_WebRTC_SendH264Nal(directgate_webrtc_t *pRTC,
+                                         const uint8_t *pNal,
+                                         size_t nNalLen,
+                                         uint32_t nTimestamp,
+                                         xbool_t bMarker)
+{
+    XCHECK((pRTC != NULL), XSTDERR);
+    XCHECK((pNal != NULL && nNalLen > 0), XSTDERR);
+
+    if (nNalLen <= DIRECTGATE_RTC_RTP_MAX_PAYLOAD)
+        return DirectGate_WebRTC_SendRtpPacket(pRTC, pNal, nNalLen, nTimestamp, bMarker);
+
+    uint8_t nHeader = pNal[0];
+    uint8_t nFuIndicator = (uint8_t)((nHeader & 0xE0U) | DIRECTGATE_RTC_H264_FU_A);
+    uint8_t nNalType = (uint8_t)(nHeader & 0x1FU);
+    const uint8_t *pBody = pNal + 1;
+    size_t nBodyLen = nNalLen - 1U;
+    size_t nOffset = 0;
+    size_t nMaxFragment = DIRECTGATE_RTC_RTP_MAX_PAYLOAD - 2U;
+
+    while (nOffset < nBodyLen)
+    {
+        size_t nFragment = nBodyLen - nOffset;
+        if (nFragment > nMaxFragment)
+            nFragment = nMaxFragment;
+
+        xbool_t bStart = (nOffset == 0) ? XTRUE : XFALSE;
+        xbool_t bEnd = (nOffset + nFragment >= nBodyLen) ? XTRUE : XFALSE;
+        uint8_t payload[DIRECTGATE_RTC_RTP_MAX_PAYLOAD];
+        payload[0] = nFuIndicator;
+        payload[1] = (uint8_t)((bStart ? DIRECTGATE_RTC_H264_START : 0U) |
+            (bEnd ? DIRECTGATE_RTC_H264_END : 0U) | nNalType);
+        memcpy(payload + 2, pBody + nOffset, nFragment);
+
+        if (DirectGate_WebRTC_SendRtpPacket(pRTC, payload, nFragment + 2U,
+            nTimestamp, (bMarker && bEnd) ? XTRUE : XFALSE) < 0)
+        {
+            return XSTDERR;
+        }
+
+        nOffset += nFragment;
+    }
+
+    return XSTDOK;
+}
+
+XSTATUS DirectGate_WebRTC_SendH264AnnexB(directgate_webrtc_t *pRTC,
+                                     const uint8_t *pData,
+                                     size_t nLen,
+                                     uint64_t nPtsUs)
+{
+    XCHECK((pRTC != NULL), XSTDERR);
+    XCHECK((pData != NULL && nLen > 0), XSTDERR);
+    XCHECK_NL((pRTC->nVideoTrackID >= 0), XSTDERR);
+    XCHECK_NL(DirectGate_WebRTC_IsVideoOpen(pRTC), XSTDERR);
+
+    const uint8_t *pEnd = pData + nLen;
+    const uint8_t *pStart = DirectGate_WebRTC_FindStartCode(pData, pEnd, NULL);
+    uint32_t nTimestamp = DirectGate_WebRTC_NextVideoTimestamp(pRTC, nPtsUs);
+
+    if (pStart == NULL)
+        return DirectGate_WebRTC_SendH264Nal(pRTC, pData, nLen, nTimestamp, XTRUE);
+
+    const uint8_t *pCursor = pStart;
+    while (pCursor != NULL && pCursor < pEnd)
+    {
+        size_t nCurrentStartLen = 0;
+        const uint8_t *pNalStart = DirectGate_WebRTC_FindStartCode(pCursor, pEnd, &nCurrentStartLen);
+        if (pNalStart == NULL) break;
+
+        const uint8_t *pNal = pNalStart + nCurrentStartLen;
+        const uint8_t *pNext = DirectGate_WebRTC_FindStartCode(pNal, pEnd, NULL);
+        const uint8_t *pNalEnd = pNext != NULL ? pNext : pEnd;
+
+        while (pNalEnd > pNal && pNalEnd[-1] == 0)
+            pNalEnd--;
+
+        if (pNalEnd > pNal)
+        {
+            xbool_t bMarker = (pNext == NULL) ? XTRUE : XFALSE;
+            if (DirectGate_WebRTC_SendH264Nal(pRTC, pNal, (size_t)(pNalEnd - pNal),
+                nTimestamp, bMarker) < 0)
+            {
+                return XSTDERR;
+            }
+        }
+
+        pCursor = pNext;
+    }
+
+    return XSTDOK;
+}
+
 static void DirectGate_WebRTC_DispatchDataCb(directgate_webrtc_t *pRTC, directgate_webrtc_event_t *pEvt)
 {
     XCHECK_VOID((pRTC != NULL));
@@ -1027,16 +1565,23 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
         directgate_webrtc_event_t *pEvt = pHead;
         pHead = pHead->pNext;
 
-        if (pEvt->nSourceID >= 0 &&
-            pEvt->eType != DIRECTGATE_WEBRTC_SIGNAL &&
-            pEvt->nSourceID != pRTC->nDataChannelID)
+        if (pEvt->nSourceID >= 0 && pEvt->eType != DIRECTGATE_WEBRTC_SIGNAL)
         {
-            xlogd("Dropping stale WebRTC queue event: pc(%d), dc(%d), current(%d), type(%d)",
-                DirectGate_WebRTC_GetPC(pRTC), pEvt->nSourceID, DirectGate_WebRTC_GetDC(pRTC), (int)pEvt->eType);
+            xbool_t bVideoEvent =
+                (pEvt->eType == DIRECTGATE_WEBRTC_VIDEO_OPEN ||
+                 pEvt->eType == DIRECTGATE_WEBRTC_VIDEO_CLOSED ||
+                 pEvt->eType == DIRECTGATE_WEBRTC_VIDEO_KEYFRAME) ? XTRUE : XFALSE;
+            int nCurrent = bVideoEvent ? pRTC->nVideoTrackID : pRTC->nDataChannelID;
 
-            free(pEvt->pData);
-            free(pEvt);
-            continue;
+            if (pEvt->nSourceID != nCurrent)
+            {
+                xlogd("Dropping stale WebRTC queue event: pc(%d), source(%d), current(%d), type(%d)",
+                    DirectGate_WebRTC_GetPC(pRTC), pEvt->nSourceID, nCurrent, (int)pEvt->eType);
+
+                free(pEvt->pData);
+                free(pEvt);
+                continue;
+            }
         }
 
         switch (pEvt->eType)
@@ -1065,6 +1610,28 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
                 break;
             case DIRECTGATE_WEBRTC_SIGNAL:
                 DirectGate_WebRTC_DispatchSignalCb(pRTC, pEvt);
+                break;
+            case DIRECTGATE_WEBRTC_VIDEO_OPEN:
+            {
+                pRTC->bVideoTrackOpen = XTRUE;
+                xlogn("WebRTC media video track is active: pc(%d), track(%d), mid(%s)",
+                    DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetVideoTrack(pRTC), pRTC->sVideoMid);
+
+                break;
+            }
+            case DIRECTGATE_WEBRTC_VIDEO_CLOSED:
+            {
+                pRTC->bVideoTrackOpen = XFALSE;
+                xlogn("WebRTC media video track is inactive: pc(%d), track(%d)",
+                    DirectGate_WebRTC_GetPC(pRTC), pEvt->nSourceID);
+
+                if (pRTC->nVideoTrackID == pEvt->nSourceID)
+                    pRTC->nVideoTrackID = -1;
+
+                break;
+            }
+            case DIRECTGATE_WEBRTC_VIDEO_KEYFRAME:
+                pRTC->bVideoKeyframeRequested = XTRUE;
                 break;
         }
 
