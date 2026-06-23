@@ -60,7 +60,9 @@ directgate_smoke(keyfile_apply_smoke ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c
 directgate_smoke(search_smoke        ${AGENT_DIR}/search.c ${AGENT_DIR}/files.c)
 directgate_smoke(enroll_prompt_smoke ${AGENT_DIR}/enroll.c)
 directgate_smoke(files_smoke         ${AGENT_DIR}/files.c)
-directgate_smoke(session_smoke       ${AGENT_DIR}/session.c)
+directgate_smoke(session_smoke       ${AGENT_DIR}/session.c
+                                     ${AGENT_DIR}/desktop.c ${DESKTOP_BACKEND_SRC})
+target_link_libraries(session_smoke PRIVATE ${DESKTOP_BACKEND_LIBS})
 
 # Client utility tests that compile the client-only implementation files.
 directgate_smoke(client_devices_smoke ${CLIENT_DIR}/devices.c)
@@ -69,12 +71,14 @@ directgate_smoke(client_relay_smoke   ${CLIENT_DIR}/relay.c)
 
 directgate_smoke(connection_lifecycle_smoke
     ${AGENT_DIR}/config.c
+    ${AGENT_DIR}/desktop.c ${DESKTOP_BACKEND_SRC}
     ${AGENT_DIR}/enroll.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
     ${AGENT_DIR}/term.c
     ${AGENT_DIR}/directgate.c)
+target_link_libraries(connection_lifecycle_smoke PRIVATE ${DESKTOP_BACKEND_LIBS})
 target_compile_definitions(connection_lifecycle_smoke PRIVATE DIRECTGATE_TESTING)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(connection_lifecycle_smoke PRIVATE -Wno-unused-function)

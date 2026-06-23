@@ -28,6 +28,7 @@
 #include "common.h"
 #include "protocol.h"
 #include "transfer.h"
+#include "desktop.h"
 #include "websock.h"
 #include "webrtc.h"
 #include "enroll.h"
@@ -1174,6 +1175,27 @@ static int DirectGate_HandleData(xapi_session_t *pApiSession, directgate_pkg_t *
     return XAPI_CONTINUE;
 }
 
+static int DirectGate_HandleDesktop(xapi_session_t *pApiSession, directgate_pkg_t *pPkg)
+{
+    directgate_conn_t *pConn = (directgate_conn_t*)pApiSession->pSessionData;
+    XCHECK((pConn != NULL), xthrowr(XAPI_DISCONNECT, "Invalid connection"));
+
+    directgate_session_t *pSession = DirectGate_SessionMgr_Find(&pConn->mgr, pPkg->header.nSessionId);
+    XCHECK_NL((pSession != NULL), XAPI_CONTINUE);
+
+    if (!pSession->bAuthenticated)
+    {
+        xlogw("Desktop message rejected, session is not authenticated: id(%u), fd(%d), sid(%u)",
+            DirectGate_Conn_GetID(pConn, pApiSession),
+            DirectGate_Conn_GetFD(pConn, pApiSession),
+            pPkg->header.nSessionId);
+
+        return XAPI_CONTINUE;
+    }
+
+    return DirectGate_Desktop_HandleMessage(pSession, pPkg);
+}
+
 static int DirectGate_HandleStatus(xapi_session_t *pApiSession, directgate_pkg_t *pPkg)
 {
     const directgate_pkg_status_t *pStatusPkg = (const directgate_pkg_status_t*)pPkg->pPackage;
@@ -1822,6 +1844,7 @@ static int DirectGate_DispatchMessage(xapi_session_t *pApiSession, directgate_pk
     if (xstrcmp(pPkg->header.pType, "data")) return DirectGate_HandleData(pApiSession, pPkg);
     if (xstrcmp(pPkg->header.pType, "file")) return DirectGate_Files_HandleFile(pApiSession, pPkg);
     if (xstrcmp(pPkg->header.pType, "manager")) return DirectGate_Files_HandleManager(pApiSession, pPkg);
+    if (xstrcmp(pPkg->header.pType, "desktop")) return DirectGate_HandleDesktop(pApiSession, pPkg);
     if (xstrcmp(pPkg->header.pType, "admin")) return DirectGate_HandleAdmin(pApiSession, pPkg);
     if (xstrcmp(pPkg->header.pType, "keepalive")) return DirectGate_HandleKeepalive(pApiSession, pPkg);
 
@@ -1919,6 +1942,7 @@ static xbool_t DirectGate_RequiresEncryption(directgate_conn_t *pConn, directgat
             xstrcmp(pPkg->header.pType, "data") ||
             xstrcmp(pPkg->header.pType, "file") ||
             xstrcmp(pPkg->header.pType, "manager") ||
+            xstrcmp(pPkg->header.pType, "desktop") ||
             xstrcmp(pPkg->header.pType, "resize") ||
             xstrcmp(pPkg->header.pType, "webrtc") ||
             xstrcmp(pPkg->header.pType, "role") ||

@@ -48,7 +48,8 @@ typedef enum {
     DIRECTGATE_PKG_RESIZE,
     DIRECTGATE_PKG_VERIFY,
     DIRECTGATE_PKG_WEBRTC,
-    DIRECTGATE_PKG_ADMIN
+    DIRECTGATE_PKG_ADMIN,
+    DIRECTGATE_PKG_DESKTOP
 } directgate_pkg_type_t;
 
 typedef struct directgate_pkg_header_ {
@@ -176,6 +177,20 @@ typedef struct directgate_pkg_admin_ {
     const char *pStatus;
     const char *pReason;
 } directgate_pkg_admin_t;
+
+typedef struct directgate_pkg_desktop_ {
+    const char *pAction;
+    const char *pMonitorId;
+    const char *pPreset;
+    const char *pInputType;
+    int32_t nX;
+    int32_t nY;
+    int32_t nButton;
+    int32_t nDeltaX;
+    int32_t nDeltaY;
+    uint32_t nKeyCode;
+    uint32_t nModifiers;
+} directgate_pkg_desktop_t;
 
 typedef struct directgate_pkg_ {
     directgate_pkg_header_t header;

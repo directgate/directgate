@@ -25,12 +25,13 @@
 #include "includes.h"
 #include "protocol.h"
 #include "transfer.h"
+#include "desktop.h"
 #include "config.h"
 #include "webrtc.h"
 #include "term.h"
-#include "search.h"
 #include "e2e.h"
 #include "srp.h"
+#include "search.h"
 #include "keyauth.h"
 
 typedef struct directgate_cfg_ directgate_cfg_t;
@@ -49,6 +50,7 @@ typedef enum directgate_session_mode_ {
     DIRECTGATE_SESSION_MODE_NONE = 0,
     DIRECTGATE_SESSION_MODE_TERMINAL,
     DIRECTGATE_SESSION_MODE_FILE_MANAGER,
+    DIRECTGATE_SESSION_MODE_DESKTOP,
 } directgate_session_mode_t;
 
 typedef struct directgate_session_ {
@@ -63,6 +65,7 @@ typedef struct directgate_session_ {
     directgate_search_t search;
     directgate_webrtc_t webrtc;
     directgate_term_t term;
+    directgate_desktop_t desktop;
     directgate_e2e_t e2e;
     directgate_srp_t srp;
     directgate_keyauth_t keyauth;
@@ -124,6 +127,7 @@ const char* DirectGate_SessionMode_ToString(directgate_session_mode_t eMode);
 int DirectGate_Session_EnsureMode(directgate_session_t *pSession, directgate_session_mode_t eMode, const char *pReason);
 int DirectGate_Session_StartMode(directgate_session_t *pSession, directgate_session_mode_t eMode);
 int DirectGate_Session_StartTerminal(directgate_session_t *pSession);
+int DirectGate_Session_StartDesktop(directgate_session_t *pSession);
 xbool_t DirectGate_Session_ConsumeAuthMessage(directgate_session_t *pSession);
 
 int DirectGate_Session_DeriveE2EFromKey(directgate_session_t *pSession, const char *pDeviceId);

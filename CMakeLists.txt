@@ -233,9 +233,25 @@ else()
     target_link_libraries(xcommon PUBLIC m)
 endif()
 
+# Desktop session preview backend: one platform implementation behind the
+# common desktop.c front end (which calls DirectGate_Desktop_GetPlatformBackend).
+# Shared by the agent binary and the smoke tests that compile session.c /
+# directgate.c, so both link the same way.
+if(WIN32)
+    set(DESKTOP_BACKEND_SRC  ${AGENT_DIR}/desktop_win.c)
+    set(DESKTOP_BACKEND_LIBS user32)
+elseif(APPLE)
+    set(DESKTOP_BACKEND_SRC  ${AGENT_DIR}/desktop_macos.c)
+    set(DESKTOP_BACKEND_LIBS "-framework ApplicationServices" "-framework CoreFoundation")
+else()
+    set(DESKTOP_BACKEND_SRC  ${AGENT_DIR}/desktop_linux.c)
+    set(DESKTOP_BACKEND_LIBS "")
+endif()
+
 # ---- agent binary: directgate --------------------------------------------------
 add_executable(directgate
     ${AGENT_DIR}/config.c
+    ${AGENT_DIR}/desktop.c
     ${AGENT_DIR}/enroll.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
@@ -258,6 +274,10 @@ if(WIN32)
     enable_language(RC)
     target_sources(directgate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/misc/win/directgate.rc")
 endif()
+
+# Platform desktop preview backend (see DESKTOP_BACKEND_* above).
+target_sources(directgate PRIVATE ${DESKTOP_BACKEND_SRC})
+target_link_libraries(directgate PRIVATE ${DESKTOP_BACKEND_LIBS})
 
 if(UTIL_LIBRARY)
     target_link_libraries(directgate PRIVATE ${UTIL_LIBRARY})

@@ -64,6 +64,7 @@ static void DirectGate_Session_Destroy(directgate_session_t *pSession)
     DirectGate_E2E_Clear(&pSession->e2e);
     DirectGate_SRP_Destroy(&pSession->srp);
     DirectGate_KeyAuth_Cleanse(&pSession->keyauth);
+    DirectGate_Desktop_Cleanup(&pSession->desktop);
 
     if (pSession->pPipeSession != NULL)
     {
@@ -216,6 +217,7 @@ directgate_session_t* DirectGate_SessionMgr_Create(directgate_session_mgr_t *pMg
     DirectGate_Search_Init(&pSession->search);
     DirectGate_Transfer_Init(&pSession->transfer);
     DirectGate_KeyAuth_Init(&pSession->keyauth);
+    DirectGate_Desktop_Init(&pSession->desktop);
 
     pSession->term.pE2E = &pSession->e2e;
     pSession->term.nSessionId = nSessionId;
@@ -487,6 +489,9 @@ directgate_session_mode_t DirectGate_SessionMode_FromString(const char *pMode)
     if (xstrused(pMode) && xstrcmp(pMode, "file-manager"))
         return DIRECTGATE_SESSION_MODE_FILE_MANAGER;
 
+    if (xstrused(pMode) && xstrcmp(pMode, "desktop"))
+        return DIRECTGATE_SESSION_MODE_DESKTOP;
+
     return DIRECTGATE_SESSION_MODE_NONE;
 }
 
@@ -494,6 +499,7 @@ const char* DirectGate_SessionMode_ToString(directgate_session_mode_t eMode)
 {
     if (eMode == DIRECTGATE_SESSION_MODE_TERMINAL) return "terminal";
     if (eMode == DIRECTGATE_SESSION_MODE_FILE_MANAGER) return "file-manager";
+    if (eMode == DIRECTGATE_SESSION_MODE_DESKTOP) return "desktop";
     return "none";
 }
 
@@ -720,6 +726,25 @@ int DirectGate_Session_StartTerminal(directgate_session_t *pSession)
     return XAPI_CONTINUE;
 }
 
+int DirectGate_Session_StartDesktop(directgate_session_t *pSession)
+{
+    XCHECK((pSession != NULL), XAPI_DISCONNECT);
+    XCHECK((pSession->pWsSession != NULL), XAPI_DISCONNECT);
+
+    if (DirectGate_Session_AddRTCPipeEndpoint(pSession) < 0)
+        return XAPI_DISCONNECT;
+
+    pSession->eActiveMode = DIRECTGATE_SESSION_MODE_DESKTOP;
+
+    xlogi("Desktop mode activated: sid(%u), wsfd(%d)",
+        pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
+
+    if (DirectGate_Desktop_SendStatus(pSession, "desktop session ready") < 0)
+        return XAPI_DISCONNECT;
+
+    return XAPI_CONTINUE;
+}
+
 int DirectGate_Session_StartMode(directgate_session_t *pSession, directgate_session_mode_t eMode)
 {
     XCHECK((pSession != NULL), XAPI_DISCONNECT);
@@ -752,6 +777,9 @@ int DirectGate_Session_StartMode(directgate_session_t *pSession, directgate_sess
 
         return XAPI_CONTINUE;
     }
+
+    if (eMode == DIRECTGATE_SESSION_MODE_DESKTOP)
+        return DirectGate_Session_StartDesktop(pSession);
 
     return DirectGate_Session_StartTerminal(pSession);
 }
