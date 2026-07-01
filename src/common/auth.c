@@ -104,8 +104,9 @@ xbool_t DirectGate_AuthLoad(directgate_auth_t *pAuth, xjson_obj_t *pRoot)
     const char *pVerifierHex = XJSON_GetString(XJSON_GetObject(pAuthObj, "verifier"));
     if (xstrused(pVerifierHex)) xstrncpy(pAuth->sVerifierHex, sizeof(pAuth->sVerifierHex), pVerifierHex);
 
-    /* Versioning suite will be useful in the future to track changes made to the protocol */
     pAuth->nSuite = XJSON_GetU32(XJSON_GetObject(pAuthObj, "suite"));
+    if (xstrused(pAuth->sVerifierHex) && pAuth->nSuite < DIRECTGATE_SRP_SUITE)
+        pAuth->nSuite = DIRECTGATE_SRP_SUITE;
 
     return XTRUE;
 }

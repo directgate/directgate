@@ -389,7 +389,7 @@ xbool_t DirectGate_KeyAuth_IsClientAuthorized(const uint8_t *pClientPubKey,
             bFound = XTRUE;
 
         OPENSSL_cleanse(decoded, sizeof(decoded));
-        /* Do not short-circuit — scan all entries in roughly constant time. */
+        /* Do not short-circuit - scan all entries in roughly constant time. */
     }
 
     return bFound;

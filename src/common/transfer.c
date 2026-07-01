@@ -367,7 +367,7 @@ XSTATUS DirectGate_Transfer_SendNext(directgate_transfer_t *pFT, directgate_file
 
     if (pFT->nCurrentChunk >= pFT->nTotalChunks)
     {
-        /* All chunks sent — send end message */
+        /* All chunks sent - send end message */
         char sSha256Hex[XSHA256_HEX_LENGTH];
         XSHA256_Final(&pFT->sha256Ctx, pFT->sha256);
         DirectGate_Transfer_SHA256ToHex(pFT->sha256, sSha256Hex, sizeof(sSha256Hex));
@@ -421,7 +421,7 @@ XSTATUS DirectGate_Transfer_SendNext(directgate_transfer_t *pFT, directgate_file
             return XSTDERR;
         }
 
-        /* EOF reached before expected — treat as complete */
+        /* EOF reached before expected - treat as complete */
         pFT->nCurrentChunk = pFT->nTotalChunks;
         return DirectGate_Transfer_SendNext(pFT, sendFn, pCtx);
     }

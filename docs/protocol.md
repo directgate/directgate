@@ -42,7 +42,7 @@ Common fields present in all message headers:
 Type-specific fields:
 
 - `role`: `role` (agent/client), `id` (pairing identifier)
-- `auth`: SRP handshake metadata (`user`, `A`, `B`, `salt`, `M1`, `M2`, `status`, `reason`)
+- `auth`: SRP handshake metadata (`user`, `A`, `B`, `salt`, `nonce`, `suite`, `M1`, `M2`, `status`, `reason`). The `M1`/`M2` transcript binds both `nonce` values, so nonce tampering fails authentication (see [Security](security.md#srp-6a-authentication))
 - `cmd`: `action` (start/stop), `status`, `reason`
 - `resize`: `rows`, `cols`, `width`, `height`
 - `webrtc`: `sdp` (SDP string), `candidate`, `sdpMid`

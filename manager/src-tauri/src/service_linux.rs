@@ -29,7 +29,7 @@
 //! full desktops *and* bare window managers (i3, sway, ...) that do not run a
 //! PolicyKit agent by default:
 //!
-//!   1. `pkexec` — works out of the box on any desktop with a polkit agent.
+//!   1. `pkexec` - works out of the box on any desktop with a polkit agent.
 //!   2. If pkexec has no agent to prompt with, try to launch a known polkit
 //!      authentication agent ourselves, then retry pkexec once.
 //!   3. If still no agent can be found, fall back to graphical `sudo -A` using

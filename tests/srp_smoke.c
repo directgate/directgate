@@ -90,6 +90,21 @@ int main(void)
     CHECK(strlen(agentNonceHex) == DIRECTGATE_SRP_NONCE_SIZE * 2,
         "agent nonce hex length");
 
+    /* Plumb the exchanged nonces into both sides exactly as the live protocol
+       does: the agent stores the client nonce from auth/hello, the client
+       stores the agent nonce from auth/challenge. Suite 2 folds both into M1. */
+    uint8_t clientNonce[DIRECTGATE_SRP_NONCE_SIZE];
+    uint8_t agentNonce[DIRECTGATE_SRP_NONCE_SIZE];
+    size_t nNonceBytes = 0;
+    CHECK(DirectGate_SRP_HexToBytes(clientNonceHex, clientNonce,
+        sizeof(clientNonce), &nNonceBytes) && nNonceBytes == sizeof(clientNonce),
+        "parse client nonce");
+    CHECK(DirectGate_SRP_HexToBytes(agentNonceHex, agentNonce,
+        sizeof(agentNonce), &nNonceBytes) && nNonceBytes == sizeof(agentNonce),
+        "parse agent nonce");
+    memcpy(server.clientNonce, clientNonce, sizeof(clientNonce));
+    memcpy(client.agentNonce, agentNonce, sizeof(agentNonce));
+
     char m1Hex[DIRECTGATE_SRP_KEY_SIZE * 2 + 1];
     char m2Hex[DIRECTGATE_SRP_KEY_SIZE * 2 + 1];
     CHECK(DirectGate_SRP_ClientComputeKey(&client, pDeviceId, pPassword,
@@ -119,6 +134,10 @@ int main(void)
     CHECK(DirectGate_SRP_GenerateChallenge(&tamperServer, tamperBHex,
         sizeof(tamperBHex), tamperNonceHex, sizeof(tamperNonceHex)),
         "tamper server challenge");
+    memcpy(tamperServer.clientNonce, clientNonce, sizeof(clientNonce));
+    CHECK(DirectGate_SRP_HexToBytes(tamperNonceHex, client.agentNonce,
+        sizeof(client.agentNonce), &nNonceBytes) &&
+        nNonceBytes == sizeof(client.agentNonce), "parse tamper agent nonce");
     CHECK(DirectGate_SRP_ClientComputeKey(&client, pDeviceId, pPassword,
         saltHex, tamperBHex, DIRECTGATE_SRP_SUITE, tamperM1Hex, sizeof(tamperM1Hex)),
         "tamper client compute key");
@@ -126,6 +145,37 @@ int main(void)
     CHECK(!DirectGate_SRP_VerifyClientProof(&tamperServer, tamperM1Hex,
         tamperM2Hex, sizeof(tamperM2Hex)), "tampered M1 rejected");
     CHECK(!tamperServer.bAuthenticated, "tamper server remains unauthenticated");
+
+    /* Nonce binding (M-2 fix): if the agent nonce the client folds into M1 does
+       not match the one the agent used (a relay altered it in transit), the
+       proof must be rejected at auth rather than silently deriving mismatched
+       E2E keys. Only the agent nonce is corrupted here, so the failure isolates
+       the nonce-binding property. */
+    directgate_srp_t nonceServer;
+    CHECK(DirectGate_SRP_Init(&nonceServer), "nonce server init");
+    xstrncpy(nonceServer.sDeviceId, sizeof(nonceServer.sDeviceId), pDeviceId);
+    CHECK(DirectGate_SRP_LoadVerifier(&nonceServer, salt, sizeof(salt), verifierHex),
+        "nonce server load verifier");
+    CHECK(DirectGate_SRP_SetClientPublic(&nonceServer, aHex),
+        "nonce server accepts A");
+
+    char nonceBHex[1024];
+    char nonceNonceHex[DIRECTGATE_SRP_NONCE_SIZE * 2 + 1];
+    char nonceM1Hex[DIRECTGATE_SRP_KEY_SIZE * 2 + 1];
+    char nonceM2Hex[DIRECTGATE_SRP_KEY_SIZE * 2 + 1];
+    CHECK(DirectGate_SRP_GenerateChallenge(&nonceServer, nonceBHex,
+        sizeof(nonceBHex), nonceNonceHex, sizeof(nonceNonceHex)),
+        "nonce server challenge");
+    memcpy(nonceServer.clientNonce, clientNonce, sizeof(clientNonce));
+    memcpy(client.agentNonce, nonceServer.nonce, sizeof(client.agentNonce));
+    client.agentNonce[0] ^= 0xff; /* relay flips a byte of the agent nonce */
+    CHECK(DirectGate_SRP_ClientComputeKey(&client, pDeviceId, pPassword,
+        saltHex, nonceBHex, DIRECTGATE_SRP_SUITE, nonceM1Hex, sizeof(nonceM1Hex)),
+        "nonce client compute key");
+    CHECK(!DirectGate_SRP_VerifyClientProof(&nonceServer, nonceM1Hex,
+        nonceM2Hex, sizeof(nonceM2Hex)), "tampered agent nonce rejected");
+    CHECK(!nonceServer.bAuthenticated, "nonce server remains unauthenticated");
+    DirectGate_SRP_Destroy(&nonceServer);
 
     size_t nOutLen = 0;
     CHECK(DirectGate_SRP_HexToBytes("0a0B", parsedSalt, sizeof(parsedSalt), &nOutLen),

@@ -49,7 +49,7 @@
  * no longer healthy (presence has expired or its :alive is gone). */
 #define DIRECTGATE_RECONNECT_REPROBE_AFTER  5U
 
-/* Don't re-probe the API more often than this — a relay that's unreachable
+/* Don't re-probe the API more often than this - a relay that's unreachable
  * to us may briefly reappear in the registry and we don't want to flap. */
 #define DIRECTGATE_RECONNECT_REPROBE_GAP_MS 30000U
 

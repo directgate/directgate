@@ -162,7 +162,7 @@ fn pair_device(
 /// Changes the SRP auth password on an already-paired device by invoking
 /// `directgate -s` (plus `-c <config>` on Windows). The agent prompts for the
 /// new password twice; both prompts are answered with `auth_password`. The
-/// device must already be paired — the agent reads its existing config.
+/// device must already be paired - the agent reads its existing config.
 ///
 /// `async` for the same reason as `pair_device` (blocking child I/O off the
 /// main thread).
@@ -236,7 +236,7 @@ fn run_agent_with_password(
     }
 
     // Drain the PTY output in a separate thread. On Windows, ConPTY does not
-    // signal EOF when the child exits — the read pipe stays open until the
+    // signal EOF when the child exits - the read pipe stays open until the
     // master handle is closed. We therefore wait for the child first, then
     // drop the master to unblock the reader thread.
     let mut reader = pair
@@ -280,8 +280,8 @@ fn run_agent_with_password(
 
 /// Windows variant: drives the agent through plain pipes instead of a ConPTY.
 ///
-/// On Windows the agent reads the password with `fgets(stdin)` — no terminal is
-/// required — so a normal stdin pipe is both sufficient and far more reliable
+/// On Windows the agent reads the password with `fgets(stdin)` - no terminal is
+/// required - so a normal stdin pipe is both sufficient and far more reliable
 /// than a pseudo-console (ConPTY's terminal emulation can hang the read).
 ///
 /// `-c <config>` is prepended so the agent reads/writes the machine-wide config
@@ -529,7 +529,7 @@ fn get_pairing_status() -> Result<String, String> {
 /// (`C:\ProgramData\directgate\agent.json`), matching the service install in
 /// docs/windows.md (`sc.exe create ... -c C:\ProgramData\directgate\agent.json`).
 /// The agent's own default is the per-user `%APPDATA%`, but a service account
-/// cannot read the interactive user's roaming profile — so pairing and the
+/// cannot read the interactive user's roaming profile - so pairing and the
 /// service must agree on the all-users path, not the per-user default.
 #[cfg(windows)]
 fn agent_config_path() -> Option<PathBuf> {
@@ -558,7 +558,7 @@ pub fn run() {
     }
 
     // On some Linux GPU/driver combinations (and many VMs) WebKitGTK's DMABUF
-    // renderer fails to allocate a GBM buffer — the window opens blank/gray and
+    // renderer fails to allocate a GBM buffer - the window opens blank/gray and
     // the log shows "Failed to create GBM buffer ... Invalid argument".
     // Disabling the DMABUF renderer falls back to a path that renders fine.
     // Set it before GTK/WebKit initializes, and only if the user has not

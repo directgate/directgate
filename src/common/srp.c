@@ -228,6 +228,8 @@ static xbool_t DirectGate_SRP_ComputeM1(const directgate_srp_t *pSRP,
     SHA256_Update(&ctx, pSRP->salt, sizeof(pSRP->salt));
     SHA256_Update(&ctx, pAPad, nBytes);
     SHA256_Update(&ctx, pBPad, nBytes);
+    SHA256_Update(&ctx, pSRP->nonce, sizeof(pSRP->nonce));
+    SHA256_Update(&ctx, pSRP->clientNonce, sizeof(pSRP->clientNonce));
     SHA256_Update(&ctx, pSRP->K, sizeof(pSRP->K));
     SHA256_Final(pOut, &ctx);
 
@@ -892,6 +894,8 @@ xbool_t DirectGate_SRP_ClientComputeKey(directgate_srp_client_t *pClient,
         SHA256_Update(&ctx, salt, DIRECTGATE_SRP_SALT_SIZE);
         SHA256_Update(&ctx, aPad, nBytes);
         SHA256_Update(&ctx, bPad, nBytes);
+        SHA256_Update(&ctx, pClient->agentNonce, sizeof(pClient->agentNonce));
+        SHA256_Update(&ctx, pClient->nonce, sizeof(pClient->nonce));
         SHA256_Update(&ctx, pClient->K, sizeof(pClient->K));
         SHA256_Final(pClient->M1, &ctx);
 

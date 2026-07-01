@@ -69,6 +69,7 @@ The agent uses a JSON configuration file. You can point to one with `-c <path>`,
 | `shell.home`                  | string   | Working directory for the shell            |
 | `auth.srp.salt`               | string   | SRP salt in hex (32 bytes / 64 hex chars)  |
 | `auth.srp.verifier`           | string   | SRP verifier in hex                        |
+| `auth.srp.suite`              | number   | SRP credential suite advertised at auth (managed by the agent; older records are upgraded in place on load) |
 | `auth.key.agentIdentity.seed` | string   | Agent Ed25519 identity seed for key auth   |
 | `auth.key.agentIdentity.pub`  | string   | Agent Ed25519 public identity for key auth |
 | `auth.key.authorizedKeys`     | string[] | Authorized client Ed25519 public keys      |

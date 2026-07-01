@@ -795,7 +795,7 @@ XSTATUS DirectGate_WebRTC_CreateOffer(directgate_webrtc_t *pRTC)
     rtcSetGatheringStateChangeCallback(pRTC->nPeerConnectionID, DirectGate_WebRTC_OnGatheringStateChange);
     rtcSetSignalingStateChangeCallback(pRTC->nPeerConnectionID, DirectGate_WebRTC_OnSignalingStateChange);
 
-    /* Create data channel — triggers offer SDP generation */
+    /* Create data channel - triggers offer SDP generation */
     pRTC->nDataChannelID = rtcCreateDataChannel(pRTC->nPeerConnectionID, "directgate");
     if (pRTC->nDataChannelID < 0)
     {
@@ -913,7 +913,7 @@ XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSd
         return XSTDERR;
     }
 
-    /* Set the remote description (offer from client) — this triggers answer generation */
+    /* Set the remote description (offer from client) - this triggers answer generation */
     int nRet = rtcSetRemoteDescription(pRTC->nPeerConnectionID, pUnescaped, "offer");
     free(pUnescaped);
 

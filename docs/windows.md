@@ -124,7 +124,7 @@ Finish setup after installing:
 
 The launcher serves sessions only while `shell.user` is logged on (console/RDP);
 when they are not it waits and starts the agent on the next logon. There is no
-headless mode — that is the deliberate cost of never storing a password.
+headless mode - that is the deliberate cost of never storing a password.
 
 Uninstalling stops and removes the service, deletes the files, and removes the
 `PATH` entry.

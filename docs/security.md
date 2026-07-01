@@ -40,12 +40,14 @@ This ensures:
 Authentication uses SRP-6a (Secure Remote Password). No password is ever transmitted in any form:
 
 1. Client sends SRP public value `A` and client `nonce` (`auth/hello`)
-2. Agent responds with `salt`, `B`, and agent `nonce` (`auth/challenge`)
+2. Agent responds with `salt`, `B`, agent `nonce`, and credential `suite` (`auth/challenge`)
 3. Client sends SRP proof `M1` (`auth/proof`)
 4. Agent verifies `M1`, replies with `M2` (`auth/result`)
 5. Client verifies `M2` before enabling encryption
 6. Both sides derive E2E keys from the SRP session key `K` via HKDF-SHA256
 7. On success: agent starts the PTY, client enables encrypted terminal I/O
+
+The credential `suite` (advertised in `auth/challenge`) pins both the `x` derivation and the proof transcript. Under the current suite (`1`), the agent and client nonces are folded into the `M1`/`M2` transcript in addition to seeding the E2E HKDF salt. Because the nonces are now covered by the mutually verified proof, a relay that tampers with either nonce in transit is rejected at authentication - it can no longer silently force the two sides to derive mismatched keys. The agent, the native client, and the browser client all require this exact suite; there is no legacy fallback, so a device enrolled under an earlier scheme must re-run SRP password setup to regenerate its credential.
 
 After step 6, the client initiates WebRTC P2P negotiation in parallel with the active terminal session. The P2P link uses DTLS-secured WebRTC data channels for transport, and the payload is additionally protected by AES-256-SIV using keys derived from the SRP session key.
 

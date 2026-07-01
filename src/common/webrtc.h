@@ -109,10 +109,10 @@ void DirectGate_WebRTC_SetIceServers(directgate_webrtc_t *pRTC, const directgate
 /* Create peer connection and data channel, generate SDP offer (client/offerer side) */
 XSTATUS DirectGate_WebRTC_CreateOffer(directgate_webrtc_t *pRTC);
 
-/* Handle incoming SDP answer from agent — completes the offer/answer exchange */
+/* Handle incoming SDP answer from agent - completes the offer/answer exchange */
 XSTATUS DirectGate_WebRTC_HandleAnswer(directgate_webrtc_t *pRTC, const char *pSdp);
 
-/* Handle incoming SDP offer from client — creates peer connection and answer */
+/* Handle incoming SDP offer from client - creates peer connection and answer */
 XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSdp);
 
 /* Handle incoming ICE candidate from remote peer */
