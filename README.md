@@ -160,6 +160,7 @@ sudo dnf install directgate
 
 ```bash
 brew tap directgate/directgate
+brew trust directgate/directgate
 brew install directgate
 ```
 
