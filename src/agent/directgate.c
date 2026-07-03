@@ -1197,6 +1197,17 @@ static int DirectGate_HandleData(xapi_session_t *pApiSession, directgate_pkg_t *
             pDataPkg->pPayload, pDataPkg->nPayloadLength);
     }
 
+    if (pDataPkg->pPayloadType != NULL &&
+        !strncmp(pDataPkg->pPayloadType, "desktop-", 8))
+    {
+        const char *pReason = DirectGate_Desktop_GetReason(&pSession->desktop);
+        xlogw("Desktop data on a session without desktop mode: sid(%u), type(%s), reason(%s)",
+            pSession->nSessionId, pDataPkg->pPayloadType, pReason);
+
+        DirectGate_Session_SendErrorMsg(pSession, pReason);
+        return XAPI_CONTINUE;
+    }
+
     if (DirectGate_Session_EnsureMode(pSession, DIRECTGATE_SESSION_MODE_TERMINAL,
         "terminal session not started") != XSTDOK) return XAPI_CONTINUE;
 

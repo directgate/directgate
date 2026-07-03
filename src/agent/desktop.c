@@ -740,7 +740,9 @@ static int DirectGate_Desktop_OpenX11(directgate_session_t *pSession)
         }
 
         xstrncpy(pDesktop->sBackend, sizeof(pDesktop->sBackend), "none");
-        DirectGate_Desktop_SetReason(pDesktop, "No X11 display is available for this host process.");
+        DirectGate_Desktop_SetReason(pDesktop,
+            "No display is available on this host. Headless servers without "
+            "a graphical session cannot stream a desktop.");
         return XSTDERR;
     }
 
@@ -1432,8 +1434,8 @@ static int DirectGate_Desktop_OpenMacOS(directgate_session_t *pSession)
         xlogw("macOS desktop capture requires Screen Recording permission for directgate");
         DirectGate_Desktop_SetReason(pDesktop,
             "macOS requires Screen Recording permission for desktop streaming. "
-            "Grant it to the DirectGate host process in System Settings > Privacy & Security > Screen Recording, "
-            "then restart the host.");
+            "Grant it to the DirectGate agent process in System Settings > Privacy & Security > Screen Recording, "
+            "then restart the agent.");
         if (!CGRequestScreenCaptureAccess())
         {
             xlogw("macOS Screen Recording permission was not granted for directgate");
