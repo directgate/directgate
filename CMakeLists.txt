@@ -269,13 +269,26 @@ if(APPLE)
         "-framework ScreenCaptureKit")
 elseif(UNIX)
     # Linux X11 capture + XTest input (XTest is dlopen'd at runtime, hence dl).
+    # The H.264 pipeline lives in desktop_linux.c (XShm capture) with
+    # openh264.c (encoder, dlopen'd at runtime - only the vendored
+    # API headers under src/agent/openh264 are needed at build time) and
+    # yuv.c (BGRA scaling + I420 conversion). XShm needs Xext.
     find_package(X11 REQUIRED)
-    target_include_directories(directgate PRIVATE ${X11_INCLUDE_DIR})
+    target_sources(directgate PRIVATE
+        ${AGENT_DIR}/desktop_linux.c
+        ${AGENT_DIR}/openh264.c
+        ${AGENT_DIR}/yuv.c)
+    target_include_directories(directgate PRIVATE ${X11_INCLUDE_DIR} ${AGENT_DIR}/openh264)
     target_link_libraries(directgate PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
     if(X11_Xrandr_FOUND)
         target_link_libraries(directgate PRIVATE ${X11_Xrandr_LIB})
     else()
         target_link_libraries(directgate PRIVATE Xrandr)
+    endif()
+    if(X11_Xext_FOUND)
+        target_link_libraries(directgate PRIVATE ${X11_Xext_LIB})
+    else()
+        target_link_libraries(directgate PRIVATE Xext)
     endif()
 endif()
 

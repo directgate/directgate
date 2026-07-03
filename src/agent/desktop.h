@@ -119,8 +119,10 @@ typedef struct directgate_desktop_ {
     xbool_t bForceRaw;       /* true when fallback raw RGBA path is forced */
     xbool_t bRequestKeyframe;/* set by preset change / drop recovery */
     xbool_t bWebRTCVideoFailed; /* avoid oscillating after media send failure */
-    /* macOS-only encoder state (opaque to cross-platform code) */
-    void *pMacEncoder;
+    /* Platform encoder state (opaque to cross-platform code): the macOS
+     * ScreenCaptureKit/VideoToolbox encoder or the Linux X11/OpenH264
+     * pipeline, owned by desktop_mac.m / desktop_linux.c respectively. */
+    void *pEncoder;
 #if defined(__APPLE__)
     int nTimerWriteFd;
     xbool_t bTimerThreadRunning;
@@ -156,12 +158,23 @@ int DirectGate_Desktop_SendEncodedFrame(directgate_session_t *pSession,
                                     xbool_t bKeyframe,
                                     uint64_t nPtsUs);
 
-/* Preset helpers (shared by macOS encoder + control message handler). */
+/* Preset helpers (shared by platform encoders + control message handler). */
 void DirectGate_Desktop_ApplyPreset(directgate_desktop_t *pDesktop, directgate_desktop_preset_t ePreset);
 const char* DirectGate_Desktop_PresetName(directgate_desktop_preset_t ePreset);
 const char* DirectGate_Desktop_PipelineName(directgate_desktop_pipeline_t ePipeline);
 
+/* True while the transport (WebRTC data channel) is too backed up to accept
+ * another frame; platform encoders skip the capture entirely in that case. */
+xbool_t DirectGate_Desktop_ShouldSkipForBackpressure(const directgate_session_t *pSession);
+
 #if defined(__APPLE__)
+/* Returns an owned CGImageRef as an opaque pointer. The caller must release it
+ * with CGImageRelease. Keeping the CoreGraphics type out of this header avoids
+ * leaking Apple framework headers into cross-platform translation units. */
+void* DirectGate_Desktop_MacCaptureImage(int32_t nX, int32_t nY,
+                                     uint32_t nWidth, uint32_t nHeight,
+                                     char *pError, size_t nErrorSize);
+
 /* ScreenCaptureKit + VideoToolbox encoder lifecycle. Implemented in
  * desktop_mac.m and only called by desktop.c on Darwin. */
 int DirectGate_Desktop_MacEncoder_Start(directgate_session_t *pSession,
@@ -173,11 +186,34 @@ int DirectGate_Desktop_MacEncoder_UpdateRect(directgate_session_t *pSession,
 void DirectGate_Desktop_MacEncoder_ApplyQuality(directgate_session_t *pSession);
 void DirectGate_Desktop_MacEncoder_RequestKeyframe(directgate_session_t *pSession);
 void DirectGate_Desktop_MacEncoder_Stop(directgate_session_t *pSession);
+void DirectGate_Desktop_MacEncoder_StopDesktop(directgate_desktop_t *pDesktop);
 const char* DirectGate_Desktop_MacEncoder_LastError(const directgate_session_t *pSession);
 
 /* Drains the encoder mailbox on the main loop. Called from
  * DirectGate_Desktop_Process after the timer pipe wakes the loop. */
 int DirectGate_Desktop_MacEncoder_DrainMain(directgate_session_t *pSession);
+#endif
+
+#if defined(__linux__)
+/* X11 (XShm) capture + OpenH264 encoder pipeline. Implemented in
+ * desktop_linux.c and only called by desktop.c on Linux. */
+int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
+                                      int32_t nX, int32_t nY,
+                                      uint32_t nWidth, uint32_t nHeight);
+void DirectGate_Desktop_LinuxEncoder_ApplyQuality(directgate_session_t *pSession);
+void DirectGate_Desktop_LinuxEncoder_RequestKeyframe(directgate_session_t *pSession);
+void DirectGate_Desktop_LinuxEncoder_Stop(directgate_session_t *pSession);
+void DirectGate_Desktop_LinuxEncoder_StopDesktop(directgate_desktop_t *pDesktop);
+const char* DirectGate_Desktop_LinuxEncoder_LastError(const directgate_session_t *pSession);
+
+/* True after too many consecutive capture/encode failures; desktop.c then
+ * demotes the session to the raw RGBA pipeline. */
+xbool_t DirectGate_Desktop_LinuxEncoder_HasFailed(const directgate_session_t *pSession);
+
+/* Captures, encodes and sends one frame. Called from
+ * DirectGate_Desktop_Process on every timer tick while an encoded
+ * pipeline is active. */
+int DirectGate_Desktop_LinuxEncoder_ProcessTick(directgate_session_t *pSession);
 #endif
 
 #ifdef __cplusplus

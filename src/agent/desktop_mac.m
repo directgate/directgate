@@ -24,6 +24,8 @@
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
 
+#include <dlfcn.h>
+
 #if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #define DIRECTGATE_SCK_AVAILABLE 1
@@ -39,14 +41,35 @@
 /* SDK too old to provide ScreenCaptureKit. The encoder API is still
  * compiled as failing stubs so desktop.c falls back to raw RGBA cleanly. */
 
+void* DirectGate_Desktop_MacCaptureImage(int32_t nX, int32_t nY,
+                                     uint32_t nWidth, uint32_t nHeight,
+                                     char *pError, size_t nErrorSize)
+{
+    CGRect rect = CGRectMake((CGFloat)nX, (CGFloat)nY,
+                             (CGFloat)nWidth, (CGFloat)nHeight);
+    CGImageRef image = CGWindowListCreateImage(rect,
+        kCGWindowListOptionOnScreenOnly, kCGNullWindowID,
+        kCGWindowImageBoundsIgnoreFraming);
+    if (image == NULL && pError != NULL && nErrorSize > 0)
+        snprintf(pError, nErrorSize, "CoreGraphics screen capture failed.");
+    return image;
+}
+
 int DirectGate_Desktop_MacEncoder_Start(directgate_session_t *pSession,
                                     int32_t nX, int32_t nY,
                                     uint32_t nWidth, uint32_t nHeight)
 {
-    (void)nX; (void)nY; (void)nWidth; (void)nHeight;
+    (void)nX;
+    (void)nY;
+    (void)nWidth;
+    (void)nHeight;
+
     if (pSession != NULL)
+    {
         xstrncpy(pSession->desktop.sReason, sizeof(pSession->desktop.sReason),
             "ScreenCaptureKit is not available on this SDK; falling back to raw RGBA.");
+    }
+
     return -1;
 }
 
@@ -62,6 +85,7 @@ void DirectGate_Desktop_MacEncoder_ApplyQuality(directgate_session_t *pSession) 
 void DirectGate_Desktop_MacEncoder_RequestKeyframe(directgate_session_t *pSession) { (void)pSession; }
 void DirectGate_Desktop_MacEncoder_Stop(directgate_session_t *pSession) { (void)pSession; }
 void DirectGate_Desktop_MacEncoder_StopDesktop(directgate_desktop_t *pDesktop) { (void)pDesktop; }
+
 const char* DirectGate_Desktop_MacEncoder_LastError(const directgate_session_t *pSession)
 {
     (void)pSession;
@@ -75,6 +99,159 @@ int DirectGate_Desktop_MacEncoder_DrainMain(directgate_session_t *pSession)
 }
 
 #else  /* DIRECTGATE_SCK_AVAILABLE */
+
+typedef CGImageRef (*DirectGateLegacyCaptureFn)(CGRect, CGWindowListOption,
+                                                CGWindowID, CGWindowImageOption);
+
+static CGImageRef DirectGate_Desktop_MacCaptureLegacy(CGRect rect)
+{
+    /* Referencing CGWindowListCreateImage directly is a compile error with the
+     * macOS 15 SDK. Resolve it only for systems older than ScreenCaptureKit's
+     * screenshot API, where the symbol is still supported. */
+    DirectGateLegacyCaptureFn capture = (DirectGateLegacyCaptureFn)dlsym(
+        RTLD_DEFAULT, "CGWindowListCreateImage");
+    return capture ? capture(rect, kCGWindowListOptionOnScreenOnly,
+        kCGNullWindowID, kCGWindowImageBoundsIgnoreFraming) : NULL;
+}
+
+static CGImageRef DirectGate_Desktop_MacWaitForScreenshot(
+    SCContentFilter *filter, SCStreamConfiguration *config,
+    char *pError, size_t nErrorSize) API_AVAILABLE(macos(14.0));
+
+static CGImageRef DirectGate_Desktop_MacWaitForScreenshot(
+    SCContentFilter *filter, SCStreamConfiguration *config,
+    char *pError, size_t nErrorSize)
+{
+    __block CGImageRef result = NULL;
+    __block NSError *captureError = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+    [SCScreenshotManager captureImageWithFilter:filter
+                                   configuration:config
+                               completionHandler:^(CGImageRef image, NSError *error) {
+        if (image != NULL) result = CGImageRetain(image);
+        captureError = error;
+        dispatch_semaphore_signal(sem);
+    }];
+
+    if (dispatch_semaphore_wait(sem,
+        dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC)) != 0)
+    {
+        if (pError != NULL && nErrorSize > 0)
+            snprintf(pError, nErrorSize, "ScreenCaptureKit screenshot timed out (5s).");
+        return NULL;
+    }
+
+    if (result == NULL && pError != NULL && nErrorSize > 0)
+        snprintf(pError, nErrorSize, "ScreenCaptureKit screenshot failed: %s",
+            captureError ? captureError.localizedDescription.UTF8String : "unknown");
+    return result;
+}
+
+void* DirectGate_Desktop_MacCaptureImage(int32_t nX, int32_t nY,
+                                     uint32_t nWidth, uint32_t nHeight,
+                                     char *pError, size_t nErrorSize)
+{
+    if (pError != NULL && nErrorSize > 0) pError[0] = '\0';
+    if (nWidth == 0 || nHeight == 0)
+    {
+        if (pError != NULL && nErrorSize > 0)
+            snprintf(pError, nErrorSize, "Empty macOS capture rectangle.");
+        return NULL;
+    }
+
+    CGRect rect = CGRectMake((CGFloat)nX, (CGFloat)nY,
+                             (CGFloat)nWidth, (CGFloat)nHeight);
+
+    if (@available(macOS 15.2, *))
+    {
+        __block CGImageRef result = NULL;
+        __block NSError *captureError = nil;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+        [SCScreenshotManager captureImageInRect:rect
+                              completionHandler:^(CGImageRef image, NSError *error) {
+            if (image != NULL) result = CGImageRetain(image);
+            captureError = error;
+            dispatch_semaphore_signal(sem);
+        }];
+
+        if (dispatch_semaphore_wait(sem,
+            dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC)) != 0)
+        {
+            if (pError != NULL && nErrorSize > 0)
+                snprintf(pError, nErrorSize, "ScreenCaptureKit screenshot timed out (5s).");
+            return NULL;
+        }
+
+        if (result == NULL && pError != NULL && nErrorSize > 0)
+            snprintf(pError, nErrorSize, "ScreenCaptureKit screenshot failed: %s",
+                captureError ? captureError.localizedDescription.UTF8String : "unknown");
+        return result;
+    }
+
+    if (@available(macOS 14.0, *))
+    {
+        __block SCShareableContent *content = nil;
+        __block NSError *contentError = nil;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [SCShareableContent getShareableContentExcludingDesktopWindows:NO
+                                                  onScreenWindowsOnly:NO
+                                             completionHandler:^(SCShareableContent *c,
+                                                                 NSError *error) {
+            content = c;
+            contentError = error;
+            dispatch_semaphore_signal(sem);
+        }];
+
+        if (dispatch_semaphore_wait(sem,
+            dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC)) != 0)
+        {
+            if (pError != NULL && nErrorSize > 0)
+                snprintf(pError, nErrorSize, "ScreenCaptureKit content query timed out (5s).");
+            return NULL;
+        }
+
+        SCDisplay *target = nil;
+        for (SCDisplay *display in content.displays)
+        {
+            if (CGRectContainsPoint(display.frame, rect.origin) ||
+                CGRectIntersectsRect(display.frame, rect))
+            {
+                target = display;
+                break;
+            }
+        }
+
+        if (contentError != nil || target == nil)
+        {
+            if (pError != NULL && nErrorSize > 0)
+                snprintf(pError, nErrorSize, "ScreenCaptureKit content query failed: %s",
+                    contentError ? contentError.localizedDescription.UTF8String : "no matching display");
+            return NULL;
+        }
+
+        CGRect clipped = CGRectIntersection(rect, target.frame);
+        SCContentFilter *filter = [[SCContentFilter alloc]
+            initWithDisplay:target excludingWindows:@[]];
+        SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
+        config.pixelFormat = kCVPixelFormatType_32BGRA;
+        config.sourceRect = CGRectMake(clipped.origin.x - target.frame.origin.x,
+            clipped.origin.y - target.frame.origin.y,
+            clipped.size.width, clipped.size.height);
+        config.width = (size_t)ceil(clipped.size.width);
+        config.height = (size_t)ceil(clipped.size.height);
+        config.scalesToFit = YES;
+        config.showsCursor = YES;
+        return DirectGate_Desktop_MacWaitForScreenshot(filter, config,
+            pError, nErrorSize);
+    }
+
+    CGImageRef legacy = DirectGate_Desktop_MacCaptureLegacy(rect);
+    if (legacy == NULL && pError != NULL && nErrorSize > 0)
+        snprintf(pError, nErrorSize, "CoreGraphics screen capture failed.");
+    return legacy;
+}
 
 @class DirectGateDesktopEncoder;
 
@@ -510,7 +687,6 @@ API_AVAILABLE(macos(12.3))
     /* Same logic for transport backpressure: skipping the capture leaves
      * the reference chain intact, so do not request a keyframe on the next
      * encode. */
-    extern xbool_t DirectGate_Desktop_ShouldSkipForBackpressure(const directgate_session_t *pSession);
     if (_session && DirectGate_Desktop_ShouldSkipForBackpressure(_session))
         return;
 
@@ -708,7 +884,7 @@ API_AVAILABLE(macos(12.3))
 static DirectGateDesktopEncoder *encoderOf(directgate_session_t *pSession)
 {
     if (!pSession) return nil;
-    return (__bridge DirectGateDesktopEncoder *)pSession->desktop.pMacEncoder;
+    return (__bridge DirectGateDesktopEncoder *)pSession->desktop.pEncoder;
 }
 
 int DirectGate_Desktop_MacEncoder_Start(directgate_session_t *pSession,
@@ -751,7 +927,7 @@ int DirectGate_Desktop_MacEncoder_Start(directgate_session_t *pSession,
             return -1;
         }
 
-        pSession->desktop.pMacEncoder = (__bridge_retained void *)enc;
+        pSession->desktop.pEncoder = (__bridge_retained void *)enc;
         return 0;
     }
     else
@@ -766,7 +942,7 @@ int DirectGate_Desktop_MacEncoder_UpdateRect(directgate_session_t *pSession,
                                         int32_t nX, int32_t nY,
                                         uint32_t nWidth, uint32_t nHeight)
 {
-    if (!pSession || !pSession->desktop.pMacEncoder) return -1;
+    if (!pSession || !pSession->desktop.pEncoder) return -1;
     return DirectGate_Desktop_MacEncoder_Start(pSession, nX, nY, nWidth, nHeight);
 }
 
@@ -776,6 +952,36 @@ void DirectGate_Desktop_MacEncoder_ApplyQuality(directgate_session_t *pSession)
     if (@available(macOS 12.3, *))
     {
         DirectGateDesktopEncoder *enc = encoderOf(pSession);
+        if (!enc) return;
+
+        /* A preset switch can change quality.nMaxEdge, which changes the
+         * encode resolution. VTCompressionSession and SCStream are created
+         * at a fixed size, so recompute the dimensions the same way
+         * startWithDisplay does and rebuild the whole capture+encode chain
+         * when they differ; bitrate/fps/GOP-only updates apply live. */
+        directgate_desktop_t *pDesktop = &pSession->desktop;
+        uint32_t maxEdge = pDesktop->quality.nMaxEdge ? pDesktop->quality.nMaxEdge : 1920U;
+        uint32_t captureWidth = enc.captureWidth;
+        uint32_t captureHeight = enc.captureHeight;
+        int32_t captureX = enc.captureX;
+        int32_t captureY = enc.captureY;
+
+        uint32_t width = DirectGateDesktopEncoder_PickEncodeDim(captureWidth, maxEdge, captureWidth, captureHeight, YES);
+        uint32_t height = DirectGateDesktopEncoder_PickEncodeDim(captureHeight, maxEdge, captureWidth, captureHeight, NO);
+
+        width  &= ~1U;
+        height &= ~1U;
+
+        if (width < 16) width = 16;
+        if (height < 16) height = 16;
+
+        if (width != enc.encodeWidth || height != enc.encodeHeight)
+        {
+            (void)DirectGate_Desktop_MacEncoder_Start(pSession,
+                captureX, captureY, captureWidth, captureHeight);
+            return;
+        }
+
         [enc applyQualityUpdate];
     }
 }
@@ -792,17 +998,17 @@ void DirectGate_Desktop_MacEncoder_RequestKeyframe(directgate_session_t *pSessio
 
 void DirectGate_Desktop_MacEncoder_StopDesktop(directgate_desktop_t *pDesktop)
 {
-    if (!pDesktop || !pDesktop->pMacEncoder) return;
+    if (!pDesktop || !pDesktop->pEncoder) return;
     if (@available(macOS 12.3, *))
     {
-        DirectGateDesktopEncoder *enc = (__bridge_transfer DirectGateDesktopEncoder *)pDesktop->pMacEncoder;
-        pDesktop->pMacEncoder = NULL;
+        DirectGateDesktopEncoder *enc = (__bridge_transfer DirectGateDesktopEncoder *)pDesktop->pEncoder;
+        pDesktop->pEncoder = NULL;
         [enc teardownEncoder];
         [enc stopStream];
     }
     else
     {
-        pDesktop->pMacEncoder = NULL;
+        pDesktop->pEncoder = NULL;
     }
 }
 

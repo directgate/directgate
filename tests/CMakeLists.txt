@@ -36,8 +36,12 @@ function(directgate_smoke_desktop name)
             "-framework VideoToolbox"
             "-framework ScreenCaptureKit")
     elseif(UNIX)
-        target_include_directories(${name} PRIVATE ${X11_INCLUDE_DIR})
-        target_link_libraries(${name} PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS} Xrandr)
+        target_sources(${name} PRIVATE
+            ${AGENT_DIR}/desktop_linux.c
+            ${AGENT_DIR}/openh264.c
+            ${AGENT_DIR}/yuv.c)
+        target_include_directories(${name} PRIVATE ${X11_INCLUDE_DIR} ${AGENT_DIR}/openh264)
+        target_link_libraries(${name} PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS} Xrandr Xext)
     endif()
 endfunction()
 
@@ -81,6 +85,7 @@ directgate_smoke(config_smoke        ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c
 directgate_smoke(config_extra_smoke  ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(keyfile_apply_smoke ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(search_smoke        ${AGENT_DIR}/search.c ${AGENT_DIR}/files.c)
+directgate_smoke(yuv_smoke   ${AGENT_DIR}/yuv.c)
 directgate_smoke(enroll_prompt_smoke ${AGENT_DIR}/enroll.c)
 directgate_smoke(files_smoke         ${AGENT_DIR}/files.c)
 directgate_smoke(session_smoke       ${AGENT_DIR}/session.c)

@@ -59,15 +59,9 @@ browser starts a `desktop` session. The browser offer carries:
 - the existing ordered `directgate` DataChannel (encrypted DirectGate binary protocol)
 - a recv-only video transceiver that advertises H.264
 
-When the active session mode is `desktop`, the agent answers with an H.264
-send-only track. The capture backend emits Annex-B H.264 access units
-(VideoToolbox on macOS), and the agent packetizes them as RTP and sends them
-through libdatachannel's Track API (`rtcAddTrackEx` / `rtcSendMessage`). The
-browser renders the remote `MediaStreamTrack` in a `<video>` element. Linux
-hosts capture the X11 root window and fall back to the raw-RGBA pipeline.
+When the active session mode is `desktop`, the agent answers with an H.264 send-only track. The capture backend emits Annex-B H.264 access units (ScreenCaptureKit + VideoToolbox on macOS; X11 XShm capture + a runtime-loaded [Cisco OpenH264](https://github.com/cisco/openh264) encoder on Linux), and the agent packetizes them as RTP and sends them through libdatachannel's Track API (`rtcAddTrackEx` / `rtcSendMessage`). The browser renders the remote `MediaStreamTrack` in a `<video>` element. On Linux the OpenH264 library is dlopen'd at session start (`DIRECTGATE_OPENH264_LIB` overrides the search path); when it is missing - or the X11 pixel format is unsupported - the agent demotes the session to the raw-RGBA pipeline and reports the reason in the desktop status `fallbackReason` field.
 
-The pipeline degrades in this order, and the desktop status payload reports
-which one is active:
+The pipeline degrades in this order, and the desktop status payload reports which one is active:
 
 1. `webrtc-video` - preferred H.264 RTP over the WebRTC media track, encrypted by DTLS-SRTP
 2. `h264-datachannel` - `desktop-frame-encoded` H.264 chunks over the AES-SIV-encrypted DataChannel

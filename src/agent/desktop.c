@@ -175,8 +175,7 @@ int DirectGate_Desktop_SendEncodedFrame(directgate_session_t *pSession,
         XCHECK((pHeader != NULL), XAPI_DISCONNECT);
 
         XJSON_AddString(pHeader, "payloadType", "desktop-frame-encoded");
-        XJSON_AddString(pHeader, "codec",
-            xstrused(pDesktop->sCodec) ? pDesktop->sCodec : "h264");
+        XJSON_AddString(pHeader, "codec", xstrused(pDesktop->sCodec) ? pDesktop->sCodec : "h264");
         XJSON_AddU64(pHeader, "frameId", nFrameId);
         XJSON_AddU32(pHeader, "chunkIndex", i);
         XJSON_AddU32(pHeader, "chunks", nChunks);
@@ -258,7 +257,7 @@ void DirectGate_Desktop_Init(directgate_desktop_t *pDesktop)
 #endif
     pDesktop->nFps = DIRECTGATE_DESKTOP_DEFAULT_FPS;
     pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_RAW;
-    pDesktop->pMacEncoder = NULL;
+    pDesktop->pEncoder = NULL;
     pDesktop->bForceRaw = XFALSE;
     pDesktop->bRequestKeyframe = XFALSE;
     pDesktop->bWebRTCVideoFailed = XFALSE;
@@ -266,7 +265,7 @@ void DirectGate_Desktop_Init(directgate_desktop_t *pDesktop)
     xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "raw-rgba");
     DirectGate_Desktop_ApplyPreset(pDesktop, DIRECTGATE_DESKTOP_PRESET_BALANCED);
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
     const char *pForce = getenv("DIRECTGATE_DESKTOP_FORCE_RAW");
     if (xstrused(pForce) && pForce[0] != '0')
         pDesktop->bForceRaw = XTRUE;
@@ -287,10 +286,9 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     XCHECK_VOID_NL((pDesktop != NULL));
 
 #if defined(__APPLE__)
-    if (pDesktop->pMacEncoder != NULL)
+    if (pDesktop->pEncoder != NULL)
     {
         /* The encoder owns its own queue/thread; this stops + drains it. */
-        extern void DirectGate_Desktop_MacEncoder_StopDesktop(directgate_desktop_t *pDesktop);
         DirectGate_Desktop_MacEncoder_StopDesktop(pDesktop);
     }
 
@@ -324,6 +322,10 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
 #endif
 
 #if defined(__linux__)
+    /* Detaches the XShm segment, so it must run before the display closes. */
+    if (pDesktop->pEncoder != NULL)
+        DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
+
     if (pDesktop->pDisplay != NULL)
     {
         XCloseDisplay((Display*)pDesktop->pDisplay);
@@ -359,7 +361,7 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_RAW;
     pDesktop->bRequestKeyframe = XFALSE;
     pDesktop->bWebRTCVideoFailed = XFALSE;
-    pDesktop->pMacEncoder = NULL;
+    pDesktop->pEncoder = NULL;
     pDesktop->sFallbackReason[0] = '\0';
     xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "raw-rgba");
 }
@@ -401,33 +403,26 @@ static int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const c
     XCHECK((pRoot != NULL), XAPI_DISCONNECT);
 
     XJSON_AddString(pRoot, "status", xstrused(pStatus) ? pStatus : "unknown");
-    XJSON_AddString(pRoot, "backend", xstrused(pSession->desktop.sBackend) ?
-        pSession->desktop.sBackend : "unknown");
-    XJSON_AddString(pRoot, "display", xstrused(pSession->desktop.sDisplay) ?
-        pSession->desktop.sDisplay : "");
+    XJSON_AddString(pRoot, "backend", xstrused(pSession->desktop.sBackend) ? pSession->desktop.sBackend : "unknown");
+    XJSON_AddString(pRoot, "display", xstrused(pSession->desktop.sDisplay) ? pSession->desktop.sDisplay : "");
     XJSON_AddBool(pRoot, "input", pSession->desktop.bInputReady);
     XJSON_AddU32(pRoot, "screenWidth", pSession->desktop.nScreenWidth);
     XJSON_AddU32(pRoot, "screenHeight", pSession->desktop.nScreenHeight);
     XJSON_AddBool(pRoot, "captureReady", pSession->desktop.bCaptureReady);
     XJSON_AddStrIfUsed(pRoot, "selectedMonitor", pSession->desktop.sSelectedMonitor);
-    XJSON_AddString(pRoot, "pipeline",
-        DirectGate_Desktop_PipelineName(pSession->desktop.ePipeline));
-    XJSON_AddString(pRoot, "codec",
-        xstrused(pSession->desktop.sCodec) ? pSession->desktop.sCodec : "raw-rgba");
-    XJSON_AddString(pRoot, "preset",
-        DirectGate_Desktop_PresetName(pSession->desktop.quality.ePreset));
-    XJSON_AddString(pRoot, "transport",
-        DirectGate_Desktop_TransportName(pSession->desktop.ePipeline));
+    XJSON_AddString(pRoot, "pipeline", DirectGate_Desktop_PipelineName(pSession->desktop.ePipeline));
+    XJSON_AddString(pRoot, "codec", xstrused(pSession->desktop.sCodec) ? pSession->desktop.sCodec : "raw-rgba");
+    XJSON_AddString(pRoot, "preset", DirectGate_Desktop_PresetName(pSession->desktop.quality.ePreset));
+    XJSON_AddString(pRoot, "transport", DirectGate_Desktop_TransportName(pSession->desktop.ePipeline));
     XJSON_AddU32(pRoot, "frameWidth", pSession->desktop.nFrameWidth);
     XJSON_AddU32(pRoot, "frameHeight", pSession->desktop.nFrameHeight);
     XJSON_AddU32(pRoot, "fps", pSession->desktop.quality.nFps);
     XJSON_AddU32(pRoot, "bitrateKbps", pSession->desktop.quality.nBitrateKbps);
     XJSON_AddBool(pRoot, "fallbackRaw", pSession->desktop.bForceRaw);
     XJSON_AddStrIfUsed(pRoot, "fallbackReason", pSession->desktop.sFallbackReason);
-    if (xstrused(pReason))
-        XJSON_AddString(pRoot, "reason", pReason);
-    else if (xstrused(pSession->desktop.sReason))
-        XJSON_AddString(pRoot, "reason", pSession->desktop.sReason);
+
+    if (xstrused(pReason)) XJSON_AddString(pRoot, "reason", pReason);
+    else if (xstrused(pSession->desktop.sReason)) XJSON_AddString(pRoot, "reason", pSession->desktop.sReason);
 
     xjson_obj_t *pMonitors = XJSON_NewArray(NULL, "monitors", XFALSE);
     if (pMonitors != NULL)
@@ -729,6 +724,98 @@ static int DirectGate_Desktop_StartTimer(directgate_desktop_t *pDesktop)
     return XSTDOK;
 }
 
+/* Mirrors DirectGate_Desktop_StartMacPipeline: prefer the H.264 pipeline and
+ * demote to raw RGBA when the encoder cannot start (missing OpenH264
+ * library, unsupported pixel format, capture probe failure, ...). */
+static int DirectGate_Desktop_StartLinuxPipeline(directgate_session_t *pSession)
+{
+    directgate_desktop_t *pDesktop = &pSession->desktop;
+
+    if (pDesktop->bForceRaw)
+    {
+        pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_RAW;
+        xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "raw-rgba");
+
+        DirectGate_Desktop_SetFallbackReason(pDesktop, "Raw RGBA forced by DIRECTGATE_DESKTOP_FORCE_RAW.");
+        DirectGate_Desktop_ComputeFrameSize(pDesktop);
+        return XSTDOK;
+    }
+
+    if (DirectGate_Desktop_LinuxEncoder_Start(pSession,
+        pDesktop->nCaptureX, pDesktop->nCaptureY,
+        pDesktop->nCaptureWidth, pDesktop->nCaptureHeight) < 0)
+    {
+        const char *pErr = DirectGate_Desktop_LinuxEncoder_LastError(pSession);
+        xlogw("Linux H.264 encoder unavailable, falling back to raw RGBA: sid(%u), reason(%s)",
+            pSession->nSessionId, xstrused(pErr) ? pErr : "unknown");
+
+        pDesktop->bForceRaw = XTRUE;
+        pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_RAW;
+        xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "raw-rgba");
+
+        DirectGate_Desktop_SetFallbackReason(pDesktop, xstrused(pErr) ? pErr : "OpenH264 encoder failed; using raw RGBA.");
+        DirectGate_Desktop_ComputeFrameSize(pDesktop);
+        return XSTDOK;
+    }
+
+    xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "h264");
+    if (!pDesktop->bWebRTCVideoFailed && DirectGate_WebRTC_IsVideoOpen(&pSession->webrtc))
+    {
+        pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO;
+        DirectGate_Desktop_SetFallbackReason(pDesktop, NULL);
+    }
+    else
+    {
+        pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_H264_DC;
+        DirectGate_Desktop_SetFallbackReason(pDesktop,
+            "WebRTC video track is unavailable; using encrypted H.264 data channel.");
+    }
+
+    return XSTDOK;
+}
+
+static void DirectGate_Desktop_MaybePromoteWebRTCVideo(directgate_session_t *pSession)
+{
+    XCHECK_VOID_NL((pSession != NULL));
+    directgate_desktop_t *pDesktop = &pSession->desktop;
+
+    if (pDesktop->bForceRaw || pDesktop->bWebRTCVideoFailed)
+        return;
+
+    if (pDesktop->ePipeline != DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
+        return;
+
+    if (!DirectGate_WebRTC_IsVideoOpen(&pSession->webrtc))
+        return;
+
+    pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO;
+    DirectGate_Desktop_SetFallbackReason(pDesktop, NULL);
+    DirectGate_Desktop_LinuxEncoder_RequestKeyframe(pSession);
+    DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
+}
+
+/* Runtime failure demotion: too many consecutive capture/encode failures
+ * flip the session to the raw RGBA path so the operator keeps a picture. */
+static void DirectGate_Desktop_DemoteToRaw(directgate_session_t *pSession)
+{
+    directgate_desktop_t *pDesktop = &pSession->desktop;
+    const char *pErr = DirectGate_Desktop_LinuxEncoder_LastError(pSession);
+
+    xlogw("Linux H.264 pipeline failed, falling back to raw RGBA: sid(%u), reason(%s)",
+        pSession->nSessionId, xstrused(pErr) ? pErr : "unknown");
+
+    DirectGate_Desktop_SetFallbackReason(pDesktop,
+        xstrused(pErr) ? pErr : "H.264 pipeline failed at runtime; using raw RGBA.");
+    DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
+
+    pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_RAW;
+    pDesktop->bForceRaw = XTRUE;
+    xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "raw-rgba");
+
+    DirectGate_Desktop_ComputeFrameSize(pDesktop);
+    DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
+}
+
 int DirectGate_Desktop_Start(directgate_session_t *pSession)
 {
     XCHECK((pSession != NULL), XAPI_DISCONNECT);
@@ -861,6 +948,7 @@ static int DirectGate_Desktop_CaptureFrame(directgate_session_t *pSession)
 
     XDestroyImage(pImage);
     int nStatus = DirectGate_Desktop_SendFrameChunks(pSession, pFrame, nFrameSize);
+
     free(pFrame);
     return nStatus;
 }
@@ -875,6 +963,25 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
     {
         uint64_t nTicks = 0;
         while (read(pDesktop->nTimerFd, &nTicks, sizeof(nTicks)) > 0) {}
+    }
+
+    /* The H.264 pipeline captures + encodes synchronously on each tick;
+     * the raw path keeps the legacy pull-per-tick behavior. */
+    if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||
+        pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
+    {
+        if (DirectGate_WebRTC_TakeVideoKeyframeRequest(&pSession->webrtc))
+            DirectGate_Desktop_LinuxEncoder_RequestKeyframe(pSession);
+
+        DirectGate_Desktop_MaybePromoteWebRTCVideo(pSession);
+
+        if (DirectGate_Desktop_LinuxEncoder_HasFailed(pSession))
+        {
+            DirectGate_Desktop_DemoteToRaw(pSession);
+            return XAPI_CONTINUE;
+        }
+
+        return DirectGate_Desktop_LinuxEncoder_ProcessTick(pSession);
     }
 
     return DirectGate_Desktop_CaptureFrame(pSession);
@@ -1055,11 +1162,22 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
         {
             DirectGate_Desktop_SetCapture(pDesktop, pSelected->sId, pSelected->nX,
                 pSelected->nY, pSelected->nWidth, pSelected->nHeight);
+
+            if (DirectGate_Desktop_StartLinuxPipeline(pSession) < 0)
+            {
+                XJSON_Destroy(&json);
+                free(pJsonText);
+
+                DirectGate_Desktop_SendStatus(pSession, "error", "Failed to start desktop pipeline.");
+                return XAPI_CONTINUE;
+            }
+
             DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
-            xlogi("Desktop monitor selected: sid(%u), monitor(%s), rect(%d,%d %ux%u), frame(%ux%u)",
+            xlogi("Desktop monitor selected: sid(%u), monitor(%s), rect(%d,%d %ux%u), pipeline(%s), preset(%s)",
                 pSession->nSessionId, pSelected->sId, pSelected->nX, pSelected->nY,
                 pSelected->nWidth, pSelected->nHeight,
-                pDesktop->nFrameWidth, pDesktop->nFrameHeight);
+                DirectGate_Desktop_PipelineName(pDesktop->ePipeline),
+                DirectGate_Desktop_PresetName(pDesktop->quality.ePreset));
         }
         else
         {
@@ -1073,15 +1191,25 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
         if (xstrcmp(pPreset, "quality")) eNext = DIRECTGATE_DESKTOP_PRESET_QUALITY;
         else if (xstrcmp(pPreset, "low-latency")) eNext = DIRECTGATE_DESKTOP_PRESET_LOW_LATENCY;
         else if (xstrcmp(pPreset, "balanced")) eNext = DIRECTGATE_DESKTOP_PRESET_BALANCED;
+
         DirectGate_Desktop_ApplyPreset(pDesktop, eNext);
-        if (pDesktop->bCaptureReady)
+        if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||
+            pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
+            DirectGate_Desktop_LinuxEncoder_ApplyQuality(pSession);
+        else if (pDesktop->bCaptureReady)
             DirectGate_Desktop_ComputeFrameSize(pDesktop);
+
         DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
-        xlogi("Desktop preset updated: sid(%u), preset(%s), frame(%ux%u), fps(%u)",
+        xlogi("Desktop preset updated: sid(%u), preset(%s), fps(%u), bitrate(%u kbps)",
             pSession->nSessionId,
             DirectGate_Desktop_PresetName(pDesktop->quality.ePreset),
-            pDesktop->nFrameWidth, pDesktop->nFrameHeight,
-            pDesktop->quality.nFps);
+            pDesktop->quality.nFps, pDesktop->quality.nBitrateKbps);
+    }
+    else if (xstrcmp(pAction, "request-keyframe"))
+    {
+        if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||
+            pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
+            DirectGate_Desktop_LinuxEncoder_RequestKeyframe(pSession);
     }
 
     XJSON_Destroy(&json);
@@ -1346,23 +1474,21 @@ static int DirectGate_Desktop_CaptureFrameRaw(directgate_session_t *pSession)
     directgate_desktop_t *pDesktop = &pSession->desktop;
     XCHECK_NL((pDesktop->bCaptureReady), XAPI_CONTINUE);
 
-    CGRect rect = CGRectMake((CGFloat)pDesktop->nCaptureX,
-        (CGFloat)pDesktop->nCaptureY,
-        (CGFloat)pDesktop->nCaptureWidth,
-        (CGFloat)pDesktop->nCaptureHeight);
-
-    /* CGWindowListCreateImage is deprecated on macOS 14 but still functional;
-     * we only reach this path when DIRECTGATE_DESKTOP_FORCE_RAW=1 or the H.264
-     * pipeline failed at runtime. */
-    CGImageRef image = CGWindowListCreateImage(rect,
-        kCGWindowListOptionOnScreenOnly,
-        kCGNullWindowID,
-        kCGWindowImageBoundsIgnoreFraming);
+    /* The Objective-C bridge uses ScreenCaptureKit on current macOS releases.
+     * Keep the raw fallback here because it is also useful when H.264 setup
+     * fails, but do not reference CoreGraphics' obsoleted capture API. */
+    char sCaptureError[160] = {0};
+    CGImageRef image = (CGImageRef)DirectGate_Desktop_MacCaptureImage(
+        pDesktop->nCaptureX, pDesktop->nCaptureY,
+        pDesktop->nCaptureWidth, pDesktop->nCaptureHeight,
+        sCaptureError, sizeof(sCaptureError));
     if (image == NULL)
     {
-        xlogw("Failed to capture macOS frame: sid(%u)", pSession->nSessionId);
+        xlogw("Failed to capture macOS frame: sid(%u), reason(%s)",
+            pSession->nSessionId, xstrused(sCaptureError) ? sCaptureError : "unknown");
         pDesktop->bCaptureReady = XFALSE;
         DirectGate_Desktop_SendStatus(pSession, "error",
+            xstrused(sCaptureError) ? sCaptureError :
             "macOS screen capture failed. Grant Screen Recording permission to directgate and restart it.");
         return XAPI_CONTINUE;
     }
@@ -1810,6 +1936,7 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
             {
                 XJSON_Destroy(&json);
                 free(pJsonText);
+
                 DirectGate_Desktop_SendStatus(pSession, "error", "Failed to start desktop pipeline.");
                 return XAPI_CONTINUE;
             }
@@ -1837,7 +1964,26 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
         DirectGate_Desktop_ApplyPreset(pDesktop, eNext);
         if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||
             pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
+        {
             DirectGate_Desktop_MacEncoder_ApplyQuality(pSession);
+
+            /* A max-edge change rebuilds the encoder; when that rebuild
+             * fails the encoder is gone, so demote to raw RGBA instead of
+             * leaving a silently frozen stream. */
+            if (pDesktop->pEncoder == NULL)
+            {
+                const char *pErr = DirectGate_Desktop_MacEncoder_LastError(pSession);
+                xlogw("macOS H.264 encoder rebuild failed, falling back to raw RGBA: sid(%u), reason(%s)",
+                    pSession->nSessionId, xstrused(pErr) ? pErr : "unknown");
+
+                pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_RAW;
+                pDesktop->bForceRaw = XTRUE;
+
+                xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "raw-rgba");
+                DirectGate_Desktop_SetFallbackReason(pDesktop,
+                    xstrused(pErr) ? pErr : "VideoToolbox H.264 encoder rebuild failed; using raw RGBA.");
+            }
+        }
 
         DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
         xlogi("Desktop preset updated: sid(%u), preset(%s), fps(%u), bitrate(%u kbps)",
