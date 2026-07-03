@@ -85,6 +85,8 @@ void DirectGate_Desktop_MacEncoder_ApplyQuality(directgate_session_t *pSession) 
 void DirectGate_Desktop_MacEncoder_RequestKeyframe(directgate_session_t *pSession) { (void)pSession; }
 void DirectGate_Desktop_MacEncoder_Stop(directgate_session_t *pSession) { (void)pSession; }
 void DirectGate_Desktop_MacEncoder_StopDesktop(directgate_desktop_t *pDesktop) { (void)pDesktop; }
+void DirectGate_Desktop_MacEncoder_SetBitrate(directgate_session_t *pSession, uint32_t nBitrateKbps)
+{ (void)pSession; (void)nBitrateKbps; }
 
 const char* DirectGate_Desktop_MacEncoder_LastError(const directgate_session_t *pSession)
 {
@@ -659,6 +661,33 @@ API_AVAILABLE(macos(12.3))
     _requestKeyframe = YES;
 }
 
+- (void)applyBitrateOnly:(uint32_t)bitrateKbps
+{
+    /* Live bitrate step from the adaptive controller. Deliberately does
+     * not request a keyframe: the encoder keeps the reference chain and
+     * simply converges to the new rate, so a congested link is not hit
+     * with an IDR burst on top of the loss that triggered the step. */
+    if (_vtSession == NULL || bitrateKbps == 0) return;
+
+    int32_t bps = (int32_t)(bitrateKbps * 1000U);
+    CFNumberRef bitrate = CFNumberCreate(NULL, kCFNumberSInt32Type, &bps);
+    VTSessionSetProperty(_vtSession, kVTCompressionPropertyKey_AverageBitRate, bitrate);
+    CFRelease(bitrate);
+
+    /* Keep the burst cap in step with the new average (same 1.5x budget as createVTSessionWithError). */
+    int64_t dataLimit[2] = { (int64_t)(((int64_t)bps * 3) / 16), 1 };
+    CFNumberRef bytes = CFNumberCreate(NULL, kCFNumberSInt64Type, &dataLimit[0]);
+    CFNumberRef seconds = CFNumberCreate(NULL, kCFNumberSInt64Type, &dataLimit[1]);
+
+    const void *valuesArr[2] = { bytes, seconds };
+    CFArrayRef limits = CFArrayCreate(NULL, valuesArr, 2, &kCFTypeArrayCallBacks);
+    VTSessionSetProperty(_vtSession, kVTCompressionPropertyKey_DataRateLimits, limits);
+
+    CFRelease(limits);
+    CFRelease(bytes);
+    CFRelease(seconds);
+}
+
 - (void)markKeyframeRequested
 {
     _requestKeyframe = YES;
@@ -983,6 +1012,16 @@ void DirectGate_Desktop_MacEncoder_ApplyQuality(directgate_session_t *pSession)
         }
 
         [enc applyQualityUpdate];
+    }
+}
+
+void DirectGate_Desktop_MacEncoder_SetBitrate(directgate_session_t *pSession, uint32_t nBitrateKbps)
+{
+    if (!pSession) return;
+    if (@available(macOS 12.3, *))
+    {
+        DirectGateDesktopEncoder *enc = encoderOf(pSession);
+        [enc applyBitrateOnly:nBitrateKbps];
     }
 }
 

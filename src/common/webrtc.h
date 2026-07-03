@@ -109,6 +109,12 @@ typedef struct directgate_webrtc_ {
     uint64_t nVideoLastPtsUs;
     xbool_t bVideoHasTimestamp;
     char sVideoMid[DIRECTGATE_RTC_VIDEO_MID_SIZE];
+
+    /* Latest RTCP receiver-report loss signal (fraction lost, 0..255).
+     * Written by the libdatachannel callback thread, consumed once by the
+     * main-loop bitrate controller via TakeVideoLossReport. */
+    volatile int nVideoFractionLost;
+    volatile xbool_t bVideoLossUpdated;
 } directgate_webrtc_t;
 
 void DirectGate_WebRTC_Init(directgate_webrtc_t *pRTC);
@@ -147,6 +153,17 @@ void DirectGate_WebRTC_SetVideoEnabled(directgate_webrtc_t *pRTC, xbool_t bEnabl
 xbool_t DirectGate_WebRTC_HasVideoTrack(const directgate_webrtc_t *pRTC);
 xbool_t DirectGate_WebRTC_IsVideoOpen(const directgate_webrtc_t *pRTC);
 xbool_t DirectGate_WebRTC_TakeVideoKeyframeRequest(directgate_webrtc_t *pRTC);
+
+/* Consumes the latest RTCP receiver-report loss signal for the video track.
+ * Returns XTRUE when a new report arrived since the last call and stores
+ * the fraction-lost octet (lost packets * 256 / expected) in pFractionLost. */
+xbool_t DirectGate_WebRTC_TakeVideoLossReport(directgate_webrtc_t *pRTC, uint8_t *pFractionLost);
+
+/* Walks a compound RTCP datagram: reports whether it contains a keyframe
+ * request (PLI/FIR) and the highest fraction-lost across RR/SR report
+ * blocks (-1 when no report block is present). Exposed for tests. */
+void DirectGate_WebRTC_ParseRtcp(const uint8_t *pData, size_t nSize,
+                             xbool_t *pKeyframeRequest, int *pFractionLost);
 
 /* Send one Annex-B H.264 access unit over the negotiated WebRTC media track.
  * Returns XSTDERR if no open video track is available or a packet send fails. */

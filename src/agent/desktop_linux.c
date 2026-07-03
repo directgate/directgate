@@ -473,6 +473,18 @@ void DirectGate_Desktop_LinuxEncoder_ApplyQuality(directgate_session_t *pSession
     pEnc->bForceKeyframe = XTRUE;
 }
 
+void DirectGate_Desktop_LinuxEncoder_SetBitrate(directgate_session_t *pSession, uint32_t nBitrateKbps)
+{
+    XCHECK_VOID_NL((pSession != NULL));
+    directgate_x11enc_t *pEnc = DirectGate_Desktop_X11Enc(&pSession->desktop);
+    XCHECK_VOID_NL((pEnc != NULL && pEnc->pEncoder != NULL));
+
+    /* Deliberately no keyframe request: the encoder keeps its reference
+     * chain and converges to the new rate, so a congested link is not hit
+     * with an IDR burst on top of the loss that triggered the step. */
+    DirectGate_OpenH264_SetBitrate(pEnc->pEncoder, nBitrateKbps);
+}
+
 void DirectGate_Desktop_LinuxEncoder_RequestKeyframe(directgate_session_t *pSession)
 {
     XCHECK_VOID_NL((pSession != NULL));

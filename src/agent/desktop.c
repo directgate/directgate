@@ -36,8 +36,17 @@
 
 /* H.264 encoded transport never sends more than one frame in flight to the
  * data channel; this is the backpressure threshold (bytes) above which we
- * skip a capture and ask the encoder for a fresh keyframe later. */
-#define DIRECTGATE_DESKTOP_ENCODED_BUFFER_LIMIT (1U * 1024U * 1024U)
+ * skip a capture and ask the encoder for a fresh keyframe later. 256 KB is
+ * ~250 ms of queue at the balanced 8 Mbps target: enough to ride out jitter
+ * without letting the fallback path accumulate a second of latency. */
+#define DIRECTGATE_DESKTOP_ENCODED_BUFFER_LIMIT (256U * 1024U)
+
+/* Adaptive bitrate bounds: never throttle below this floor, and step back
+ * up toward the preset target when the link stays clean. */
+#define DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS   1000U
+#define DIRECTGATE_DESKTOP_ABR_HOLD_TICKS     60U  /* ~2s at 30 fps */
+#define DIRECTGATE_DESKTOP_ABR_RAISE_TICKS    150U /* ~5s clean before raising */
+#define DIRECTGATE_DESKTOP_ABR_LOSS_THRESHOLD 8U   /* ~3% fraction lost */
 
 #if defined(__linux__)
 #include <dlfcn.h>
@@ -99,6 +108,11 @@ void DirectGate_Desktop_ApplyPreset(directgate_desktop_t *pDesktop, directgate_d
     XCHECK_VOID_NL((pDesktop != NULL));
     pDesktop->quality.ePreset = ePreset;
 
+    /* GOPs are long on purpose: an IDR is 10-50x the size of a P-frame,
+     * so periodic keyframes turn into periodic burst-loss stutter on
+     * constrained links. Recovery and late-join are handled on demand via
+     * RTCP PLI / request-keyframe, and NACK retransmission covers small
+     * loss without any keyframe at all. */
     switch (ePreset)
     {
         case DIRECTGATE_DESKTOP_PRESET_QUALITY:
@@ -106,14 +120,14 @@ void DirectGate_Desktop_ApplyPreset(directgate_desktop_t *pDesktop, directgate_d
             pDesktop->quality.nMaxEdge = 1920U;
             pDesktop->quality.nFps = 30U;
             pDesktop->quality.nBitrateKbps = 12000U;
-            pDesktop->quality.nKeyframeFrames = 120U;
+            pDesktop->quality.nKeyframeFrames = 300U;
             pDesktop->quality.bRealtime = XFALSE;
             break;
         case DIRECTGATE_DESKTOP_PRESET_LOW_LATENCY:
             pDesktop->quality.nMaxEdge = 1280U;
             pDesktop->quality.nFps = 30U;
             pDesktop->quality.nBitrateKbps = 4000U;
-            pDesktop->quality.nKeyframeFrames = 30U;
+            pDesktop->quality.nKeyframeFrames = 300U;
             pDesktop->quality.bRealtime = XTRUE;
             break;
         case DIRECTGATE_DESKTOP_PRESET_BALANCED:
@@ -122,12 +136,15 @@ void DirectGate_Desktop_ApplyPreset(directgate_desktop_t *pDesktop, directgate_d
             pDesktop->quality.nMaxEdge = 1920U;
             pDesktop->quality.nFps = 30U;
             pDesktop->quality.nBitrateKbps = 8000U;
-            pDesktop->quality.nKeyframeFrames = 90U;
+            pDesktop->quality.nKeyframeFrames = 300U;
             pDesktop->quality.bRealtime = XTRUE;
             break;
     }
 
     pDesktop->nFps = pDesktop->quality.nFps;
+    pDesktop->nCurrentBitrateKbps = pDesktop->quality.nBitrateKbps;
+    pDesktop->nAbrCleanTicks = 0;
+    pDesktop->nAbrHoldTicks = 0;
     pDesktop->bRequestKeyframe = XTRUE;
 }
 
@@ -208,6 +225,71 @@ xbool_t DirectGate_Desktop_ShouldSkipForBackpressure(const directgate_session_t 
     if (nBuffered < 0) return XFALSE;
     return ((size_t)nBuffered > DIRECTGATE_DESKTOP_ENCODED_BUFFER_LIMIT) ? XTRUE : XFALSE;
 }
+
+#if defined(__linux__) || defined(__APPLE__)
+/* Adaptive bitrate: multiplicative decrease on congestion, slow stepwise
+ * recovery toward the preset target on a clean link. RTCP receiver reports
+ * (fraction lost) are the signal on the media track; on the data-channel
+ * fallback the only available signal is transport backpressure. Runs once
+ * per timer tick while an encoded pipeline is active. */
+static void DirectGate_Desktop_AdaptBitrate(directgate_session_t *pSession)
+{
+    directgate_desktop_t *pDesktop = &pSession->desktop;
+    uint32_t nTarget = pDesktop->quality.nBitrateKbps;
+    XCHECK_VOID_NL((nTarget > 0));
+
+    uint32_t nCurrent = pDesktop->nCurrentBitrateKbps ?
+        pDesktop->nCurrentBitrateKbps : nTarget;
+
+    xbool_t bCongested = XFALSE;
+    uint8_t nFractionLost = 0;
+    if (DirectGate_WebRTC_TakeVideoLossReport(&pSession->webrtc, &nFractionLost) &&
+        nFractionLost >= DIRECTGATE_DESKTOP_ABR_LOSS_THRESHOLD)
+        bCongested = XTRUE;
+
+    if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC &&
+        DirectGate_Desktop_ShouldSkipForBackpressure(pSession))
+        bCongested = XTRUE;
+
+    if (pDesktop->nAbrHoldTicks > 0)
+        pDesktop->nAbrHoldTicks--;
+
+    uint32_t nNext = nCurrent;
+    if (bCongested)
+    {
+        pDesktop->nAbrCleanTicks = 0;
+        if (!pDesktop->nAbrHoldTicks)
+        {
+            nNext = (nCurrent * 3U) / 4U;
+            if (nNext < DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS)
+                nNext = DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS;
+
+            /* Receiver reports lag the rate change; hold before the next
+             * step so one loss episode is not punished twice. */
+            pDesktop->nAbrHoldTicks = DIRECTGATE_DESKTOP_ABR_HOLD_TICKS;
+        }
+    }
+    else if (nCurrent < nTarget && ++pDesktop->nAbrCleanTicks >= DIRECTGATE_DESKTOP_ABR_RAISE_TICKS)
+    {
+        pDesktop->nAbrCleanTicks = 0;
+        nNext = nCurrent + nTarget / 10U + 1U;
+        if (nNext > nTarget) nNext = nTarget;
+    }
+
+    pDesktop->nCurrentBitrateKbps = nNext;
+    if (nNext == nCurrent) return;
+
+#if defined(__APPLE__)
+    DirectGate_Desktop_MacEncoder_SetBitrate(pSession, nNext);
+#else
+    DirectGate_Desktop_LinuxEncoder_SetBitrate(pSession, nNext);
+#endif
+
+    xlogi("Desktop bitrate adapted: sid(%u), step(%s), rate(%u -> %u kbps), target(%u)",
+        pSession->nSessionId, nNext < nCurrent ? "down" : "up",
+        nCurrent, nNext, nTarget);
+}
+#endif /* __linux__ || __APPLE__ */
 
 static void DirectGate_Desktop_LimitFrameSize(const directgate_desktop_t *pDesktop,
                                           uint32_t *pWidth,
@@ -417,7 +499,8 @@ static int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const c
     XJSON_AddU32(pRoot, "frameWidth", pSession->desktop.nFrameWidth);
     XJSON_AddU32(pRoot, "frameHeight", pSession->desktop.nFrameHeight);
     XJSON_AddU32(pRoot, "fps", pSession->desktop.quality.nFps);
-    XJSON_AddU32(pRoot, "bitrateKbps", pSession->desktop.quality.nBitrateKbps);
+    XJSON_AddU32(pRoot, "bitrateKbps", pSession->desktop.nCurrentBitrateKbps ?
+        pSession->desktop.nCurrentBitrateKbps : pSession->desktop.quality.nBitrateKbps);
     XJSON_AddBool(pRoot, "fallbackRaw", pSession->desktop.bForceRaw);
     XJSON_AddStrIfUsed(pRoot, "fallbackReason", pSession->desktop.sFallbackReason);
 
@@ -974,6 +1057,7 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
             DirectGate_Desktop_LinuxEncoder_RequestKeyframe(pSession);
 
         DirectGate_Desktop_MaybePromoteWebRTCVideo(pSession);
+        DirectGate_Desktop_AdaptBitrate(pSession);
 
         if (DirectGate_Desktop_LinuxEncoder_HasFailed(pSession))
         {
@@ -1670,6 +1754,7 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
             DirectGate_Desktop_MacEncoder_RequestKeyframe(pSession);
 
         DirectGate_Desktop_MaybePromoteWebRTCVideo(pSession);
+        DirectGate_Desktop_AdaptBitrate(pSession);
         return DirectGate_Desktop_MacEncoder_DrainMain(pSession);
     }
 

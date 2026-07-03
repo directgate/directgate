@@ -55,6 +55,7 @@ foreach(test
         srp_smoke
         transfer_smoke
         webrtc_config_smoke
+        webrtc_rtcp_smoke
         api_invalid_role_smoke
         keyauth_smoke
         files_static_smoke

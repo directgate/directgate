@@ -119,6 +119,12 @@ typedef struct directgate_desktop_ {
     xbool_t bForceRaw;       /* true when fallback raw RGBA path is forced */
     xbool_t bRequestKeyframe;/* set by preset change / drop recovery */
     xbool_t bWebRTCVideoFailed; /* avoid oscillating after media send failure */
+    /* Adaptive bitrate controller state: current encoder rate (<= preset
+     * target), ticks since the last congestion signal, and the cooldown
+     * ticks left before the next downward step is allowed. */
+    uint32_t nCurrentBitrateKbps;
+    uint32_t nAbrCleanTicks;
+    uint32_t nAbrHoldTicks;
     /* Platform encoder state (opaque to cross-platform code): the macOS
      * ScreenCaptureKit/VideoToolbox encoder or the Linux X11/OpenH264
      * pipeline, owned by desktop_mac.m / desktop_linux.c respectively. */
@@ -184,6 +190,7 @@ int DirectGate_Desktop_MacEncoder_UpdateRect(directgate_session_t *pSession,
                                         int32_t nX, int32_t nY,
                                         uint32_t nWidth, uint32_t nHeight);
 void DirectGate_Desktop_MacEncoder_ApplyQuality(directgate_session_t *pSession);
+void DirectGate_Desktop_MacEncoder_SetBitrate(directgate_session_t *pSession, uint32_t nBitrateKbps);
 void DirectGate_Desktop_MacEncoder_RequestKeyframe(directgate_session_t *pSession);
 void DirectGate_Desktop_MacEncoder_Stop(directgate_session_t *pSession);
 void DirectGate_Desktop_MacEncoder_StopDesktop(directgate_desktop_t *pDesktop);
@@ -201,6 +208,7 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
                                       int32_t nX, int32_t nY,
                                       uint32_t nWidth, uint32_t nHeight);
 void DirectGate_Desktop_LinuxEncoder_ApplyQuality(directgate_session_t *pSession);
+void DirectGate_Desktop_LinuxEncoder_SetBitrate(directgate_session_t *pSession, uint32_t nBitrateKbps);
 void DirectGate_Desktop_LinuxEncoder_RequestKeyframe(directgate_session_t *pSession);
 void DirectGate_Desktop_LinuxEncoder_Stop(directgate_session_t *pSession);
 void DirectGate_Desktop_LinuxEncoder_StopDesktop(directgate_desktop_t *pDesktop);

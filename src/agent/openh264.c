@@ -200,7 +200,11 @@ directgate_openh264_t* DirectGate_OpenH264_Create(uint32_t nWidth,
     /* Same burst budget as the macOS encoder's data-rate cap: 1.5x average
      * so busy frames don't blow past the WebRTC backpressure threshold. */
     param.iMaxBitrate = (int)(nBitrateKbps * 1500U);
-    param.iRCMode = RC_BITRATE_MODE;
+    /* Timestamp-based rate control: the capture pipeline skips unchanged
+     * frames, so the encoder sees an irregular cadence. RC_BITRATE_MODE
+     * budgets for a fixed fps and bursts after idle gaps; the timestamp
+     * mode derives the actual rate from uiTimeStamp. */
+    param.iRCMode = RC_TIMESTAMP_MODE;
     param.fMaxFrameRate = (float)nFps;
     param.iTemporalLayerNum = 1;
     param.iSpatialLayerNum = 1;
@@ -347,15 +351,12 @@ int DirectGate_OpenH264_Encode(directgate_openh264_t *pEncoder,
     return XSTDOK;
 }
 
-int DirectGate_OpenH264_ApplyQuality(directgate_openh264_t *pEncoder,
-                                 const directgate_desktop_quality_t *pQuality)
+int DirectGate_OpenH264_SetBitrate(directgate_openh264_t *pEncoder, uint32_t nBitrateKbps)
 {
     XCHECK((pEncoder != NULL && pEncoder->pEncoder != NULL), XSTDERR);
-    XCHECK((pQuality != NULL), XSTDERR);
+    XCHECK((nBitrateKbps > 0), XSTDERR);
 
     ISVCEncoder *pWels = pEncoder->pEncoder;
-    uint32_t nBitrateKbps = pQuality->nBitrateKbps ? pQuality->nBitrateKbps : 4000U;
-
     SBitrateInfo bitrate;
     memset(&bitrate, 0, sizeof(bitrate));
     bitrate.iLayer = SPATIAL_LAYER_ALL;
@@ -364,6 +365,19 @@ int DirectGate_OpenH264_ApplyQuality(directgate_openh264_t *pEncoder,
 
     bitrate.iBitrate = (int)(nBitrateKbps * 1500U);
     (*pWels)->SetOption(pWels, ENCODER_OPTION_MAX_BITRATE, &bitrate);
+
+    return XSTDOK;
+}
+
+int DirectGate_OpenH264_ApplyQuality(directgate_openh264_t *pEncoder,
+                                 const directgate_desktop_quality_t *pQuality)
+{
+    XCHECK((pEncoder != NULL && pEncoder->pEncoder != NULL), XSTDERR);
+    XCHECK((pQuality != NULL), XSTDERR);
+
+    ISVCEncoder *pWels = pEncoder->pEncoder;
+    DirectGate_OpenH264_SetBitrate(pEncoder,
+        pQuality->nBitrateKbps ? pQuality->nBitrateKbps : 4000U);
 
     float fFps = (float)(pQuality->nFps ? pQuality->nFps : 30U);
     (*pWels)->SetOption(pWels, ENCODER_OPTION_FRAME_RATE, &fFps);

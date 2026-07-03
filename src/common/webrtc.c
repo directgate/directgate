@@ -31,6 +31,9 @@
 #define DIRECTGATE_RTC_H264_PAYLOAD_TYPE 102U
 #define DIRECTGATE_RTC_RTP_HEADER_BYTES 12U
 #define DIRECTGATE_RTC_RTP_MAX_PAYLOAD 1188U
+/* Retransmission cache in packets: ~1s of video at 12 Mbps with
+ * 1200-byte packets. Bounded memory (< ~1.5 MB) per session. */
+#define DIRECTGATE_RTC_NACK_CACHE 1024U
 #define DIRECTGATE_RTC_H264_FU_A 28U
 #define DIRECTGATE_RTC_H264_START 0x80U
 #define DIRECTGATE_RTC_H264_END 0x40U
@@ -528,6 +531,8 @@ void DirectGate_WebRTC_Init(directgate_webrtc_t *pRTC)
     pRTC->nVideoTimestamp = DirectGate_WebRTC_RandomU32(0x44534b54U);
     pRTC->nVideoLastPtsUs = 0;
     pRTC->bVideoHasTimestamp = XFALSE;
+    pRTC->bVideoLossUpdated = XFALSE;
+    pRTC->nVideoFractionLost = -1;
     pRTC->sVideoMid[0] = '\0';
 
     pRTC->pQueueHead = NULL;
@@ -664,6 +669,8 @@ void DirectGate_WebRTC_Destroy(directgate_webrtc_t *pRTC)
     pRTC->bVideoTrackOpen = XFALSE;
     pRTC->bVideoKeyframeRequested = XFALSE;
     pRTC->bVideoHasTimestamp = XFALSE;
+    pRTC->bVideoLossUpdated = XFALSE;
+    pRTC->nVideoFractionLost = -1;
     pRTC->sVideoMid[0] = '\0';
     DirectGate_WebRTC_DrainQueue(pRTC);
     DirectGate_WebRTC_ClearPendingIce(pRTC);
@@ -955,18 +962,58 @@ static void DirectGate_WebRTC_OnDataChannel(int nPC, int nDC, void *pPtr)
     rtcSetMessageCallback(nDC, DirectGate_WebRTC_OnDataChannelMessage);
 }
 
-static xbool_t DirectGate_WebRTC_IsRtcpKeyframeRequest(const char *pMessage, int nSize)
+void DirectGate_WebRTC_ParseRtcp(const uint8_t *pData, size_t nSize,
+                             xbool_t *pKeyframeRequest, int *pFractionLost)
 {
-    XCHECK_NL((pMessage != NULL && nSize >= 12), XFALSE);
-    const uint8_t *p = (const uint8_t*)pMessage;
-    uint8_t nFmt = p[0] & 0x1FU;
-    uint8_t nType = p[1];
+    if (pKeyframeRequest != NULL) *pKeyframeRequest = XFALSE;
+    if (pFractionLost != NULL) *pFractionLost = -1;
+    XCHECK_VOID_NL((pData != NULL && nSize >= 4));
 
-    /* PLI: PT=PSFB(206), FMT=1. FIR: PT=PSFB(206), FMT=4.
-     * Some legacy stacks still emit FIR as PT=192. */
-    if (nType == 206 && (nFmt == 1 || nFmt == 4)) return XTRUE;
-    if (nType == 192) return XTRUE;
-    return XFALSE;
+    /* Browsers deliver compound RTCP: RR + SDES + feedback packets in one
+     * datagram. Walk every packet; a PLI hiding behind an RR must still be
+     * seen, and the RR report blocks carry the loss signal the adaptive
+     * bitrate controller feeds on. */
+    size_t nOffset = 0;
+    while (nOffset + 4U <= nSize)
+    {
+        const uint8_t *p = pData + nOffset;
+        if ((p[0] >> 6U) != 2U) break; /* RTCP version must be 2 */
+
+        uint8_t nCount = p[0] & 0x1FU;
+        uint8_t nType = p[1];
+        size_t nLength = ((size_t)((p[2] << 8U) | p[3]) + 1U) * 4U;
+        if (nOffset + nLength > nSize) break;
+
+        if (nType == 206 && (nCount == 1 || nCount == 4))
+        {
+            /* PLI: PT=PSFB(206), FMT=1. FIR: PT=PSFB(206), FMT=4. */
+            if (pKeyframeRequest != NULL) *pKeyframeRequest = XTRUE;
+        }
+        else if (nType == 192)
+        {
+            /* Some legacy stacks still emit FIR as PT=192. */
+            if (pKeyframeRequest != NULL) *pKeyframeRequest = XTRUE;
+        }
+        else if ((nType == 201 || nType == 200) && nCount > 0)
+        {
+            /* RR(201): report blocks start after header(4) + SSRC(4).
+             * SR(200): after header(4) + SSRC(4) + sender info(20).
+             * Each 24-byte block leads with the source SSRC followed by
+             * the fraction-lost octet (lost/256 since the last report). */
+            size_t nBlockBase = (nType == 200) ? 28U : 8U;
+            for (uint8_t i = 0; i < nCount; i++)
+            {
+                size_t nBlock = nBlockBase + (size_t)i * 24U;
+                if (nBlock + 24U > nLength) break;
+
+                int nFraction = p[nBlock + 4U];
+                if (pFractionLost != NULL && nFraction > *pFractionLost)
+                    *pFractionLost = nFraction;
+            }
+        }
+
+        nOffset += nLength;
+    }
 }
 
 static void DirectGate_WebRTC_OnVideoTrackOpen(int nTrack, void *pPtr)
@@ -1041,12 +1088,25 @@ static void DirectGate_WebRTC_OnVideoTrackMessage(int nTrack, const char *pMessa
         return;
     }
 
-    if (DirectGate_WebRTC_IsRtcpKeyframeRequest(pMessage, nSize))
+    xbool_t bKeyframeRequest = XFALSE;
+    int nFractionLost = -1;
+    DirectGate_WebRTC_ParseRtcp((const uint8_t*)pMessage, (size_t)nSize,
+        &bKeyframeRequest, &nFractionLost);
+
+    if (bKeyframeRequest)
     {
         xlogd("Received RTCP keyframe request: pc(%d), track(%d), bytes(%d)",
             DirectGate_WebRTC_GetPC(pRTC), nTrack, nSize);
 
         DirectGate_WebRTC_Enqueue(pRTC, DIRECTGATE_WEBRTC_VIDEO_KEYFRAME, nTrack, NULL, 0);
+    }
+
+    if (nFractionLost >= 0)
+    {
+        /* Single writer (libdatachannel thread), single reader (main loop);
+         * a torn read of an int is not possible on supported targets. */
+        pRTC->nVideoFractionLost = nFractionLost;
+        pRTC->bVideoLossUpdated = XTRUE;
     }
 }
 
@@ -1101,6 +1161,8 @@ static XSTATUS DirectGate_WebRTC_AddDesktopVideoTrack(directgate_webrtc_t *pRTC,
     pRTC->nVideoTimestamp = DirectGate_WebRTC_RandomU32(0x44534b54U);
     pRTC->nVideoLastPtsUs = 0;
     pRTC->bVideoHasTimestamp = XFALSE;
+    pRTC->bVideoLossUpdated = XFALSE;
+    pRTC->nVideoFractionLost = -1;
     xstrncpy(pRTC->sVideoMid, sizeof(pRTC->sVideoMid), sMid);
 
     rtcSetUserPointer(nTrack, pRTC);
@@ -1108,6 +1170,15 @@ static XSTATUS DirectGate_WebRTC_AddDesktopVideoTrack(directgate_webrtc_t *pRTC,
     rtcSetClosedCallback(nTrack, DirectGate_WebRTC_OnVideoTrackClosed);
     rtcSetErrorCallback(nTrack, DirectGate_WebRTC_OnVideoTrackError);
     rtcSetMessageCallback(nTrack, DirectGate_WebRTC_OnVideoTrackMessage);
+
+    /* Cache outgoing RTP so browser NACKs are answered with retransmissions.
+     * Without this the browser waits for a retransmission that never comes,
+     * escalates to PLI and forces a full IDR burst - the main source of
+     * periodic stutter on lossy links (the answer SDP already advertises
+     * nack, so the browser expects it to work). */
+    if (rtcChainRtcpNackResponder(nTrack, DIRECTGATE_RTC_NACK_CACHE) < 0)
+        xlogw("Failed to chain RTCP NACK responder: pc(%d), track(%d)",
+            DirectGate_WebRTC_GetPC(pRTC), nTrack);
 
     xlogi("Added WebRTC H.264 video track: pc(%d), track(%d), pt(%u), ssrc(%u), mid(%s)",
         DirectGate_WebRTC_GetPC(pRTC), nTrack, pRTC->nVideoPayloadType,
@@ -1381,6 +1452,21 @@ xbool_t DirectGate_WebRTC_TakeVideoKeyframeRequest(directgate_webrtc_t *pRTC)
     XCHECK_NL((pRTC != NULL), XFALSE);
     if (!pRTC->bVideoKeyframeRequested) return XFALSE;
     pRTC->bVideoKeyframeRequested = XFALSE;
+    return XTRUE;
+}
+
+xbool_t DirectGate_WebRTC_TakeVideoLossReport(directgate_webrtc_t *pRTC, uint8_t *pFractionLost)
+{
+    XCHECK_NL((pRTC != NULL), XFALSE);
+    if (!pRTC->bVideoLossUpdated) return XFALSE;
+
+    int nFraction = pRTC->nVideoFractionLost;
+    pRTC->bVideoLossUpdated = XFALSE;
+    if (nFraction < 0) return XFALSE;
+
+    if (pFractionLost != NULL)
+        *pFractionLost = (uint8_t)(nFraction > 255 ? 255 : nFraction);
+
     return XTRUE;
 }
 

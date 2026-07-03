@@ -61,6 +61,9 @@ browser starts a `desktop` session. The browser offer carries:
 
 When the active session mode is `desktop`, the agent answers with an H.264 send-only track. The capture backend emits Annex-B H.264 access units (ScreenCaptureKit + VideoToolbox on macOS; X11 XShm capture + a runtime-loaded [Cisco OpenH264](https://github.com/cisco/openh264) encoder on Linux), and the agent packetizes them as RTP and sends them through libdatachannel's Track API (`rtcAddTrackEx` / `rtcSendMessage`). The browser renders the remote `MediaStreamTrack` in a `<video>` element. On Linux the OpenH264 library is dlopen'd at session start (`DIRECTGATE_OPENH264_LIB` overrides the search path); when it is missing - or the X11 pixel format is unsupported - the agent demotes the session to the raw-RGBA pipeline and reports the reason in the desktop status `fallbackReason` field.
 
+The media track is tuned for interactive latency rather than smooth playback. The agent chains an RTCP NACK responder onto the track, so packet loss is repaired by retransmission instead of escalating to a PLI and a full
+keyframe; GOPs are long (10s) because IDR frames are ordered on demand via PLI / `request-keyframe` anyway. An adaptive bitrate controller consumes the browser's RTCP receiver reports (fraction lost) - and transport backpressure on the DataChannel fallback - stepping the encoder rate down 25% on congestion and recovering toward the preset target after ~5 clean seconds (the live rate is reported as `bitrateKbps` in the desktop status). The browser side requests a zero-length jitter buffer (`jitterBufferTarget`) on the video receiver.
+
 The pipeline degrades in this order, and the desktop status payload reports which one is active:
 
 1. `webrtc-video` - preferred H.264 RTP over the WebRTC media track, encrypted by DTLS-SRTP

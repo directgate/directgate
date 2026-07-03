@@ -75,6 +75,10 @@ int DirectGate_OpenH264_Encode(directgate_openh264_t *pEncoder,
 int DirectGate_OpenH264_ApplyQuality(directgate_openh264_t *pEncoder,
                                  const directgate_desktop_quality_t *pQuality);
 
+/* Live bitrate step (target + 1.5x burst cap) without touching fps/GOP and
+ * without forcing a keyframe; used by the adaptive bitrate controller. */
+int DirectGate_OpenH264_SetBitrate(directgate_openh264_t *pEncoder, uint32_t nBitrateKbps);
+
 uint32_t DirectGate_OpenH264_GetWidth(const directgate_openh264_t *pEncoder);
 uint32_t DirectGate_OpenH264_GetHeight(const directgate_openh264_t *pEncoder);
 
