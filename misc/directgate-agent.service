@@ -9,12 +9,21 @@ User=<username>
 WorkingDirectory=<home>
 LogsDirectory=directgate
 LogsDirectoryMode=0755
+
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/run/lightdm/<home>/xauthority
+
 ExecStartPre=/bin/sh -c 'test -f "<home>/.config/directgate/agent.json"'
 ExecStart=<exec>
+
 Restart=always
-RestartSec=2
-PrivateTmp=true
+RestartSec=3
+StartLimitBurst=20
+StartLimitIntervalSec=80
+
 NoNewPrivileges=false
+PrivateTmp=true
+LimitNOFILE=8192
 
 [Install]
 WantedBy=multi-user.target
