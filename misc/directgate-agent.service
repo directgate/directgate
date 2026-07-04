@@ -11,7 +11,7 @@ LogsDirectory=directgate
 LogsDirectoryMode=0755
 
 Environment=DISPLAY=:0
-Environment=XAUTHORITY=/run/lightdm/<home>/xauthority
+Environment=XAUTHORITY=/run/lightdm/<username>/xauthority
 
 ExecStartPre=/bin/sh -c 'test -f "<home>/.config/directgate/agent.json"'
 ExecStart=<exec>
