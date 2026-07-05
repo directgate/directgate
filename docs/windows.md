@@ -94,16 +94,13 @@ Installing `directgate-<version>-x64.msi` (double-click, or `msiexec /i directga
 
 Finish setup after installing:
 
-1. Configure/pair the machine-wide config. Do this **as `shell.user`** so that
-   account owns its config (the agent writes `agent.json` with a `0600`-equivalent
-   DACL limited to `SYSTEM`, `Administrators`, and the owner):
+1. Configure/pair the machine-wide config. Do this **as `shell.user`** so that account owns its config (the agent writes `agent.json` with a `0600`-equivalent DACL limited to `SYSTEM`, `Administrators`, and the owner):
 
    ```bat
    directgate.exe -c C:\ProgramData\directgate\agent.json -sed <device_id> -t <token>
    ```
 
-2. Set `shell.user` in that config to the account whose sessions the agent should
-   own (the logged-on user).
+2. Set `shell.user` in that config to the account whose sessions the agent should own (the logged-on user).
 3. Start it: `sc.exe start directgate-agent` (or `Start-Service directgate-agent`).
 
 The launcher serves sessions only while `shell.user` is logged on (console/RDP); when they are not it waits and starts the agent on the next logon. There is no headless mode - that is the deliberate cost of never storing a password.
@@ -193,7 +190,7 @@ Desktop streaming requires the interactive session the launcher starts the agent
 
 ## Security notes specific to Windows
 
-- Private files (config, enrollment keys) are written with a **protected DACL** restricted to `SYSTEM`,  Administrators`, and the file owner - the ACL equivalent of `0600`, with no inheritance from the parent directory.
+- Private files (config, enrollment keys) are written with a **protected DACL** restricted to `SYSTEM`,  `Administrators`, and the file owner - the ACL equivalent of `0600`, with no inheritance from the parent directory.
 - Internal IPC (the ConPTY terminal bridge, search and WebRTC notification channels) uses **AF_UNIX socket pairs** (Windows 10 1803+), which are not addressable from the network stack at all; the accepted endpoint is verified by **peer PID** before use. On systems without AF_UNIX support the implementation falls back to a loopback TCP pair hardened against connect-race hijacking.
 - Atomic config updates use `MoveFileEx(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`; targets that are reparse points (symlinks / junctions) are refused, mirroring the `O_NOFOLLOW` checks on POSIX.
 - Binaries are linked with DEP (`--nxcompat`), ASLR (`--dynamicbase`) and high-entropy 64-bit ASLR (`--high-entropy-va`).
