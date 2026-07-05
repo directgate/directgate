@@ -51,15 +51,12 @@ The terminal session stays fully functional on every tier, and traffic remains e
 
 ## Desktop video track
 
-Desktop sessions reuse the same authenticated WebRTC connection but add a
-send-only H.264 **media track** (host -> browser) on top of the `directgate`
-DataChannel. Negotiation happens only after SRP/key-auth succeeds and the
-browser starts a `desktop` session. The browser offer carries:
+Desktop sessions reuse the same authenticated WebRTC connection but add a send-only H.264 **media track** (host -> browser) on top of the `directgate` DataChannel. Negotiation happens only after SRP/key-auth succeeds and the browser starts a `desktop` session. The browser offer carries:
 
 - the existing ordered `directgate` DataChannel (encrypted DirectGate binary protocol)
 - a recv-only video transceiver that advertises H.264
 
-When the active session mode is `desktop`, the agent answers with an H.264 send-only track. The capture backend emits Annex-B H.264 access units (ScreenCaptureKit + VideoToolbox on macOS; X11 XShm capture + a runtime-loaded [Cisco OpenH264](https://github.com/cisco/openh264) encoder on Linux), and the agent packetizes them as RTP and sends them through libdatachannel's Track API (`rtcAddTrackEx` / `rtcSendMessage`). The browser renders the remote `MediaStreamTrack` in a `<video>` element. On Linux the OpenH264 library is dlopen'd at session start (`DIRECTGATE_OPENH264_LIB` overrides the search path); when it is missing - or the X11 pixel format is unsupported - the agent demotes the session to the raw-RGBA pipeline and reports the reason in the desktop status `fallbackReason` field.
+When the active session mode is `desktop`, the agent answers with an H.264 send-only track. The capture backend emits Annex-B H.264 access units (ScreenCaptureKit + VideoToolbox on macOS; X11 XShm capture + a runtime-loaded [Cisco OpenH264](https://github.com/cisco/openh264) encoder on Linux; DXGI Desktop Duplication + a Media Foundation encoder on Windows), and the agent packetizes them as RTP and sends them through libdatachannel's Track API (`rtcAddTrackEx` / `rtcSendMessage`). The browser renders the remote `MediaStreamTrack` in a `<video>` element. On Linux the OpenH264 library is dlopen'd at session start (`DIRECTGATE_OPENH264_LIB` overrides the search path); when it is missing - or the X11 pixel format is unsupported - the agent demotes the session to the raw-RGBA pipeline and reports the reason in the desktop status `fallbackReason` field. On Windows the agent prefers the GPU vendor's hardware H.264 encoder (Quick Sync / NVENC / AMF, whichever MFT the driver registered) and falls back to the Microsoft software encoder; `mfplat.dll` is loaded at runtime, so N editions without the Media Feature Pack demote to raw RGBA the same way (see [Desktop streaming on Windows](windows.md#desktop-streaming)).
 
 The media track is tuned for interactive latency rather than smooth playback. The agent chains an RTCP NACK responder onto the track, so packet loss is repaired by retransmission instead of escalating to a PLI and a full
 keyframe; GOPs are long (10s) because IDR frames are ordered on demand via PLI / `request-keyframe` anyway. An adaptive bitrate controller consumes the browser's RTCP receiver reports (fraction lost) - and transport backpressure on the DataChannel fallback - stepping the encoder rate down 25% on congestion and recovering toward the preset target after ~5 clean seconds (the live rate is reported as `bitrateKbps` in the desktop status). The browser side requests a zero-length jitter buffer (`jitterBufferTarget`) on the video receiver.
@@ -70,10 +67,7 @@ The pipeline degrades in this order, and the desktop status payload reports whic
 2. `h264-datachannel` - `desktop-frame-encoded` H.264 chunks over the AES-SIV-encrypted DataChannel
 3. `raw-rgba` - `desktop-frame-chunk` raw frames (debug / legacy fallback)
 
-Desktop input, control, status, terminal, file-manager, and file-transfer
-messages all stay on the encrypted DirectGate protocol over the DataChannel.
-TURN relays forward only encrypted WebRTC media/DataChannel packets - they
-never see plaintext desktop video or control messages.
+Desktop input, control, status, terminal, file-manager, and file-transfer messages all stay on the encrypted DirectGate protocol over the DataChannel. TURN relays forward only encrypted WebRTC media/DataChannel packets - they never see plaintext desktop video or control messages.
 
 Desktop status is a `type: "data"` packet with `payloadType: "desktop-status"`
 and a JSON payload; key fields are `status`, `pipeline`

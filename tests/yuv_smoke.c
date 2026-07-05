@@ -73,6 +73,34 @@ static int check_solid(uint8_t nB, uint8_t nG, uint8_t nR,
     return 0;
 }
 
+/* NV12 must produce exactly the I420 planes with Cb/Cr interleaved -
+ * both converters share the same BT.709 core. */
+static int check_nv12(void)
+{
+    enum { W = 16, H = 16 };
+    uint8_t bgra[W * H * 4];
+    uint8_t i420[W * H * 3 / 2];
+    uint8_t nv12[W * H * 3 / 2];
+
+    fill_bgra(bgra, W, H, 20, 40, 200);
+    DirectGate_YUV_BGRAToI420(i420, i420 + W * H, i420 + W * H + (W / 2) * (H / 2),
+        bgra, W, H);
+    DirectGate_YUV_BGRAToNV12(nv12, nv12 + W * H, bgra, W, H);
+
+    CHECK(memcmp(nv12, i420, W * H) == 0, "NV12 Y plane differs from I420");
+
+    const uint8_t *pU = i420 + W * H;
+    const uint8_t *pV = pU + (W / 2) * (H / 2);
+    const uint8_t *pUV = nv12 + W * H;
+    for (int i = 0; i < (W / 2) * (H / 2); i++)
+    {
+        CHECK(pUV[i * 2 + 0] == pU[i], "NV12 Cb sample differs from I420 U plane");
+        CHECK(pUV[i * 2 + 1] == pV[i], "NV12 Cr sample differs from I420 V plane");
+    }
+
+    return 0;
+}
+
 static int check_scaler(void)
 {
     enum { SW = 8, SH = 8, DW = 4, DH = 4 };
@@ -147,6 +175,7 @@ int main(void)
     if (check_solid(0, 255, 0, 173, 42, 26, "green")) return 1;
     if (check_solid(255, 0, 0, 32, 240, 118, "blue")) return 1;
 
+    if (check_nv12()) return 1;
     if (check_scaler()) return 1;
 
     printf("yuv_smoke: OK\n");

@@ -147,6 +147,12 @@ set(NO_TESTS ON CACHE BOOL "" FORCE)
 # supported toolchain in CI ships a newer CMake. WebSocket stays off (unused).
 set(NO_MEDIA OFF CACHE BOOL "" FORCE)
 set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
+if(WIN32)
+    # The bundled libsrtp builds itself with -Werror and trips over benign
+    # format warnings on Windows (winsock's ntohl returns u_long). Vendor
+    # code must not fail our cross-build over its own warnings.
+    set(ENABLE_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+endif()
 add_subdirectory(${DATACHANNEL_DIR} EXCLUDE_FROM_ALL)
 
 # ---- libxutils (submodule) ------------------------------------------------
@@ -237,9 +243,10 @@ else()
 endif()
 
 # ---- agent binary: directgate --------------------------------------------------
-# desktop.c is cross-platform: it carries the X11 (Linux) and a no-op fallback
-# path inline behind #if guards, while the macOS ScreenCaptureKit/VideoToolbox
-# backend lives in desktop_mac.m (added below for Apple only).
+# desktop.c is cross-platform: it carries the X11 (Linux), Windows and a no-op
+# fallback path inline behind #if guards, while the platform capture/encode
+# pipelines live in desktop_mac.m (ScreenCaptureKit/VideoToolbox, Apple only)
+# and desktop_win.c (DXGI Desktop Duplication/Media Foundation, added below).
 add_executable(directgate
     ${AGENT_DIR}/config.c
     ${AGENT_DIR}/desktop.c
@@ -300,6 +307,21 @@ if(WIN32)
     # advapi32: LookupAccountName + token queries. wtsapi32: WTSEnumerateSessions
     # / WTSQueryUserToken (shell.user logon token). userenv: CreateEnvironmentBlock.
     target_link_libraries(directgate PRIVATE advapi32 wtsapi32 userenv)
+
+    # Windows desktop streaming: DXGI Desktop Duplication capture (GDI
+    # fallback) in desktop_win.c with a Media Foundation H.264 encoder in
+    # mfenc.c (mfplat.dll is loaded at runtime - N editions ship without
+    # Media Foundation - so only static GUID archives are linked, no
+    # mfplat import) and yuv.c (BGRA scaling + NV12 conversion).
+    # user32/gdi32: monitors, SendInput, BitBlt. d3d11/dxgi: duplication.
+    # ole32/oleaut32: COM apartment + VARIANT for ICodecAPI.
+    # uuid/mfuuid/strmiids/dxguid: interface and media type GUIDs.
+    target_sources(directgate PRIVATE
+        ${AGENT_DIR}/desktop_win.c
+        ${AGENT_DIR}/mfenc.c
+        ${AGENT_DIR}/yuv.c)
+    target_link_libraries(directgate PRIVATE
+        user32 gdi32 d3d11 dxgi ole32 oleaut32 uuid mfuuid strmiids dxguid)
 
     # App manifest (UTF-8 active code page) + version / company metadata.
     enable_language(RC)

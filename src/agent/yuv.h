@@ -55,6 +55,16 @@ void DirectGate_YUV_BGRAToI420(uint8_t *pY,
                            uint32_t nWidth,
                            uint32_t nHeight);
 
+/* Same conversion as DirectGate_YUV_BGRAToI420 but with the chroma planes
+ * interleaved as Cb,Cr pairs (NV12) - the only input layout every Windows
+ * Media Foundation hardware H.264 encoder accepts. The Y plane is
+ * nWidth*nHeight bytes; the UV plane is nWidth*(nHeight/2) bytes. */
+void DirectGate_YUV_BGRAToNV12(uint8_t *pY,
+                           uint8_t *pUV,
+                           const uint8_t *pBGRA,
+                           uint32_t nWidth,
+                           uint32_t nHeight);
+
 #ifdef __cplusplus
 }
 #endif

@@ -87,7 +87,9 @@ typedef struct directgate_desktop_ {
     xbool_t bRunning;
     xbool_t bInputReady;
     xbool_t bCaptureReady;
-    int nTimerFd;
+    /* POSIX: timerfd (Linux) / pipe read end (macOS); Windows: socket pair
+     * read end (XSOCKET == int on POSIX, SOCKET on Windows). */
+    XSOCKET nTimerFd;
     uint32_t nSessionId;
     uint32_t nScreenWidth;
     uint32_t nScreenHeight;
@@ -126,13 +128,22 @@ typedef struct directgate_desktop_ {
     uint32_t nAbrCleanTicks;
     uint32_t nAbrHoldTicks;
     /* Platform encoder state (opaque to cross-platform code): the macOS
-     * ScreenCaptureKit/VideoToolbox encoder or the Linux X11/OpenH264
-     * pipeline, owned by desktop_mac.m / desktop_linux.c respectively. */
+     * ScreenCaptureKit/VideoToolbox encoder, the Linux X11/OpenH264
+     * pipeline or the Windows DXGI/MediaFoundation pipeline, owned by
+     * desktop_mac.m / desktop_linux.c / desktop_win.c respectively. */
     void *pEncoder;
-#if defined(__APPLE__)
-    int nTimerWriteFd;
+#if defined(__APPLE__) || defined(_WIN32)
+    /* macOS and Windows have no timerfd: a pipe/socket pair plus a timer
+     * thread emulate the periodic wake-up (write end below, read end in
+     * nTimerFd). Platform encoders also write to the pair to wake the main
+     * loop as soon as an encoded frame lands in their mailbox. */
+    XSOCKET nTimerWriteFd;
     xbool_t bTimerThreadRunning;
+#endif
+#if defined(__APPLE__)
     pthread_t timerThread;
+#elif defined(_WIN32)
+    void *pTimerThread;      /* HANDLE of the tick thread */
 #endif
 } directgate_desktop_t;
 
@@ -222,6 +233,31 @@ xbool_t DirectGate_Desktop_LinuxEncoder_HasFailed(const directgate_session_t *pS
  * DirectGate_Desktop_Process on every timer tick while an encoded
  * pipeline is active. */
 int DirectGate_Desktop_LinuxEncoder_ProcessTick(directgate_session_t *pSession);
+#endif
+
+#if defined(_WIN32)
+/* DXGI Desktop Duplication (GDI fallback) capture + Media Foundation H.264
+ * encoder pipeline. Implemented in desktop_win.c and only called by
+ * desktop.c on Windows. Capture and encode run on a dedicated thread (the
+ * push model of desktop_mac.m); encoded frames land in a single-slot
+ * mailbox drained by DirectGate_Desktop_WinEncoder_DrainMain on the main
+ * loop after a timer-pair wake-up. */
+int DirectGate_Desktop_WinEncoder_Start(directgate_session_t *pSession,
+                                    int32_t nX, int32_t nY,
+                                    uint32_t nWidth, uint32_t nHeight);
+void DirectGate_Desktop_WinEncoder_ApplyQuality(directgate_session_t *pSession);
+void DirectGate_Desktop_WinEncoder_SetBitrate(directgate_session_t *pSession, uint32_t nBitrateKbps);
+void DirectGate_Desktop_WinEncoder_RequestKeyframe(directgate_session_t *pSession);
+void DirectGate_Desktop_WinEncoder_StopDesktop(directgate_desktop_t *pDesktop);
+const char* DirectGate_Desktop_WinEncoder_LastError(const directgate_session_t *pSession);
+
+/* True after too many consecutive capture/encode failures; desktop.c then
+ * demotes the session to the raw RGBA pipeline. */
+xbool_t DirectGate_Desktop_WinEncoder_HasFailed(const directgate_session_t *pSession);
+
+/* Drains the encoder mailbox on the main loop. Called from
+ * DirectGate_Desktop_Process after the timer pair wakes the loop. */
+int DirectGate_Desktop_WinEncoder_DrainMain(directgate_session_t *pSession);
 #endif
 
 #ifdef __cplusplus

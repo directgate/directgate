@@ -117,19 +117,24 @@ static inline uint8_t DirectGate_YUV_Clamp(int32_t nValue)
     return (uint8_t)nValue;
 }
 
-void DirectGate_YUV_BGRAToI420(uint8_t *pY,
-                           uint8_t *pU,
-                           uint8_t *pV,
-                           const uint8_t *pBGRA,
-                           uint32_t nWidth,
-                           uint32_t nHeight)
+/* Shared BGRA -> luma + subsampled chroma core. The planar layouts only
+ * differ in where the chroma samples land: I420 keeps two planes with one
+ * byte per sample (nChromaStep 1), NV12 interleaves Cb,Cr pairs in a single
+ * plane (nChromaStep 2, pV = pU + 1). */
+static void DirectGate_YUV_BGRAToYCbCr(uint8_t *pY,
+                                   uint8_t *pU,
+                                   uint8_t *pV,
+                                   size_t nChromaStep,
+                                   size_t nChromaRowStride,
+                                   const uint8_t *pBGRA,
+                                   uint32_t nWidth,
+                                   uint32_t nHeight)
 {
     XCHECK_VOID_NL((pY != NULL && pU != NULL && pV != NULL && pBGRA != NULL));
     XCHECK_VOID_NL((nWidth > 1 && nHeight > 1));
     XCHECK_VOID_NL(((nWidth & 1U) == 0 && (nHeight & 1U) == 0));
 
     size_t nRowBytes = (size_t)nWidth * 4U;
-    uint32_t nChromaWidth = nWidth / 2U;
 
     for (uint32_t y = 0; y < nHeight; y += 2U)
     {
@@ -137,8 +142,8 @@ void DirectGate_YUV_BGRAToI420(uint8_t *pY,
         const uint8_t *pRow1 = pRow0 + nRowBytes;
         uint8_t *pY0 = pY + (size_t)y * nWidth;
         uint8_t *pY1 = pY0 + nWidth;
-        uint8_t *pURow = pU + (size_t)(y / 2U) * nChromaWidth;
-        uint8_t *pVRow = pV + (size_t)(y / 2U) * nChromaWidth;
+        uint8_t *pURow = pU + (size_t)(y / 2U) * nChromaRowStride;
+        uint8_t *pVRow = pV + (size_t)(y / 2U) * nChromaRowStride;
 
         for (uint32_t x = 0; x < nWidth; x += 2U)
         {
@@ -160,8 +165,30 @@ void DirectGate_YUV_BGRAToI420(uint8_t *pY,
             int32_t nCb = 128 + ((-26 * (int32_t)nR - 87 * (int32_t)nG + 112 * (int32_t)nB + 128) >> 8);
             int32_t nCr = 128 + ((112 * (int32_t)nR - 102 * (int32_t)nG - 10 * (int32_t)nB + 128) >> 8);
 
-            pURow[x / 2U] = DirectGate_YUV_Clamp(nCb);
-            pVRow[x / 2U] = DirectGate_YUV_Clamp(nCr);
+            pURow[(x / 2U) * nChromaStep] = DirectGate_YUV_Clamp(nCb);
+            pVRow[(x / 2U) * nChromaStep] = DirectGate_YUV_Clamp(nCr);
         }
     }
+}
+
+void DirectGate_YUV_BGRAToI420(uint8_t *pY,
+                           uint8_t *pU,
+                           uint8_t *pV,
+                           const uint8_t *pBGRA,
+                           uint32_t nWidth,
+                           uint32_t nHeight)
+{
+    DirectGate_YUV_BGRAToYCbCr(pY, pU, pV, 1U, (size_t)nWidth / 2U,
+        pBGRA, nWidth, nHeight);
+}
+
+void DirectGate_YUV_BGRAToNV12(uint8_t *pY,
+                           uint8_t *pUV,
+                           const uint8_t *pBGRA,
+                           uint32_t nWidth,
+                           uint32_t nHeight)
+{
+    XCHECK_VOID_NL((pUV != NULL));
+    DirectGate_YUV_BGRAToYCbCr(pY, pUV, pUV + 1U, 2U, (size_t)nWidth,
+        pBGRA, nWidth, nHeight);
 }
