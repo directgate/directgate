@@ -24,9 +24,10 @@ This repository is the **agent**: the program you install on a machine you want 
 - End-to-end encrypted (AES-256-SIV) at the application layer, independent of transport
 - Peer-to-peer over WebRTC whenever possible; the relay never sees plaintext
 - Terminal, file manager, and a browser-based code editor over a single connection
-- Multiple concurrent sessions multiplexed over one link
+- Ultra-low-latency remote desktop over WebRTC (in development, PoC in the `dev` branch)
 - Full file manager experience with upload/download, rename, copy, move, and delete
 - Advanced file search, image/video playback, and drag-and-drop between devices
+- Multiple concurrent sessions multiplexed over one link
 
 ## Screenshots
 
