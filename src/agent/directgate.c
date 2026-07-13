@@ -1322,6 +1322,9 @@ static int DirectGate_HandleWebRTC(xapi_session_t *pApiSession, directgate_pkg_t
 
     directgate_webrtc_t *pRTC = &pSession->webrtc;
     const directgate_cfg_t *pCfg = pConn->pCfg;
+    xjson_obj_t *pHdrObj = pPkg->jsonHeader.pRootObj;
+    uint32_t nGeneration = pHdrObj != NULL ?
+        XJSON_GetU32(XJSON_GetObject(pHdrObj, "generation")) : 0;
 
     if (pRTC->signalCb == NULL)
     {
@@ -1336,7 +1339,6 @@ static int DirectGate_HandleWebRTC(xapi_session_t *pApiSession, directgate_pkg_t
 
     if (xstrcmp(pWebRTC->pAction, "offer"))
     {
-        xjson_obj_t *pHdrObj = pPkg->jsonHeader.pRootObj;
         const char *pSdp = NULL;
 
         if (pHdrObj != NULL)
@@ -1353,13 +1355,14 @@ static int DirectGate_HandleWebRTC(xapi_session_t *pApiSession, directgate_pkg_t
             return XAPI_CONTINUE;
         }
 
-        xlogi("Received WebRTC offer: sid(%u), wsfd(%d)", pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
+        xlogi("Received WebRTC offer: sid(%u), wsfd(%d), generation(%u)",
+            pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), nGeneration);
         xlogd("WebRTC offer SDP: sid(%u), wsfd(%d), sdp(%s)", pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), pSdp);
 
         DirectGate_WebRTC_SetVideoEnabled(pRTC,
             pSession->eActiveMode == DIRECTGATE_SESSION_MODE_DESKTOP ? XTRUE : XFALSE);
 
-        if (DirectGate_WebRTC_HandleOffer(pRTC, pSdp) < 0)
+        if (DirectGate_WebRTC_HandleOffer(pRTC, pSdp, nGeneration) < 0)
         {
             xloge("Failed to handle WebRTC offer: sid(%u), wsfd(%d)",
                 pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
@@ -1369,7 +1372,6 @@ static int DirectGate_HandleWebRTC(xapi_session_t *pApiSession, directgate_pkg_t
     }
     else if (xstrcmp(pWebRTC->pAction, "ice"))
     {
-        xjson_obj_t *pHdrObj = pPkg->jsonHeader.pRootObj;
         const char *pCandidate = NULL;
         const char *pMid = NULL;
 
@@ -1383,7 +1385,8 @@ static int DirectGate_HandleWebRTC(xapi_session_t *pApiSession, directgate_pkg_t
         }
 
         if (xstrused(pCandidate))
-            DirectGate_WebRTC_HandleIceCandidate(pRTC, pCandidate, pMid);
+            DirectGate_WebRTC_HandleIceCandidate(pRTC, pCandidate, pMid,
+                nGeneration);
     }
 
     return XAPI_CONTINUE;

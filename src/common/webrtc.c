@@ -435,7 +435,10 @@ static void DirectGate_WebRTC_DrainQueue(directgate_webrtc_t *pRTC)
     }
 }
 
-static void DirectGate_WebRTC_BufferIce(directgate_webrtc_t *pRTC, const char *pCandidate, const char *pMid)
+static void DirectGate_WebRTC_BufferIce(directgate_webrtc_t *pRTC,
+                                        const char *pCandidate,
+                                        const char *pMid,
+                                        uint32_t nGeneration)
 {
     XCHECK_VOID((pRTC != NULL));
     XCHECK_VOID(xstrused(pCandidate));
@@ -446,6 +449,7 @@ static void DirectGate_WebRTC_BufferIce(directgate_webrtc_t *pRTC, const char *p
     const char *pUseMid = xstrused(pMid) ? pMid : DIRECTGATE_RTC_DEFAULT_MID;
     xstrncpy(pIce->sCandidate, sizeof(pIce->sCandidate), pCandidate);
     xstrncpy(pIce->sMid, sizeof(pIce->sMid), pUseMid);
+    pIce->nGeneration = nGeneration;
     pIce->pNext = NULL;
 
     /* Append to the end of pending list */
@@ -460,8 +464,8 @@ static void DirectGate_WebRTC_BufferIce(directgate_webrtc_t *pRTC, const char *p
         pTail->pNext = pIce;
     }
 
-    xlogd("Buffered remote ICE candidate (peer connection pending): dc(%d)",
-        DirectGate_WebRTC_GetDC(pRTC));
+    xlogd("Buffered remote ICE candidate: dc(%d), generation(%u)",
+        DirectGate_WebRTC_GetDC(pRTC), nGeneration);
 }
 
 static void DirectGate_WebRTC_FlushPendingIce(directgate_webrtc_t *pRTC)
@@ -469,21 +473,45 @@ static void DirectGate_WebRTC_FlushPendingIce(directgate_webrtc_t *pRTC)
     XCHECK_VOID((pRTC != NULL));
 
     directgate_pending_ice_t *pIce = pRTC->pPendingIce;
+    directgate_pending_ice_t *pFutureHead = NULL;
+    directgate_pending_ice_t *pFutureTail = NULL;
     pRTC->pPendingIce = NULL;
 
     while (pIce != NULL)
     {
         directgate_pending_ice_t *pNext = pIce->pNext;
 
-        if (pRTC->nPeerConnectionID >= 0)
+        xbool_t bMatches = (!pIce->nGeneration || !pRTC->nSignalGeneration ||
+            pIce->nGeneration == pRTC->nSignalGeneration) ? XTRUE : XFALSE;
+
+        if (bMatches && pRTC->nPeerConnectionID >= 0)
         {
-            xlogd("Applying buffered ICE candidate: pc(%d), mid(%s)", pRTC->nPeerConnectionID, pIce->sMid);
+            xlogd("Applying buffered ICE candidate: pc(%d), mid(%s), generation(%u)",
+                pRTC->nPeerConnectionID, pIce->sMid, pIce->nGeneration);
             rtcAddRemoteCandidate(pRTC->nPeerConnectionID, pIce->sCandidate, pIce->sMid);
+        }
+        else if (pIce->nGeneration > pRTC->nSignalGeneration)
+        {
+            /* A future generation raced ahead of its offer. Keep it for the
+             * matching peer instead of applying it to the current route. */
+            pIce->pNext = NULL;
+            if (pFutureTail != NULL) pFutureTail->pNext = pIce;
+            else pFutureHead = pIce;
+            pFutureTail = pIce;
+            pIce = pNext;
+            continue;
+        }
+        else if (!bMatches)
+        {
+            xlogd("Dropping stale buffered ICE candidate: currentGeneration(%u), candidateGeneration(%u)",
+                pRTC->nSignalGeneration, pIce->nGeneration);
         }
 
         free(pIce);
         pIce = pNext;
     }
+
+    pRTC->pPendingIce = pFutureHead;
 }
 
 static void DirectGate_WebRTC_ClearPendingIce(directgate_webrtc_t *pRTC)
@@ -545,6 +573,7 @@ void DirectGate_WebRTC_Init(directgate_webrtc_t *pRTC)
     pRTC->bVideoEnabled = XFALSE;
     pRTC->bVideoTrackOpen = XFALSE;
     pRTC->bVideoKeyframeRequested = XFALSE;
+    pRTC->nSignalGeneration = 0;
     pRTC->nVideoPayloadType = DIRECTGATE_RTC_H264_PAYLOAD_TYPE;
     pRTC->nVideoSeq = (uint16_t)(DirectGate_WebRTC_RandomU32(1U) & 0xFFFFU);
     pRTC->nVideoSsrc = DirectGate_WebRTC_RandomU32(0x58485348U);
@@ -761,6 +790,9 @@ static void DirectGate_WebRTC_OnLocalDescription(int nPC, const char *pSdp, cons
     XJSON_AddString(pHeader, "action", pType);
     XJSON_AddString(pHeader, "sdp", pEscaped);
 
+    if (pRTC->nSignalGeneration)
+        XJSON_AddU32(pHeader, "generation", pRTC->nSignalGeneration);
+
     free(pEscaped);
     size_t nLen = 0;
 
@@ -794,6 +826,9 @@ static void DirectGate_WebRTC_OnLocalCandidate(int nPC, const char *pCand, const
     XJSON_AddString(pHeader, "action", "ice");
     XJSON_AddString(pHeader, "candidate", pCand);
     XJSON_AddString(pHeader, "sdpMid", pUseMid);
+
+    if (pRTC->nSignalGeneration)
+        XJSON_AddU32(pHeader, "generation", pRTC->nSignalGeneration);
 
     size_t nLen = 0;
     char *pJson = XJSON_DumpObj(pHeader, 0, &nLen);
@@ -1324,16 +1359,34 @@ XSTATUS DirectGate_WebRTC_HandleAnswer(directgate_webrtc_t *pRTC, const char *pS
     return XSTDOK;
 }
 
-XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSdp)
+XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSdp, uint32_t nGeneration)
 {
     XCHECK((pRTC != NULL), XSTDERR);
     XCHECK((pSdp != NULL), XSTDERR);
 
     DirectGate_WebRTC_InitLib(pRTC);
 
-    /* Destroy existing connection if any */
+    if (nGeneration && pRTC->nSignalGeneration &&
+        nGeneration <= pRTC->nSignalGeneration &&
+        pRTC->nPeerConnectionID >= 0)
+    {
+        xlogd("Dropping stale or duplicate WebRTC offer: pc(%d), currentGeneration(%u), offerGeneration(%u)",
+            DirectGate_WebRTC_GetPC(pRTC), pRTC->nSignalGeneration, nGeneration);
+
+        return XSTDOK;
+    }
+
+    /* Candidates for the new generation can race just ahead of its offer.
+     * Preserve them while the previous peer is torn down. */
     if (pRTC->nPeerConnectionID >= 0)
+    {
+        directgate_pending_ice_t *pPendingIce = pRTC->pPendingIce;
+        pRTC->pPendingIce = NULL;
         DirectGate_WebRTC_Destroy(pRTC);
+        pRTC->pPendingIce = pPendingIce;
+    }
+
+    pRTC->nSignalGeneration = nGeneration;
 
     /* Create peer connection with ICE servers */
     rtcConfiguration config;
@@ -1407,15 +1460,32 @@ XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSd
     return XSTDOK;
 }
 
-XSTATUS DirectGate_WebRTC_HandleIceCandidate(directgate_webrtc_t *pRTC, const char *pCandidate, const char *pMid)
+XSTATUS DirectGate_WebRTC_HandleIceCandidate(directgate_webrtc_t *pRTC,
+                                             const char *pCandidate,
+                                             const char *pMid,
+                                             uint32_t nGeneration)
 {
     XCHECK((pRTC != NULL), XSTDERR);
     XCHECK((pCandidate != NULL), XSTDERR);
 
+    if (nGeneration && nGeneration != pRTC->nSignalGeneration)
+    {
+        if (!pRTC->nSignalGeneration || nGeneration > pRTC->nSignalGeneration)
+        {
+            DirectGate_WebRTC_BufferIce(pRTC, pCandidate, pMid, nGeneration);
+            return XSTDOK;
+        }
+
+        xlogd("Dropping stale remote ICE candidate: pc(%d), currentGeneration(%u), candidateGeneration(%u)",
+            DirectGate_WebRTC_GetPC(pRTC), pRTC->nSignalGeneration, nGeneration);
+
+        return XSTDOK;
+    }
+
     if (pRTC->nPeerConnectionID < 0)
     {
         /* Buffer the candidate as it arrived before the offer was processed */
-        DirectGate_WebRTC_BufferIce(pRTC, pCandidate, pMid);
+        DirectGate_WebRTC_BufferIce(pRTC, pCandidate, pMid, nGeneration);
         return XSTDOK;
     }
 

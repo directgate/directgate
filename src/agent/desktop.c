@@ -231,6 +231,36 @@ int DirectGate_Desktop_SendEncodedFrame(directgate_session_t *pSession,
     return XAPI_CONTINUE;
 }
 
+/* A media track may be open while the browser receives no decodable frame
+ * (lost first IDR, decoder rejection, or a half-open route after TURN/P2P
+ * replacement). In that case the browser explicitly asks for the already
+ * supported encrypted H.264 data-channel path. Keep that choice latched for
+ * this desktop session so a later RTCP PLI cannot immediately promote the
+ * same broken media track and start a black-screen loop. */
+static xbool_t DirectGate_Desktop_FallbackToDataChannel(directgate_session_t *pSession)
+{
+    XCHECK_NL((pSession != NULL), XFALSE);
+    directgate_desktop_t *pDesktop = &pSession->desktop;
+
+    if (pDesktop->bForceRaw ||
+        (pDesktop->ePipeline != DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO &&
+         pDesktop->ePipeline != DIRECTGATE_DESKTOP_PIPELINE_H264_DC))
+        return XFALSE;
+
+    pDesktop->bPreferDataChannel = XTRUE;
+    pDesktop->bWebRTCVideoFailed = XTRUE;
+    pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_H264_DC;
+
+    DirectGate_Desktop_SetFallbackReason(pDesktop,
+        "Browser did not receive WebRTC video; using encrypted H.264 data channel.");
+    DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
+
+    xlogw("WebRTC video handoff timed out, using data-channel fallback: sid(%u)",
+        pSession->nSessionId);
+
+    return XTRUE;
+}
+
 xbool_t DirectGate_Desktop_ShouldSkipForBackpressure(const directgate_session_t *pSession)
 {
     XCHECK_NL((pSession != NULL), XFALSE);
@@ -421,6 +451,7 @@ void DirectGate_Desktop_Init(directgate_desktop_t *pDesktop)
     pDesktop->bForceRaw = XFALSE;
     pDesktop->bRequestKeyframe = XFALSE;
     pDesktop->bWebRTCVideoFailed = XFALSE;
+    pDesktop->bPreferDataChannel = XFALSE;
     pDesktop->sFallbackReason[0] = '\0';
     xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "raw-rgba");
     DirectGate_Desktop_ApplyPreset(pDesktop, DIRECTGATE_DESKTOP_PRESET_BALANCED);
@@ -535,12 +566,21 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     }
 #endif
 
+    pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_SCALE;
+    pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_RAW;
     pDesktop->bRunning = XFALSE;
     pDesktop->bInputReady = XFALSE;
     pDesktop->bCaptureReady = XFALSE;
+    pDesktop->bDisplayModeChanged = XFALSE;
+    pDesktop->bRequestKeyframe = XFALSE;
+    pDesktop->bWebRTCVideoFailed = XFALSE;
+    pDesktop->bPreferDataChannel = XFALSE;
+    pDesktop->pOriginalDisplayMode = NULL;
     pDesktop->pFakeMotion = NULL;
     pDesktop->pFakeButton = NULL;
     pDesktop->pFakeKey = NULL;
+    pDesktop->pEncoder = NULL;
+    pDesktop->nFrameId = 0;
     pDesktop->nScreenWidth = 0;
     pDesktop->nScreenHeight = 0;
     pDesktop->nCaptureX = 0;
@@ -549,21 +589,13 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     pDesktop->nCaptureHeight = 0;
     pDesktop->nFrameWidth = 0;
     pDesktop->nFrameHeight = 0;
-    pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_SCALE;
     pDesktop->nTargetWidth = 0;
     pDesktop->nTargetHeight = 0;
-    pDesktop->bDisplayModeChanged = XFALSE;
-    pDesktop->pOriginalDisplayMode = NULL;
     pDesktop->nPointerButtons = 0;
-    pDesktop->nFrameId = 0;
     pDesktop->nMonitorCount = 0;
-    memset(pDesktop->monitors, 0, sizeof(pDesktop->monitors));
     pDesktop->sSelectedMonitor[0] = '\0';
-    pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_RAW;
-    pDesktop->bRequestKeyframe = XFALSE;
-    pDesktop->bWebRTCVideoFailed = XFALSE;
-    pDesktop->pEncoder = NULL;
     pDesktop->sFallbackReason[0] = '\0';
+    memset(pDesktop->monitors, 0, sizeof(pDesktop->monitors));
     xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "raw-rgba");
 }
 
@@ -1119,7 +1151,9 @@ static int DirectGate_Desktop_StartLinuxPipeline(directgate_session_t *pSession)
     }
 
     xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "h264");
-    if (!pDesktop->bWebRTCVideoFailed && DirectGate_WebRTC_IsVideoOpen(&pSession->webrtc))
+
+    if (!pDesktop->bWebRTCVideoFailed && !pDesktop->bPreferDataChannel &&
+        DirectGate_WebRTC_IsVideoOpen(&pSession->webrtc))
     {
         pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO;
         DirectGate_Desktop_SetFallbackReason(pDesktop, NULL);
@@ -1139,7 +1173,8 @@ static void DirectGate_Desktop_MaybePromoteWebRTCVideo(directgate_session_t *pSe
     XCHECK_VOID_NL((pSession != NULL));
     directgate_desktop_t *pDesktop = &pSession->desktop;
 
-    if (pDesktop->bForceRaw || pDesktop->bWebRTCVideoFailed)
+    if (pDesktop->bForceRaw || pDesktop->bWebRTCVideoFailed ||
+        pDesktop->bPreferDataChannel)
         return;
 
     if (pDesktop->ePipeline != DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
@@ -1648,6 +1683,11 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
             pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
             DirectGate_Desktop_LinuxEncoder_RequestKeyframe(pSession);
     }
+    else if (xstrcmp(pAction, "fallback-datachannel"))
+    {
+        if (DirectGate_Desktop_FallbackToDataChannel(pSession))
+            DirectGate_Desktop_LinuxEncoder_RequestKeyframe(pSession);
+    }
 
     XJSON_Destroy(&json);
     free(pJsonText);
@@ -2149,7 +2189,9 @@ static int DirectGate_Desktop_StartMacPipeline(directgate_session_t *pSession)
     }
 
     xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "h264");
-    if (!pDesktop->bWebRTCVideoFailed && DirectGate_WebRTC_IsVideoOpen(&pSession->webrtc))
+
+    if (!pDesktop->bWebRTCVideoFailed && !pDesktop->bPreferDataChannel &&
+        DirectGate_WebRTC_IsVideoOpen(&pSession->webrtc))
     {
         pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO;
         DirectGate_Desktop_SetFallbackReason(pDesktop, NULL);
@@ -2169,7 +2211,8 @@ static void DirectGate_Desktop_MaybePromoteWebRTCVideo(directgate_session_t *pSe
     XCHECK_VOID_NL((pSession != NULL));
     directgate_desktop_t *pDesktop = &pSession->desktop;
 
-    if (pDesktop->bForceRaw || pDesktop->bWebRTCVideoFailed)
+    if (pDesktop->bForceRaw || pDesktop->bWebRTCVideoFailed ||
+        pDesktop->bPreferDataChannel)
         return;
 
     if (pDesktop->ePipeline != DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
@@ -2651,6 +2694,11 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
     {
         if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||
             pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
+            DirectGate_Desktop_MacEncoder_RequestKeyframe(pSession);
+    }
+    else if (xstrcmp(pAction, "fallback-datachannel"))
+    {
+        if (DirectGate_Desktop_FallbackToDataChannel(pSession))
             DirectGate_Desktop_MacEncoder_RequestKeyframe(pSession);
     }
 
@@ -3146,7 +3194,9 @@ static int DirectGate_Desktop_StartWinPipeline(directgate_session_t *pSession)
     }
 
     xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "h264");
-    if (!pDesktop->bWebRTCVideoFailed && DirectGate_WebRTC_IsVideoOpen(&pSession->webrtc))
+
+    if (!pDesktop->bWebRTCVideoFailed && !pDesktop->bPreferDataChannel &&
+        DirectGate_WebRTC_IsVideoOpen(&pSession->webrtc))
     {
         pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO;
         DirectGate_Desktop_SetFallbackReason(pDesktop, NULL);
@@ -3166,7 +3216,8 @@ static void DirectGate_Desktop_MaybePromoteWebRTCVideo(directgate_session_t *pSe
     XCHECK_VOID_NL((pSession != NULL));
     directgate_desktop_t *pDesktop = &pSession->desktop;
 
-    if (pDesktop->bForceRaw || pDesktop->bWebRTCVideoFailed)
+    if (pDesktop->bForceRaw || pDesktop->bWebRTCVideoFailed ||
+        pDesktop->bPreferDataChannel)
         return;
 
     if (pDesktop->ePipeline != DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
@@ -3680,6 +3731,11 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
     {
         if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||
             pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
+            DirectGate_Desktop_WinEncoder_RequestKeyframe(pSession);
+    }
+    else if (xstrcmp(pAction, "fallback-datachannel"))
+    {
+        if (DirectGate_Desktop_FallbackToDataChannel(pSession))
             DirectGate_Desktop_WinEncoder_RequestKeyframe(pSession);
     }
 

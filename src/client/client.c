@@ -639,7 +639,7 @@ static int DirectGate_Client_HandleWebRTCMsg(directgate_ctx_t *pCli, directgate_
         }
 
         if (xstrused(pCandidate))
-            DirectGate_WebRTC_HandleIceCandidate(&pCli->webrtc, pCandidate, pMid);
+            DirectGate_WebRTC_HandleIceCandidate(&pCli->webrtc, pCandidate, pMid, 0);
     }
 
     return XAPI_CONTINUE;

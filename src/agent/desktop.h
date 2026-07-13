@@ -147,6 +147,7 @@ typedef struct directgate_desktop_ {
     xbool_t bForceRaw;       /* true when fallback raw RGBA path is forced */
     xbool_t bRequestKeyframe;/* set by preset change / drop recovery */
     xbool_t bWebRTCVideoFailed; /* suppress retry until track/ICE recovery */
+    xbool_t bPreferDataChannel; /* browser could not decode RTP; avoid pipeline flapping */
     /* Adaptive bitrate controller state: current encoder rate (<= preset
      * target), ticks since the last congestion signal, and the cooldown
      * ticks left before the next downward step is allowed. */

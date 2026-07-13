@@ -59,6 +59,7 @@ typedef struct directgate_webrtc_event_ {
 
 typedef struct directgate_pending_ice_ {
     struct directgate_pending_ice_ *pNext;
+    uint32_t nGeneration;
     char sCandidate[XSTR_SUB];
     char sMid[XSTR_PICO];
 } directgate_pending_ice_t;
@@ -71,6 +72,7 @@ typedef struct directgate_webrtc_ {
     xbool_t bVideoEnabled;      /* Offer answers may include a desktop video track */
     xbool_t bVideoTrackOpen;    /* Outbound media track is open */
     xbool_t bVideoKeyframeRequested; /* new track or RTCP PLI/FIR needs an IDR */
+    uint32_t nSignalGeneration; /* Browser negotiation generation; rejects stale SDP/ICE */
     rtcLogLevel logLevel;       /* Log level for libdatachannel */
 
     /* Callbacks to send signaling messages via relay WebSocket */
@@ -136,10 +138,14 @@ XSTATUS DirectGate_WebRTC_CreateOffer(directgate_webrtc_t *pRTC);
 XSTATUS DirectGate_WebRTC_HandleAnswer(directgate_webrtc_t *pRTC, const char *pSdp);
 
 /* Handle incoming SDP offer from client - creates peer connection and answer */
-XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSdp);
+XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSdp,
+                                      uint32_t nGeneration);
 
 /* Handle incoming ICE candidate from remote peer */
-XSTATUS DirectGate_WebRTC_HandleIceCandidate(directgate_webrtc_t *pRTC, const char *pCandidate, const char *pMid);
+XSTATUS DirectGate_WebRTC_HandleIceCandidate(directgate_webrtc_t *pRTC,
+                                             const char *pCandidate,
+                                             const char *pMid,
+                                             uint32_t nGeneration);
 
 /* Send binary data over the data channel. Returns 0 on success, -1 on failure */
 XSTATUS DirectGate_WebRTC_Send(directgate_webrtc_t *pRTC, const uint8_t *pData, size_t nLen);
