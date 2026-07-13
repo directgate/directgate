@@ -171,7 +171,9 @@ int DirectGate_Desktop_SendEncodedFrame(directgate_session_t *pSession,
 
     if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO)
     {
-        if (DirectGate_WebRTC_SendH264AnnexB(&pSession->webrtc, pPayload, nPayloadLength, nPtsUs) >= 0)
+        xbool_t bVideoTrackOpen = DirectGate_WebRTC_IsVideoOpen(&pSession->webrtc);
+        if (bVideoTrackOpen && DirectGate_WebRTC_SendH264AnnexB(&pSession->webrtc,
+                pPayload, nPayloadLength, nPtsUs) >= 0)
         {
             pDesktop->nFrameWidth = nWidth;
             pDesktop->nFrameHeight = nHeight;
@@ -179,9 +181,15 @@ int DirectGate_Desktop_SendEncodedFrame(directgate_session_t *pSession,
         }
 
         pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_H264_DC;
-        pDesktop->bWebRTCVideoFailed = XTRUE;
-        DirectGate_Desktop_SetFallbackReason(pDesktop,
-            "WebRTC video track send failed; using encrypted H.264 data channel.");
+        /* A closed track is expected while the browser replaces a TURN peer
+         * with P2P (or falls back the other way).  Keep that demotion
+         * temporary so VIDEO_OPEN on the replacement track can promote the
+         * encoder again.  Only an actual send failure on an open track is
+         * latched until a new keyframe/recovery signal arrives. */
+        pDesktop->bWebRTCVideoFailed = bVideoTrackOpen;
+        DirectGate_Desktop_SetFallbackReason(pDesktop, bVideoTrackOpen ?
+            "WebRTC video track send failed; using encrypted H.264 data channel." :
+            "WebRTC video track is reconnecting; using encrypted H.264 data channel.");
         DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
     }
 
@@ -1323,7 +1331,11 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
         pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
     {
         if (DirectGate_WebRTC_TakeVideoKeyframeRequest(&pSession->webrtc))
+        {
             DirectGate_Desktop_LinuxEncoder_RequestKeyframe(pSession);
+            if (DirectGate_WebRTC_IsVideoOpen(&pSession->webrtc))
+                pDesktop->bWebRTCVideoFailed = XFALSE;
+        }
 
         DirectGate_Desktop_MaybePromoteWebRTCVideo(pSession);
         DirectGate_Desktop_AdaptBitrate(pSession);
@@ -2233,7 +2245,11 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
         pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
     {
         if (DirectGate_WebRTC_TakeVideoKeyframeRequest(&pSession->webrtc))
+        {
             DirectGate_Desktop_MacEncoder_RequestKeyframe(pSession);
+            if (DirectGate_WebRTC_IsVideoOpen(&pSession->webrtc))
+                pDesktop->bWebRTCVideoFailed = XFALSE;
+        }
 
         DirectGate_Desktop_MaybePromoteWebRTCVideo(pSession);
         DirectGate_Desktop_AdaptBitrate(pSession);
@@ -3249,7 +3265,11 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
         pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
     {
         if (DirectGate_WebRTC_TakeVideoKeyframeRequest(&pSession->webrtc))
+        {
             DirectGate_Desktop_WinEncoder_RequestKeyframe(pSession);
+            if (DirectGate_WebRTC_IsVideoOpen(&pSession->webrtc))
+                pDesktop->bWebRTCVideoFailed = XFALSE;
+        }
 
         DirectGate_Desktop_MaybePromoteWebRTCVideo(pSession);
         DirectGate_Desktop_AdaptBitrate(pSession);

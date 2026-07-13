@@ -71,6 +71,13 @@ static int DirectGate_WebRTC_GetPipe(const directgate_webrtc_t *pRTC)
     return (int)pRTC->nPipeFds[0];
 }
 
+static xbool_t DirectGate_WebRTC_IsCurrentPeerConnection(const directgate_webrtc_t *pRTC, int nPC)
+{
+    return (pRTC != NULL && nPC >= 0 &&
+        pRTC->nPeerConnectionID == nPC) ?
+        XTRUE : XFALSE;
+}
+
 /* Unescape JSON string sequences (\r \n \t \\ \") in place.
    The xutils JSON parser does not unescape string values, so
    SDP strings arrive with literal \r\n instead of CR/LF. */
@@ -401,6 +408,19 @@ static void DirectGate_WebRTC_CloseVideoTrack(int nTrack)
     rtcDeleteTrack(nTrack);
 }
 
+static void DirectGate_WebRTC_DetachPeerConnection(int nPC)
+{
+    if (nPC < 0) return;
+    rtcSetUserPointer(nPC, NULL);
+    rtcSetLocalDescriptionCallback(nPC, NULL);
+    rtcSetLocalCandidateCallback(nPC, NULL);
+    rtcSetStateChangeCallback(nPC, NULL);
+    rtcSetDataChannelCallback(nPC, NULL);
+    rtcSetIceStateChangeCallback(nPC, NULL);
+    rtcSetGatheringStateChangeCallback(nPC, NULL);
+    rtcSetSignalingStateChangeCallback(nPC, NULL);
+}
+
 static void DirectGate_WebRTC_DrainQueue(directgate_webrtc_t *pRTC)
 {
     directgate_webrtc_event_t *pHead;
@@ -660,9 +680,11 @@ void DirectGate_WebRTC_Destroy(directgate_webrtc_t *pRTC)
 
     if (pRTC->nPeerConnectionID >= 0)
     {
-        rtcClosePeerConnection(pRTC->nPeerConnectionID);
-        rtcDeletePeerConnection(pRTC->nPeerConnectionID);
+        int nPC = pRTC->nPeerConnectionID;
         pRTC->nPeerConnectionID = -1;
+        DirectGate_WebRTC_DetachPeerConnection(nPC);
+        rtcClosePeerConnection(nPC);
+        rtcDeletePeerConnection(nPC);
     }
 
     pRTC->bConnected = XFALSE;
@@ -716,7 +738,7 @@ static void DirectGate_WebRTC_OnLocalDescription(int nPC, const char *pSdp, cons
     XCHECK_VOID((pRTC != NULL));
     XCHECK_VOID((pSdp != NULL));
     XCHECK_VOID((pType != NULL));
-    pRTC->nPeerConnectionID = nPC;
+    XCHECK_VOID_NL(DirectGate_WebRTC_IsCurrentPeerConnection(pRTC, nPC));
 
     xlogi("Generated local WebRTC description: pc(%d), dc(%d), type(%s)",
         DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC), pType);
@@ -758,8 +780,8 @@ static void DirectGate_WebRTC_OnLocalCandidate(int nPC, const char *pCand, const
     directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
     XCHECK_VOID((pRTC != NULL));
     XCHECK_VOID((pCand != NULL));
+    XCHECK_VOID_NL(DirectGate_WebRTC_IsCurrentPeerConnection(pRTC, nPC));
 
-    pRTC->nPeerConnectionID = nPC;
     const char *pUseMid = xstrused(pMid) ? pMid : DIRECTGATE_RTC_DEFAULT_MID;
 
     xlogd("Generated local WebRTC ICE candidate: pc(%d), dc(%d), mid(%s)",
@@ -788,7 +810,7 @@ static void DirectGate_WebRTC_OnLocalCandidate(int nPC, const char *pCand, const
 static void DirectGate_WebRTC_OnGatheringStateChange(int nPC, rtcGatheringState state, void *pPtr)
 {
     directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
-    if (pRTC != NULL) pRTC->nPeerConnectionID = nPC;
+    XCHECK_VOID_NL(DirectGate_WebRTC_IsCurrentPeerConnection(pRTC, nPC));
 
     const char *pStates[] = {"new", "inprogress", "complete"};
     const char *pStateStr = (state >= 0 && state <= 2) ? pStates[state] : "unknown";
@@ -801,7 +823,7 @@ static void DirectGate_WebRTC_OnGatheringStateChange(int nPC, rtcGatheringState 
 static void DirectGate_WebRTC_OnStateChange(int nPC, rtcState state, void *pPtr)
 {
     directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
-    if (pRTC != NULL) pRTC->nPeerConnectionID = nPC;
+    XCHECK_VOID_NL(DirectGate_WebRTC_IsCurrentPeerConnection(pRTC, nPC));
 
     const char *pStates[] = {
         "new",
@@ -821,7 +843,7 @@ static void DirectGate_WebRTC_OnStateChange(int nPC, rtcState state, void *pPtr)
 static void DirectGate_WebRTC_OnIceStateChange(int nPC, rtcIceState state, void *pPtr)
 {
     directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
-    if (pRTC != NULL) pRTC->nPeerConnectionID = nPC;
+    XCHECK_VOID_NL(DirectGate_WebRTC_IsCurrentPeerConnection(pRTC, nPC));
 
     const char *pStates[] = {
         "new",
@@ -836,13 +858,23 @@ static void DirectGate_WebRTC_OnIceStateChange(int nPC, rtcIceState state, void 
     xlogi("ICE state changed: pc(%d), dc(%d), state(%s)",
         DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC),
         (state >= 0 && state <= 6) ? pStates[state] : "unknown");
+
+    /* ICE can recover on the same media track while switching between a
+     * direct candidate pair and TURN.  The decoder may have lost every
+     * reference frame during that gap, so start the recovered route with a
+     * fresh SPS/PPS + IDR instead of waiting for its next periodic keyframe. */
+    if (state == RTC_ICE_CONNECTED && pRTC->nVideoTrackID >= 0)
+    {
+        xlogi("WebRTC ICE route recovered; requesting video keyframe: pc(%d), track(%d)", nPC, pRTC->nVideoTrackID);
+        DirectGate_WebRTC_Enqueue(pRTC, DIRECTGATE_WEBRTC_VIDEO_KEYFRAME, pRTC->nVideoTrackID, NULL, 0);
+    }
 }
 
 /* Callback: signaling state change */
 static void DirectGate_WebRTC_OnSignalingStateChange(int nPC, rtcSignalingState state, void *pPtr)
 {
     directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
-    if (pRTC != NULL) pRTC->nPeerConnectionID = nPC;
+    XCHECK_VOID_NL(DirectGate_WebRTC_IsCurrentPeerConnection(pRTC, nPC));
 
     const char *pStates[] = {
         "stable",
@@ -940,6 +972,7 @@ static void DirectGate_WebRTC_OnDataChannel(int nPC, int nDC, void *pPtr)
 {
     directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
     XCHECK_VOID((pRTC != NULL));
+    XCHECK_VOID_NL(DirectGate_WebRTC_IsCurrentPeerConnection(pRTC, nPC));
 
     if (pRTC->nDataChannelID >= 0 && pRTC->nDataChannelID != nDC)
     {
@@ -950,7 +983,6 @@ static void DirectGate_WebRTC_OnDataChannel(int nPC, int nDC, void *pPtr)
     }
 
     pRTC->nDataChannelID = nDC;
-    pRTC->nPeerConnectionID = nPC;
 
     xlogi("Accepted incoming WebRTC data channel: pc(%d), dc(%d), pipefd(%d)",
         DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC), DirectGate_WebRTC_GetPipe(pRTC));
