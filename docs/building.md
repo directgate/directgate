@@ -45,7 +45,7 @@ This produces:
 sudo make -C build install
 ```
 
-This installs the `directgate` and `dgcli` binaries plus a system service that runs the agent **as the installing user** (not root). The user and home directory are detected at install time (`$SUDO_USER`, falling back to `$USER`) and substituted into the service template, so you never edit it by hand.
+This installs the `directgate` and `dgcli` binaries plus a system service that runs the agent **as the installing user** (not root). The user and home directory are detected at install time (`$SUDO_USER`, falling back to `$USER`) and substituted into the service template. On Linux, the installer also detects the active X11 authority file from the environment, GDM, LightDM, `~/.Xauthority`, or the user's graphical session, so the generated unit does not hardcode a display manager.
 
 **Linux** - binaries to `/usr/bin`, and a systemd unit from [misc/directgate-agent.service](../misc/directgate-agent.service):
 

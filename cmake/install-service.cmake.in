@@ -47,6 +47,86 @@ if(NOT _home)
   endif()
 endif()
 
+# Resolve the X11 authority file at install time instead of assuming a
+# particular display manager. GDM and LightDM keep the cookie in different
+# runtime directories, while XDM/SDDM commonly use ~/.Xauthority. Prefer a
+# valid environment override, then stable display-manager paths. As a final
+# fallback, inspect graphical processes owned by the target user; this also
+# covers display managers that create a randomized authority filename.
+set(_xauthority "")
+set(_env_xauthority "$ENV{XAUTHORITY}")
+if(_env_xauthority AND IS_ABSOLUTE "${_env_xauthority}" AND EXISTS "${_env_xauthority}")
+  set(_xauthority "${_env_xauthority}")
+endif()
+
+set(_uid "")
+execute_process(COMMAND id -u "${_user}"
+  OUTPUT_VARIABLE _uid OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+
+if(NOT _xauthority AND _uid MATCHES "^[0-9]+$")
+  set(_xauthority_candidates
+    "/run/user/${_uid}/gdm/Xauthority"
+    "/run/lightdm/${_user}/xauthority"
+    "${_home}/.Xauthority")
+
+  foreach(_candidate IN LISTS _xauthority_candidates)
+    if(EXISTS "${_candidate}")
+      set(_xauthority "${_candidate}")
+      break()
+    endif()
+  endforeach()
+endif()
+
+# The authority file may not exist yet when installing over SSH or before the
+# first graphical login. In that case infer the stable path from the system's
+# configured display manager so the unit is already correct when it appears.
+if(NOT _xauthority AND _uid MATCHES "^[0-9]+$")
+  set(_display_manager "")
+  if(EXISTS "/etc/systemd/system/display-manager.service")
+    get_filename_component(_display_manager_service
+      "/etc/systemd/system/display-manager.service" REALPATH)
+    get_filename_component(_display_manager "${_display_manager_service}" NAME_WE)
+  elseif(EXISTS "/etc/X11/default-display-manager")
+    file(READ "/etc/X11/default-display-manager" _display_manager_path LIMIT 4096)
+    string(STRIP "${_display_manager_path}" _display_manager_path)
+    get_filename_component(_display_manager "${_display_manager_path}" NAME_WE)
+  endif()
+
+  if(_display_manager MATCHES "^gdm(3)?(-.*)?$")
+    set(_xauthority "/run/user/${_uid}/gdm/Xauthority")
+  elseif(_display_manager MATCHES "^lightdm(-.*)?$")
+    set(_xauthority "/run/lightdm/${_user}/xauthority")
+  elseif(_display_manager MATCHES "^(sddm|xdm)(-.*)?$")
+    set(_xauthority "${_home}/.Xauthority")
+  endif()
+endif()
+
+if(NOT _xauthority AND _uid MATCHES "^[0-9]+$")
+  execute_process(
+    COMMAND /bin/sh -c [=[
+      uid="$1"
+      for env_file in /proc/[0-9]*/environ; do
+        owner=$(stat -c %u "$env_file" 2>/dev/null) || continue
+        [ "$owner" = "$uid" ] || continue
+        authority=$(tr '\0' '\n' < "$env_file" 2>/dev/null |
+          sed -n 's/^XAUTHORITY=//p' | head -n 1)
+        [ -n "$authority" ] && [ -r "$authority" ] || continue
+        case "$authority" in
+          /*) printf '%s' "$authority"; exit 0 ;;
+        esac
+      done
+      exit 1
+    ]=] directgate-xauthority "${_uid}"
+    OUTPUT_VARIABLE _process_xauthority
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+
+  if(_process_xauthority AND IS_ABSOLUTE "${_process_xauthority}" AND
+      EXISTS "${_process_xauthority}")
+    set(_xauthority "${_process_xauthority}")
+  endif()
+endif()
+
 # Render the unit from the template. The legacy /home/<username> replacement is
 # kept so older local templates still render to the resolved home directory.
 file(READ "${_template}" _content)
@@ -54,11 +134,24 @@ string(REPLACE "<home>" "${_home}" _content "${_content}")
 string(REPLACE "/home/<username>" "${_home}" _content "${_content}")
 string(REPLACE "<username>" "${_user}" _content "${_content}")
 string(REPLACE "<exec>" "${_bindir}/directgate" _content "${_content}")
+if(_xauthority)
+  string(REPLACE "<xauthority>" "${_xauthority}" _content "${_content}")
+else()
+  string(REPLACE "Environment=\"XAUTHORITY=<xauthority>\"\n" "" _content "${_content}")
+  message(WARNING
+    "directgate-agent.service: no readable XAUTHORITY file found for ${_user}; "
+    "installing the unit without an XAUTHORITY override")
+endif()
 
 get_filename_component(_dest_dir "${_dest}" DIRECTORY)
 file(MAKE_DIRECTORY "${_dest_dir}")
 file(WRITE "${_dest}" "${_content}")
-message(STATUS "Installed systemd unit: ${_dest} (User=${_user})")
+if(_xauthority)
+  message(STATUS
+    "Installed systemd unit: ${_dest} (User=${_user}, XAUTHORITY=${_xauthority})")
+else()
+  message(STATUS "Installed systemd unit: ${_dest} (User=${_user})")
+endif()
 
 # Best-effort: refresh systemd so the new unit is visible. Skipped for staged
 # installs (DESTDIR) and when systemd is not running.
