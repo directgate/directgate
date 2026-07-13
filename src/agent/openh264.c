@@ -46,10 +46,51 @@ struct directgate_openh264_ {
     uint32_t nFps;
 };
 
+/* OpenH264 2.6 added rPsnr[3] to SLayerBSInfo. SFrameBSInfo embeds an array
+ * of 128 layer records, so that trailing field changes the stride of every
+ * entry and moves eFrameType/iFrameSizeInBytes/uiTimeStamp. Ubuntu 24.04
+ * currently ships 2.4.x while Fedora ships 2.6.x; parsing a 2.4 frame with
+ * the vendored 2.6 headers therefore loses every layer after layer zero.
+ *
+ * The encoder vtable and the prefixes of SEncParamExt/SSourcePicture remain
+ * compatible. Keep the pre-2.6 frame layout here and select it from the
+ * runtime version reported by WelsGetCodecVersionEx. */
+typedef struct directgate_openh264_layer_pre26_ {
+    unsigned char uiTemporalId;
+    unsigned char uiSpatialId;
+    unsigned char uiQualityId;
+    EVideoFrameType eFrameType;
+    unsigned char uiLayerType;
+    int iSubSeqId;
+    int iNalCount;
+    int *pNalLengthInByte;
+    unsigned char *pBsBuf;
+} directgate_openh264_layer_pre26_t;
+
+typedef struct directgate_openh264_frame_pre26_ {
+    int iLayerNum;
+    directgate_openh264_layer_pre26_t sLayerInfo[MAX_LAYER_NUM_OF_FRAME];
+    EVideoFrameType eFrameType;
+    int iFrameSizeInBytes;
+    long long uiTimeStamp;
+} directgate_openh264_frame_pre26_t;
+
+typedef union directgate_openh264_frame_storage_ {
+    SFrameBSInfo current;
+    directgate_openh264_frame_pre26_t pre26;
+} directgate_openh264_frame_storage_t;
+
 static directgate_openh264_lib_t g_openh264;
 
+static xbool_t DirectGate_OpenH264_UsesPre26FrameLayout(void)
+{
+    return (g_openh264.version.uMajor == 2U && g_openh264.version.uMinor < 6U) ?
+        XTRUE : XFALSE;
+}
+
 /* Sonames the Cisco/openh264 binary releases have shipped under. Newest
- * first; the vendored headers are 2.x so any 2.x soname is ABI-compatible. */
+ * first; the encoder vtable is compatible across 2.x and the versioned
+ * frame-metadata layouts are handled explicitly above. */
 static const char *g_pOpenH264Names[] = {
     "libopenh264.so.8",
     "libopenh264.so.7",
@@ -148,8 +189,9 @@ int DirectGate_OpenH264_Load(char *pErrBuf, size_t nErrSize)
     snprintf(pLib->sVersion, sizeof(pLib->sVersion), "openh264 %u.%u.%u",
         version.uMajor, version.uMinor, version.uRevision);
 
-    xlogi("Loaded OpenH264 encoder library: name(%s), version(%u.%u.%u)",
-        pLoadedName, version.uMajor, version.uMinor, version.uRevision);
+    xlogi("Loaded OpenH264 encoder library: name(%s), version(%u.%u.%u), frame-layout(%s)",
+        pLoadedName, version.uMajor, version.uMinor, version.uRevision,
+        DirectGate_OpenH264_UsesPre26FrameLayout() ? "pre-2.6" : "2.6+");
 
     return XSTDOK;
 }
@@ -306,10 +348,13 @@ int DirectGate_OpenH264_Encode(directgate_openh264_t *pEncoder,
     picture.pData[2] = (unsigned char*)pI420 + nLumaSize + nLumaSize / 4U;
     picture.uiTimeStamp = (long long)(nPtsUs / 1000ULL);
 
-    SFrameBSInfo info;
+    directgate_openh264_frame_storage_t info;
     memset(&info, 0, sizeof(info));
 
-    int nRet = (*pWels)->EncodeFrame(pWels, &picture, &info);
+    xbool_t bPre26 = DirectGate_OpenH264_UsesPre26FrameLayout();
+    SFrameBSInfo *pInfo = bPre26 ? (SFrameBSInfo*)&info.pre26 : &info.current;
+
+    int nRet = (*pWels)->EncodeFrame(pWels, &picture, pInfo);
     if (nRet != 0)
     {
         xloge("OpenH264 EncodeFrame failed: size(%ux%u), ret(%d)",
@@ -317,22 +362,53 @@ int DirectGate_OpenH264_Encode(directgate_openh264_t *pEncoder,
         return XSTDERR;
     }
 
-    if (info.eFrameType == videoFrameTypeSkip || info.iLayerNum <= 0)
+    EVideoFrameType eFrameType = bPre26 ? info.pre26.eFrameType : info.current.eFrameType;
+    int nLayerNum = bPre26 ? info.pre26.iLayerNum : info.current.iLayerNum;
+
+    if (eFrameType == videoFrameTypeSkip || nLayerNum <= 0)
         return XSTDNON;
+
+    if (nLayerNum > MAX_LAYER_NUM_OF_FRAME)
+    {
+        xloge("OpenH264 returned invalid layer count: version(%s), layers(%d)",
+            DirectGate_OpenH264_Version(), nLayerNum);
+        return XSTDERR;
+    }
 
     pOut->nUsed = 0;
 
-    for (int i = 0; i < info.iLayerNum; i++)
+    for (int i = 0; i < nLayerNum; i++)
     {
-        const SLayerBSInfo *pLayer = &info.sLayerInfo[i];
+        int nNalCount = bPre26 ? info.pre26.sLayerInfo[i].iNalCount :
+            info.current.sLayerInfo[i].iNalCount;
+        int *pNalLengths = bPre26 ? info.pre26.sLayerInfo[i].pNalLengthInByte :
+            info.current.sLayerInfo[i].pNalLengthInByte;
+        unsigned char *pBitstream = bPre26 ? info.pre26.sLayerInfo[i].pBsBuf :
+            info.current.sLayerInfo[i].pBsBuf;
+
+        if (nNalCount < 0 || (nNalCount > 0 && (pNalLengths == NULL || pBitstream == NULL)))
+        {
+            xloge("OpenH264 returned invalid layer metadata: version(%s), layer(%d), nals(%d)",
+                DirectGate_OpenH264_Version(), i, nNalCount);
+            return XSTDERR;
+        }
+
         size_t nLayerSize = 0;
 
-        for (int j = 0; j < pLayer->iNalCount; j++)
-            nLayerSize += (size_t)pLayer->pNalLengthInByte[j];
+        for (int j = 0; j < nNalCount; j++)
+        {
+            if (pNalLengths[j] <= 0)
+            {
+                xloge("OpenH264 returned invalid NAL length: version(%s), layer(%d), nal(%d), bytes(%d)",
+                    DirectGate_OpenH264_Version(), i, j, pNalLengths[j]);
+                return XSTDERR;
+            }
+            nLayerSize += (size_t)pNalLengths[j];
+        }
 
         /* Each layer buffer already carries Annex-B start codes. */
         if (nLayerSize > 0 &&
-            XByteBuffer_Add(pOut, pLayer->pBsBuf, nLayerSize) <= 0)
+            XByteBuffer_Add(pOut, pBitstream, nLayerSize) <= 0)
         {
             xloge("Failed to buffer encoded frame: bytes(%zu)", nLayerSize);
             return XSTDERR;
@@ -343,8 +419,8 @@ int DirectGate_OpenH264_Encode(directgate_openh264_t *pEncoder,
 
     if (pKeyframe != NULL)
     {
-        *pKeyframe = (info.eFrameType == videoFrameTypeIDR ||
-                      info.eFrameType == videoFrameTypeI) ?
+        *pKeyframe = (eFrameType == videoFrameTypeIDR ||
+                      eFrameType == videoFrameTypeI) ?
                       XTRUE : XFALSE;
     }
 
