@@ -1700,6 +1700,8 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
             case DIRECTGATE_WEBRTC_VIDEO_OPEN:
             {
                 pRTC->bVideoTrackOpen = XTRUE;
+                pRTC->bVideoKeyframeRequested = XTRUE;
+
                 xlogn("WebRTC media video track is active: pc(%d), track(%d), mid(%s)",
                     DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetVideoTrack(pRTC), pRTC->sVideoMid);
 

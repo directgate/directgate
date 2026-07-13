@@ -70,7 +70,7 @@ typedef struct directgate_webrtc_ {
     xbool_t bConnected;         /* Data channel is open (main thread only) */
     xbool_t bVideoEnabled;      /* Offer answers may include a desktop video track */
     xbool_t bVideoTrackOpen;    /* Outbound media track is open */
-    xbool_t bVideoKeyframeRequested; /* RTCP PLI/FIR received */
+    xbool_t bVideoKeyframeRequested; /* new track or RTCP PLI/FIR needs an IDR */
     rtcLogLevel logLevel;       /* Log level for libdatachannel */
 
     /* Callbacks to send signaling messages via relay WebSocket */
