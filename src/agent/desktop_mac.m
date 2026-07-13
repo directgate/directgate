@@ -292,30 +292,9 @@ API_AVAILABLE(macos(12.3))
 static void DirectGateDesktopEncoder_SetError(DirectGateDesktopEncoder *enc, const char *msg)
 {
     if (!enc || !msg) return;
-    if (enc.lastError == nil)
-        enc.lastError = [NSMutableString string];
+    if (enc.lastError == nil) enc.lastError = [NSMutableString string];
     [enc.lastError setString:[NSString stringWithUTF8String:msg]];
-    if (enc.desktop)
-        xstrncpy(enc.desktop->sReason, sizeof(enc.desktop->sReason), msg);
-}
-
-static uint32_t DirectGateDesktopEncoder_PickEncodeDim(uint32_t value, uint32_t maxEdge,
-                                                   uint32_t srcW, uint32_t srcH,
-                                                   BOOL isWidth)
-{
-    uint32_t edge = srcW > srcH ? srcW : srcH;
-    if (edge == 0 || maxEdge == 0) return value;
-    if (edge <= maxEdge)
-    {
-        /* Scaling already inside the encoder budget — keep source-aligned. */
-        return value;
-    }
-    uint64_t scaled = ((uint64_t)value * maxEdge) / edge;
-    /* H.264 hardware prefers even dimensions. */
-    uint32_t result = (uint32_t)(scaled & ~1ULL);
-    if (result < 16) result = 16;
-    (void)isWidth;
-    return result;
+    if (enc.desktop) xstrncpy(enc.desktop->sReason, sizeof(enc.desktop->sReason), msg);
 }
 
 static OSStatus DirectGateDesktopEncoder_EmitAnnexB(NSMutableData *out, const uint8_t *src, size_t len);
@@ -507,11 +486,10 @@ API_AVAILABLE(macos(12.3))
         return NO;
     }
 
-    uint32_t maxEdge = _desktop ? _desktop->quality.nMaxEdge : 1920U;
-    _encodeWidth  = DirectGateDesktopEncoder_PickEncodeDim(_captureWidth,  maxEdge,
-                                                     _captureWidth, _captureHeight, YES);
-    _encodeHeight = DirectGateDesktopEncoder_PickEncodeDim(_captureHeight, maxEdge,
-                                                     _captureWidth, _captureHeight, NO);
+    _encodeWidth = _captureWidth;
+    _encodeHeight = _captureHeight;
+
+    DirectGate_Desktop_ComputeOutputSize(_desktop, _captureWidth, _captureHeight, &_encodeWidth, &_encodeHeight);
     if (_encodeWidth == 0 || _encodeHeight == 0)
     {
         _encodeWidth = _captureWidth;
@@ -989,14 +967,15 @@ void DirectGate_Desktop_MacEncoder_ApplyQuality(directgate_session_t *pSession)
          * startWithDisplay does and rebuild the whole capture+encode chain
          * when they differ; bitrate/fps/GOP-only updates apply live. */
         directgate_desktop_t *pDesktop = &pSession->desktop;
-        uint32_t maxEdge = pDesktop->quality.nMaxEdge ? pDesktop->quality.nMaxEdge : 1920U;
         uint32_t captureWidth = enc.captureWidth;
         uint32_t captureHeight = enc.captureHeight;
         int32_t captureX = enc.captureX;
         int32_t captureY = enc.captureY;
 
-        uint32_t width = DirectGateDesktopEncoder_PickEncodeDim(captureWidth, maxEdge, captureWidth, captureHeight, YES);
-        uint32_t height = DirectGateDesktopEncoder_PickEncodeDim(captureHeight, maxEdge, captureWidth, captureHeight, NO);
+        uint32_t width = captureWidth;
+        uint32_t height = captureHeight;
+        DirectGate_Desktop_ComputeOutputSize(pDesktop, captureWidth, captureHeight,
+            &width, &height);
 
         width  &= ~1U;
         height &= ~1U;

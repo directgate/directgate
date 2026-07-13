@@ -105,21 +105,19 @@ static uint64_t DirectGate_Desktop_X11Enc_MonotonicUs(void)
     return (uint64_t)now.tv_sec * 1000000ULL + (uint64_t)now.tv_nsec / 1000ULL;
 }
 
-/* Same policy as DirectGateDesktopEncoder_PickEncodeDim on macOS: fit the
- * longest capture edge into the preset budget, keep dimensions even (H.264
- * requirement) and never collapse below 16 pixels. */
-static uint32_t DirectGate_Desktop_X11Enc_PickDim(uint32_t nValue, uint32_t nMaxEdge,
-                                              uint32_t nSrcW, uint32_t nSrcH)
+static void DirectGate_Desktop_X11Enc_PickSize(const directgate_desktop_t *pDesktop,
+                                               uint32_t nSrcW, uint32_t nSrcH,
+                                               uint32_t *pWidth, uint32_t *pHeight)
 {
-    uint32_t nEdge = nSrcW > nSrcH ? nSrcW : nSrcH;
-    uint32_t nResult = nValue;
-
-    if (nEdge > 0 && nMaxEdge > 0 && nEdge > nMaxEdge)
-        nResult = (uint32_t)(((uint64_t)nValue * nMaxEdge) / nEdge);
-
-    nResult &= ~1U;
-    if (nResult < 16U) nResult = 16U;
-    return nResult;
+    uint32_t nWidth = nSrcW;
+    uint32_t nHeight = nSrcH;
+    DirectGate_Desktop_ComputeOutputSize(pDesktop, nSrcW, nSrcH, &nWidth, &nHeight);
+    nWidth &= ~1U;
+    nHeight &= ~1U;
+    if (nWidth < 16U) nWidth = 16U;
+    if (nHeight < 16U) nHeight = 16U;
+    *pWidth = nWidth;
+    *pHeight = nHeight;
 }
 
 static xbool_t DirectGate_Desktop_X11Enc_HostIsLittleEndian(void)
@@ -354,9 +352,8 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     pEnc->nCaptureWidth = nWidth;
     pEnc->nCaptureHeight = nHeight;
 
-    uint32_t nMaxEdge = pDesktop->quality.nMaxEdge ? pDesktop->quality.nMaxEdge : 1920U;
-    pEnc->nEncodeWidth = DirectGate_Desktop_X11Enc_PickDim(nWidth, nMaxEdge, nWidth, nHeight);
-    pEnc->nEncodeHeight = DirectGate_Desktop_X11Enc_PickDim(nHeight, nMaxEdge, nWidth, nHeight);
+    DirectGate_Desktop_X11Enc_PickSize(pDesktop, nWidth, nHeight,
+        &pEnc->nEncodeWidth, &pEnc->nEncodeHeight);
 
     char sError[DIRECTGATE_DESKTOP_REASON_LEN] = {0};
     pEnc->pEncoder = DirectGate_OpenH264_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
@@ -444,11 +441,9 @@ void DirectGate_Desktop_LinuxEncoder_ApplyQuality(directgate_session_t *pSession
     directgate_x11enc_t *pEnc = DirectGate_Desktop_X11Enc(pDesktop);
     XCHECK_VOID_NL((pEnc != NULL));
 
-    uint32_t nMaxEdge = pDesktop->quality.nMaxEdge ? pDesktop->quality.nMaxEdge : 1920U;
-    uint32_t nWidth = DirectGate_Desktop_X11Enc_PickDim(pEnc->nCaptureWidth, nMaxEdge,
-        pEnc->nCaptureWidth, pEnc->nCaptureHeight);
-    uint32_t nHeight = DirectGate_Desktop_X11Enc_PickDim(pEnc->nCaptureHeight, nMaxEdge,
-        pEnc->nCaptureWidth, pEnc->nCaptureHeight);
+    uint32_t nWidth = 0U;
+    uint32_t nHeight = 0U;
+    DirectGate_Desktop_X11Enc_PickSize(pDesktop, pEnc->nCaptureWidth, pEnc->nCaptureHeight, &nWidth, &nHeight);
 
     /* A resolution change needs a full encoder + buffer rebuild; bitrate,
      * frame rate and GOP updates go through without re-initialization. */

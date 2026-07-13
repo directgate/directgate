@@ -47,6 +47,30 @@ static int send_header(directgate_conn_t *pConn, xapi_session_t *pSession, xjson
 
 int main(void)
 {
+    directgate_desktop_t desktop;
+    DirectGate_Desktop_Init(&desktop);
+    desktop.nTargetWidth = 1280;
+    desktop.nTargetHeight = 800;
+    uint32_t nWidth = 0;
+    uint32_t nHeight = 0;
+    DirectGate_Desktop_ComputeOutputSize(&desktop, 2560, 1440, &nWidth, &nHeight);
+    CHECK(nWidth == 1280 && nHeight == 720,
+        "desktop output should aspect-fit the browser viewport");
+
+    desktop.nTargetWidth = 2560;
+    desktop.nTargetHeight = 1440;
+    DirectGate_Desktop_ComputeOutputSize(&desktop, 1280, 720, &nWidth, &nHeight);
+    CHECK(nWidth == 1280 && nHeight == 720,
+        "desktop output must never upscale above the capture size");
+
+    desktop.eResizeMode = DIRECTGATE_DESKTOP_RESIZE_DISPLAY;
+    desktop.nTargetWidth = 800;
+    desktop.nTargetHeight = 600;
+    DirectGate_Desktop_ComputeOutputSize(&desktop, 1024, 768, &nWidth, &nHeight);
+    CHECK(nWidth == 1024 && nHeight == 768,
+        "display mode must encode the resized display without a second scale");
+    DirectGate_Desktop_Clear(&desktop);
+
     directgate_cfg_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     xstrncpy(cfg.auth.sSaltHex, sizeof(cfg.auth.sSaltHex),

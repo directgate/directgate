@@ -151,18 +151,19 @@ static uint64_t DirectGate_Desktop_WinEnc_MonotonicUs(const directgate_winenc_t 
 /* Same policy as the Linux/macOS pipelines: fit the longest capture edge
  * into the preset budget, keep dimensions even (H.264 requirement) and
  * never collapse below 16 pixels. */
-static uint32_t DirectGate_Desktop_WinEnc_PickDim(uint32_t nValue, uint32_t nMaxEdge,
-                                              uint32_t nSrcW, uint32_t nSrcH)
+static void DirectGate_Desktop_WinEnc_PickSize(const directgate_desktop_t *pDesktop,
+                                               uint32_t nSrcW, uint32_t nSrcH,
+                                               uint32_t *pWidth, uint32_t *pHeight)
 {
-    uint32_t nEdge = nSrcW > nSrcH ? nSrcW : nSrcH;
-    uint32_t nResult = nValue;
-
-    if (nEdge > 0 && nMaxEdge > 0 && nEdge > nMaxEdge)
-        nResult = (uint32_t)(((uint64_t)nValue * nMaxEdge) / nEdge);
-
-    nResult &= ~1U;
-    if (nResult < 16U) nResult = 16U;
-    return nResult;
+    uint32_t nWidth = nSrcW;
+    uint32_t nHeight = nSrcH;
+    DirectGate_Desktop_ComputeOutputSize(pDesktop, nSrcW, nSrcH, &nWidth, &nHeight);
+    nWidth &= ~1U;
+    nHeight &= ~1U;
+    if (nWidth < 16U) nWidth = 16U;
+    if (nHeight < 16U) nHeight = 16U;
+    *pWidth = nWidth;
+    *pHeight = nHeight;
 }
 
 static void DirectGate_Desktop_WinEnc_SleepUs(directgate_winenc_t *pEnc, uint64_t nUs)
@@ -857,10 +858,7 @@ int DirectGate_Desktop_WinEncoder_Start(directgate_session_t *pSession,
     pEnc->nCaptureWidth = nWidth;
     pEnc->nCaptureHeight = nHeight;
     pEnc->nFps = pDesktop->quality.nFps ? pDesktop->quality.nFps : 30U;
-
-    uint32_t nMaxEdge = pDesktop->quality.nMaxEdge ? pDesktop->quality.nMaxEdge : 1920U;
-    pEnc->nEncodeWidth = DirectGate_Desktop_WinEnc_PickDim(nWidth, nMaxEdge, nWidth, nHeight);
-    pEnc->nEncodeHeight = DirectGate_Desktop_WinEnc_PickDim(nHeight, nMaxEdge, nWidth, nHeight);
+    DirectGate_Desktop_WinEnc_PickSize(pDesktop, nWidth, nHeight, &pEnc->nEncodeWidth, &pEnc->nEncodeHeight);
 
     InitializeSRWLock(&pEnc->mailboxLock);
     XByteBuffer_Init(&pEnc->encoded, XSTDNON, XFALSE);
@@ -917,11 +915,9 @@ void DirectGate_Desktop_WinEncoder_ApplyQuality(directgate_session_t *pSession)
     directgate_winenc_t *pEnc = DirectGate_Desktop_WinEnc(pDesktop);
     XCHECK_VOID_NL((pEnc != NULL));
 
-    uint32_t nMaxEdge = pDesktop->quality.nMaxEdge ? pDesktop->quality.nMaxEdge : 1920U;
-    uint32_t nWidth = DirectGate_Desktop_WinEnc_PickDim(pEnc->nCaptureWidth, nMaxEdge,
-        pEnc->nCaptureWidth, pEnc->nCaptureHeight);
-    uint32_t nHeight = DirectGate_Desktop_WinEnc_PickDim(pEnc->nCaptureHeight, nMaxEdge,
-        pEnc->nCaptureWidth, pEnc->nCaptureHeight);
+    uint32_t nWidth = 0U;
+    uint32_t nHeight = 0U;
+    DirectGate_Desktop_WinEnc_PickSize(pDesktop, pEnc->nCaptureWidth, pEnc->nCaptureHeight, &nWidth, &nHeight);
 
     /* A resolution change needs a full pipeline rebuild; bitrate and GOP
      * updates are marshalled to the capture thread and applied live. */

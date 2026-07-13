@@ -38,6 +38,7 @@ extern "C" {
 #define DIRECTGATE_DESKTOP_PRESET_LEN       16
 #define DIRECTGATE_DESKTOP_PIPELINE_LEN     24
 #define DIRECTGATE_DESKTOP_TRANSPORT_LEN    32
+#define DIRECTGATE_DESKTOP_DEVICE_ID_LEN    128
 
 /* Encoded desktop frame transport (cross-platform).
  * Chunk size matches the raw-RGBA path so the relay/WebRTC fragments stay
@@ -62,6 +63,11 @@ typedef enum {
     DIRECTGATE_DESKTOP_PRESET_LOW_LATENCY   /*  720p 30fps 4 Mbps */
 } directgate_desktop_preset_t;
 
+typedef enum {
+    DIRECTGATE_DESKTOP_RESIZE_SCALE = 0,
+    DIRECTGATE_DESKTOP_RESIZE_DISPLAY
+} directgate_desktop_resize_mode_t;
+
 typedef struct directgate_desktop_quality_ {
     directgate_desktop_preset_t ePreset;
     uint32_t nMaxEdge;       /* longest edge of encoded output, e.g. 1920 */
@@ -81,6 +87,11 @@ typedef struct directgate_desktop_monitor_ {
     uint32_t nWidth;
     uint32_t nHeight;
     xbool_t bPrimary;
+    /* Native display identifier. It is intentionally not exposed over the
+     * wire: Linux stores the XRandR monitor index, Windows the display device
+     * name, and macOS the CGDirectDisplayID. */
+    char sDeviceId[DIRECTGATE_DESKTOP_DEVICE_ID_LEN];
+    uint64_t nNativeId;
 } directgate_desktop_monitor_t;
 
 typedef struct directgate_desktop_ {
@@ -99,6 +110,21 @@ typedef struct directgate_desktop_ {
     uint32_t nCaptureHeight;
     uint32_t nFrameWidth;
     uint32_t nFrameHeight;
+    directgate_desktop_resize_mode_t eResizeMode;
+    uint32_t nTargetWidth;
+    uint32_t nTargetHeight;
+    xbool_t bDisplayModeChanged;
+    char sModeMonitorId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
+    char sModeDeviceId[DIRECTGATE_DESKTOP_DEVICE_ID_LEN];
+    uint64_t nModeNativeId;
+    uint64_t nOriginalModeId;
+    int32_t nOriginalModeX;
+    int32_t nOriginalModeY;
+    uint32_t nOriginalModeWidth;
+    uint32_t nOriginalModeHeight;
+    uint32_t nOriginalModeRefresh;
+    uint32_t nOriginalModeRotation;
+    void *pOriginalDisplayMode;
     uint32_t nFps;
     uint32_t nPointerButtons;
     uint64_t nFrameId;
@@ -179,6 +205,14 @@ int DirectGate_Desktop_SendEncodedFrame(directgate_session_t *pSession,
 void DirectGate_Desktop_ApplyPreset(directgate_desktop_t *pDesktop, directgate_desktop_preset_t ePreset);
 const char* DirectGate_Desktop_PresetName(directgate_desktop_preset_t ePreset);
 const char* DirectGate_Desktop_PipelineName(directgate_desktop_pipeline_t ePipeline);
+const char* DirectGate_Desktop_ResizeModeName(directgate_desktop_resize_mode_t eMode);
+
+/* Chooses the encoded dimensions for a capture rectangle. An explicit scale
+ * target is an aspect-fit box and never permits upscaling. Display mode sends
+ * the capture at its native size because the OS display itself was resized. */
+void DirectGate_Desktop_ComputeOutputSize(const directgate_desktop_t *pDesktop,
+                                          uint32_t nSourceWidth, uint32_t nSourceHeight,
+                                          uint32_t *pWidth, uint32_t *pHeight);
 
 /* True while the transport (WebRTC data channel) is too backed up to accept
  * another frame; platform encoders skip the capture entirely in that case. */

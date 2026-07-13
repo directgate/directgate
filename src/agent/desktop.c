@@ -74,6 +74,9 @@ static void DirectGate_Desktop_SetReason(directgate_desktop_t *pDesktop, const c
 }
 
 static int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const char *pStatus, const char *pReason);
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
+static void DirectGate_Desktop_RestoreDisplayMode(directgate_desktop_t *pDesktop);
+#endif
 
 const char* DirectGate_Desktop_PresetName(directgate_desktop_preset_t ePreset)
 {
@@ -87,6 +90,11 @@ const char* DirectGate_Desktop_PipelineName(directgate_desktop_pipeline_t ePipel
     if (ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO) return "webrtc-video";
     if (ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC) return "h264-datachannel";
     return "raw-rgba";
+}
+
+const char* DirectGate_Desktop_ResizeModeName(directgate_desktop_resize_mode_t eMode)
+{
+    return eMode == DIRECTGATE_DESKTOP_RESIZE_DISPLAY ? "display" : "scale";
 }
 
 static const char* DirectGate_Desktop_TransportName(directgate_desktop_pipeline_t ePipeline)
@@ -293,15 +301,43 @@ static void DirectGate_Desktop_AdaptBitrate(directgate_session_t *pSession)
 }
 #endif /* __linux__ || __APPLE__ || _WIN32 */
 
-static void DirectGate_Desktop_LimitFrameSize(const directgate_desktop_t *pDesktop,
-                                          uint32_t *pWidth,
-                                          uint32_t *pHeight)
+void DirectGate_Desktop_ComputeOutputSize(const directgate_desktop_t *pDesktop,
+                                          uint32_t nSourceWidth, uint32_t nSourceHeight,
+                                          uint32_t *pWidth, uint32_t *pHeight)
 {
-    uint32_t nWidth = (pWidth != NULL && *pWidth) ? *pWidth : 1U;
-    uint32_t nHeight = (pHeight != NULL && *pHeight) ? *pHeight : 1U;
+    uint32_t nWidth = nSourceWidth ? nSourceWidth : 1U;
+    uint32_t nHeight = nSourceHeight ? nSourceHeight : 1U;
     uint32_t nEdge = nWidth > nHeight ? nWidth : nHeight;
     uint32_t nMaxEdge = (pDesktop != NULL && pDesktop->quality.nMaxEdge > 0U) ?
         pDesktop->quality.nMaxEdge : DIRECTGATE_DESKTOP_MAX_FRAME_EDGE;
+
+    /* In display mode capture already has the requested OS display size, so
+     * a second scaler would defeat the mode's purpose. In scale mode the
+     * browser supplies an aspect-fit box. Clamp both axes to the source so a
+     * large browser never makes the host waste time on an upscale. */
+    if (pDesktop != NULL && pDesktop->eResizeMode == DIRECTGATE_DESKTOP_RESIZE_DISPLAY)
+    {
+        nMaxEdge = 0U;
+    }
+    else if (pDesktop != NULL && pDesktop->nTargetWidth > 0U && pDesktop->nTargetHeight > 0U)
+    {
+        uint32_t nTargetWidth = pDesktop->nTargetWidth;
+        uint32_t nTargetHeight = pDesktop->nTargetHeight;
+        if (nTargetWidth < nWidth || nTargetHeight < nHeight)
+        {
+            if ((uint64_t)nWidth * nTargetHeight > (uint64_t)nHeight * nTargetWidth)
+            {
+                nHeight = (uint32_t)(((uint64_t)nHeight * nTargetWidth) / nWidth);
+                nWidth = nTargetWidth;
+            }
+            else
+            {
+                nWidth = (uint32_t)(((uint64_t)nWidth * nTargetHeight) / nHeight);
+                nHeight = nTargetHeight;
+            }
+        }
+        nMaxEdge = 0U;
+    }
 
 #if defined(__linux__) || defined(_WIN32)
     /* The raw path converts every pixel on the CPU per frame; cap the
@@ -313,7 +349,7 @@ static void DirectGate_Desktop_LimitFrameSize(const directgate_desktop_t *pDeskt
         nMaxEdge = DIRECTGATE_DESKTOP_RAW_BALANCED_EDGE;
 #endif
 
-    if (nEdge > nMaxEdge)
+    if (nMaxEdge > 0U && nEdge > nMaxEdge)
     {
         if (nWidth >= nHeight)
         {
@@ -333,6 +369,35 @@ static void DirectGate_Desktop_LimitFrameSize(const directgate_desktop_t *pDeskt
     if (pHeight != NULL) *pHeight = nHeight;
 }
 
+static void DirectGate_Desktop_LimitFrameSize(const directgate_desktop_t *pDesktop,
+                                              uint32_t *pWidth, uint32_t *pHeight)
+{
+    uint32_t nWidth = (pWidth != NULL && *pWidth) ? *pWidth : 1U;
+    uint32_t nHeight = (pHeight != NULL && *pHeight) ? *pHeight : 1U;
+    DirectGate_Desktop_ComputeOutputSize(pDesktop, nWidth, nHeight, pWidth, pHeight);
+}
+
+static void DirectGate_Desktop_ReadResizeRequest(directgate_desktop_t *pDesktop, xjson_obj_t *pRoot)
+{
+    XCHECK_VOID_NL((pDesktop != NULL && pRoot != NULL));
+    const char *pMode = XJSON_GetString(XJSON_GetObject(pRoot, "mode"));
+    uint32_t nWidth = XJSON_GetU32(XJSON_GetObject(pRoot, "width"));
+    uint32_t nHeight = XJSON_GetU32(XJSON_GetObject(pRoot, "height"));
+
+    if (xstrcmp(pMode, "display"))
+        pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_DISPLAY;
+    else if (xstrcmp(pMode, "scale"))
+        pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_SCALE;
+
+    /* Bound allocations and reject partial sizes. 8K on either axis is well
+     * beyond current browser viewports while still allowing native 8K hosts. */
+    if (nWidth > 0U && nHeight > 0U && nWidth <= 8192U && nHeight <= 8192U)
+    {
+        pDesktop->nTargetWidth = nWidth;
+        pDesktop->nTargetHeight = nHeight;
+    }
+}
+
 void DirectGate_Desktop_Init(directgate_desktop_t *pDesktop)
 {
     XCHECK_VOID_NL((pDesktop != NULL));
@@ -343,6 +408,7 @@ void DirectGate_Desktop_Init(directgate_desktop_t *pDesktop)
 #endif
     pDesktop->nFps = DIRECTGATE_DESKTOP_DEFAULT_FPS;
     pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_RAW;
+    pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_SCALE;
     pDesktop->pEncoder = NULL;
     pDesktop->bForceRaw = XFALSE;
     pDesktop->bRequestKeyframe = XFALSE;
@@ -378,6 +444,8 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
         DirectGate_Desktop_MacEncoder_StopDesktop(pDesktop);
     }
 
+    DirectGate_Desktop_RestoreDisplayMode(pDesktop);
+
     if (pDesktop->bTimerThreadRunning)
     {
         pDesktop->bTimerThreadRunning = XFALSE;
@@ -412,6 +480,8 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     if (pDesktop->pEncoder != NULL)
         DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
 
+    DirectGate_Desktop_RestoreDisplayMode(pDesktop);
+
     if (pDesktop->pDisplay != NULL)
     {
         XCloseDisplay((Display*)pDesktop->pDisplay);
@@ -430,6 +500,8 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
      * tick thread) before the sockets close. */
     if (pDesktop->pEncoder != NULL)
         DirectGate_Desktop_WinEncoder_StopDesktop(pDesktop);
+
+    DirectGate_Desktop_RestoreDisplayMode(pDesktop);
 
     if (pDesktop->bTimerThreadRunning)
     {
@@ -469,6 +541,11 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     pDesktop->nCaptureHeight = 0;
     pDesktop->nFrameWidth = 0;
     pDesktop->nFrameHeight = 0;
+    pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_SCALE;
+    pDesktop->nTargetWidth = 0;
+    pDesktop->nTargetHeight = 0;
+    pDesktop->bDisplayModeChanged = XFALSE;
+    pDesktop->pOriginalDisplayMode = NULL;
     pDesktop->nPointerButtons = 0;
     pDesktop->nFrameId = 0;
     pDesktop->nMonitorCount = 0;
@@ -533,6 +610,9 @@ static int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const c
     XJSON_AddString(pRoot, "transport", DirectGate_Desktop_TransportName(pSession->desktop.ePipeline));
     XJSON_AddU32(pRoot, "frameWidth", pSession->desktop.nFrameWidth);
     XJSON_AddU32(pRoot, "frameHeight", pSession->desktop.nFrameHeight);
+    XJSON_AddString(pRoot, "resizeMode", DirectGate_Desktop_ResizeModeName(pSession->desktop.eResizeMode));
+    XJSON_AddU32(pRoot, "targetWidth", pSession->desktop.nTargetWidth);
+    XJSON_AddU32(pRoot, "targetHeight", pSession->desktop.nTargetHeight);
     XJSON_AddU32(pRoot, "fps", pSession->desktop.quality.nFps);
     XJSON_AddU32(pRoot, "bitrateKbps", pSession->desktop.nCurrentBitrateKbps ?
         pSession->desktop.nCurrentBitrateKbps : pSession->desktop.quality.nBitrateKbps);
@@ -691,11 +771,163 @@ static void DirectGate_Desktop_EnumerateMonitors(directgate_desktop_t *pDesktop)
             pInfo->x, pInfo->y, (uint32_t)pInfo->width, (uint32_t)pInfo->height,
             pInfo->primary ? XTRUE : XFALSE);
 
+        if (pInfo->noutput > 0)
+        {
+            directgate_desktop_monitor_t *pAdded = &pDesktop->monitors[pDesktop->nMonitorCount - 1U];
+            pAdded->nNativeId = (uint64_t)pInfo->outputs[0];
+            snprintf(pAdded->sDeviceId, sizeof(pAdded->sDeviceId), "%lu", (unsigned long)pInfo->outputs[0]);
+        }
+
         if (pAtomName != NULL)
             XFree(pAtomName);
     }
 
     XRRFreeMonitors(pMonitors);
+}
+
+static void DirectGate_Desktop_RefreshLinuxMonitors(directgate_desktop_t *pDesktop)
+{
+    Display *pDisplay = (Display*)pDesktop->pDisplay;
+    if (pDisplay == NULL) return;
+    int nScreen = DefaultScreen(pDisplay);
+    Window root = RootWindow(pDisplay, nScreen);
+    XWindowAttributes attrs;
+    if (XGetWindowAttributes(pDisplay, root, &attrs) && attrs.width > 0 && attrs.height > 0)
+    {
+        pDesktop->nScreenWidth = (uint32_t)attrs.width;
+        pDesktop->nScreenHeight = (uint32_t)attrs.height;
+    }
+    pDesktop->nMonitorCount = 0;
+    memset(pDesktop->monitors, 0, sizeof(pDesktop->monitors));
+    DirectGate_Desktop_EnumerateMonitors(pDesktop);
+}
+
+static const directgate_desktop_monitor_t* DirectGate_Desktop_FindMonitor(
+    const directgate_desktop_t *pDesktop, const char *pMonitorId)
+{
+    if (pDesktop == NULL || !xstrused(pMonitorId)) return NULL;
+    for (uint32_t i = 0; i < pDesktop->nMonitorCount; i++)
+        if (xstrcmp(pDesktop->monitors[i].sId, pMonitorId))
+            return &pDesktop->monitors[i];
+    return NULL;
+}
+
+static RRMode DirectGate_Desktop_ClosestXrandrMode(const XRRScreenResources *pResources,
+                                               const XRROutputInfo *pOutput,
+                                               uint32_t nWidth, uint32_t nHeight)
+{
+    RRMode nBest = None;
+    uint64_t nBestScore = UINT64_MAX;
+    if (pResources == NULL || pOutput == NULL) return None;
+    for (int i = 0; i < pOutput->nmode; i++)
+    {
+        const XRRModeInfo *pMode = NULL;
+        for (int j = 0; j < pResources->nmode; j++)
+            if (pResources->modes[j].id == pOutput->modes[i])
+            {
+                pMode = &pResources->modes[j];
+                break;
+            }
+        if (pMode == NULL) continue;
+        uint64_t nDx = pMode->width > nWidth ? pMode->width - nWidth : nWidth - pMode->width;
+        uint64_t nDy = pMode->height > nHeight ? pMode->height - nHeight : nHeight - pMode->height;
+        uint64_t nAspect = (uint64_t)llabs((long long)pMode->width * nHeight -
+            (long long)nWidth * pMode->height);
+        uint64_t nScore = (nDx + nDy) * 1000000ULL + nAspect;
+        if (nScore < nBestScore)
+        {
+            nBestScore = nScore;
+            nBest = pMode->id;
+        }
+    }
+    return nBest;
+}
+
+static int DirectGate_Desktop_SetDisplayResolution(directgate_desktop_t *pDesktop,
+                                                const directgate_desktop_monitor_t *pMonitor,
+                                                uint32_t nWidth, uint32_t nHeight)
+{
+    Display *pDisplay = (Display*)pDesktop->pDisplay;
+    if (pDisplay == NULL || pMonitor == NULL || pMonitor->nNativeId == 0U)
+    {
+        DirectGate_Desktop_SetReason(pDesktop,
+            "Display mode requires one physical monitor; All displays cannot be resized.");
+        return XSTDERR;
+    }
+
+    Window root = RootWindow(pDisplay, DefaultScreen(pDisplay));
+    XRRScreenResources *pResources = XRRGetScreenResourcesCurrent(pDisplay, root);
+    if (pResources == NULL)
+    {
+        DirectGate_Desktop_SetReason(pDesktop, "Failed to read XRandR display modes.");
+        return XSTDERR;
+    }
+    XRROutputInfo *pOutput = XRRGetOutputInfo(pDisplay, pResources, (RROutput)pMonitor->nNativeId);
+    XRRCrtcInfo *pCrtc = (pOutput != NULL && pOutput->crtc != None) ?
+        XRRGetCrtcInfo(pDisplay, pResources, pOutput->crtc) : NULL;
+    RRMode nMode = DirectGate_Desktop_ClosestXrandrMode(pResources, pOutput, nWidth, nHeight);
+    if (pOutput == NULL || pCrtc == NULL || nMode == None)
+    {
+        if (pCrtc != NULL) XRRFreeCrtcInfo(pCrtc);
+        if (pOutput != NULL) XRRFreeOutputInfo(pOutput);
+        XRRFreeScreenResources(pResources);
+        DirectGate_Desktop_SetReason(pDesktop, "No usable XRandR mode is available for this monitor.");
+        return XSTDERR;
+    }
+
+    if (!pDesktop->bDisplayModeChanged)
+    {
+        pDesktop->nOriginalModeId = (uint64_t)pCrtc->mode;
+        pDesktop->nOriginalModeX = pCrtc->x;
+        pDesktop->nOriginalModeY = pCrtc->y;
+        pDesktop->nOriginalModeRotation = (uint32_t)pCrtc->rotation;
+        pDesktop->nModeNativeId = (uint64_t)pOutput->crtc;
+        xstrncpy(pDesktop->sModeMonitorId, sizeof(pDesktop->sModeMonitorId), pMonitor->sId);
+        xstrncpy(pDesktop->sModeDeviceId, sizeof(pDesktop->sModeDeviceId), pMonitor->sDeviceId);
+    }
+
+    Status nStatus = XRRSetCrtcConfig(pDisplay, pResources, pOutput->crtc, CurrentTime,
+        pCrtc->x, pCrtc->y, nMode, pCrtc->rotation, pCrtc->outputs, pCrtc->noutput);
+    XRRFreeCrtcInfo(pCrtc);
+    XRRFreeOutputInfo(pOutput);
+    XRRFreeScreenResources(pResources);
+    if (nStatus != Success)
+    {
+        DirectGate_Desktop_SetReason(pDesktop, "XRandR rejected the requested display mode.");
+        return XSTDERR;
+    }
+
+    pDesktop->bDisplayModeChanged = XTRUE;
+    XSync(pDisplay, False);
+    DirectGate_Desktop_RefreshLinuxMonitors(pDesktop);
+    return XSTDOK;
+}
+
+static void DirectGate_Desktop_RestoreDisplayMode(directgate_desktop_t *pDesktop)
+{
+    Display *pDisplay = pDesktop != NULL ? (Display*)pDesktop->pDisplay : NULL;
+    if (pDisplay == NULL || !pDesktop->bDisplayModeChanged) return;
+
+    Window root = RootWindow(pDisplay, DefaultScreen(pDisplay));
+    XRRScreenResources *pResources = XRRGetScreenResourcesCurrent(pDisplay, root);
+    XRRCrtcInfo *pCrtc = pResources != NULL ? XRRGetCrtcInfo(pDisplay, pResources, (RRCrtc)pDesktop->nModeNativeId) : NULL;
+
+    if (pResources != NULL && pCrtc != NULL)
+    {
+        (void)XRRSetCrtcConfig(pDisplay, pResources, (RRCrtc)pDesktop->nModeNativeId,
+            CurrentTime, pDesktop->nOriginalModeX, pDesktop->nOriginalModeY,
+            (RRMode)pDesktop->nOriginalModeId, (Rotation)pDesktop->nOriginalModeRotation,
+            pCrtc->outputs, pCrtc->noutput);
+        XSync(pDisplay, False);
+    }
+
+    if (pCrtc != NULL) XRRFreeCrtcInfo(pCrtc);
+    if (pResources != NULL) XRRFreeScreenResources(pResources);
+
+    pDesktop->bDisplayModeChanged = XFALSE;
+    pDesktop->nModeNativeId = 0U;
+    pDesktop->nOriginalModeId = 0U;
+    DirectGate_Desktop_RefreshLinuxMonitors(pDesktop);
 }
 
 static void DirectGate_Desktop_LoadXTest(directgate_desktop_t *pDesktop)
@@ -1269,6 +1501,7 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
 
     if (xstrcmp(pAction, "select-monitor") && xstrused(pMonitorId))
     {
+        DirectGate_Desktop_ReadResizeRequest(pDesktop, pRoot);
         const directgate_desktop_monitor_t *pSelected = NULL;
         for (uint32_t i = 0; i < pDesktop->nMonitorCount; i++)
         {
@@ -1281,6 +1514,28 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
 
         if (pSelected != NULL)
         {
+            char sSelectedId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
+            xstrncpy(sSelectedId, sizeof(sSelectedId), pSelected->sId);
+            const char *pResizeReason = NULL;
+
+            if (pDesktop->eResizeMode == DIRECTGATE_DESKTOP_RESIZE_DISPLAY &&
+                DirectGate_Desktop_SetDisplayResolution(pDesktop, pSelected,
+                    pDesktop->nTargetWidth, pDesktop->nTargetHeight) != XSTDOK)
+            {
+                pResizeReason = DirectGate_Desktop_GetReason(pDesktop);
+                pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_SCALE;
+            }
+
+            pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+            if (pSelected == NULL)
+            {
+                DirectGate_Desktop_SendStatus(pSession, "error",
+                    "Selected monitor disappeared after its display mode changed.");
+                XJSON_Destroy(&json);
+                free(pJsonText);
+                return XAPI_CONTINUE;
+            }
+
             DirectGate_Desktop_SetCapture(pDesktop, pSelected->sId, pSelected->nX,
                 pSelected->nY, pSelected->nWidth, pSelected->nHeight);
 
@@ -1293,7 +1548,7 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
                 return XAPI_CONTINUE;
             }
 
-            DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
+            DirectGate_Desktop_SendStatus(pSession, "streaming", pResizeReason);
             xlogi("Desktop monitor selected: sid(%u), monitor(%s), rect(%d,%d %ux%u), pipeline(%s), preset(%s)",
                 pSession->nSessionId, pSelected->sId, pSelected->nX, pSelected->nY,
                 pSelected->nWidth, pSelected->nHeight,
@@ -1304,6 +1559,55 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
         {
             DirectGate_Desktop_SendStatus(pSession, "error", "Selected monitor is not available.");
         }
+    }
+    else if (xstrcmp(pAction, "set-resolution"))
+    {
+        directgate_desktop_resize_mode_t ePreviousMode = pDesktop->eResizeMode;
+        DirectGate_Desktop_ReadResizeRequest(pDesktop, pRoot);
+        char sSelectedId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
+        xstrncpy(sSelectedId, sizeof(sSelectedId), pDesktop->sSelectedMonitor);
+        const directgate_desktop_monitor_t *pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+        const char *pResizeReason = NULL;
+        xbool_t bCaptureChanged = XFALSE;
+
+        if (pDesktop->bCaptureReady && ePreviousMode == DIRECTGATE_DESKTOP_RESIZE_DISPLAY &&
+            pDesktop->eResizeMode == DIRECTGATE_DESKTOP_RESIZE_SCALE)
+        {
+            DirectGate_Desktop_LinuxEncoder_Stop(pSession);
+            DirectGate_Desktop_RestoreDisplayMode(pDesktop);
+            pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+            bCaptureChanged = XTRUE;
+        }
+        else if (pDesktop->bCaptureReady &&
+            pDesktop->eResizeMode == DIRECTGATE_DESKTOP_RESIZE_DISPLAY)
+        {
+            DirectGate_Desktop_LinuxEncoder_Stop(pSession);
+            if (DirectGate_Desktop_SetDisplayResolution(pDesktop, pSelected,
+                pDesktop->nTargetWidth, pDesktop->nTargetHeight) != XSTDOK)
+            {
+                pResizeReason = DirectGate_Desktop_GetReason(pDesktop);
+                if (!pDesktop->bDisplayModeChanged)
+                    pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_SCALE;
+            }
+            pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+            bCaptureChanged = XTRUE;
+        }
+
+        if (pDesktop->bCaptureReady && pSelected != NULL && bCaptureChanged)
+        {
+            DirectGate_Desktop_SetCapture(pDesktop, pSelected->sId, pSelected->nX,
+                pSelected->nY, pSelected->nWidth, pSelected->nHeight);
+            (void)DirectGate_Desktop_StartLinuxPipeline(pSession);
+        }
+        else if (pDesktop->bCaptureReady &&
+            (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||
+             pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC))
+            DirectGate_Desktop_LinuxEncoder_ApplyQuality(pSession);
+        else if (pDesktop->bCaptureReady)
+            DirectGate_Desktop_ComputeFrameSize(pDesktop);
+
+        DirectGate_Desktop_SendStatus(pSession,
+            pDesktop->bCaptureReady ? "streaming" : "ready", pResizeReason);
     }
     else if (xstrcmp(pAction, "set-preset"))
     {
@@ -1461,6 +1765,9 @@ static int DirectGate_Desktop_OpenMacOS(directgate_session_t *pSession)
             (int32_t)floor(rect.origin.x), (int32_t)floor(rect.origin.y),
             DirectGate_Desktop_RectWidth(rect), DirectGate_Desktop_RectHeight(rect),
             CGDisplayIsMain(displays[i]) ? XTRUE : XFALSE);
+        directgate_desktop_monitor_t *pAdded = &pDesktop->monitors[pDesktop->nMonitorCount - 1U];
+        pAdded->nNativeId = (uint64_t)displays[i];
+        snprintf(pAdded->sDeviceId, sizeof(pAdded->sDeviceId), "%u", displays[i]);
     }
 
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 101500
@@ -1484,6 +1791,144 @@ static int DirectGate_Desktop_OpenMacOS(directgate_session_t *pSession)
         xlogw("macOS desktop input disabled: grant Accessibility permission to directgate");
 
     return XSTDOK;
+}
+
+static void DirectGate_Desktop_RefreshMacMonitors(directgate_desktop_t *pDesktop)
+{
+    CGDirectDisplayID displays[DIRECTGATE_DESKTOP_MAX_MONITORS];
+    uint32_t nDisplayCount = 0;
+    if (CGGetActiveDisplayList(DIRECTGATE_DESKTOP_MAX_MONITORS, displays,
+        &nDisplayCount) != kCGErrorSuccess || nDisplayCount == 0) return;
+
+    CGRect unionRect = CGRectNull;
+    for (uint32_t i = 0; i < nDisplayCount; i++)
+    {
+        CGRect rect = CGDisplayBounds(displays[i]);
+        unionRect = CGRectIsNull(unionRect) ? rect : CGRectUnion(unionRect, rect);
+    }
+    pDesktop->nScreenWidth = DirectGate_Desktop_RectWidth(unionRect);
+    pDesktop->nScreenHeight = DirectGate_Desktop_RectHeight(unionRect);
+    pDesktop->nMonitorCount = 0;
+    memset(pDesktop->monitors, 0, sizeof(pDesktop->monitors));
+    DirectGate_Desktop_AddMonitor(pDesktop, "all", "All displays",
+        (int32_t)floor(unionRect.origin.x), (int32_t)floor(unionRect.origin.y),
+        DirectGate_Desktop_RectWidth(unionRect), DirectGate_Desktop_RectHeight(unionRect), XFALSE);
+
+    for (uint32_t i = 0; i < nDisplayCount &&
+        pDesktop->nMonitorCount < DIRECTGATE_DESKTOP_MAX_MONITORS; i++)
+    {
+        CGRect rect = CGDisplayBounds(displays[i]);
+        char sId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
+        char sName[DIRECTGATE_DESKTOP_MONITOR_NAME_LEN];
+        snprintf(sId, sizeof(sId), "display-%u", i + 1U);
+        snprintf(sName, sizeof(sName), "Display %u", i + 1U);
+        DirectGate_Desktop_AddMonitor(pDesktop, sId, sName,
+            (int32_t)floor(rect.origin.x), (int32_t)floor(rect.origin.y),
+            DirectGate_Desktop_RectWidth(rect), DirectGate_Desktop_RectHeight(rect),
+            CGDisplayIsMain(displays[i]) ? XTRUE : XFALSE);
+        directgate_desktop_monitor_t *pAdded =
+            &pDesktop->monitors[pDesktop->nMonitorCount - 1U];
+        pAdded->nNativeId = (uint64_t)displays[i];
+        snprintf(pAdded->sDeviceId, sizeof(pAdded->sDeviceId), "%u", displays[i]);
+    }
+}
+
+static const directgate_desktop_monitor_t* DirectGate_Desktop_FindMonitor(
+    const directgate_desktop_t *pDesktop, const char *pMonitorId)
+{
+    if (pDesktop == NULL || !xstrused(pMonitorId)) return NULL;
+    for (uint32_t i = 0; i < pDesktop->nMonitorCount; i++)
+        if (xstrcmp(pDesktop->monitors[i].sId, pMonitorId))
+            return &pDesktop->monitors[i];
+    return NULL;
+}
+
+static int DirectGate_Desktop_SetDisplayResolution(directgate_desktop_t *pDesktop,
+                                                const directgate_desktop_monitor_t *pMonitor,
+                                                uint32_t nWidth, uint32_t nHeight)
+{
+    if (pMonitor == NULL || pMonitor->nNativeId == 0U)
+    {
+        DirectGate_Desktop_SetReason(pDesktop,
+            "Display mode requires one physical monitor; All displays cannot be resized.");
+        return XSTDERR;
+    }
+
+    CGDirectDisplayID nDisplay = (CGDirectDisplayID)pMonitor->nNativeId;
+    CGDisplayModeRef pCurrent = CGDisplayCopyDisplayMode(nDisplay);
+    CFArrayRef pModes = CGDisplayCopyAllDisplayModes(nDisplay, NULL);
+
+    if (pCurrent == NULL || pModes == NULL)
+    {
+        if (pCurrent != NULL) CGDisplayModeRelease(pCurrent);
+        if (pModes != NULL) CFRelease(pModes);
+        DirectGate_Desktop_SetReason(pDesktop, "Failed to read macOS display modes.");
+        return XSTDERR;
+    }
+
+    CGDisplayModeRef pBest = NULL;
+    uint64_t nBestScore = UINT64_MAX;
+    CFIndex nCount = CFArrayGetCount(pModes);
+
+    for (CFIndex i = 0; i < nCount; i++)
+    {
+        CGDisplayModeRef pMode = (CGDisplayModeRef)CFArrayGetValueAtIndex(pModes, i);
+        uint32_t nModeWidth = (uint32_t)CGDisplayModeGetWidth(pMode);
+        uint32_t nModeHeight = (uint32_t)CGDisplayModeGetHeight(pMode);
+        uint64_t nDx = nModeWidth > nWidth ? nModeWidth - nWidth : nWidth - nModeWidth;
+        uint64_t nDy = nModeHeight > nHeight ? nModeHeight - nHeight : nHeight - nModeHeight;
+        uint64_t nAspect = (uint64_t)llabs((long long)nModeWidth * nHeight - (long long)nWidth * nModeHeight);
+        uint64_t nScore = (nDx + nDy) * 1000000ULL + nAspect;
+
+        if (nScore < nBestScore)
+        {
+            nBestScore = nScore;
+            pBest = pMode;
+        }
+    }
+
+    if (pBest != NULL) CGDisplayModeRetain(pBest);
+    CFRelease(pModes);
+
+    if (pBest == NULL || CGDisplaySetDisplayMode(nDisplay, pBest, NULL) != kCGErrorSuccess)
+    {
+        if (pBest != NULL) CGDisplayModeRelease(pBest);
+        CGDisplayModeRelease(pCurrent);
+        DirectGate_Desktop_SetReason(pDesktop, "macOS rejected the requested display mode.");
+        return XSTDERR;
+    }
+
+    CGDisplayModeRelease(pBest);
+
+    if (!pDesktop->bDisplayModeChanged)
+    {
+        pDesktop->pOriginalDisplayMode = pCurrent;
+        pDesktop->nModeNativeId = (uint64_t)nDisplay;
+        xstrncpy(pDesktop->sModeMonitorId, sizeof(pDesktop->sModeMonitorId), pMonitor->sId);
+    }
+    else
+    {
+        CGDisplayModeRelease(pCurrent);
+    }
+
+    pDesktop->bDisplayModeChanged = XTRUE;
+    DirectGate_Desktop_RefreshMacMonitors(pDesktop);
+    return XSTDOK;
+}
+
+static void DirectGate_Desktop_RestoreDisplayMode(directgate_desktop_t *pDesktop)
+{
+    if (pDesktop == NULL || !pDesktop->bDisplayModeChanged ||
+        pDesktop->pOriginalDisplayMode == NULL) return;
+
+    CGDisplayModeRef pMode = (CGDisplayModeRef)pDesktop->pOriginalDisplayMode;
+    (void)CGDisplaySetDisplayMode((CGDirectDisplayID)pDesktop->nModeNativeId, pMode, NULL);
+    CGDisplayModeRelease(pMode);
+
+    pDesktop->pOriginalDisplayMode = NULL;
+    pDesktop->bDisplayModeChanged = XFALSE;
+    pDesktop->nModeNativeId = 0U;
+    DirectGate_Desktop_RefreshMacMonitors(pDesktop);
 }
 
 static int DirectGate_Desktop_SetFdNonBlocking(int nFd)
@@ -2039,6 +2484,7 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
 
     if (xstrcmp(pAction, "select-monitor") && xstrused(pMonitorId))
     {
+        DirectGate_Desktop_ReadResizeRequest(pDesktop, pRoot);
         const directgate_desktop_monitor_t *pSelected = NULL;
         for (uint32_t i = 0; i < pDesktop->nMonitorCount; i++)
         {
@@ -2051,6 +2497,28 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
 
         if (pSelected != NULL)
         {
+            char sSelectedId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
+            xstrncpy(sSelectedId, sizeof(sSelectedId), pSelected->sId);
+            const char *pResizeReason = NULL;
+
+            if (pDesktop->eResizeMode == DIRECTGATE_DESKTOP_RESIZE_DISPLAY &&
+                DirectGate_Desktop_SetDisplayResolution(pDesktop, pSelected,
+                    pDesktop->nTargetWidth, pDesktop->nTargetHeight) != XSTDOK)
+            {
+                pResizeReason = DirectGate_Desktop_GetReason(pDesktop);
+                pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_SCALE;
+            }
+
+            pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+            if (pSelected == NULL)
+            {
+                DirectGate_Desktop_SendStatus(pSession, "error",
+                    "Selected display disappeared after its display mode changed.");
+                XJSON_Destroy(&json);
+                free(pJsonText);
+                return XAPI_CONTINUE;
+            }
+
             DirectGate_Desktop_SetCapture(pDesktop, pSelected->sId, pSelected->nX,
                 pSelected->nY, pSelected->nWidth, pSelected->nHeight);
 
@@ -2063,7 +2531,7 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
                 return XAPI_CONTINUE;
             }
 
-            DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
+            DirectGate_Desktop_SendStatus(pSession, "streaming", pResizeReason);
             xlogi("Desktop monitor selected: sid(%u), monitor(%s), rect(%d,%d %ux%u), pipeline(%s), preset(%s)",
                 pSession->nSessionId, pSelected->sId, pSelected->nX, pSelected->nY,
                 pSelected->nWidth, pSelected->nHeight,
@@ -2074,6 +2542,56 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
         {
             DirectGate_Desktop_SendStatus(pSession, "error", "Selected display is not available.");
         }
+    }
+    else if (xstrcmp(pAction, "set-resolution"))
+    {
+        directgate_desktop_resize_mode_t ePreviousMode = pDesktop->eResizeMode;
+        DirectGate_Desktop_ReadResizeRequest(pDesktop, pRoot);
+        char sSelectedId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
+        xstrncpy(sSelectedId, sizeof(sSelectedId), pDesktop->sSelectedMonitor);
+        const directgate_desktop_monitor_t *pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+        const char *pResizeReason = NULL;
+        xbool_t bCaptureChanged = XFALSE;
+
+        if (pDesktop->bCaptureReady && ePreviousMode == DIRECTGATE_DESKTOP_RESIZE_DISPLAY &&
+            pDesktop->eResizeMode == DIRECTGATE_DESKTOP_RESIZE_SCALE)
+        {
+            DirectGate_Desktop_MacEncoder_Stop(pSession);
+            DirectGate_Desktop_RestoreDisplayMode(pDesktop);
+            pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+            bCaptureChanged = XTRUE;
+        }
+        else if (pDesktop->bCaptureReady &&
+            pDesktop->eResizeMode == DIRECTGATE_DESKTOP_RESIZE_DISPLAY)
+        {
+            DirectGate_Desktop_MacEncoder_Stop(pSession);
+            if (DirectGate_Desktop_SetDisplayResolution(pDesktop, pSelected,
+                pDesktop->nTargetWidth, pDesktop->nTargetHeight) != XSTDOK)
+            {
+                pResizeReason = DirectGate_Desktop_GetReason(pDesktop);
+                if (!pDesktop->bDisplayModeChanged)
+                    pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_SCALE;
+            }
+
+            pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+            bCaptureChanged = XTRUE;
+        }
+
+        if (pDesktop->bCaptureReady && pSelected != NULL && bCaptureChanged)
+        {
+            DirectGate_Desktop_SetCapture(pDesktop, pSelected->sId, pSelected->nX,
+                pSelected->nY, pSelected->nWidth, pSelected->nHeight);
+            (void)DirectGate_Desktop_StartMacPipeline(pSession);
+        }
+        else if (pDesktop->bCaptureReady &&
+            (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||
+             pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC))
+            DirectGate_Desktop_MacEncoder_ApplyQuality(pSession);
+        else if (pDesktop->bCaptureReady)
+            DirectGate_Desktop_ComputeFrameSize(pDesktop);
+
+        DirectGate_Desktop_SendStatus(pSession,
+            pDesktop->bCaptureReady ? "streaming" : "ready", pResizeReason);
     }
     else if (xstrcmp(pAction, "set-preset"))
     {
@@ -2189,10 +2707,10 @@ static BOOL CALLBACK DirectGate_Desktop_MonitorEnumProc(HMONITOR hMonitor, HDC h
     (void)pRect;
     directgate_desktop_t *pDesktop = (directgate_desktop_t*)lParam;
 
-    MONITORINFO info;
+    MONITORINFOEXA info;
     memset(&info, 0, sizeof(info));
     info.cbSize = sizeof(info);
-    if (!GetMonitorInfoW(hMonitor, &info)) return TRUE;
+    if (!GetMonitorInfoA(hMonitor, (LPMONITORINFO)&info)) return TRUE;
 
     char sId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
     char sName[DIRECTGATE_DESKTOP_MONITOR_NAME_LEN];
@@ -2206,7 +2724,137 @@ static BOOL CALLBACK DirectGate_Desktop_MonitorEnumProc(HMONITOR hMonitor, HDC h
         (uint32_t)(info.rcMonitor.bottom - info.rcMonitor.top),
         (info.dwFlags & MONITORINFOF_PRIMARY) ? XTRUE : XFALSE);
 
+    directgate_desktop_monitor_t *pAdded =
+        &pDesktop->monitors[pDesktop->nMonitorCount - 1U];
+    xstrncpy(pAdded->sDeviceId, sizeof(pAdded->sDeviceId), info.szDevice);
+    pAdded->nNativeId = (uint64_t)(uintptr_t)hMonitor;
+
     return (pDesktop->nMonitorCount < DIRECTGATE_DESKTOP_MAX_MONITORS) ? TRUE : FALSE;
+}
+
+static void DirectGate_Desktop_RefreshWindowsMonitors(directgate_desktop_t *pDesktop)
+{
+    int32_t nVirtualX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int32_t nVirtualY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int32_t nVirtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int32_t nVirtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (nVirtualWidth <= 0 || nVirtualHeight <= 0) return;
+
+    pDesktop->nScreenWidth = (uint32_t)nVirtualWidth;
+    pDesktop->nScreenHeight = (uint32_t)nVirtualHeight;
+    pDesktop->nMonitorCount = 0;
+    memset(pDesktop->monitors, 0, sizeof(pDesktop->monitors));
+
+    DirectGate_Desktop_AddMonitor(pDesktop, "all", "All displays", nVirtualX, nVirtualY,
+        (uint32_t)nVirtualWidth, (uint32_t)nVirtualHeight, XFALSE);
+    EnumDisplayMonitors(NULL, NULL, DirectGate_Desktop_MonitorEnumProc, (LPARAM)pDesktop);
+}
+
+static const directgate_desktop_monitor_t* DirectGate_Desktop_FindMonitor(
+    const directgate_desktop_t *pDesktop, const char *pMonitorId)
+{
+    if (pDesktop == NULL || !xstrused(pMonitorId)) return NULL;
+    for (uint32_t i = 0; i < pDesktop->nMonitorCount; i++)
+        if (xstrcmp(pDesktop->monitors[i].sId, pMonitorId))
+            return &pDesktop->monitors[i];
+    return NULL;
+}
+
+static int DirectGate_Desktop_SetDisplayResolution(directgate_desktop_t *pDesktop,
+                                                   const directgate_desktop_monitor_t *pMonitor,
+                                                   uint32_t nWidth, uint32_t nHeight)
+{
+    if (pMonitor == NULL || !xstrused(pMonitor->sDeviceId))
+    {
+        DirectGate_Desktop_SetReason(pDesktop,
+            "Display mode requires one physical monitor; All displays cannot be resized.");
+        return XSTDERR;
+    }
+
+    DEVMODEA current;
+    memset(&current, 0, sizeof(current));
+    current.dmSize = sizeof(current);
+    if (!EnumDisplaySettingsExA(pMonitor->sDeviceId, ENUM_CURRENT_SETTINGS, &current, 0))
+    {
+        DirectGate_Desktop_SetReason(pDesktop, "Failed to read the current Windows display mode.");
+        return XSTDERR;
+    }
+
+    DEVMODEA best;
+    memset(&best, 0, sizeof(best));
+    uint64_t nBestScore = UINT64_MAX;
+    for (DWORD i = 0;; i++)
+    {
+        DEVMODEA candidate;
+        memset(&candidate, 0, sizeof(candidate));
+        candidate.dmSize = sizeof(candidate);
+
+        if (!EnumDisplaySettingsExA(pMonitor->sDeviceId, i, &candidate, 0)) break;
+        if (candidate.dmBitsPerPel != current.dmBitsPerPel) continue;
+
+        uint64_t nDx = candidate.dmPelsWidth > nWidth ? candidate.dmPelsWidth - nWidth : nWidth - candidate.dmPelsWidth;
+        uint64_t nDy = candidate.dmPelsHeight > nHeight ? candidate.dmPelsHeight - nHeight : nHeight - candidate.dmPelsHeight;
+        uint64_t nAspect = (uint64_t)llabs((long long)candidate.dmPelsWidth * nHeight - (long long)nWidth * candidate.dmPelsHeight);
+        uint64_t nScore = (nDx + nDy) * 1000000ULL + nAspect;
+
+        if (nScore < nBestScore)
+        {
+            nBestScore = nScore;
+            best = candidate;
+        }
+    }
+    if (nBestScore == UINT64_MAX)
+    {
+        DirectGate_Desktop_SetReason(pDesktop, "No usable Windows display mode is available.");
+        return XSTDERR;
+    }
+
+    if (!pDesktop->bDisplayModeChanged)
+    {
+        xstrncpy(pDesktop->sModeMonitorId, sizeof(pDesktop->sModeMonitorId), pMonitor->sId);
+        xstrncpy(pDesktop->sModeDeviceId, sizeof(pDesktop->sModeDeviceId), pMonitor->sDeviceId);
+        pDesktop->nOriginalModeX = current.dmPosition.x;
+        pDesktop->nOriginalModeY = current.dmPosition.y;
+        pDesktop->nOriginalModeWidth = current.dmPelsWidth;
+        pDesktop->nOriginalModeHeight = current.dmPelsHeight;
+        pDesktop->nOriginalModeRefresh = current.dmDisplayFrequency;
+        pDesktop->nOriginalModeRotation = current.dmDisplayOrientation;
+        pDesktop->nOriginalModeId = current.dmBitsPerPel;
+    }
+
+    LONG nResult = ChangeDisplaySettingsExA(pMonitor->sDeviceId, &best, NULL, CDS_FULLSCREEN, NULL);
+    if (nResult != DISP_CHANGE_SUCCESSFUL)
+    {
+        DirectGate_Desktop_SetReason(pDesktop, "Windows rejected the requested display mode.");
+        return XSTDERR;
+    }
+
+    pDesktop->bDisplayModeChanged = XTRUE;
+    DirectGate_Desktop_RefreshWindowsMonitors(pDesktop);
+    return XSTDOK;
+}
+
+static void DirectGate_Desktop_RestoreDisplayMode(directgate_desktop_t *pDesktop)
+{
+    if (pDesktop == NULL || !pDesktop->bDisplayModeChanged ||
+        !xstrused(pDesktop->sModeDeviceId)) return;
+
+    DEVMODEA mode;
+    memset(&mode, 0, sizeof(mode));
+    mode.dmSize = sizeof(mode);
+    mode.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT |
+        DM_BITSPERPEL | DM_DISPLAYFREQUENCY | DM_DISPLAYORIENTATION;
+    mode.dmPosition.x = pDesktop->nOriginalModeX;
+    mode.dmPosition.y = pDesktop->nOriginalModeY;
+    mode.dmPelsWidth = pDesktop->nOriginalModeWidth;
+    mode.dmPelsHeight = pDesktop->nOriginalModeHeight;
+    mode.dmBitsPerPel = (DWORD)pDesktop->nOriginalModeId;
+    mode.dmDisplayFrequency = pDesktop->nOriginalModeRefresh;
+    mode.dmDisplayOrientation = pDesktop->nOriginalModeRotation;
+    (void)ChangeDisplaySettingsExA(pDesktop->sModeDeviceId, &mode, NULL, CDS_FULLSCREEN, NULL);
+    pDesktop->bDisplayModeChanged = XFALSE;
+    pDesktop->sModeDeviceId[0] = '\0';
+    DirectGate_Desktop_RefreshWindowsMonitors(pDesktop);
 }
 
 /* Physical-pixel coordinates everywhere: without per-monitor DPI awareness
@@ -2857,6 +3505,7 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
 
     if (xstrcmp(pAction, "select-monitor") && xstrused(pMonitorId))
     {
+        DirectGate_Desktop_ReadResizeRequest(pDesktop, pRoot);
         const directgate_desktop_monitor_t *pSelected = NULL;
         for (uint32_t i = 0; i < pDesktop->nMonitorCount; i++)
         {
@@ -2869,6 +3518,28 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
 
         if (pSelected != NULL)
         {
+            char sSelectedId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
+            xstrncpy(sSelectedId, sizeof(sSelectedId), pSelected->sId);
+            const char *pResizeReason = NULL;
+
+            if (pDesktop->eResizeMode == DIRECTGATE_DESKTOP_RESIZE_DISPLAY &&
+                DirectGate_Desktop_SetDisplayResolution(pDesktop, pSelected,
+                    pDesktop->nTargetWidth, pDesktop->nTargetHeight) != XSTDOK)
+            {
+                pResizeReason = DirectGate_Desktop_GetReason(pDesktop);
+                pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_SCALE;
+            }
+
+            pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+            if (pSelected == NULL)
+            {
+                DirectGate_Desktop_SendStatus(pSession, "error",
+                    "Selected display disappeared after its display mode changed.");
+                XJSON_Destroy(&json);
+                free(pJsonText);
+                return XAPI_CONTINUE;
+            }
+
             DirectGate_Desktop_SetCapture(pDesktop, pSelected->sId, pSelected->nX,
                 pSelected->nY, pSelected->nWidth, pSelected->nHeight);
 
@@ -2881,7 +3552,7 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
                 return XAPI_CONTINUE;
             }
 
-            DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
+            DirectGate_Desktop_SendStatus(pSession, "streaming", pResizeReason);
             xlogi("Desktop monitor selected: sid(%u), monitor(%s), rect(%d,%d %ux%u), pipeline(%s), preset(%s)",
                 pSession->nSessionId, pSelected->sId, pSelected->nX, pSelected->nY,
                 pSelected->nWidth, pSelected->nHeight,
@@ -2892,6 +3563,55 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
         {
             DirectGate_Desktop_SendStatus(pSession, "error", "Selected display is not available.");
         }
+    }
+    else if (xstrcmp(pAction, "set-resolution"))
+    {
+        directgate_desktop_resize_mode_t ePreviousMode = pDesktop->eResizeMode;
+        DirectGate_Desktop_ReadResizeRequest(pDesktop, pRoot);
+        char sSelectedId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
+        xstrncpy(sSelectedId, sizeof(sSelectedId), pDesktop->sSelectedMonitor);
+        const directgate_desktop_monitor_t *pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+        const char *pResizeReason = NULL;
+        xbool_t bCaptureChanged = XFALSE;
+
+        if (pDesktop->bCaptureReady && ePreviousMode == DIRECTGATE_DESKTOP_RESIZE_DISPLAY &&
+            pDesktop->eResizeMode == DIRECTGATE_DESKTOP_RESIZE_SCALE)
+        {
+            DirectGate_Desktop_WinEncoder_StopDesktop(pDesktop);
+            DirectGate_Desktop_RestoreDisplayMode(pDesktop);
+            pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+            bCaptureChanged = XTRUE;
+        }
+        else if (pDesktop->bCaptureReady &&
+            pDesktop->eResizeMode == DIRECTGATE_DESKTOP_RESIZE_DISPLAY)
+        {
+            DirectGate_Desktop_WinEncoder_StopDesktop(pDesktop);
+            if (DirectGate_Desktop_SetDisplayResolution(pDesktop, pSelected,
+                pDesktop->nTargetWidth, pDesktop->nTargetHeight) != XSTDOK)
+            {
+                pResizeReason = DirectGate_Desktop_GetReason(pDesktop);
+                if (!pDesktop->bDisplayModeChanged)
+                    pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_SCALE;
+            }
+            pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+            bCaptureChanged = XTRUE;
+        }
+
+        if (pDesktop->bCaptureReady && pSelected != NULL && bCaptureChanged)
+        {
+            DirectGate_Desktop_SetCapture(pDesktop, pSelected->sId, pSelected->nX,
+                pSelected->nY, pSelected->nWidth, pSelected->nHeight);
+            (void)DirectGate_Desktop_StartWinPipeline(pSession);
+        }
+        else if (pDesktop->bCaptureReady &&
+            (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||
+             pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC))
+            DirectGate_Desktop_WinEncoder_ApplyQuality(pSession);
+        else if (pDesktop->bCaptureReady)
+            DirectGate_Desktop_ComputeFrameSize(pDesktop);
+
+        DirectGate_Desktop_SendStatus(pSession,
+            pDesktop->bCaptureReady ? "streaming" : "ready", pResizeReason);
     }
     else if (xstrcmp(pAction, "set-preset"))
     {
