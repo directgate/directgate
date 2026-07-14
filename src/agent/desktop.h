@@ -138,6 +138,7 @@ typedef struct directgate_desktop_ {
     void *pDisplay;
     void *pXtst;
     void *pFakeMotion;
+    void *pFakeRelativeMotion;
     void *pFakeButton;
     void *pFakeKey;
     /* Encoded pipeline state */

@@ -58,6 +58,7 @@
 #include <X11/extensions/Xrandr.h>
 
 typedef Bool (*directgate_xtest_motion_fn)(Display*, int, int, int, unsigned long);
+typedef Bool (*directgate_xtest_relative_motion_fn)(Display*, int, int, unsigned long);
 typedef Bool (*directgate_xtest_button_fn)(Display*, unsigned int, Bool, unsigned long);
 typedef Bool (*directgate_xtest_key_fn)(Display*, unsigned int, Bool, unsigned long);
 #elif defined(__APPLE__)
@@ -586,6 +587,7 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     pDesktop->bPreferDataChannel = XFALSE;
     pDesktop->pOriginalDisplayMode = NULL;
     pDesktop->pFakeMotion = NULL;
+    pDesktop->pFakeRelativeMotion = NULL;
     pDesktop->pFakeButton = NULL;
     pDesktop->pFakeKey = NULL;
     pDesktop->pEncoder = NULL;
@@ -994,6 +996,7 @@ static void DirectGate_Desktop_LoadXTest(directgate_desktop_t *pDesktop)
     }
 
     pDesktop->pFakeMotion = dlsym(pDesktop->pXtst, "XTestFakeMotionEvent");
+    pDesktop->pFakeRelativeMotion = dlsym(pDesktop->pXtst, "XTestFakeRelativeMotionEvent");
     pDesktop->pFakeButton = dlsym(pDesktop->pXtst, "XTestFakeButtonEvent");
     pDesktop->pFakeKey = dlsym(pDesktop->pXtst, "XTestFakeKeyEvent");
 
@@ -1508,11 +1511,29 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         }
         if (nSequence != 0U) pDesktop->nPointerSequence = nSequence;
 
-        int nX = XJSON_GetInt(XJSON_GetObject(pRoot, "x"));
-        int nY = XJSON_GetInt(XJSON_GetObject(pRoot, "y"));
-        int nScreenX = DirectGate_Desktop_FrameToScreenX(pDesktop, nX);
-        int nScreenY = DirectGate_Desktop_FrameToScreenY(pDesktop, nY);
-        ((directgate_xtest_motion_fn)pDesktop->pFakeMotion)(pDisplay, nScreen, nScreenX, nScreenY, CurrentTime);
+        xbool_t bRelative = XJSON_GetBool(XJSON_GetObject(pRoot, "relative"));
+        if (bRelative)
+        {
+            int nDx = XJSON_GetInt(XJSON_GetObject(pRoot, "dx"));
+            int nDy = XJSON_GetInt(XJSON_GetObject(pRoot, "dy"));
+            if (nDx != 0 || nDy != 0)
+            {
+                if (pDesktop->pFakeRelativeMotion != NULL)
+                    ((directgate_xtest_relative_motion_fn)pDesktop->pFakeRelativeMotion)(
+                        pDisplay, nDx, nDy, CurrentTime);
+                else
+                    XWarpPointer(pDisplay, None, None, 0, 0, 0, 0, nDx, nDy);
+            }
+        }
+        else
+        {
+            int nX = XJSON_GetInt(XJSON_GetObject(pRoot, "x"));
+            int nY = XJSON_GetInt(XJSON_GetObject(pRoot, "y"));
+            int nScreenX = DirectGate_Desktop_FrameToScreenX(pDesktop, nX);
+            int nScreenY = DirectGate_Desktop_FrameToScreenY(pDesktop, nY);
+            ((directgate_xtest_motion_fn)pDesktop->pFakeMotion)(
+                pDisplay, nScreen, nScreenX, nScreenY, CurrentTime);
+        }
 
         if (xstrcmp(pEvent, "button"))
         {
@@ -2366,6 +2387,27 @@ static CGMouseButton DirectGate_Desktop_MacMouseButton(uint32_t nButton)
     return kCGMouseButtonLeft;
 }
 
+static CGPoint DirectGate_Desktop_MacRelativePoint(int nDx, int nDy)
+{
+    CGPoint point = CGPointZero;
+    CGEventRef current = CGEventCreate(NULL);
+    if (current != NULL)
+    {
+        point = CGEventGetLocation(current);
+        CFRelease(current);
+    }
+    point.x += (CGFloat)nDx;
+    point.y += (CGFloat)nDy;
+    return point;
+}
+
+static void DirectGate_Desktop_MacSetRelativeDelta(CGEventRef event, int nDx, int nDy)
+{
+    if (event == NULL) return;
+    CGEventSetIntegerValueField(event, kCGMouseEventDeltaX, (int64_t)nDx);
+    CGEventSetIntegerValueField(event, kCGMouseEventDeltaY, (int64_t)nDy);
+}
+
 typedef struct directgate_mac_key_ {
     const char *pCode;
     CGKeyCode nKeyCode;
@@ -2487,10 +2529,18 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         }
         if (nSequence != 0U) pDesktop->nPointerSequence = nSequence;
 
-        int nX = XJSON_GetInt(XJSON_GetObject(pRoot, "x"));
-        int nY = XJSON_GetInt(XJSON_GetObject(pRoot, "y"));
-        CGPoint point = CGPointMake((CGFloat)DirectGate_Desktop_FrameToScreenX(pDesktop, nX),
-            (CGFloat)DirectGate_Desktop_FrameToScreenY(pDesktop, nY));
+        xbool_t bRelative = XJSON_GetBool(XJSON_GetObject(pRoot, "relative"));
+        int nDx = XJSON_GetInt(XJSON_GetObject(pRoot, "dx"));
+        int nDy = XJSON_GetInt(XJSON_GetObject(pRoot, "dy"));
+        CGPoint point;
+        if (bRelative) point = DirectGate_Desktop_MacRelativePoint(nDx, nDy);
+        else
+        {
+            int nX = XJSON_GetInt(XJSON_GetObject(pRoot, "x"));
+            int nY = XJSON_GetInt(XJSON_GetObject(pRoot, "y"));
+            point = CGPointMake((CGFloat)DirectGate_Desktop_FrameToScreenX(pDesktop, nX),
+                (CGFloat)DirectGate_Desktop_FrameToScreenY(pDesktop, nY));
+        }
 
         if (xstrcmp(pEvent, "button"))
         {
@@ -2506,6 +2556,7 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
                     point, DirectGate_Desktop_MacMouseButton(nButton));
                 if (event != NULL)
                 {
+                    if (bRelative) DirectGate_Desktop_MacSetRelativeDelta(event, nDx, nDy);
                     CGEventPost(kCGHIDEventTap, event);
                     CFRelease(event);
                 }
@@ -2529,6 +2580,7 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
                 point, DirectGate_Desktop_MacMouseButton(1));
             if (event != NULL)
             {
+                if (bRelative) DirectGate_Desktop_MacSetRelativeDelta(event, nDx, nDy);
                 CGEventPost(kCGHIDEventTap, event);
                 CFRelease(event);
             }
@@ -3411,6 +3463,20 @@ static void DirectGate_Desktop_SendMouseInput(DWORD nFlags, DWORD nMouseData,
     SendInput(1, &input, sizeof(input));
 }
 
+static void DirectGate_Desktop_SendMouseRelative(DWORD nFlags, DWORD nMouseData,
+                                              int nDx, int nDy)
+{
+    INPUT input;
+    memset(&input, 0, sizeof(input));
+    input.type = INPUT_MOUSE;
+    input.mi.dx = (LONG)nDx;
+    input.mi.dy = (LONG)nDy;
+    input.mi.mouseData = nMouseData;
+    input.mi.dwFlags = nFlags | ((nDx != 0 || nDy != 0) ?
+        (MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE) : 0U);
+    SendInput(1, &input, sizeof(input));
+}
+
 static DWORD DirectGate_Desktop_MouseButtonFlag(uint32_t nButton, xbool_t bDown)
 {
     if (nButton == 3) return bDown ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
@@ -3560,29 +3626,43 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         }
         if (nSequence != 0U) pDesktop->nPointerSequence = nSequence;
 
-        int nX = XJSON_GetInt(XJSON_GetObject(pRoot, "x"));
-        int nY = XJSON_GetInt(XJSON_GetObject(pRoot, "y"));
-        int nScreenX = DirectGate_Desktop_FrameToScreenX(pDesktop, nX);
-        int nScreenY = DirectGate_Desktop_FrameToScreenY(pDesktop, nY);
+        xbool_t bRelative = XJSON_GetBool(XJSON_GetObject(pRoot, "relative"));
+        int nScreenX = 0, nScreenY = 0;
+        int nDx = XJSON_GetInt(XJSON_GetObject(pRoot, "dx"));
+        int nDy = XJSON_GetInt(XJSON_GetObject(pRoot, "dy"));
+        if (!bRelative)
+        {
+            int nX = XJSON_GetInt(XJSON_GetObject(pRoot, "x"));
+            int nY = XJSON_GetInt(XJSON_GetObject(pRoot, "y"));
+            nScreenX = DirectGate_Desktop_FrameToScreenX(pDesktop, nX);
+            nScreenY = DirectGate_Desktop_FrameToScreenY(pDesktop, nY);
+        }
 
         if (xstrcmp(pEvent, "button"))
         {
             uint32_t nButton = XJSON_GetU32(XJSON_GetObject(pRoot, "button"));
             xbool_t bDown = XJSON_GetBool(XJSON_GetObject(pRoot, "down"));
             if (nButton >= 1 && nButton <= 3)
-                DirectGate_Desktop_SendMouseInput(
-                    DirectGate_Desktop_MouseButtonFlag(nButton, bDown), 0, nScreenX, nScreenY);
+            {
+                DWORD nFlag = DirectGate_Desktop_MouseButtonFlag(nButton, bDown);
+                if (bRelative) DirectGate_Desktop_SendMouseRelative(nFlag, 0, nDx, nDy);
+                else DirectGate_Desktop_SendMouseInput(nFlag, 0, nScreenX, nScreenY);
+            }
         }
         else if (xstrcmp(pEvent, "wheel"))
         {
             /* One notch per event, like the Linux X11 button-4/5 mapping. */
             int nDeltaY = XJSON_GetInt(XJSON_GetObject(pRoot, "deltaY"));
             DWORD nWheel = (DWORD)(nDeltaY < 0 ? WHEEL_DELTA : -WHEEL_DELTA);
-            DirectGate_Desktop_SendMouseInput(MOUSEEVENTF_WHEEL, nWheel, nScreenX, nScreenY);
+            if (bRelative)
+                DirectGate_Desktop_SendMouseRelative(MOUSEEVENTF_WHEEL, nWheel, nDx, nDy);
+            else
+                DirectGate_Desktop_SendMouseInput(MOUSEEVENTF_WHEEL, nWheel, nScreenX, nScreenY);
         }
         else
         {
-            DirectGate_Desktop_SendMouseInput(0, 0, nScreenX, nScreenY);
+            if (bRelative) DirectGate_Desktop_SendMouseRelative(0, 0, nDx, nDy);
+            else DirectGate_Desktop_SendMouseInput(0, 0, nScreenX, nScreenY);
         }
     }
     else if (xstrcmp(pAction, "key"))
