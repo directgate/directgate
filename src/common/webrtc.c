@@ -567,6 +567,7 @@ void DirectGate_WebRTC_Init(directgate_webrtc_t *pRTC)
     pRTC->logLevel = RTC_LOG_ERROR;
     pRTC->nPeerConnectionID = -1;
     pRTC->nDataChannelID = -1;
+    pRTC->nInputDataChannelID = -1;
     pRTC->nVideoTrackID = -1;
     pRTC->nIceSrvCount = 0;
     pRTC->bConnected = XFALSE;
@@ -699,6 +700,12 @@ void DirectGate_WebRTC_Destroy(directgate_webrtc_t *pRTC)
     {
         DirectGate_WebRTC_CloseDataChannel(pRTC->nDataChannelID);
         pRTC->nDataChannelID = -1;
+    }
+
+    if (pRTC->nInputDataChannelID >= 0)
+    {
+        DirectGate_WebRTC_CloseDataChannel(pRTC->nInputDataChannelID);
+        pRTC->nInputDataChannelID = -1;
     }
 
     if (pRTC->nVideoTrackID >= 0)
@@ -930,6 +937,14 @@ static void DirectGate_WebRTC_OnDataChannelOpen(int nDC, void *pPtr)
     directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
     XCHECK_VOID((pRTC != NULL));
 
+    if (pRTC->nInputDataChannelID == nDC)
+    {
+        xlogn("WebRTC fast input channel opened: pc(%d), dc(%d), pipefd(%d)",
+            DirectGate_WebRTC_GetPC(pRTC), nDC, DirectGate_WebRTC_GetPipe(pRTC));
+        DirectGate_WebRTC_Enqueue(pRTC, DIRECTGATE_WEBRTC_INPUT_OPEN, nDC, NULL, 0);
+        return;
+    }
+
     if (pRTC->nDataChannelID != nDC)
     {
         xlogd("Ignoring stale WebRTC data channel open: pc(%d), dc(%d), current(%d)",
@@ -950,6 +965,14 @@ static void DirectGate_WebRTC_OnDataChannelClosed(int nDC, void *pPtr)
     directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
     XCHECK_VOID((pRTC != NULL));
 
+    if (pRTC->nInputDataChannelID == nDC)
+    {
+        xlogn("WebRTC fast input channel closed: pc(%d), dc(%d), pipefd(%d)",
+            DirectGate_WebRTC_GetPC(pRTC), nDC, DirectGate_WebRTC_GetPipe(pRTC));
+        DirectGate_WebRTC_Enqueue(pRTC, DIRECTGATE_WEBRTC_INPUT_CLOSED, nDC, NULL, 0);
+        return;
+    }
+
     if (pRTC->nDataChannelID != nDC)
     {
         xlogd("Ignoring stale WebRTC data channel close: pc(%d), dc(%d), current(%d)",
@@ -968,7 +991,7 @@ static void DirectGate_WebRTC_OnDataChannelClosed(int nDC, void *pPtr)
 static void DirectGate_WebRTC_OnDataChannelError(int nDC, const char *pError, void *pPtr)
 {
     directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
-    if (pRTC != NULL && pRTC->nDataChannelID != nDC)
+    if (pRTC != NULL && pRTC->nDataChannelID != nDC && pRTC->nInputDataChannelID != nDC)
     {
         xlogd("Ignoring stale WebRTC data channel error: pc(%d), dc(%d), current(%d), error(%s)",
             DirectGate_WebRTC_GetPC(pRTC), nDC, DirectGate_WebRTC_GetDC(pRTC), pError ? pError : "unknown");
@@ -988,7 +1011,7 @@ static void DirectGate_WebRTC_OnDataChannelMessage(int nDC, const char *pMessage
     XCHECK_VOID((pMessage != NULL));
     XCHECK_VOID((nSize > 0));
 
-    if (pRTC->nDataChannelID != nDC)
+    if (pRTC->nDataChannelID != nDC && pRTC->nInputDataChannelID != nDC)
     {
         xlogd("Ignoring stale WebRTC data channel message: pc(%d), dc(%d), current(%d), bytes(%d)",
             DirectGate_WebRTC_GetPC(pRTC), nDC, DirectGate_WebRTC_GetDC(pRTC), nSize);
@@ -996,8 +1019,9 @@ static void DirectGate_WebRTC_OnDataChannelMessage(int nDC, const char *pMessage
         return;
     }
 
-    xlogd("Received WebRTC data channel message: pc(%d), dc(%d), bytes(%d)",
-        DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC), nSize);
+    xlogd("Received WebRTC data channel message: pc(%d), dc(%d), fast(%d), bytes(%d)",
+        DirectGate_WebRTC_GetPC(pRTC), nDC,
+        nDC == pRTC->nInputDataChannelID ? 1 : 0, nSize);
 
     DirectGate_WebRTC_Enqueue(pRTC, DIRECTGATE_WEBRTC_DATA, nDC, (const uint8_t*)pMessage, (size_t)nSize);
 }
@@ -1009,18 +1033,41 @@ static void DirectGate_WebRTC_OnDataChannel(int nPC, int nDC, void *pPtr)
     XCHECK_VOID((pRTC != NULL));
     XCHECK_VOID_NL(DirectGate_WebRTC_IsCurrentPeerConnection(pRTC, nPC));
 
-    if (pRTC->nDataChannelID >= 0 && pRTC->nDataChannelID != nDC)
-    {
-        xlogw("Replacing stale WebRTC data channel: pc(%d), oldDc(%d), newDc(%d)",
-            DirectGate_WebRTC_GetPC(pRTC), pRTC->nDataChannelID, nDC);
+    char sLabel[64] = { 0 };
+    if (rtcGetDataChannelLabel(nDC, sLabel, (int)sizeof(sLabel)) < 0)
+        sLabel[0] = '\0';
 
-        DirectGate_WebRTC_CloseDataChannel(pRTC->nDataChannelID);
+    if (xstrcmp(sLabel, "directgate-input"))
+    {
+        if (pRTC->nInputDataChannelID >= 0 && pRTC->nInputDataChannelID != nDC)
+        {
+            xlogw("Replacing stale WebRTC fast input channel: pc(%d), oldDc(%d), newDc(%d)",
+                DirectGate_WebRTC_GetPC(pRTC), pRTC->nInputDataChannelID, nDC);
+            DirectGate_WebRTC_CloseDataChannel(pRTC->nInputDataChannelID);
+        }
+        pRTC->nInputDataChannelID = nDC;
+    }
+    else if (xstrcmp(sLabel, "directgate"))
+    {
+        if (pRTC->nDataChannelID >= 0 && pRTC->nDataChannelID != nDC)
+        {
+            xlogw("Replacing stale WebRTC data channel: pc(%d), oldDc(%d), newDc(%d)",
+                DirectGate_WebRTC_GetPC(pRTC), pRTC->nDataChannelID, nDC);
+
+            DirectGate_WebRTC_CloseDataChannel(pRTC->nDataChannelID);
+        }
+        pRTC->nDataChannelID = nDC;
+    }
+    else
+    {
+        xlogw("Rejecting unknown WebRTC data channel: pc(%d), dc(%d), label(%s)",
+            DirectGate_WebRTC_GetPC(pRTC), nDC, xstrused(sLabel) ? sLabel : "unknown");
+        DirectGate_WebRTC_CloseDataChannel(nDC);
+        return;
     }
 
-    pRTC->nDataChannelID = nDC;
-
-    xlogi("Accepted incoming WebRTC data channel: pc(%d), dc(%d), pipefd(%d)",
-        DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC), DirectGate_WebRTC_GetPipe(pRTC));
+    xlogi("Accepted incoming WebRTC data channel: pc(%d), dc(%d), label(%s), pipefd(%d)",
+        DirectGate_WebRTC_GetPC(pRTC), nDC, sLabel, DirectGate_WebRTC_GetPipe(pRTC));
 
     rtcSetUserPointer(nDC, pRTC);
     rtcSetOpenCallback(nDC, DirectGate_WebRTC_OnDataChannelOpen);
@@ -1759,7 +1806,19 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
                 (pEvt->eType == DIRECTGATE_WEBRTC_VIDEO_OPEN ||
                  pEvt->eType == DIRECTGATE_WEBRTC_VIDEO_CLOSED ||
                  pEvt->eType == DIRECTGATE_WEBRTC_VIDEO_KEYFRAME) ? XTRUE : XFALSE;
-            int nCurrent = bVideoEvent ? pRTC->nVideoTrackID : pRTC->nDataChannelID;
+            xbool_t bInputEvent =
+                (pEvt->eType == DIRECTGATE_WEBRTC_INPUT_OPEN ||
+                 pEvt->eType == DIRECTGATE_WEBRTC_INPUT_CLOSED) ? XTRUE : XFALSE;
+            int nCurrent = bVideoEvent ? pRTC->nVideoTrackID :
+                (bInputEvent ? pRTC->nInputDataChannelID : pRTC->nDataChannelID);
+
+            /* Payloads may arrive on either data channel. OPEN/CLOSED stay
+             * channel-specific so losing the replaceable-input channel can
+             * never mark the reliable session disconnected. */
+            if (pEvt->eType == DIRECTGATE_WEBRTC_DATA &&
+                (pEvt->nSourceID == pRTC->nDataChannelID ||
+                 pEvt->nSourceID == pRTC->nInputDataChannelID))
+                nCurrent = pEvt->nSourceID;
 
             if (pEvt->nSourceID != nCurrent)
             {
@@ -1795,6 +1854,16 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
             }
             case DIRECTGATE_WEBRTC_DATA:
                 DirectGate_WebRTC_DispatchDataCb(pRTC, pEvt);
+                break;
+            case DIRECTGATE_WEBRTC_INPUT_OPEN:
+                xlogn("WebRTC replaceable-input path is active: pc(%d), dc(%d)",
+                    DirectGate_WebRTC_GetPC(pRTC), pEvt->nSourceID);
+                break;
+            case DIRECTGATE_WEBRTC_INPUT_CLOSED:
+                xlogn("WebRTC replaceable-input path is inactive: pc(%d), dc(%d)",
+                    DirectGate_WebRTC_GetPC(pRTC), pEvt->nSourceID);
+                if (pRTC->nInputDataChannelID == pEvt->nSourceID)
+                    pRTC->nInputDataChannelID = -1;
                 break;
             case DIRECTGATE_WEBRTC_SIGNAL:
                 DirectGate_WebRTC_DispatchSignalCb(pRTC, pEvt);

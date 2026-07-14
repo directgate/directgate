@@ -133,8 +133,17 @@ void DirectGate_Desktop_ApplyPreset(directgate_desktop_t *pDesktop, directgate_d
             break;
         case DIRECTGATE_DESKTOP_PRESET_LOW_LATENCY:
             pDesktop->quality.nMaxEdge = 1280U;
+#if defined(_WIN32)
+            /* Windows has an event-driven DXGI capture thread and a hardware
+             * Media Foundation path, so make Low the first gaming-grade
+             * preset. Keeping Linux/macOS at 30 here preserves the requested
+             * Windows-first rollout until their pipelines are tuned next. */
+            pDesktop->quality.nFps = 60U;
+            pDesktop->quality.nBitrateKbps = 6000U;
+#else
             pDesktop->quality.nFps = 30U;
             pDesktop->quality.nBitrateKbps = 4000U;
+#endif
             pDesktop->quality.nKeyframeFrames = 300U;
             pDesktop->quality.bRealtime = XTRUE;
             break;
@@ -643,6 +652,11 @@ static int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const c
     XJSON_AddU32(pRoot, "screenWidth", pSession->desktop.nScreenWidth);
     XJSON_AddU32(pRoot, "screenHeight", pSession->desktop.nScreenHeight);
     XJSON_AddBool(pRoot, "captureReady", pSession->desktop.bCaptureReady);
+#if defined(_WIN32)
+    XJSON_AddBool(pRoot, "fastInput", XTRUE);
+#else
+    XJSON_AddBool(pRoot, "fastInput", XFALSE);
+#endif
     XJSON_AddStrIfUsed(pRoot, "selectedMonitor", pSession->desktop.sSelectedMonitor);
     XJSON_AddString(pRoot, "pipeline", DirectGate_Desktop_PipelineName(pSession->desktop.ePipeline));
     XJSON_AddString(pRoot, "codec", xstrused(pSession->desktop.sCodec) ? pSession->desktop.sCodec : "raw-rgba");
@@ -1484,6 +1498,16 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
 
     if (xstrcmp(pAction, "pointer"))
     {
+        uint32_t nSequence = XJSON_GetU32(XJSON_GetObject(pRoot, "sequence"));
+        if (nSequence != 0U && pDesktop->nPointerSequence != 0U &&
+            (int32_t)(nSequence - pDesktop->nPointerSequence) <= 0)
+        {
+            XJSON_Destroy(&json);
+            free(pJsonText);
+            return XAPI_CONTINUE;
+        }
+        if (nSequence != 0U) pDesktop->nPointerSequence = nSequence;
+
         int nX = XJSON_GetInt(XJSON_GetObject(pRoot, "x"));
         int nY = XJSON_GetInt(XJSON_GetObject(pRoot, "y"));
         int nScreenX = DirectGate_Desktop_FrameToScreenX(pDesktop, nX);
@@ -2450,6 +2474,19 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
 
     if (xstrcmp(pAction, "pointer"))
     {
+        /* Unordered SCTP can deliver an older motion sample after a newer
+         * one. Sequence arithmetic is wrap-safe for any realistic in-flight
+         * window and prevents the cursor from jumping backwards. */
+        uint32_t nSequence = XJSON_GetU32(XJSON_GetObject(pRoot, "sequence"));
+        if (nSequence != 0U && pDesktop->nPointerSequence != 0U &&
+            (int32_t)(nSequence - pDesktop->nPointerSequence) <= 0)
+        {
+            XJSON_Destroy(&json);
+            free(pJsonText);
+            return XAPI_CONTINUE;
+        }
+        if (nSequence != 0U) pDesktop->nPointerSequence = nSequence;
+
         int nX = XJSON_GetInt(XJSON_GetObject(pRoot, "x"));
         int nY = XJSON_GetInt(XJSON_GetObject(pRoot, "y"));
         CGPoint point = CGPointMake((CGFloat)DirectGate_Desktop_FrameToScreenX(pDesktop, nX),
@@ -3510,6 +3547,19 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
 
     if (xstrcmp(pAction, "pointer"))
     {
+        /* Unordered SCTP can deliver an older motion sample after a newer
+         * one. Sequence arithmetic is wrap-safe for any realistic in-flight
+         * window and prevents the cursor from jumping backwards. */
+        uint32_t nSequence = XJSON_GetU32(XJSON_GetObject(pRoot, "sequence"));
+        if (nSequence != 0U && pDesktop->nPointerSequence != 0U &&
+            (int32_t)(nSequence - pDesktop->nPointerSequence) <= 0)
+        {
+            XJSON_Destroy(&json);
+            free(pJsonText);
+            return XAPI_CONTINUE;
+        }
+        if (nSequence != 0U) pDesktop->nPointerSequence = nSequence;
+
         int nX = XJSON_GetInt(XJSON_GetObject(pRoot, "x"));
         int nY = XJSON_GetInt(XJSON_GetObject(pRoot, "y"));
         int nScreenX = DirectGate_Desktop_FrameToScreenX(pDesktop, nX);

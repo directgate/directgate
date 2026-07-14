@@ -44,6 +44,8 @@ typedef enum {
     DIRECTGATE_WEBRTC_CLOSED,
     DIRECTGATE_WEBRTC_DATA,
     DIRECTGATE_WEBRTC_SIGNAL,
+    DIRECTGATE_WEBRTC_INPUT_OPEN,
+    DIRECTGATE_WEBRTC_INPUT_CLOSED,
     DIRECTGATE_WEBRTC_VIDEO_OPEN,
     DIRECTGATE_WEBRTC_VIDEO_CLOSED,
     DIRECTGATE_WEBRTC_VIDEO_KEYFRAME
@@ -67,6 +69,7 @@ typedef struct directgate_pending_ice_ {
 typedef struct directgate_webrtc_ {
     int nPeerConnectionID;      /* Peer connection ID (-1 if not created) */
     int nDataChannelID;         /* Data channel ID (-1 if not created) */
+    int nInputDataChannelID;    /* Unordered replaceable-input channel */
     int nVideoTrackID;          /* Outbound desktop video track ID (-1 if unavailable) */
     xbool_t bConnected;         /* Data channel is open (main thread only) */
     xbool_t bVideoEnabled;      /* Offer answers may include a desktop video track */

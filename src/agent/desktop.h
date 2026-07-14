@@ -60,7 +60,7 @@ typedef enum {
 typedef enum {
     DIRECTGATE_DESKTOP_PRESET_BALANCED = 0, /* 1080p 30fps 8 Mbps (default) */
     DIRECTGATE_DESKTOP_PRESET_QUALITY,      /* 1080p 30fps 12 Mbps */
-    DIRECTGATE_DESKTOP_PRESET_LOW_LATENCY   /*  720p 30fps 4 Mbps */
+    DIRECTGATE_DESKTOP_PRESET_LOW_LATENCY   /*  720p; Windows gaming path runs at 60fps */
 } directgate_desktop_preset_t;
 
 typedef enum {
@@ -127,6 +127,7 @@ typedef struct directgate_desktop_ {
     void *pOriginalDisplayMode;
     uint32_t nFps;
     uint32_t nPointerButtons;
+    uint32_t nPointerSequence;
     uint64_t nFrameId;
     uint32_t nMonitorCount;
     directgate_desktop_monitor_t monitors[DIRECTGATE_DESKTOP_MAX_MONITORS];

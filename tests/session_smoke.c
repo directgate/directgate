@@ -76,6 +76,7 @@ void DirectGate_WebRTC_Init(directgate_webrtc_t *pRTC)
     memset(pRTC, 0, sizeof(*pRTC));
     pRTC->nPeerConnectionID = -1;
     pRTC->nDataChannelID = -1;
+    pRTC->nInputDataChannelID = -1;
     pRTC->nPipeFds[0] = -1;
     pRTC->nPipeFds[1] = -1;
 }
