@@ -75,6 +75,9 @@ static void DirectGate_Desktop_SetReason(directgate_desktop_t *pDesktop, const c
 }
 
 static int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const char *pStatus, const char *pReason);
+static void DirectGate_Desktop_SendCursorPosition(directgate_session_t *pSession,
+                                               int nScreenX, int nScreenY,
+                                               uint32_t nSequence);
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
 static void DirectGate_Desktop_RestoreDisplayMode(directgate_desktop_t *pDesktop);
 #endif
@@ -654,6 +657,7 @@ static int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const c
     XJSON_AddU32(pRoot, "screenWidth", pSession->desktop.nScreenWidth);
     XJSON_AddU32(pRoot, "screenHeight", pSession->desktop.nScreenHeight);
     XJSON_AddBool(pRoot, "captureReady", pSession->desktop.bCaptureReady);
+    XJSON_AddBool(pRoot, "cursorSync", XTRUE);
 #if defined(_WIN32)
     XJSON_AddBool(pRoot, "fastInput", XTRUE);
 #else
@@ -717,6 +721,33 @@ static int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const c
     XJSON_FreeObject(pHeader);
     free(pPayload);
     return nStatus;
+}
+
+static void DirectGate_Desktop_SendCursorPosition(directgate_session_t *pSession,
+                                               int nScreenX, int nScreenY,
+                                               uint32_t nSequence)
+{
+    XCHECK_VOID_NL((pSession != NULL));
+    directgate_desktop_t *pDesktop = &pSession->desktop;
+    uint32_t nWidth = pDesktop->nCaptureWidth ? pDesktop->nCaptureWidth : 1U;
+    uint32_t nHeight = pDesktop->nCaptureHeight ? pDesktop->nCaptureHeight : 1U;
+    int64_t nX = (int64_t)nScreenX - pDesktop->nCaptureX;
+    int64_t nY = (int64_t)nScreenY - pDesktop->nCaptureY;
+    if (nX < 0) nX = 0;
+    if (nY < 0) nY = 0;
+    if ((uint64_t)nX >= nWidth) nX = (int64_t)nWidth - 1;
+    if ((uint64_t)nY >= nHeight) nY = (int64_t)nHeight - 1;
+
+    xjson_obj_t *pHeader = DirectGate_Proto_BuildData(pSession->nSessionId);
+    if (pHeader == NULL) return;
+    XJSON_AddString(pHeader, "payloadType", "desktop-cursor");
+    XJSON_AddInt(pHeader, "x", (int)nX);
+    XJSON_AddInt(pHeader, "y", (int)nY);
+    XJSON_AddU32(pHeader, "screenWidth", nWidth);
+    XJSON_AddU32(pHeader, "screenHeight", nHeight);
+    XJSON_AddU32(pHeader, "sequence", nSequence);
+    (void)DirectGate_Session_Send(pSession, pHeader, NULL, 0);
+    XJSON_FreeObject(pHeader);
 }
 
 #if defined(__linux__)
@@ -1548,6 +1579,20 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
             uint32_t nButton = nDeltaY < 0 ? 4U : 5U;
             ((directgate_xtest_button_fn)pDesktop->pFakeButton)(pDisplay, nButton, True, CurrentTime);
             ((directgate_xtest_button_fn)pDesktop->pFakeButton)(pDisplay, nButton, False, CurrentTime);
+        }
+
+        if (bRelative)
+        {
+            XFlush(pDisplay);
+            Window rootReturn, childReturn;
+            int nRootX = 0, nRootY = 0, nWindowX = 0, nWindowY = 0;
+            unsigned int nMask = 0;
+            if (XQueryPointer(pDisplay, RootWindow(pDisplay, nScreen),
+                &rootReturn, &childReturn, &nRootX, &nRootY,
+                &nWindowX, &nWindowY, &nMask))
+            {
+                DirectGate_Desktop_SendCursorPosition(pSession, nRootX, nRootY, nSequence);
+            }
         }
     }
     else if (xstrcmp(pAction, "key"))
@@ -2583,6 +2628,18 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
                 if (bRelative) DirectGate_Desktop_MacSetRelativeDelta(event, nDx, nDy);
                 CGEventPost(kCGHIDEventTap, event);
                 CFRelease(event);
+            }
+        }
+
+        if (bRelative)
+        {
+            CGEventRef currentPointer = CGEventCreate(NULL);
+            if (currentPointer != NULL)
+            {
+                CGPoint currentPoint = CGEventGetLocation(currentPointer);
+                DirectGate_Desktop_SendCursorPosition(pSession,
+                    (int)currentPoint.x, (int)currentPoint.y, nSequence);
+                CFRelease(currentPointer);
             }
         }
     }
@@ -3663,6 +3720,14 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         {
             if (bRelative) DirectGate_Desktop_SendMouseRelative(0, 0, nDx, nDy);
             else DirectGate_Desktop_SendMouseInput(0, 0, nScreenX, nScreenY);
+        }
+
+        if (bRelative)
+        {
+            POINT cursorPoint;
+            if (GetCursorPos(&cursorPoint))
+                DirectGate_Desktop_SendCursorPosition(pSession,
+                    (int)cursorPoint.x, (int)cursorPoint.y, nSequence);
         }
     }
     else if (xstrcmp(pAction, "key"))
