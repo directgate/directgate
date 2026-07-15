@@ -49,6 +49,7 @@ typedef enum {
     DIRECTGATE_WEBRTC_VIDEO_OPEN,
     DIRECTGATE_WEBRTC_VIDEO_CLOSED,
     DIRECTGATE_WEBRTC_VIDEO_KEYFRAME,
+    DIRECTGATE_WEBRTC_PENDING_DIRECT,
     DIRECTGATE_WEBRTC_PENDING_FAILED
 } directgate_webrtc_event_type_t;
 
@@ -87,6 +88,7 @@ typedef struct directgate_webrtc_ {
     uint32_t nPendingSignalGeneration;
     xbool_t bPendingDataOpen;
     xbool_t bPendingVideoOpen;
+    xbool_t bPendingDirect;
     xbool_t bPendingReadySignaled;
     uint8_t nPendingVideoPayloadType;
     uint16_t nPendingVideoSeq;

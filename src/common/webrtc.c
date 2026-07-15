@@ -90,6 +90,13 @@ static xbool_t DirectGate_WebRTC_IsKnownPeerConnection(const directgate_webrtc_t
         DirectGate_WebRTC_IsPendingPeerConnection(pRTC, nPC)) ? XTRUE : XFALSE;
 }
 
+static int DirectGate_WebRTC_GetDataChannelForPeer(const directgate_webrtc_t *pRTC, int nPC)
+{
+    if (DirectGate_WebRTC_IsPendingPeerConnection(pRTC, nPC))
+        return pRTC->nPendingDataChannelID;
+    return DirectGate_WebRTC_GetDC(pRTC);
+}
+
 /* Unescape JSON string sequences (\r \n \t \\ \") in place.
    The xutils JSON parser does not unescape string values, so
    SDP strings arrive with literal \r\n instead of CR/LF. */
@@ -601,6 +608,7 @@ void DirectGate_WebRTC_Init(directgate_webrtc_t *pRTC)
     pRTC->nPendingSignalGeneration = 0;
     pRTC->bPendingDataOpen = XFALSE;
     pRTC->bPendingVideoOpen = XFALSE;
+    pRTC->bPendingDirect = XFALSE;
     pRTC->bPendingReadySignaled = XFALSE;
     pRTC->nPendingVideoPayloadType = DIRECTGATE_RTC_H264_PAYLOAD_TYPE;
     pRTC->nPendingVideoSeq = 0;
@@ -743,6 +751,7 @@ static void DirectGate_WebRTC_DestroyPending(directgate_webrtc_t *pRTC)
     pRTC->nPendingSignalGeneration = 0;
     pRTC->bPendingDataOpen = XFALSE;
     pRTC->bPendingVideoOpen = XFALSE;
+    pRTC->bPendingDirect = XFALSE;
     pRTC->bPendingReadySignaled = XFALSE;
     pRTC->nPendingVideoPayloadType = DIRECTGATE_RTC_H264_PAYLOAD_TYPE;
     pRTC->nPendingVideoSeq = 0;
@@ -768,6 +777,7 @@ static void DirectGate_WebRTC_PromotePending(directgate_webrtc_t *pRTC)
     XCHECK_VOID_NL((pRTC != NULL));
     XCHECK_VOID_NL((pRTC->nPendingPeerConnectionID >= 0));
     XCHECK_VOID_NL(pRTC->bPendingDataOpen);
+    XCHECK_VOID_NL(pRTC->bPendingDirect);
     if (pRTC->bVideoEnabled)
         XCHECK_VOID_NL(pRTC->bPendingVideoOpen && pRTC->nPendingVideoTrackID >= 0);
 
@@ -803,6 +813,7 @@ static void DirectGate_WebRTC_PromotePending(directgate_webrtc_t *pRTC)
     pRTC->nPendingSignalGeneration = 0;
     pRTC->bPendingDataOpen = XFALSE;
     pRTC->bPendingVideoOpen = XFALSE;
+    pRTC->bPendingDirect = XFALSE;
     pRTC->bPendingReadySignaled = XFALSE;
     pRTC->nPendingVideoPayloadType = DIRECTGATE_RTC_H264_PAYLOAD_TYPE;
     pRTC->nPendingVideoSeq = 0;
@@ -953,7 +964,8 @@ static void DirectGate_WebRTC_NotifyTransport(directgate_webrtc_t *pRTC, int nPC
 static void DirectGate_WebRTC_NotifyPendingReady(directgate_webrtc_t *pRTC)
 {
     XCHECK_VOID_NL((pRTC != NULL));
-    if (pRTC->bPendingReadySignaled || !pRTC->bPendingDataOpen) return;
+    if (pRTC->bPendingReadySignaled || !pRTC->bPendingDirect ||
+        !pRTC->bPendingDataOpen) return;
     if (pRTC->bVideoEnabled && !pRTC->bPendingVideoOpen) return;
 
     xjson_obj_t *pHeader = XJSON_NewObject(NULL, NULL, XSTDNON);
@@ -984,7 +996,7 @@ static void DirectGate_WebRTC_OnLocalDescription(int nPC, const char *pSdp, cons
     XCHECK_VOID_NL(DirectGate_WebRTC_IsKnownPeerConnection(pRTC, nPC));
 
     xlogi("Generated local WebRTC description: pc(%d), dc(%d), type(%s)",
-        DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC), pType);
+        nPC, DirectGate_WebRTC_GetDataChannelForPeer(pRTC, nPC), pType);
 
     xjson_obj_t *pHeader = XJSON_NewObject(NULL, NULL, XSTDNON);
     XCHECK_VOID((pHeader != NULL));
@@ -1033,8 +1045,10 @@ static void DirectGate_WebRTC_OnLocalCandidate(int nPC, const char *pCand, const
 
     const char *pUseMid = xstrused(pMid) ? pMid : DIRECTGATE_RTC_DEFAULT_MID;
 
-    xlogd("Generated local WebRTC ICE candidate: pc(%d), dc(%d), mid(%s)",
-        DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC), pUseMid);
+    xlogi("Generated local WebRTC ICE candidate: pc(%d), dc(%d), mid(%s), generation(%u)",
+        nPC, DirectGate_WebRTC_GetDataChannelForPeer(pRTC, nPC), pUseMid,
+        DirectGate_WebRTC_IsPendingPeerConnection(pRTC, nPC) ?
+            pRTC->nPendingSignalGeneration : pRTC->nSignalGeneration);
 
     xjson_obj_t *pHeader = XJSON_NewObject(NULL, NULL, XSTDNON);
     XCHECK_VOID((pHeader != NULL));
@@ -1069,8 +1083,8 @@ static void DirectGate_WebRTC_OnGatheringStateChange(int nPC, rtcGatheringState 
     const char *pStates[] = {"new", "inprogress", "complete"};
     const char *pStateStr = (state >= 0 && state <= 2) ? pStates[state] : "unknown";
 
-    xlogd("ICE gathering state changed: pc(%d), dc(%d), state(%s)",
-        DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC), pStateStr);
+    xlogi("ICE gathering state changed: pc(%d), dc(%d), state(%s)",
+        nPC, DirectGate_WebRTC_GetDataChannelForPeer(pRTC, nPC), pStateStr);
 }
 
 /* Callback: peer connection state change */
@@ -1089,7 +1103,7 @@ static void DirectGate_WebRTC_OnStateChange(int nPC, rtcState state, void *pPtr)
     };
 
     xlogi("Peer connection state changed: pc(%d), dc(%d), state(%s)",
-        DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC),
+        nPC, DirectGate_WebRTC_GetDataChannelForPeer(pRTC, nPC),
         (state >= 0 && state <= 5) ? pStates[state] : "unknown");
 
     if (DirectGate_WebRTC_IsPendingPeerConnection(pRTC, nPC) &&
@@ -1116,13 +1130,37 @@ static void DirectGate_WebRTC_OnIceStateChange(int nPC, rtcIceState state, void 
     };
 
     xlogi("ICE state changed: pc(%d), dc(%d), state(%s)",
-        DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC),
+        nPC, DirectGate_WebRTC_GetDataChannelForPeer(pRTC, nPC),
         (state >= 0 && state <= 6) ? pStates[state] : "unknown");
 
     if (DirectGate_WebRTC_IsCurrentPeerConnection(pRTC, nPC) &&
         (state == RTC_ICE_CONNECTED || state == RTC_ICE_COMPLETED))
     {
         DirectGate_WebRTC_NotifyTransport(pRTC, nPC);
+    }
+
+    if (DirectGate_WebRTC_IsPendingPeerConnection(pRTC, nPC) &&
+        (state == RTC_ICE_CONNECTED || state == RTC_ICE_COMPLETED))
+    {
+        char sLocal[XSTR_SUB] = {0};
+        char sRemote[XSTR_SUB] = {0};
+        if (rtcGetSelectedCandidatePair(nPC, sLocal, sizeof(sLocal),
+                sRemote, sizeof(sRemote)) >= 0)
+        {
+            if (DirectGate_WebRTC_IsRelayCandidate(sLocal) ||
+                DirectGate_WebRTC_IsRelayCandidate(sRemote))
+            {
+                xlogw("Background ICE connected through TURN; rejecting non-P2P candidate: pc(%d)", nPC);
+                DirectGate_WebRTC_Enqueue(pRTC, DIRECTGATE_WEBRTC_PENDING_FAILED,
+                    nPC, NULL, 0);
+            }
+            else
+            {
+                xlogn("Background ICE selected a direct P2P route: pc(%d)", nPC);
+                DirectGate_WebRTC_Enqueue(pRTC, DIRECTGATE_WEBRTC_PENDING_DIRECT,
+                    nPC, NULL, 0);
+            }
+        }
     }
 
     /* ICE can recover on the same media track while switching between a
@@ -1707,10 +1745,6 @@ XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSd
     {
         for (int i = 0; i < pRTC->nIceSrvCount; i++)
         {
-            if (bPending && strncasecmp(pRTC->sIceServers[i], "stun:", 5) &&
-                strncasecmp(pRTC->sIceServers[i], "stuns:", 6))
-                continue;
-
             pConfigServers[nConfigServerCount++] = pRTC->sIceServers[i];
         }
     }
@@ -1722,7 +1756,10 @@ XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSd
     }
     else
     {
-        /* The built-in list is STUN-only and is safe for a P2P probe. */
+        /* The built-in list is STUN-only and is safe when no ICE service was
+         * configured. Configured pending peers use the same candidate set as
+         * the old proven reconnect path; relay-selected pairs are rejected
+         * before promotion. */
         config.iceServers = g_pIceServers;
         config.iceServersCount = (int)XARR_SIZE(g_pIceServers);
     }
@@ -1850,11 +1887,12 @@ XSTATUS DirectGate_WebRTC_CommitPending(directgate_webrtc_t *pRTC, uint32_t nGen
         return XSTDOK;
     }
 
-    if (!pRTC->bPendingDataOpen ||
+    if (!pRTC->bPendingDirect || !pRTC->bPendingDataOpen ||
         (pRTC->bVideoEnabled && !pRTC->bPendingVideoOpen))
     {
-        xlogw("Ignoring premature P2P migration commit: pendingPc(%d), dataOpen(%d), videoOpen(%d)",
-            pRTC->nPendingPeerConnectionID, pRTC->bPendingDataOpen, pRTC->bPendingVideoOpen);
+        xlogw("Ignoring premature P2P migration commit: pendingPc(%d), direct(%d), dataOpen(%d), videoOpen(%d)",
+            pRTC->nPendingPeerConnectionID, pRTC->bPendingDirect,
+            pRTC->bPendingDataOpen, pRTC->bPendingVideoOpen);
         return XSTDERR;
     }
 
@@ -2176,7 +2214,8 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
             int nPending = bVideoEvent ? pRTC->nPendingVideoTrackID :
                 (bInputEvent ? pRTC->nPendingInputDataChannelID : pRTC->nPendingDataChannelID);
 
-            if (pEvt->eType == DIRECTGATE_WEBRTC_PENDING_FAILED)
+            if (pEvt->eType == DIRECTGATE_WEBRTC_PENDING_DIRECT ||
+                pEvt->eType == DIRECTGATE_WEBRTC_PENDING_FAILED)
             {
                 nCurrent = -1;
                 nPending = pRTC->nPendingPeerConnectionID;
@@ -2317,6 +2356,10 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
             }
             case DIRECTGATE_WEBRTC_VIDEO_KEYFRAME:
                 if (!bPendingSource) pRTC->bVideoKeyframeRequested = XTRUE;
+                break;
+            case DIRECTGATE_WEBRTC_PENDING_DIRECT:
+                pRTC->bPendingDirect = XTRUE;
+                DirectGate_WebRTC_NotifyPendingReady(pRTC);
                 break;
             case DIRECTGATE_WEBRTC_PENDING_FAILED:
                 xlogw("Background P2P peer failed; keeping active TURN peer: pc(%d)",
