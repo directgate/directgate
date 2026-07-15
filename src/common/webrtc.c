@@ -903,6 +903,52 @@ static void DirectGate_WebRTC_SendSignal(directgate_webrtc_t *pRTC, const char *
     DirectGate_WebRTC_Enqueue(pRTC, DIRECTGATE_WEBRTC_SIGNAL, -1, (const uint8_t*)pJson, nLen);
 }
 
+static xbool_t DirectGate_WebRTC_IsRelayCandidate(const char *pCandidate)
+{
+    if (!xstrused(pCandidate)) return XFALSE;
+    return strstr(pCandidate, " typ relay") != NULL ? XTRUE : XFALSE;
+}
+
+/* Browser getStats() is not consistent about exposing linked candidate
+ * records. The agent can inspect its selected pair directly, so report the
+ * active route classification as a signaling hint. */
+static void DirectGate_WebRTC_NotifyTransport(directgate_webrtc_t *pRTC, int nPC)
+{
+    XCHECK_VOID_NL((pRTC != NULL));
+    if (!DirectGate_WebRTC_IsCurrentPeerConnection(pRTC, nPC)) return;
+
+    char sLocal[XSTR_SUB] = {0};
+    char sRemote[XSTR_SUB] = {0};
+    if (rtcGetSelectedCandidatePair(nPC, sLocal, sizeof(sLocal),
+            sRemote, sizeof(sRemote)) < 0)
+    {
+        xlogd("Selected ICE candidate pair is not available yet: pc(%d)", nPC);
+        return;
+    }
+
+    xbool_t bRelay = DirectGate_WebRTC_IsRelayCandidate(sLocal) ||
+        DirectGate_WebRTC_IsRelayCandidate(sRemote);
+    xlogn("Selected WebRTC transport: pc(%d), route(%s)",
+        nPC, bRelay ? "turn" : "p2p");
+
+    xjson_obj_t *pHeader = XJSON_NewObject(NULL, NULL, XSTDNON);
+    XCHECK_VOID((pHeader != NULL));
+    XJSON_AddString(pHeader, "type", "webrtc");
+    XJSON_AddString(pHeader, "action", "transport");
+    XJSON_AddBool(pHeader, "relay", bRelay);
+    if (pRTC->nSignalGeneration)
+        XJSON_AddU32(pHeader, "generation", pRTC->nSignalGeneration);
+
+    size_t nLen = 0;
+    char *pJson = XJSON_DumpObj(pHeader, 0, &nLen);
+    if (pJson != NULL)
+    {
+        DirectGate_WebRTC_SendSignal(pRTC, pJson, nLen);
+        free(pJson);
+    }
+    XJSON_FreeObject(pHeader);
+}
+
 static void DirectGate_WebRTC_NotifyPendingReady(directgate_webrtc_t *pRTC)
 {
     XCHECK_VOID_NL((pRTC != NULL));
@@ -1070,6 +1116,12 @@ static void DirectGate_WebRTC_OnIceStateChange(int nPC, rtcIceState state, void 
     xlogi("ICE state changed: pc(%d), dc(%d), state(%s)",
         DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC),
         (state >= 0 && state <= 6) ? pStates[state] : "unknown");
+
+    if (DirectGate_WebRTC_IsCurrentPeerConnection(pRTC, nPC) &&
+        (state == RTC_ICE_CONNECTED || state == RTC_ICE_COMPLETED))
+    {
+        DirectGate_WebRTC_NotifyTransport(pRTC, nPC);
+    }
 
     /* ICE can recover on the same media track while switching between a
      * direct candidate pair and TURN.  The decoder may have lost every
