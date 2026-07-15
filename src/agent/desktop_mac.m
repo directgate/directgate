@@ -1083,5 +1083,4 @@ int DirectGate_Desktop_MacEncoder_DrainMain(directgate_session_t *pSession)
 
     return XAPI_CONTINUE;
 }
-
 #endif /* DIRECTGATE_SCK_AVAILABLE */

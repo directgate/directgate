@@ -308,8 +308,7 @@ static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
     DirectGate_MFEnc_SetCodecBool(pEnc, &g_MFEncLowLatencyMode, XTRUE);
     DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncBPictureCount, 0);
     DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncGopSize, nKeyEvery);
-    if (pQuality->bRealtime)
-        DirectGate_MFEnc_SetCodecBool(pEnc, &g_MFEncCommonRealTime, XTRUE);
+    if (pQuality->bRealtime) DirectGate_MFEnc_SetCodecBool(pEnc, &g_MFEncCommonRealTime, XTRUE);
 
     IMFMediaType *pOutType = NULL;
     HRESULT hr = DirectGate_MFEnc_BuildType(&pOutType, &MFVideoFormat_H264,
@@ -699,11 +698,11 @@ static IMFSample* DirectGate_MFEnc_BuildInputSample(directgate_mfenc_t *pEnc,
 }
 
 int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
-                        const uint8_t *pNV12,
-                        uint64_t nPtsUs,
-                        xbool_t bForceKeyframe,
-                        xbyte_buffer_t *pOut,
-                        xbool_t *pKeyframe)
+                            const uint8_t *pNV12,
+                            uint64_t nPtsUs,
+                            xbool_t bForceKeyframe,
+                            xbyte_buffer_t *pOut,
+                            xbool_t *pKeyframe)
 {
     XCHECK((pEncoder != NULL && pEncoder->pTransform != NULL), XSTDERR);
     XCHECK((pNV12 != NULL && pOut != NULL), XSTDERR);
@@ -756,9 +755,7 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
 
     /* Synchronous (software) model: feed the frame, then drain until the
      * MFT reports it needs more input. */
-    HRESULT hr = IMFTransform_ProcessInput(pEncoder->pTransform,
-        pEncoder->nInputStreamId, pSample, 0);
-
+    HRESULT hr = IMFTransform_ProcessInput(pEncoder->pTransform, pEncoder->nInputStreamId, pSample, 0);
     if (hr == MF_E_NOTACCEPTING)
     {
         /* Leftover output from the previous frame blocks the input queue. */
@@ -785,8 +782,7 @@ int DirectGate_MFEnc_SetBitrate(directgate_mfenc_t *pEncoder, uint32_t nBitrateK
     XCHECK((pEncoder != NULL), XSTDERR);
     XCHECK((nBitrateKbps > 0), XSTDERR);
 
-    HRESULT hr = DirectGate_MFEnc_SetCodecU32(pEncoder, &g_MFEncMeanBitRate,
-        nBitrateKbps * 1000U);
+    HRESULT hr = DirectGate_MFEnc_SetCodecU32(pEncoder, &g_MFEncMeanBitRate, nBitrateKbps * 1000U);
     if (FAILED(hr) && !pEncoder->bBitrateLiveFailed)
     {
         /* Some hardware MFTs reject mid-stream bitrate changes; the adaptive
@@ -804,10 +800,8 @@ int DirectGate_MFEnc_ApplyQuality(directgate_mfenc_t *pEncoder,
 {
     XCHECK((pEncoder != NULL && pQuality != NULL), XSTDERR);
 
-    DirectGate_MFEnc_SetBitrate(pEncoder,
-        pQuality->nBitrateKbps ? pQuality->nBitrateKbps : 4000U);
-    DirectGate_MFEnc_SetCodecU32(pEncoder, &g_MFEncGopSize,
-        pQuality->nKeyframeFrames ? pQuality->nKeyframeFrames : 60U);
+    DirectGate_MFEnc_SetBitrate(pEncoder, pQuality->nBitrateKbps ? pQuality->nBitrateKbps : 4000U);
+    DirectGate_MFEnc_SetCodecU32(pEncoder, &g_MFEncGopSize, pQuality->nKeyframeFrames ? pQuality->nKeyframeFrames : 60U);
 
     /* All presets run 30 fps, so the input media type's frame rate is left
      * untouched; a dimension change rebuilds the encoder anyway. */

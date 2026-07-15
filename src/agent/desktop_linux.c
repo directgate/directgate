@@ -92,10 +92,8 @@ static void DirectGate_Desktop_X11Enc_SetError(directgate_x11enc_t *pEnc,
                                            const char *pError)
 {
     XCHECK_VOID_NL((xstrused(pError)));
-    if (pEnc != NULL)
-        xstrncpy(pEnc->sLastError, sizeof(pEnc->sLastError), pError);
-    if (pDesktop != NULL)
-        xstrncpy(pDesktop->sReason, sizeof(pDesktop->sReason), pError);
+    if (pEnc != NULL) xstrncpy(pEnc->sLastError, sizeof(pEnc->sLastError), pError);
+    if (pDesktop != NULL) xstrncpy(pDesktop->sReason, sizeof(pDesktop->sReason), pError);
 }
 
 static uint64_t DirectGate_Desktop_X11Enc_MonotonicUs(void)
@@ -112,10 +110,13 @@ static void DirectGate_Desktop_X11Enc_PickSize(const directgate_desktop_t *pDesk
     uint32_t nWidth = nSrcW;
     uint32_t nHeight = nSrcH;
     DirectGate_Desktop_ComputeOutputSize(pDesktop, nSrcW, nSrcH, &nWidth, &nHeight);
+
     nWidth &= ~1U;
     nHeight &= ~1U;
+
     if (nWidth < 16U) nWidth = 16U;
     if (nHeight < 16U) nHeight = 16U;
+
     *pWidth = nWidth;
     *pHeight = nHeight;
 }
@@ -130,11 +131,13 @@ static uint32_t DirectGate_Desktop_X11Enc_MaskShift(unsigned long nMask)
 {
     uint32_t nShift = 0;
     if (!nMask) return 0;
+
     while ((nMask & 1UL) == 0)
     {
         nShift++;
         nMask >>= 1;
     }
+
     return nShift;
 }
 
@@ -159,6 +162,7 @@ static int DirectGate_Desktop_X11Enc_CheckFormat(directgate_x11enc_t *pEnc,
         snprintf(sError, sizeof(sError),
             "Unsupported X11 pixel format for H.264 capture (%d bpp, need 32).",
             pImage->bits_per_pixel);
+
         DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop, sError);
         return XSTDERR;
     }
@@ -330,7 +334,6 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     XCHECK((pSession != NULL), XSTDERR);
     directgate_desktop_t *pDesktop = &pSession->desktop;
     Display *pDisplay = (Display*)pDesktop->pDisplay;
-
     DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
 
     if (pDisplay == NULL || nWidth == 0 || nHeight == 0)
@@ -371,10 +374,8 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     pEnc->pPrevBGRA = (uint8_t*)malloc(nFrameBytes);
     pEnc->pI420 = (uint8_t*)malloc((size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight * 3U / 2U);
 
-    xbool_t bScaling = (pEnc->nEncodeWidth != nWidth || pEnc->nEncodeHeight != nHeight) ?
-        XTRUE : XFALSE;
-    if (bScaling)
-        pEnc->pCaptureBGRA = (uint8_t*)malloc((size_t)nWidth * nHeight * 4U);
+    xbool_t bScaling = (pEnc->nEncodeWidth != nWidth || pEnc->nEncodeHeight != nHeight) ? XTRUE : XFALSE;
+    if (bScaling) pEnc->pCaptureBGRA = (uint8_t*)malloc((size_t)nWidth * nHeight * 4U);
 
     if (pEnc->pFrameBGRA == NULL || pEnc->pPrevBGRA == NULL || pEnc->pI420 == NULL ||
         (bScaling && pEnc->pCaptureBGRA == NULL))
@@ -454,8 +455,7 @@ void DirectGate_Desktop_LinuxEncoder_ApplyQuality(directgate_session_t *pSession
         uint32_t nCaptureWidth = pEnc->nCaptureWidth;
         uint32_t nCaptureHeight = pEnc->nCaptureHeight;
 
-        if (DirectGate_Desktop_LinuxEncoder_Start(pSession, nX, nY,
-            nCaptureWidth, nCaptureHeight) != XSTDOK)
+        if (DirectGate_Desktop_LinuxEncoder_Start(pSession, nX, nY, nCaptureWidth, nCaptureHeight) != XSTDOK)
         {
             xlogw("Failed to rebuild X11 H.264 pipeline for preset change: sid(%u), reason(%s)",
                 pSession->nSessionId, DirectGate_Desktop_GetReason(pDesktop));
@@ -516,8 +516,7 @@ int DirectGate_Desktop_LinuxEncoder_ProcessTick(directgate_session_t *pSession)
     /* Transport backpressure: skipping the whole capture keeps the encoder
      * reference chain untouched, so no keyframe is needed on resume (same
      * reasoning as the macOS SCK callback). */
-    if (DirectGate_Desktop_ShouldSkipForBackpressure(pSession))
-        return XAPI_CONTINUE;
+    if (DirectGate_Desktop_ShouldSkipForBackpressure(pSession)) return XAPI_CONTINUE;
 
     XImage *pImage = NULL;
     if (pEnc->pShmImage != NULL)
@@ -600,5 +599,4 @@ int DirectGate_Desktop_LinuxEncoder_ProcessTick(directgate_session_t *pSession)
         pEnc->encoded.nUsed, pEnc->nEncodeWidth, pEnc->nEncodeHeight,
         bKeyframe, nPtsUs);
 }
-
 #endif /* __linux__ */

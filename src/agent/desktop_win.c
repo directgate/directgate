@@ -159,11 +159,14 @@ static void DirectGate_Desktop_WinEnc_PickSize(const directgate_desktop_t *pDesk
 {
     uint32_t nWidth = nSrcW;
     uint32_t nHeight = nSrcH;
+
     DirectGate_Desktop_ComputeOutputSize(pDesktop, nSrcW, nSrcH, &nWidth, &nHeight);
     nWidth &= ~1U;
     nHeight &= ~1U;
+
     if (nWidth < 16U) nWidth = 16U;
     if (nHeight < 16U) nHeight = 16U;
+
     *pWidth = nWidth;
     *pHeight = nHeight;
 }
@@ -278,11 +281,9 @@ static int DirectGate_Desktop_WinEnc_InitDxgi(directgate_winenc_t *pEnc)
     IDXGIAdapter *pFoundAdapter = NULL;
     IDXGIOutput1 *pFoundOutput = NULL;
 
-    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void**)&pFactory)) || pFactory == NULL)
-        return XSTDNON;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void**)&pFactory)) || pFactory == NULL) return XSTDNON;
 
-    for (UINT a = 0; pFoundOutput == NULL &&
-         IDXGIFactory1_EnumAdapters(pFactory, a, &pAdapter) == S_OK; a++)
+    for (UINT a = 0; pFoundOutput == NULL && IDXGIFactory1_EnumAdapters(pFactory, a, &pAdapter) == S_OK; a++)
     {
         for (UINT o = 0; IDXGIAdapter_EnumOutputs(pAdapter, o, &pOutput) == S_OK; o++)
         {
@@ -356,6 +357,7 @@ static int DirectGate_Desktop_WinEnc_CaptureDxgi(directgate_winenc_t *pEnc, uint
         IDXGIOutputDuplication_ReleaseFrame(pEnc->pDuplication);
         return XSTDNON;
     }
+
     uint64_t nCapturedUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
 
     ID3D11Texture2D *pTexture = NULL;
@@ -398,8 +400,7 @@ static int DirectGate_Desktop_WinEnc_CaptureDxgi(directgate_winenc_t *pEnc, uint
     D3D11_MAPPED_SUBRESOURCE mapped;
     memset(&mapped, 0, sizeof(mapped));
     if (FAILED(ID3D11DeviceContext_Map(pEnc->pContext, (ID3D11Resource*)pEnc->pStaging,
-        0, D3D11_MAP_READ, 0, &mapped)) || mapped.pData == NULL)
-        return XSTDERR;
+        0, D3D11_MAP_READ, 0, &mapped)) || mapped.pData == NULL) return XSTDERR;
 
     if (desc.Width == pEnc->nEncodeWidth && desc.Height == pEnc->nEncodeHeight)
     {
@@ -503,13 +504,13 @@ static int DirectGate_Desktop_WinEnc_InitGdi(directgate_winenc_t *pEnc)
 static int DirectGate_Desktop_WinEnc_CaptureGdi(directgate_winenc_t *pEnc, xbool_t bForceKeyframe)
 {
     if (!BitBlt(pEnc->hMemDC, 0, 0, (int)pEnc->nCaptureWidth, (int)pEnc->nCaptureHeight,
-        pEnc->hScreenDC, pEnc->nCaptureX, pEnc->nCaptureY, SRCCOPY))
-        return XSTDERR;
+        pEnc->hScreenDC, pEnc->nCaptureX, pEnc->nCaptureY, SRCCOPY)) return XSTDERR;
 
     GdiFlush();
     DirectGate_YUV_ScaleBGRA(pEnc->pFrameBGRA, pEnc->nEncodeWidth, pEnc->nEncodeHeight,
         pEnc->pDibBits, pEnc->nCaptureWidth, pEnc->nCaptureHeight,
         (size_t)pEnc->nCaptureWidth * 4U);
+
     pEnc->bHaveFrame = XTRUE;
     pEnc->nFrameCapturedUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
 
@@ -1020,9 +1021,7 @@ int DirectGate_Desktop_WinEncoder_DrainMain(directgate_session_t *pSession)
     AcquireSRWLockExclusive(&pEnc->mailboxLock);
     if (pEnc->bMailboxHasFrame)
     {
-        uint64_t nAgeUs = (nNowUs >= pEnc->nMailboxCapturedUs) ?
-            nNowUs - pEnc->nMailboxCapturedUs : 0U;
-
+        uint64_t nAgeUs = (nNowUs >= pEnc->nMailboxCapturedUs) ? nNowUs - pEnc->nMailboxCapturedUs : 0U;
         if (pEnc->nMailboxCapturedUs && nAgeUs > nMaxAgeUs)
         {
             /* Never put an already-obsolete frame on the wire. Dropping an
@@ -1047,12 +1046,15 @@ int DirectGate_Desktop_WinEncoder_DrainMain(directgate_session_t *pSession)
         }
         pEnc->bMailboxHasFrame = XFALSE;
     }
+
     ReleaseSRWLockExclusive(&pEnc->mailboxLock);
 
     if (bDroppedStale)
+    {
         xlogd("Dropping stale Windows desktop frame: sid(%u), ageUs(%llu), maxUs(%llu)",
             pSession->nSessionId, (unsigned long long)nDroppedAgeUs,
             (unsigned long long)nMaxAgeUs);
+    }
 
     if (!bHasFrame || !pEnc->drain.nUsed) return XAPI_CONTINUE;
 

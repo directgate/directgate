@@ -84,8 +84,9 @@ static directgate_openh264_lib_t g_openh264;
 
 static xbool_t DirectGate_OpenH264_UsesPre26FrameLayout(void)
 {
-    return (g_openh264.version.uMajor == 2U && g_openh264.version.uMinor < 6U) ?
-        XTRUE : XFALSE;
+    return (g_openh264.version.uMajor == 2U &&
+            g_openh264.version.uMinor < 6U) ?
+            XTRUE : XFALSE;
 }
 
 /* Sonames the Cisco/openh264 binary releases have shipped under. Newest
@@ -117,6 +118,7 @@ int DirectGate_OpenH264_Load(char *pErrBuf, size_t nErrSize)
         DirectGate_OpenH264_SetError(pErrBuf, nErrSize,
             "OpenH264 library is not available (install the Cisco openh264 binary "
             "or set DIRECTGATE_OPENH264_LIB).");
+
         return XSTDERR;
     }
 
@@ -133,6 +135,7 @@ int DirectGate_OpenH264_Load(char *pErrBuf, size_t nErrSize)
         {
             DirectGate_OpenH264_SetError(pErrBuf, nErrSize,
                 "Failed to load OpenH264 from DIRECTGATE_OPENH264_LIB (%s).", pEnvPath);
+
             return XSTDERR;
         }
     }
@@ -148,21 +151,20 @@ int DirectGate_OpenH264_Load(char *pErrBuf, size_t nErrSize)
         DirectGate_OpenH264_SetError(pErrBuf, nErrSize,
             "OpenH264 library is not available (install the Cisco openh264 binary "
             "or set DIRECTGATE_OPENH264_LIB).");
+
         return XSTDERR;
     }
 
-    directgate_wels_create_fn createFn =
-        (directgate_wels_create_fn)dlsym(pHandle, "WelsCreateSVCEncoder");
-    directgate_wels_destroy_fn destroyFn =
-        (directgate_wels_destroy_fn)dlsym(pHandle, "WelsDestroySVCEncoder");
-    directgate_wels_version_fn versionFn =
-        (directgate_wels_version_fn)dlsym(pHandle, "WelsGetCodecVersionEx");
+    directgate_wels_create_fn createFn = (directgate_wels_create_fn)dlsym(pHandle, "WelsCreateSVCEncoder");
+    directgate_wels_destroy_fn destroyFn = (directgate_wels_destroy_fn)dlsym(pHandle, "WelsDestroySVCEncoder");
+    directgate_wels_version_fn versionFn = (directgate_wels_version_fn)dlsym(pHandle, "WelsGetCodecVersionEx");
 
     if (createFn == NULL || destroyFn == NULL || versionFn == NULL)
     {
-        dlclose(pHandle);
         DirectGate_OpenH264_SetError(pErrBuf, nErrSize,
             "OpenH264 library %s is missing required encoder symbols.", pLoadedName);
+
+        dlclose(pHandle);
         return XSTDERR;
     }
 
@@ -265,8 +267,6 @@ directgate_openh264_t* DirectGate_OpenH264_Create(uint32_t nWidth,
     pLayer->fFrameRate = (float)nFps;
     pLayer->iSpatialBitrate = param.iTargetBitrate;
     pLayer->iMaxSpatialBitrate = param.iMaxBitrate;
-    /* Main+CABAC everywhere except low-latency, matching the profile choice
-     * the macOS VideoToolbox pipeline makes for WebCodecs decoders. */
     pLayer->uiProfileIdc = bLowLatency ? PRO_BASELINE : PRO_MAIN;
 
     /* Pin BT.709 limited range in the SPS VUI so the browser decoder does
@@ -286,6 +286,7 @@ directgate_openh264_t* DirectGate_OpenH264_Create(uint32_t nWidth,
         g_openh264.destroyEncoder(pWels);
         DirectGate_OpenH264_SetError(pErrBuf, nErrSize,
             "OpenH264 InitializeExt failed: size(%ux%u), ret(%d)", nWidth, nHeight, nRet);
+
         return NULL;
     }
 
@@ -320,19 +321,18 @@ void DirectGate_OpenH264_Destroy(directgate_openh264_t *pEncoder)
 }
 
 int DirectGate_OpenH264_Encode(directgate_openh264_t *pEncoder,
-                           const uint8_t *pI420,
-                           uint64_t nPtsUs,
-                           xbool_t bForceKeyframe,
-                           xbyte_buffer_t *pOut,
-                           xbool_t *pKeyframe)
+                                const uint8_t *pI420,
+                                uint64_t nPtsUs,
+                                xbool_t bForceKeyframe,
+                                xbyte_buffer_t *pOut,
+                                xbool_t *pKeyframe)
 {
     XCHECK((pEncoder != NULL && pEncoder->pEncoder != NULL), XSTDERR);
     XCHECK((pI420 != NULL && pOut != NULL), XSTDERR);
     if (pKeyframe != NULL) *pKeyframe = XFALSE;
 
     ISVCEncoder *pWels = pEncoder->pEncoder;
-    if (bForceKeyframe)
-        (*pWels)->ForceIntraFrame(pWels, true);
+    if (bForceKeyframe) (*pWels)->ForceIntraFrame(pWels, true);
 
     size_t nLumaSize = (size_t)pEncoder->nWidth * pEncoder->nHeight;
     SSourcePicture picture;
@@ -359,19 +359,19 @@ int DirectGate_OpenH264_Encode(directgate_openh264_t *pEncoder,
     {
         xloge("OpenH264 EncodeFrame failed: size(%ux%u), ret(%d)",
             pEncoder->nWidth, pEncoder->nHeight, nRet);
+
         return XSTDERR;
     }
 
     EVideoFrameType eFrameType = bPre26 ? info.pre26.eFrameType : info.current.eFrameType;
     int nLayerNum = bPre26 ? info.pre26.iLayerNum : info.current.iLayerNum;
-
-    if (eFrameType == videoFrameTypeSkip || nLayerNum <= 0)
-        return XSTDNON;
+    if (eFrameType == videoFrameTypeSkip || nLayerNum <= 0) return XSTDNON;
 
     if (nLayerNum > MAX_LAYER_NUM_OF_FRAME)
     {
         xloge("OpenH264 returned invalid layer count: version(%s), layers(%d)",
             DirectGate_OpenH264_Version(), nLayerNum);
+
         return XSTDERR;
     }
 
@@ -390,6 +390,7 @@ int DirectGate_OpenH264_Encode(directgate_openh264_t *pEncoder,
         {
             xloge("OpenH264 returned invalid layer metadata: version(%s), layer(%d), nals(%d)",
                 DirectGate_OpenH264_Version(), i, nNalCount);
+
             return XSTDERR;
         }
 
@@ -401,14 +402,15 @@ int DirectGate_OpenH264_Encode(directgate_openh264_t *pEncoder,
             {
                 xloge("OpenH264 returned invalid NAL length: version(%s), layer(%d), nal(%d), bytes(%d)",
                     DirectGate_OpenH264_Version(), i, j, pNalLengths[j]);
+
                 return XSTDERR;
             }
+
             nLayerSize += (size_t)pNalLengths[j];
         }
 
         /* Each layer buffer already carries Annex-B start codes. */
-        if (nLayerSize > 0 &&
-            XByteBuffer_Add(pOut, pBitstream, nLayerSize) <= 0)
+        if (nLayerSize > 0 && XByteBuffer_Add(pOut, pBitstream, nLayerSize) <= 0)
         {
             xloge("Failed to buffer encoded frame: bytes(%zu)", nLayerSize);
             return XSTDERR;
@@ -434,6 +436,7 @@ int DirectGate_OpenH264_SetBitrate(directgate_openh264_t *pEncoder, uint32_t nBi
 
     ISVCEncoder *pWels = pEncoder->pEncoder;
     SBitrateInfo bitrate;
+
     memset(&bitrate, 0, sizeof(bitrate));
     bitrate.iLayer = SPATIAL_LAYER_ALL;
     bitrate.iBitrate = (int)(nBitrateKbps * 1000U);
