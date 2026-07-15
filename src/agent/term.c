@@ -693,7 +693,8 @@ static XSTATUS DirectGate_Term_SendWs(directgate_term_t *pTerm, const uint8_t *p
 
     /* Add packet counter for encrypted sessions */
     if (pTerm->bEncrypt && DirectGate_E2E_IsInitialized(pTerm->pE2E))
-        XJSON_AddU32(pHeader, "cc", ++pTerm->pE2E->nTxPacketId);
+        DirectGate_Proto_AddCC(pHeader, pTerm->pE2E,
+            pTerm->pWebRTC != NULL ? pTerm->pWebRTC->nSignalGeneration : 0);
 
     xbyte_buffer_t packet;
     XByteBuffer_Init(&packet, XSTDNON, XSTDNON);

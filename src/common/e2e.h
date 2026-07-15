@@ -46,6 +46,12 @@ typedef struct directgate_e2e_ {
     uint8_t rxCtrKey[XE2E_KEY_SIZE];
     uint32_t nTxPacketId;
     uint32_t nRxPacketId;
+    uint32_t nTxSessionPacketId;
+    uint32_t nRxSessionPacketId;
+    uint32_t nTxSessionEpoch;
+    uint32_t nRxSessionEpoch;
+    uint32_t nTxSignalPacketId;
+    uint32_t nRxSignalPacketId;
     xbool_t bInitialized;
 } directgate_e2e_t;
 
