@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.21)
 project(directgate LANGUAGES C CXX)
 
 # ---------------------------------------------------------------------------
@@ -143,8 +143,8 @@ set(NO_TESTS ON CACHE BOOL "" FORCE)
 # Media transport (RTP/SRTP) is enabled so the desktop streaming pipeline can
 # push H.264 over a negotiated WebRTC video track (see desktop.c / webrtc.c
 # DirectGate_WebRTC_SendH264AnnexB). The bundled deps/libsrtp needs CMake >= 3.21,
-# which this project's minimum (3.16) does not guarantee on its own — but every
-# supported toolchain in CI ships a newer CMake. WebSocket stays off (unused).
+# which is also the minimum declared by this project. WebSocket stays off
+# because DirectGate does not use libdatachannel's WebSocket implementation.
 set(NO_MEDIA OFF CACHE BOOL "" FORCE)
 set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
 if(WIN32)
