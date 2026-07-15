@@ -46,6 +46,7 @@
     serves sessions while shell.user is logged on.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:firewall="http://wixtoolset.org/schemas/v4/wxs/firewall"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
 
@@ -87,7 +88,23 @@
                 <Component Id="CmpAgentExe" Bitness="always64">
                     <File Id="FileAgentExe"
                           Source="$(var.StageDir)/directgate.exe"
-                          KeyPath="yes" />
+                          KeyPath="yes">
+                        <!-- WebRTC uses dynamically selected local UDP ports.
+                             Bind the inbound allow rule to the installed agent
+                             executable instead of opening a global port range.
+                             WiX removes the rule with this component on uninstall. -->
+                        <firewall:FirewallException
+                            Id="DirectGateP2PUdpFirewall"
+                            Name="DirectGate P2P UDP"
+                            Description="Allows DirectGate WebRTC P2P connections"
+                            Protocol="udp"
+                            Scope="any"
+                            Profile="all"
+                            Action="allow"
+                            EdgeTraversal="allow"
+                            Enabled="yes"
+                            IgnoreFailure="no" />
+                    </File>
 
                     <!-- One LocalSystem service that runs the launcher. No account
                          or password is needed: the launcher mints shell.user's

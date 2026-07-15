@@ -86,9 +86,16 @@ The project's Windows CI builds a Windows x64 MSI with the [WiX Toolset](https:/
 
 Installing `directgate-<version>-x64.msi` (double-click, or `msiexec /i directgate-<version>-x64.msi`, add `/qn` for silent):
 
+- requests elevation once for the per-machine installation;
+- installs the `DirectGate P2P UDP` inbound Windows Firewall rule for `directgate.exe` on every profile, with edge traversal enabled;
+- removes that firewall rule automatically when DirectGate is uninstalled;
 - installs `directgate.exe` and `dgcli.exe` into `C:\Program Files\DirectGate\` and adds that directory to the system `PATH`;
 - creates `C:\ProgramData\directgate\`, the machine-wide config home;
-- registers one Windows service, `directgate-agent`, running as **LocalSystem**   and configured to start automatically at boot with the command line `directgate.exe --win-service --win-launcher -c "C:\ProgramData\directgate\agent.json"`.
+- registers one Windows service, `directgate-agent`, running as **LocalSystem**
+  and configured to start automatically at boot with the command line
+  `directgate.exe --win-service --win-launcher -c "C:\ProgramData\directgate\agent.json"`.
+
+An interactive install shows the normal Windows UAC prompt. A silent `/qn` install cannot display UAC, so it must be launched from an already elevated process or deployment service.
 
 **Operational disclosure.** The service runs only the privilege-separation *launcher* (see [As a Windows service](#as-a-windows-service)): a tiny LocalSystem supervisor that acquires `shell.user`'s logon token and runs the actual agent as `shell.user`. Terminal sessions, file-manager operations, protocol parsing and network session handling run as `shell.user`, not as LocalSystem. Remote access is unavailable until the device is explicitly paired and the client authenticates; the installed service does not grant anonymous remote access. No Windows password is ever stored or prompted.
 

@@ -758,7 +758,7 @@ static xbool_t DirectGate_Proto_IsSignalScope(const char *pScope)
 }
 
 xbool_t DirectGate_Proto_AddCC(xjson_obj_t *pHeader, directgate_e2e_t *pE2E,
-                              uint32_t nSessionEpoch)
+                               uint32_t nSessionEpoch)
 {
     XCHECK((pHeader != NULL), XFALSE);
     XCHECK((pE2E != NULL), XFALSE);
