@@ -659,6 +659,7 @@ static int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const c
     XJSON_AddU32(pRoot, "screenHeight", pSession->desktop.nScreenHeight);
     XJSON_AddBool(pRoot, "captureReady", pSession->desktop.bCaptureReady);
     XJSON_AddBool(pRoot, "cursorSync", XTRUE);
+    XJSON_AddBool(pRoot, "p2pMigration", XTRUE);
 #if defined(_WIN32)
     XJSON_AddBool(pRoot, "fastInput", XTRUE);
 #else

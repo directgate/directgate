@@ -48,7 +48,8 @@ typedef enum {
     DIRECTGATE_WEBRTC_INPUT_CLOSED,
     DIRECTGATE_WEBRTC_VIDEO_OPEN,
     DIRECTGATE_WEBRTC_VIDEO_CLOSED,
-    DIRECTGATE_WEBRTC_VIDEO_KEYFRAME
+    DIRECTGATE_WEBRTC_VIDEO_KEYFRAME,
+    DIRECTGATE_WEBRTC_PENDING_FAILED
 } directgate_webrtc_event_type_t;
 
 typedef struct directgate_webrtc_event_ {
@@ -76,6 +77,24 @@ typedef struct directgate_webrtc_ {
     xbool_t bVideoTrackOpen;    /* Outbound media track is open */
     xbool_t bVideoKeyframeRequested; /* new track or RTCP PLI/FIR needs an IDR */
     uint32_t nSignalGeneration; /* Browser negotiation generation; rejects stale SDP/ICE */
+
+    /* Background P2P candidate. The active TURN peer remains untouched until
+     * this peer's reliable data channel and video track are both open. */
+    int nPendingPeerConnectionID;
+    int nPendingDataChannelID;
+    int nPendingInputDataChannelID;
+    int nPendingVideoTrackID;
+    uint32_t nPendingSignalGeneration;
+    xbool_t bPendingDataOpen;
+    xbool_t bPendingVideoOpen;
+    xbool_t bPendingReadySignaled;
+    uint8_t nPendingVideoPayloadType;
+    uint16_t nPendingVideoSeq;
+    uint32_t nPendingVideoSsrc;
+    uint32_t nPendingVideoTimestamp;
+    uint64_t nPendingVideoLastPtsUs;
+    xbool_t bPendingVideoHasTimestamp;
+    char sPendingVideoMid[DIRECTGATE_RTC_VIDEO_MID_SIZE];
     rtcLogLevel logLevel;       /* Log level for libdatachannel */
 
     /* Callbacks to send signaling messages via relay WebSocket */
@@ -142,13 +161,16 @@ XSTATUS DirectGate_WebRTC_HandleAnswer(directgate_webrtc_t *pRTC, const char *pS
 
 /* Handle incoming SDP offer from client - creates peer connection and answer */
 XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSdp,
-                                      uint32_t nGeneration);
+                                      uint32_t nGeneration, xbool_t bBackgroundP2P);
 
 /* Handle incoming ICE candidate from remote peer */
 XSTATUS DirectGate_WebRTC_HandleIceCandidate(directgate_webrtc_t *pRTC,
                                              const char *pCandidate,
                                              const char *pMid,
                                              uint32_t nGeneration);
+
+/* Atomically promote a fully ready background P2P peer. */
+XSTATUS DirectGate_WebRTC_CommitPending(directgate_webrtc_t *pRTC, uint32_t nGeneration);
 
 /* Send binary data over the data channel. Returns 0 on success, -1 on failure */
 XSTATUS DirectGate_WebRTC_Send(directgate_webrtc_t *pRTC, const uint8_t *pData, size_t nLen);

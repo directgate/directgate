@@ -1325,6 +1325,13 @@ static int DirectGate_HandleWebRTC(xapi_session_t *pApiSession, directgate_pkg_t
     xjson_obj_t *pHdrObj = pPkg->jsonHeader.pRootObj;
     uint32_t nGeneration = pHdrObj != NULL ?
         XJSON_GetU32(XJSON_GetObject(pHdrObj, "generation")) : 0;
+    xbool_t bBackgroundP2P = XFALSE;
+    if (pHdrObj != NULL)
+    {
+        xjson_obj_t *pMigrationObj = XJSON_GetObject(pHdrObj, "migration");
+        const char *pMigration = pMigrationObj != NULL ? XJSON_GetString(pMigrationObj) : NULL;
+        bBackgroundP2P = (xstrused(pMigration) && xstrcmp(pMigration, "p2p")) ? XTRUE : XFALSE;
+    }
 
     if (pRTC->signalCb == NULL)
     {
@@ -1362,12 +1369,20 @@ static int DirectGate_HandleWebRTC(xapi_session_t *pApiSession, directgate_pkg_t
         DirectGate_WebRTC_SetVideoEnabled(pRTC,
             pSession->eActiveMode == DIRECTGATE_SESSION_MODE_DESKTOP ? XTRUE : XFALSE);
 
-        if (DirectGate_WebRTC_HandleOffer(pRTC, pSdp, nGeneration) < 0)
+        if (DirectGate_WebRTC_HandleOffer(pRTC, pSdp, nGeneration, bBackgroundP2P) < 0)
         {
             xloge("Failed to handle WebRTC offer: sid(%u), wsfd(%d)",
                 pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
 
             return XAPI_CONTINUE;
+        }
+    }
+    else if (xstrcmp(pWebRTC->pAction, "migration-commit"))
+    {
+        if (DirectGate_WebRTC_CommitPending(pRTC, nGeneration) < 0)
+        {
+            xlogw("P2P migration commit was not ready: sid(%u), generation(%u)",
+                pSession->nSessionId, nGeneration);
         }
     }
     else if (xstrcmp(pWebRTC->pAction, "ice"))
