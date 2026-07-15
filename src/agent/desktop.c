@@ -589,8 +589,8 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     pDesktop->bWebRTCVideoFailed = XFALSE;
     pDesktop->bPreferDataChannel = XFALSE;
     pDesktop->pOriginalDisplayMode = NULL;
-    pDesktop->pFakeMotion = NULL;
     pDesktop->pFakeRelativeMotion = NULL;
+    pDesktop->pFakeMotion = NULL;
     pDesktop->pFakeButton = NULL;
     pDesktop->pFakeKey = NULL;
     pDesktop->pEncoder = NULL;
@@ -606,6 +606,7 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     pDesktop->nTargetWidth = 0;
     pDesktop->nTargetHeight = 0;
     pDesktop->nPointerButtons = 0;
+    pDesktop->nPointerSequence = 0;
     pDesktop->nMonitorCount = 0;
     pDesktop->sSelectedMonitor[0] = '\0';
     pDesktop->sFallbackReason[0] = '\0';
@@ -748,6 +749,28 @@ static void DirectGate_Desktop_SendCursorPosition(directgate_session_t *pSession
     XJSON_AddU32(pHeader, "sequence", nSequence);
     (void)DirectGate_Session_Send(pSession, pHeader, NULL, 0);
     XJSON_FreeObject(pHeader);
+}
+
+static xbool_t DirectGate_Desktop_ClampCursorToCapture(
+    const directgate_desktop_t *pDesktop, int *pScreenX, int *pScreenY)
+{
+    if (pDesktop == NULL || pScreenX == NULL || pScreenY == NULL || !pDesktop->bCaptureReady ||
+        !xstrused(pDesktop->sSelectedMonitor) || xstrcmp(pDesktop->sSelectedMonitor, "all") ||
+        !pDesktop->nCaptureWidth || !pDesktop->nCaptureHeight) return XFALSE;
+
+    int nOriginalX = *pScreenX;
+    int nOriginalY = *pScreenY;
+
+    int64_t nMaxX = (int64_t)pDesktop->nCaptureX + pDesktop->nCaptureWidth - 1;
+    int64_t nMaxY = (int64_t)pDesktop->nCaptureY + pDesktop->nCaptureHeight - 1;
+
+    if (*pScreenX < pDesktop->nCaptureX) *pScreenX = pDesktop->nCaptureX;
+    else if ((int64_t)*pScreenX > nMaxX) *pScreenX = (int)nMaxX;
+
+    if (*pScreenY < pDesktop->nCaptureY) *pScreenY = pDesktop->nCaptureY;
+    else if ((int64_t)*pScreenY > nMaxY) *pScreenY = (int)nMaxY;
+
+    return (*pScreenX != nOriginalX || *pScreenY != nOriginalY) ? XTRUE : XFALSE;
 }
 
 #if defined(__linux__)
@@ -1583,15 +1606,24 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
 
         if (bRelative)
         {
-            XFlush(pDisplay);
             Window rootReturn, childReturn;
             int nRootX = 0, nRootY = 0, nWindowX = 0, nWindowY = 0;
             unsigned int nMask = 0;
+
             if (XQueryPointer(pDisplay, RootWindow(pDisplay, nScreen),
                 &rootReturn, &childReturn, &nRootX, &nRootY,
                 &nWindowX, &nWindowY, &nMask))
             {
-                DirectGate_Desktop_SendCursorPosition(pSession, nRootX, nRootY, nSequence);
+                if (DirectGate_Desktop_ClampCursorToCapture(
+                    pDesktop, &nRootX, &nRootY))
+                {
+                    ((directgate_xtest_motion_fn)pDesktop->pFakeMotion)(
+                        pDisplay, nScreen, nRootX, nRootY, CurrentTime);
+                    XFlush(pDisplay);
+                }
+
+                DirectGate_Desktop_SendCursorPosition(
+                    pSession, nRootX, nRootY, nSequence);
             }
         }
     }
@@ -1602,8 +1634,7 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         {
             KeyCode code = XKeysymToKeycode(pDisplay, sym);
             xbool_t bDown = XJSON_GetBool(XJSON_GetObject(pRoot, "down"));
-            if (code != 0)
-                ((directgate_xtest_key_fn)pDesktop->pFakeKey)(pDisplay, code, bDown ? True : False, CurrentTime);
+            if (code != 0) ((directgate_xtest_key_fn)pDesktop->pFakeKey)(pDisplay, code, bDown ? True : False, CurrentTime);
         }
     }
 
@@ -2586,6 +2617,14 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
             point = CGPointMake((CGFloat)DirectGate_Desktop_FrameToScreenX(pDesktop, nX),
                 (CGFloat)DirectGate_Desktop_FrameToScreenY(pDesktop, nY));
         }
+        if (bRelative)
+        {
+            int nPointX = (int)point.x;
+            int nPointY = (int)point.y;
+
+            (void)DirectGate_Desktop_ClampCursorToCapture(pDesktop, &nPointX, &nPointY);
+            point = CGPointMake((CGFloat)nPointX, (CGFloat)nPointY);
+        }
 
         if (xstrcmp(pEvent, "button"))
         {
@@ -2599,6 +2638,7 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
                 CGEventRef event = CGEventCreateMouseEvent(NULL,
                     DirectGate_Desktop_MacMouseEvent(nButton, bDown),
                     point, DirectGate_Desktop_MacMouseButton(nButton));
+
                 if (event != NULL)
                 {
                     if (bRelative) DirectGate_Desktop_MacSetRelativeDelta(event, nDx, nDy);
@@ -2632,16 +2672,8 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         }
 
         if (bRelative)
-        {
-            CGEventRef currentPointer = CGEventCreate(NULL);
-            if (currentPointer != NULL)
-            {
-                CGPoint currentPoint = CGEventGetLocation(currentPointer);
-                DirectGate_Desktop_SendCursorPosition(pSession,
-                    (int)currentPoint.x, (int)currentPoint.y, nSequence);
-                CFRelease(currentPointer);
-            }
-        }
+            DirectGate_Desktop_SendCursorPosition(pSession,
+                (int)point.x, (int)point.y, nSequence);
     }
     else if (xstrcmp(pAction, "key"))
     {
@@ -3726,8 +3758,15 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         {
             POINT cursorPoint;
             if (GetCursorPos(&cursorPoint))
-                DirectGate_Desktop_SendCursorPosition(pSession,
-                    (int)cursorPoint.x, (int)cursorPoint.y, nSequence);
+            {
+                int nCursorX = (int)cursorPoint.x;
+                int nCursorY = (int)cursorPoint.y;
+
+                if (DirectGate_Desktop_ClampCursorToCapture(pDesktop, &nCursorX, &nCursorY))
+                    SetCursorPos(nCursorX, nCursorY);
+
+                DirectGate_Desktop_SendCursorPosition(pSession, nCursorX, nCursorY, nSequence);
+            }
         }
     }
     else if (xstrcmp(pAction, "key"))
