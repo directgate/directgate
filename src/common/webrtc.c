@@ -936,6 +936,7 @@ static void DirectGate_WebRTC_NotifyTransport(directgate_webrtc_t *pRTC, int nPC
     XJSON_AddString(pHeader, "type", "webrtc");
     XJSON_AddString(pHeader, "action", "transport");
     XJSON_AddBool(pHeader, "relay", bRelay);
+    XJSON_AddBool(pHeader, "p2pMigration", XTRUE);
     if (pRTC->nSignalGeneration)
         XJSON_AddU32(pHeader, "generation", pRTC->nSignalGeneration);
 
@@ -2220,7 +2221,7 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
                 }
 
                 pRTC->bConnected = XTRUE;
-                xlogn("WebRTC P2P data channel is active: pc(%d), dc(%d), pipefd(%d)",
+                xlogn("WebRTC data channel is active: pc(%d), dc(%d), pipefd(%d)",
                     DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC), DirectGate_WebRTC_GetPipe(pRTC));
 
                 break;
@@ -2243,7 +2244,7 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
                 }
 
                 pRTC->bConnected = XFALSE;
-                xlogn("WebRTC P2P data channel is inactive: pc(%d), dc(%d), pipefd(%d)",
+                xlogn("WebRTC data channel is inactive: pc(%d), dc(%d), pipefd(%d)",
                     DirectGate_WebRTC_GetPC(pRTC), pEvt->nSourceID, DirectGate_WebRTC_GetPipe(pRTC));
 
                 if (pRTC->nDataChannelID == pEvt->nSourceID)
