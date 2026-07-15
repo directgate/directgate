@@ -1003,6 +1003,7 @@ static void DirectGate_WebRTC_OnLocalDescription(int nPC, const char *pSdp, cons
     XJSON_AddString(pHeader, "type", "webrtc");
     XJSON_AddString(pHeader, "action", pType);
     XJSON_AddString(pHeader, "sdp", pEscaped);
+    XJSON_AddBool(pHeader, "p2pMigration", XTRUE);
 
     uint32_t nGeneration = DirectGate_WebRTC_IsPendingPeerConnection(pRTC, nPC) ?
         pRTC->nPendingSignalGeneration : pRTC->nSignalGeneration;
