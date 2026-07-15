@@ -433,7 +433,7 @@ int DirectGate_Session_Send(directgate_session_t *pSession, xjson_obj_t *pHeader
 
     /* Add packet counter for authenticated sessions */
     if (DirectGate_E2E_IsInitialized(&pSession->e2e))
-        XJSON_AddU32(pHeader, "cc", ++pE2E->nTxPacketId);
+        DirectGate_Proto_AddCC(pHeader, pE2E, pRTC->nSignalGeneration);
 
     xbyte_buffer_t msg;
     XByteBuffer_Init(&msg, XSTDNON, XFALSE);

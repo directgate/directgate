@@ -21,8 +21,47 @@ static int build_packet(xbyte_buffer_t *pOut, xjson_obj_t *pHeader,
     return nOk ? 0 : 1;
 }
 
+static xbool_t check_scoped_cc(directgate_e2e_t *pE2E, const char *pScope,
+                               uint32_t nEpoch, uint32_t nScopedCC,
+                               uint32_t nGlobalCC)
+{
+    xbyte_buffer_t packet;
+    XByteBuffer_Init(&packet, XSTDNON, XFALSE);
+
+    xjson_obj_t *pHeader = DirectGate_Proto_BuildData(42);
+    if (pHeader == NULL) return XFALSE;
+    XJSON_AddString(pHeader, "ccScope", pScope);
+    XJSON_AddU32(pHeader, "sc", nScopedCC);
+    XJSON_AddU32(pHeader, "cc", nGlobalCC);
+    if (strcmp(pScope, "session") == 0) XJSON_AddU32(pHeader, "ce", nEpoch);
+
+    xbool_t bBuilt = DirectGate_Proto_Build(&packet, pHeader, NULL, 0, XFALSE);
+    XJSON_FreeObject(pHeader);
+    xbool_t bAccepted = bBuilt ? DirectGate_Proto_CheckCC(&packet, pE2E) : XFALSE;
+    XByteBuffer_Clear(&packet);
+    return bAccepted;
+}
+
 int main(void)
 {
+    directgate_e2e_t ccState;
+    DirectGate_E2E_Init(&ccState);
+    CHECK(check_scoped_cc(&ccState, "session", 1, 1, 1),
+        "first TURN generation packet accepted");
+    CHECK(check_scoped_cc(&ccState, "signal", 0, 1, 2),
+        "signaling has an independent strict counter");
+    CHECK(check_scoped_cc(&ccState, "session", 2, 1, 3),
+        "first P2P generation packet accepted after counter restart");
+    CHECK(!check_scoped_cc(&ccState, "session", 1, 2, 4),
+        "late TURN packet rejected after P2P generation activates");
+    CHECK(!check_scoped_cc(&ccState, "session", 2, 1, 5),
+        "duplicate packet rejected inside active P2P generation");
+    CHECK(check_scoped_cc(&ccState, "session", 2, 2, 6),
+        "next P2P generation packet accepted");
+    CHECK(!check_scoped_cc(&ccState, "signal", 0, 1, 7),
+        "duplicate signaling packet rejected");
+    DirectGate_E2E_Clear(&ccState);
+
     xbyte_buffer_t packet;
     XByteBuffer_Init(&packet, XSTDNON, XFALSE);
 

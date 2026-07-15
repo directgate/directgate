@@ -381,7 +381,8 @@ static int DirectGate_Client_SendMsg(directgate_ctx_t *pCli, xjson_obj_t *pHeade
 
     /* Add packet counter for authenticated sessions */
     if (pCli->bAuthDone && DirectGate_E2E_IsInitialized(&pCli->e2e))
-        XJSON_AddU32(pHeader, "cc", ++pCli->e2e.nTxPacketId);
+        DirectGate_Proto_AddCC(pHeader, &pCli->e2e,
+            pCli->webrtc.nSignalGeneration);
 
     xbyte_buffer_t msg;
     XByteBuffer_Init(&msg, XSTDNON, XFALSE);

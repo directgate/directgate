@@ -49,14 +49,14 @@
  * client - the thread falls back to paced GDI BitBlt capture with the
  * same encoder behind it. */
 
-/* Consecutive capture/encode failures before the pipeline reports itself
- * broken (~5s at 30 fps). Longer than the Linux threshold on purpose: a UAC
+/* Consecutive capture/encode failure duration before the pipeline reports
+ * itself broken. Longer than the Linux threshold on purpose: a UAC
  * secure-desktop prompt legitimately blocks duplication for a few seconds
  * and must not permanently demote the session to raw RGBA. */
-#define DIRECTGATE_WINENC_MAX_FAILURES     150L
+#define DIRECTGATE_WINENC_FAILURE_SECONDS  5U
 
-/* Consecutive DuplicateOutput re-init failures before flipping to GDI. */
-#define DIRECTGATE_WINENC_MAX_REINITS      90U
+/* DuplicateOutput re-init duration before flipping to GDI. */
+#define DIRECTGATE_WINENC_REINIT_SECONDS   3U
 
 /* How long DirectGate_Desktop_WinEncoder_Start waits for the capture thread
  * to bring the pipeline up. First-ever MFT activation can spin up GPU
@@ -108,6 +108,7 @@ typedef struct directgate_winenc_ {
     uint8_t *pNV12;
     xbool_t bHavePrev;
     xbool_t bHaveFrame;                 /* pFrameBGRA holds a valid image */
+    uint64_t nFrameCapturedUs;          /* absolute QPC time of freshest pixels */
 
     directgate_mfenc_t *pEncoder;
     xbyte_buffer_t encoded;             /* encoder output scratch */
@@ -121,6 +122,7 @@ typedef struct directgate_winenc_ {
     uint32_t nMailboxHeight;
     xbool_t bMailboxKeyframe;
     uint64_t nMailboxPtsUs;
+    uint64_t nMailboxCapturedUs;
     xbool_t bMailboxHasFrame;
 
     uint64_t nQpcFrequency;
@@ -354,6 +356,7 @@ static int DirectGate_Desktop_WinEnc_CaptureDxgi(directgate_winenc_t *pEnc, uint
         IDXGIOutputDuplication_ReleaseFrame(pEnc->pDuplication);
         return XSTDNON;
     }
+    uint64_t nCapturedUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
 
     ID3D11Texture2D *pTexture = NULL;
     hr = IDXGIResource_QueryInterface(pResource, &IID_ID3D11Texture2D, (void**)&pTexture);
@@ -415,6 +418,7 @@ static int DirectGate_Desktop_WinEnc_CaptureDxgi(directgate_winenc_t *pEnc, uint
 
     ID3D11DeviceContext_Unmap(pEnc->pContext, (ID3D11Resource*)pEnc->pStaging, 0);
     pEnc->bHaveFrame = XTRUE;
+    pEnc->nFrameCapturedUs = nCapturedUs;
     return XSTDOK;
 }
 
@@ -507,6 +511,7 @@ static int DirectGate_Desktop_WinEnc_CaptureGdi(directgate_winenc_t *pEnc, xbool
         pEnc->pDibBits, pEnc->nCaptureWidth, pEnc->nCaptureHeight,
         (size_t)pEnc->nCaptureWidth * 4U);
     pEnc->bHaveFrame = XTRUE;
+    pEnc->nFrameCapturedUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
 
     size_t nFrameBytes = (size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight * 4U;
     if (!bForceKeyframe && pEnc->bHavePrev &&
@@ -533,7 +538,9 @@ static int DirectGate_Desktop_WinEnc_EncodeFrame(directgate_winenc_t *pEnc, xboo
         pEnc->pNV12 + (size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight,
         pEnc->pFrameBGRA, pEnc->nEncodeWidth, pEnc->nEncodeHeight);
 
-    uint64_t nPtsUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc) - pEnc->nStartUs;
+    uint64_t nCapturedUs = pEnc->nFrameCapturedUs ? pEnc->nFrameCapturedUs :
+        DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
+    uint64_t nPtsUs = nCapturedUs - pEnc->nStartUs;
     xbool_t bKeyframe = XFALSE;
 
     int nStatus = DirectGate_MFEnc_Encode(pEnc->pEncoder, pEnc->pNV12,
@@ -557,6 +564,7 @@ static int DirectGate_Desktop_WinEnc_EncodeFrame(directgate_winenc_t *pEnc, xboo
     pEnc->nMailboxHeight = pEnc->nEncodeHeight;
     pEnc->bMailboxKeyframe = bKeyframe;
     pEnc->nMailboxPtsUs = nPtsUs;
+    pEnc->nMailboxCapturedUs = nCapturedUs;
     pEnc->bMailboxHasFrame = XTRUE;
     ReleaseSRWLockExclusive(&pEnc->mailboxLock);
 
@@ -642,6 +650,12 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
     directgate_winenc_t *pEnc = (directgate_winenc_t*)pArg;
     HRESULT hrCom = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
+    /* Do not use TIME_CRITICAL: the agent main loop must still inject input
+     * and drain RTP. ABOVE_NORMAL gives capture/encode an edge over ordinary
+     * background work without starving those latency-critical consumers. */
+    if (pEnc->pDesktop->quality.ePreset == DIRECTGATE_DESKTOP_PRESET_LOW_LATENCY)
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
     pEnc->bInitOk = (DirectGate_Desktop_WinEnc_InitPipeline(pEnc) == XSTDOK) ? XTRUE : XFALSE;
     SetEvent(pEnc->hInitDone);
 
@@ -675,13 +689,18 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
 
         if (!pEnc->bUseGdi)
         {
-            /* Block inside AcquireNextFrame until the next pacing deadline:
-             * a frame is encoded the moment the screen changes (no timer
-             * quantization latency) while the deadline still caps the rate
-             * at the preset fps. */
-            uint32_t nTimeoutMs = (nNextDueUs > nNowUs) ?
-                (uint32_t)((nNextDueUs - nNowUs) / 1000ULL) : 0U;
-            nCapture = DirectGate_Desktop_WinEnc_CaptureDxgi(pEnc, nTimeoutMs ? nTimeoutMs : 1U);
+            /* AcquireNextFrame wakes on every host present. Merely passing a
+             * deadline as its timeout does NOT cap FPS: a 144/240 Hz game
+             * returns early every time and can overwhelm a 60 Hz encoder.
+             * Wait to the pacing boundary first, then acquire the newest
+             * accumulated desktop image. A one-frame timeout preserves the
+             * event-driven low-latency path when no image is pending yet. */
+            if (nNextDueUs > nNowUs)
+                DirectGate_Desktop_WinEnc_SleepUs(pEnc, nNextDueUs - nNowUs);
+            nNowUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
+            uint32_t nTimeoutMs = (uint32_t)(nIntervalUs / 1000ULL);
+            nCapture = DirectGate_Desktop_WinEnc_CaptureDxgi(pEnc,
+                nTimeoutMs ? nTimeoutMs : 1U);
 
             if (nCapture == XSTDERR)
             {
@@ -697,7 +716,8 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
                 {
                     pEnc->nDxgiReinitFails = 0;
                 }
-                else if (++pEnc->nDxgiReinitFails >= DIRECTGATE_WINENC_MAX_REINITS)
+                else if (++pEnc->nDxgiReinitFails >=
+                    (pEnc->nFps ? pEnc->nFps : 30U) * DIRECTGATE_WINENC_REINIT_SECONDS)
                 {
                     xlogw("Desktop Duplication lost for good, switching to GDI capture: sid(%u)",
                         pEnc->pDesktop->nSessionId);
@@ -921,7 +941,8 @@ void DirectGate_Desktop_WinEncoder_ApplyQuality(directgate_session_t *pSession)
 
     /* A resolution change needs a full pipeline rebuild; bitrate and GOP
      * updates are marshalled to the capture thread and applied live. */
-    if (nWidth != pEnc->nEncodeWidth || nHeight != pEnc->nEncodeHeight)
+    if (nWidth != pEnc->nEncodeWidth || nHeight != pEnc->nEncodeHeight ||
+        pEnc->nFps != pDesktop->quality.nFps)
     {
         int32_t nX = pEnc->nCaptureX;
         int32_t nY = pEnc->nCaptureY;
@@ -975,7 +996,9 @@ xbool_t DirectGate_Desktop_WinEncoder_HasFailed(const directgate_session_t *pSes
     XCHECK_NL((pSession != NULL), XFALSE);
     const directgate_winenc_t *pEnc = DirectGate_Desktop_WinEnc(&pSession->desktop);
     if (pEnc == NULL) return XTRUE;
-    return (pEnc->nFailures >= DIRECTGATE_WINENC_MAX_FAILURES) ? XTRUE : XFALSE;
+    LONG nMaxFailures = (LONG)((pEnc->nFps ? pEnc->nFps : 30U) *
+        DIRECTGATE_WINENC_FAILURE_SECONDS);
+    return (pEnc->nFailures >= nMaxFailures) ? XTRUE : XFALSE;
 }
 
 int DirectGate_Desktop_WinEncoder_DrainMain(directgate_session_t *pSession)
@@ -987,22 +1010,49 @@ int DirectGate_Desktop_WinEncoder_DrainMain(directgate_session_t *pSession)
     uint32_t nWidth = 0, nHeight = 0;
     xbool_t bKeyframe = XFALSE, bHasFrame = XFALSE;
     uint64_t nPtsUs = 0;
+    uint64_t nNowUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
+    uint64_t nIntervalUs = 1000000ULL / (pEnc->nFps ? pEnc->nFps : 30U);
+    uint64_t nMaxAgeUs = nIntervalUs * 3U;
+    uint64_t nDroppedAgeUs = 0U;
+    xbool_t bDroppedStale = XFALSE;
+    if (nMaxAgeUs < 50000ULL) nMaxAgeUs = 50000ULL;
 
     AcquireSRWLockExclusive(&pEnc->mailboxLock);
     if (pEnc->bMailboxHasFrame)
     {
-        xbyte_buffer_t swap = pEnc->drain;
-        pEnc->drain = pEnc->mailbox;
-        pEnc->mailbox = swap;
-        pEnc->mailbox.nUsed = 0;
-        nWidth = pEnc->nMailboxWidth;
-        nHeight = pEnc->nMailboxHeight;
-        bKeyframe = pEnc->bMailboxKeyframe;
-        nPtsUs = pEnc->nMailboxPtsUs;
+        uint64_t nAgeUs = (nNowUs >= pEnc->nMailboxCapturedUs) ?
+            nNowUs - pEnc->nMailboxCapturedUs : 0U;
+
+        if (pEnc->nMailboxCapturedUs && nAgeUs > nMaxAgeUs)
+        {
+            /* Never put an already-obsolete frame on the wire. Dropping an
+             * encoded P-frame breaks the decoder reference chain, therefore
+             * the very next fresh capture is explicitly made an IDR. */
+            pEnc->mailbox.nUsed = 0;
+            InterlockedExchange(&pEnc->bForceKeyframe, 1);
+            nDroppedAgeUs = nAgeUs;
+            bDroppedStale = XTRUE;
+        }
+        else
+        {
+            xbyte_buffer_t swap = pEnc->drain;
+            pEnc->drain = pEnc->mailbox;
+            pEnc->mailbox = swap;
+            pEnc->mailbox.nUsed = 0;
+            nWidth = pEnc->nMailboxWidth;
+            nHeight = pEnc->nMailboxHeight;
+            bKeyframe = pEnc->bMailboxKeyframe;
+            nPtsUs = pEnc->nMailboxPtsUs;
+            bHasFrame = XTRUE;
+        }
         pEnc->bMailboxHasFrame = XFALSE;
-        bHasFrame = XTRUE;
     }
     ReleaseSRWLockExclusive(&pEnc->mailboxLock);
+
+    if (bDroppedStale)
+        xlogd("Dropping stale Windows desktop frame: sid(%u), ageUs(%llu), maxUs(%llu)",
+            pSession->nSessionId, (unsigned long long)nDroppedAgeUs,
+            (unsigned long long)nMaxAgeUs);
 
     if (!bHasFrame || !pEnc->drain.nUsed) return XAPI_CONTINUE;
 
