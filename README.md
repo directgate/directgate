@@ -35,9 +35,15 @@ This repository is the **agent**: the program you install on a machine you want 
 
 These are the experiences the agent powers once it is paired with your account.
 
+<p align="center">
+  <sub>
+    Ultra-low-latency remote desktop, responsive enough to play story-driven games directly in your browser.
+  </sub>
+</p>
+
 https://github.com/user-attachments/assets/5b57ef36-301b-494d-8fc8-561d4d2567b9
 
-Ultra-low-latency remote desktop, responsive enough to play story-driven games directly in your browser.
+<br />
 
 <table align="center">
   <tr>
