@@ -24,7 +24,7 @@ This repository is the **agent**: the program you install on a machine you want 
 - End-to-end encrypted (AES-256-SIV) at the application layer, independent of transport
 - Peer-to-peer over WebRTC whenever possible; the relay never sees plaintext
 - Terminal, file manager, and a browser-based code editor over a single connection
-- Ultra-low-latency remote desktop over WebRTC, with P2P when possible and TURN fallback beta <sup>beta</sup>
+- Ultra-low-latency remote desktop over WebRTC, with P2P when possible and TURN fallback <sup>beta</sup>
 - Full file manager experience with upload/download, rename, copy, move, and delete
 - Advanced file search, image/video playback, and drag-and-drop between devices
 - Multiple concurrent sessions multiplexed over one link
@@ -89,7 +89,7 @@ https://github.com/user-attachments/assets/5b57ef36-301b-494d-8fc8-561d4d2567b9
 
 DirectGate has three pieces; only the agent lives in this repository:
 
-- **Agent** (this repo) - runs on your machine: authenticates the client, spawns a PTY, serves the file manager, and encrypts all traffic end-to-end.
+- **Agent** (this repo) - runs on your machine: authenticates the client, spawns a PTY, serves the remote desktop, file manager, and encrypts all traffic end-to-end.
 - **Relay / signaling** - operated by directgate.io. Pairs agents and clients, carries signaling, and forwards encrypted payloads when a direct link isn't possible. It never sees plaintext.
 - **Client** - the web client at directgate.io, or the experimental `dgcli` in this repo.
 
