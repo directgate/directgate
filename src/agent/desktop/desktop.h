@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/desktop.h
+ * @file directgate-agent/src/agent/desktop/desktop.h
  * @brief Agent-side desktop streaming and input control.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
@@ -159,7 +159,7 @@ typedef struct directgate_desktop_ {
     /* Platform encoder state (opaque to cross-platform code): the macOS
      * ScreenCaptureKit/VideoToolbox encoder, the Linux X11/OpenH264
      * pipeline or the Windows DXGI/MediaFoundation pipeline, owned by
-     * desktop_mac.m / desktop_linux.c / desktop_win.c respectively. */
+     * mac.m / linux.c / win.c respectively. */
     void *pEncoder;
 #if defined(__APPLE__) || defined(_WIN32)
     /* macOS and Windows have no timerfd: a pipe/socket pair plus a timer
@@ -183,11 +183,11 @@ void DirectGate_Desktop_DetachEvent(directgate_desktop_t *pDesktop);
 int DirectGate_Desktop_Start(directgate_session_t *pSession);
 int DirectGate_Desktop_Process(directgate_session_t *pSession);
 int DirectGate_Desktop_HandleInput(directgate_session_t *pSession,
-                               const uint8_t *pPayload,
-                               size_t nPayloadLength);
+                                    const uint8_t *pPayload,
+                                    size_t nPayloadLength);
 int DirectGate_Desktop_HandleControl(directgate_session_t *pSession,
-                                 const uint8_t *pPayload,
-                                 size_t nPayloadLength);
+                                    const uint8_t *pPayload,
+                                    size_t nPayloadLength);
 
 int DirectGate_Desktop_GetTimerFd(const directgate_desktop_t *pDesktop);
 xbool_t DirectGate_Desktop_IsRunning(const directgate_desktop_t *pDesktop);
@@ -197,12 +197,12 @@ const char* DirectGate_Desktop_GetReason(const directgate_desktop_t *pDesktop);
  * DIRECTGATE_DESKTOP_CHUNK_BYTES-sized chunks; each chunk goes through the
  * standard DirectGate_Session_Send path (E2E-encrypted, WebRTC-preferred). */
 int DirectGate_Desktop_SendEncodedFrame(directgate_session_t *pSession,
-                                    const uint8_t *pPayload,
-                                    size_t nPayloadLength,
-                                    uint32_t nWidth,
-                                    uint32_t nHeight,
-                                    xbool_t bKeyframe,
-                                    uint64_t nPtsUs);
+                                        const uint8_t *pPayload,
+                                        size_t nPayloadLength,
+                                        uint32_t nWidth,
+                                        uint32_t nHeight,
+                                        xbool_t bKeyframe,
+                                        uint64_t nPtsUs);
 
 /* Preset helpers (shared by platform encoders + control message handler). */
 void DirectGate_Desktop_ApplyPreset(directgate_desktop_t *pDesktop, directgate_desktop_preset_t ePreset);
@@ -230,13 +230,13 @@ void* DirectGate_Desktop_MacCaptureImage(int32_t nX, int32_t nY,
                                      char *pError, size_t nErrorSize);
 
 /* ScreenCaptureKit + VideoToolbox encoder lifecycle. Implemented in
- * desktop_mac.m and only called by desktop.c on Darwin. */
+ * mac.m and only called by desktop.c on Darwin. */
 int DirectGate_Desktop_MacEncoder_Start(directgate_session_t *pSession,
-                                    int32_t nX, int32_t nY,
-                                    uint32_t nWidth, uint32_t nHeight);
-int DirectGate_Desktop_MacEncoder_UpdateRect(directgate_session_t *pSession,
                                         int32_t nX, int32_t nY,
                                         uint32_t nWidth, uint32_t nHeight);
+int DirectGate_Desktop_MacEncoder_UpdateRect(directgate_session_t *pSession,
+                                            int32_t nX, int32_t nY,
+                                            uint32_t nWidth, uint32_t nHeight);
 void DirectGate_Desktop_MacEncoder_ApplyQuality(directgate_session_t *pSession);
 void DirectGate_Desktop_MacEncoder_SetBitrate(directgate_session_t *pSession, uint32_t nBitrateKbps);
 void DirectGate_Desktop_MacEncoder_RequestKeyframe(directgate_session_t *pSession);
@@ -251,10 +251,10 @@ int DirectGate_Desktop_MacEncoder_DrainMain(directgate_session_t *pSession);
 
 #if defined(__linux__)
 /* X11 (XShm) capture + OpenH264 encoder pipeline. Implemented in
- * desktop_linux.c and only called by desktop.c on Linux. */
+ * linux.c and only called by desktop.c on Linux. */
 int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
-                                      int32_t nX, int32_t nY,
-                                      uint32_t nWidth, uint32_t nHeight);
+                                        int32_t nX, int32_t nY,
+                                        uint32_t nWidth, uint32_t nHeight);
 void DirectGate_Desktop_LinuxEncoder_ApplyQuality(directgate_session_t *pSession);
 void DirectGate_Desktop_LinuxEncoder_SetBitrate(directgate_session_t *pSession, uint32_t nBitrateKbps);
 void DirectGate_Desktop_LinuxEncoder_RequestKeyframe(directgate_session_t *pSession);
@@ -274,9 +274,9 @@ int DirectGate_Desktop_LinuxEncoder_ProcessTick(directgate_session_t *pSession);
 
 #if defined(_WIN32)
 /* DXGI Desktop Duplication (GDI fallback) capture + Media Foundation H.264
- * encoder pipeline. Implemented in desktop_win.c and only called by
+ * encoder pipeline. Implemented in win.c and only called by
  * desktop.c on Windows. Capture and encode run on a dedicated thread (the
- * push model of desktop_mac.m); encoded frames land in a single-slot
+ * push model of mac.m); encoded frames land in a single-slot
  * mailbox drained by DirectGate_Desktop_WinEncoder_DrainMain on the main
  * loop after a timer-pair wake-up. */
 int DirectGate_Desktop_WinEncoder_Start(directgate_session_t *pSession,

@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/desktop_linux.c
+ * @file directgate-agent/src/agent/desktop/linux.c
  * @brief Linux X11 (XShm) capture + OpenH264 encoder for desktop streaming.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
@@ -32,7 +32,7 @@
 #include <X11/Xutil.h>
 #include <X11/extensions/XShm.h>
 
-/* Counterpart of desktop_mac.m: desktop.c drives this pipeline from the
+/* Counterpart of mac.m: desktop.c drives this pipeline from the
  * main loop. Unlike ScreenCaptureKit there is no push-style capture on
  * Linux, so everything runs synchronously per timer tick:
  *
@@ -88,8 +88,8 @@ static directgate_x11enc_t* DirectGate_Desktop_X11Enc(const directgate_desktop_t
 }
 
 static void DirectGate_Desktop_X11Enc_SetError(directgate_x11enc_t *pEnc,
-                                           directgate_desktop_t *pDesktop,
-                                           const char *pError)
+                                                directgate_desktop_t *pDesktop,
+                                                const char *pError)
 {
     XCHECK_VOID_NL((xstrused(pError)));
     if (pEnc != NULL) xstrncpy(pEnc->sLastError, sizeof(pEnc->sLastError), pError);
@@ -151,8 +151,8 @@ static uint8_t DirectGate_Desktop_X11Enc_Component(uint32_t nPixel, unsigned lon
 }
 
 static int DirectGate_Desktop_X11Enc_CheckFormat(directgate_x11enc_t *pEnc,
-                                             directgate_desktop_t *pDesktop,
-                                             const XImage *pImage)
+                                                directgate_desktop_t *pDesktop,
+                                                const XImage *pImage)
 {
     if (pEnc->bFormatChecked) return XSTDOK;
 
@@ -184,8 +184,8 @@ static int DirectGate_Desktop_X11Enc_CheckFormat(directgate_x11enc_t *pEnc,
 }
 
 static void DirectGate_Desktop_X11Enc_Normalize(const directgate_x11enc_t *pEnc,
-                                            const XImage *pImage,
-                                            uint8_t *pDst)
+                                                const XImage *pImage,
+                                                uint8_t *pDst)
 {
     uint32_t nWidth = (uint32_t)pImage->width;
     uint32_t nHeight = (uint32_t)pImage->height;
@@ -328,8 +328,8 @@ void DirectGate_Desktop_LinuxEncoder_Stop(directgate_session_t *pSession)
 }
 
 int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
-                                      int32_t nX, int32_t nY,
-                                      uint32_t nWidth, uint32_t nHeight)
+                                          int32_t nX, int32_t nY,
+                                          uint32_t nWidth, uint32_t nHeight)
 {
     XCHECK((pSession != NULL), XSTDERR);
     directgate_desktop_t *pDesktop = &pSession->desktop;
@@ -360,11 +360,12 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
 
     char sError[DIRECTGATE_DESKTOP_REASON_LEN] = {0};
     pEnc->pEncoder = DirectGate_OpenH264_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
-        &pDesktop->quality, sError, sizeof(sError));
+                                                &pDesktop->quality, sError, sizeof(sError));
     if (pEnc->pEncoder == NULL)
     {
         DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop,
             sError[0] ? sError : "OpenH264 encoder initialization failed.");
+
         DirectGate_Desktop_X11Enc_Free(pEnc, pDisplay);
         return XSTDERR;
     }
@@ -377,8 +378,8 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     xbool_t bScaling = (pEnc->nEncodeWidth != nWidth || pEnc->nEncodeHeight != nHeight) ? XTRUE : XFALSE;
     if (bScaling) pEnc->pCaptureBGRA = (uint8_t*)malloc((size_t)nWidth * nHeight * 4U);
 
-    if (pEnc->pFrameBGRA == NULL || pEnc->pPrevBGRA == NULL || pEnc->pI420 == NULL ||
-        (bScaling && pEnc->pCaptureBGRA == NULL))
+    if (pEnc->pFrameBGRA == NULL || pEnc->pPrevBGRA == NULL ||
+        pEnc->pI420 == NULL || (bScaling && pEnc->pCaptureBGRA == NULL))
     {
         DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop, "Failed to allocate desktop frame buffers.");
         DirectGate_Desktop_X11Enc_Free(pEnc, pDisplay);
@@ -599,4 +600,5 @@ int DirectGate_Desktop_LinuxEncoder_ProcessTick(directgate_session_t *pSession)
         pEnc->encoded.nUsed, pEnc->nEncodeWidth, pEnc->nEncodeHeight,
         bKeyframe, nPtsUs);
 }
+
 #endif /* __linux__ */

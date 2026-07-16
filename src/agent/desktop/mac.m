@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/desktop_mac.m
+ * @file directgate-agent/src/agent/desktop/mac.m
  * @brief macOS ScreenCaptureKit + VideoToolbox H.264 encoder for desktop streaming.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
@@ -42,8 +42,8 @@
  * compiled as failing stubs so desktop.c falls back to raw RGBA cleanly. */
 
 void* DirectGate_Desktop_MacCaptureImage(int32_t nX, int32_t nY,
-                                     uint32_t nWidth, uint32_t nHeight,
-                                     char *pError, size_t nErrorSize)
+                                         uint32_t nWidth, uint32_t nHeight,
+                                         char *pError, size_t nErrorSize)
 {
     CGRect rect = CGRectMake((CGFloat)nX, (CGFloat)nY,
                              (CGFloat)nWidth, (CGFloat)nHeight);
@@ -56,8 +56,8 @@ void* DirectGate_Desktop_MacCaptureImage(int32_t nX, int32_t nY,
 }
 
 int DirectGate_Desktop_MacEncoder_Start(directgate_session_t *pSession,
-                                    int32_t nX, int32_t nY,
-                                    uint32_t nWidth, uint32_t nHeight)
+                                        int32_t nX, int32_t nY,
+                                        uint32_t nWidth, uint32_t nHeight)
 {
     (void)nX;
     (void)nY;
@@ -74,8 +74,8 @@ int DirectGate_Desktop_MacEncoder_Start(directgate_session_t *pSession,
 }
 
 int DirectGate_Desktop_MacEncoder_UpdateRect(directgate_session_t *pSession,
-                                        int32_t nX, int32_t nY,
-                                        uint32_t nWidth, uint32_t nHeight)
+                                             int32_t nX, int32_t nY,
+                                             uint32_t nWidth, uint32_t nHeight)
 {
     (void)pSession; (void)nX; (void)nY; (void)nWidth; (void)nHeight;
     return -1;
@@ -151,8 +151,8 @@ static CGImageRef DirectGate_Desktop_MacWaitForScreenshot(
 }
 
 void* DirectGate_Desktop_MacCaptureImage(int32_t nX, int32_t nY,
-                                     uint32_t nWidth, uint32_t nHeight,
-                                     char *pError, size_t nErrorSize)
+                                         uint32_t nWidth, uint32_t nHeight,
+                                         char *pError, size_t nErrorSize)
 {
     if (pError != NULL && nErrorSize > 0) pError[0] = '\0';
     if (nWidth == 0 || nHeight == 0)
@@ -300,10 +300,10 @@ static void DirectGateDesktopEncoder_SetError(DirectGateDesktopEncoder *enc, con
 static OSStatus DirectGateDesktopEncoder_EmitAnnexB(NSMutableData *out, const uint8_t *src, size_t len);
 
 static void DirectGateDesktopEncoder_VTCallback(void *outputCallbackRefCon,
-                                            void *sourceFrameRefCon,
-                                            OSStatus status,
-                                            VTEncodeInfoFlags infoFlags,
-                                            CMSampleBufferRef sampleBuffer);
+                                                void *sourceFrameRefCon,
+                                                OSStatus status,
+                                                VTEncodeInfoFlags infoFlags,
+                                                CMSampleBufferRef sampleBuffer);
 
 API_AVAILABLE(macos(12.3))
 @implementation DirectGateDesktopEncoder
@@ -782,14 +782,14 @@ static OSStatus DirectGateDesktopEncoder_EmitAnnexB(NSMutableData *out, const ui
 
 API_AVAILABLE(macos(12.3))
 static void DirectGateDesktopEncoder_HandleCompressed(DirectGateDesktopEncoder *enc,
-                                                  CMSampleBufferRef sampleBuffer,
-                                                  BOOL isKeyframe);
+                                                      CMSampleBufferRef sampleBuffer,
+                                                      BOOL isKeyframe);
 
 static void DirectGateDesktopEncoder_VTCallback(void *outputCallbackRefCon,
-                                            void *sourceFrameRefCon,
-                                            OSStatus status,
-                                            VTEncodeInfoFlags infoFlags,
-                                            CMSampleBufferRef sampleBuffer)
+                                                void *sourceFrameRefCon,
+                                                OSStatus status,
+                                                VTEncodeInfoFlags infoFlags,
+                                                CMSampleBufferRef sampleBuffer)
 {
     (void)sourceFrameRefCon; (void)infoFlags;
     if (@available(macOS 12.3, *))
@@ -815,8 +815,8 @@ static void DirectGateDesktopEncoder_VTCallback(void *outputCallbackRefCon,
 
 API_AVAILABLE(macos(12.3))
 static void DirectGateDesktopEncoder_HandleCompressed(DirectGateDesktopEncoder *enc,
-                                                  CMSampleBufferRef sampleBuffer,
-                                                  BOOL isKeyframe)
+                                                      CMSampleBufferRef sampleBuffer,
+                                                      BOOL isKeyframe)
 {
     NSMutableData *out = enc.encodedScratch;
     [out setLength:0];
@@ -885,8 +885,6 @@ static void DirectGateDesktopEncoder_HandleCompressed(DirectGateDesktopEncoder *
     }
 }
 
-/* ------------------ C bridge ------------------ */
-
 API_AVAILABLE(macos(12.3))
 static DirectGateDesktopEncoder *encoderOf(directgate_session_t *pSession)
 {
@@ -946,8 +944,8 @@ int DirectGate_Desktop_MacEncoder_Start(directgate_session_t *pSession,
 }
 
 int DirectGate_Desktop_MacEncoder_UpdateRect(directgate_session_t *pSession,
-                                        int32_t nX, int32_t nY,
-                                        uint32_t nWidth, uint32_t nHeight)
+                                             int32_t nX, int32_t nY,
+                                             uint32_t nWidth, uint32_t nHeight)
 {
     if (!pSession || !pSession->desktop.pEncoder) return -1;
     return DirectGate_Desktop_MacEncoder_Start(pSession, nX, nY, nWidth, nHeight);

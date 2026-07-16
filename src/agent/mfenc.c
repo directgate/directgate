@@ -188,7 +188,7 @@ static HRESULT DirectGate_MFEnc_SetCodecBool(directgate_mfenc_t *pEnc, const GUI
 /* Caches the Annex-B SPS/PPS blob the encoder attached to its output media
  * type; prepended to IDR payloads that arrive without in-band parameter
  * sets so every keyframe stays self-contained (matching OpenH264 and the
- * desktop_mac.m Annex-B emitter). */
+ * mac.m Annex-B emitter). */
 static void DirectGate_MFEnc_CacheSeqHeader(directgate_mfenc_t *pEnc)
 {
     IMFMediaType *pType = NULL;

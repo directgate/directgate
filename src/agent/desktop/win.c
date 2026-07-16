@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/desktop_win.c
+ * @file directgate-agent/src/agent/desktop/win.c
  * @brief Windows DXGI Desktop Duplication capture + Media Foundation H.264 encoder.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
@@ -31,7 +31,7 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 
-/* Counterpart of desktop_mac.m: a push-model pipeline on a dedicated
+/* Counterpart of mac.m: a push-model pipeline on a dedicated
  * capture thread (the main loop must not block in AcquireNextFrame or the
  * hardware encoder), publishing into a single-slot mailbox:
  *
@@ -188,8 +188,6 @@ static void DirectGate_Desktop_WinEnc_SleepUs(directgate_winenc_t *pEnc, uint64_
 
     Sleep((DWORD)(nUs / 1000ULL) + 1U);
 }
-
-/* ---------------- DXGI Desktop Duplication ---------------- */
 
 static void DirectGate_Desktop_WinEnc_ReleaseDuplication(directgate_winenc_t *pEnc)
 {
@@ -423,8 +421,6 @@ static int DirectGate_Desktop_WinEnc_CaptureDxgi(directgate_winenc_t *pEnc, uint
     return XSTDOK;
 }
 
-/* ---------------- GDI fallback capture ---------------- */
-
 static void DirectGate_Desktop_WinEnc_ReleaseGdi(directgate_winenc_t *pEnc)
 {
     if (pEnc->hMemDC != NULL)
@@ -522,8 +518,6 @@ static int DirectGate_Desktop_WinEnc_CaptureGdi(directgate_winenc_t *pEnc, xbool
     return XSTDOK;
 }
 
-/* ---------------- encode + publish ---------------- */
-
 static void DirectGate_Desktop_WinEnc_WakeMainLoop(directgate_winenc_t *pEnc)
 {
     XSOCKET nWriteFd = pEnc->pDesktop->nTimerWriteFd;
@@ -572,8 +566,6 @@ static int DirectGate_Desktop_WinEnc_EncodeFrame(directgate_winenc_t *pEnc, xboo
     DirectGate_Desktop_WinEnc_WakeMainLoop(pEnc);
     return XSTDOK;
 }
-
-/* ---------------- capture thread ---------------- */
 
 static int DirectGate_Desktop_WinEnc_InitPipeline(directgate_winenc_t *pEnc)
 {
@@ -795,8 +787,6 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
     if (SUCCEEDED(hrCom)) CoUninitialize();
     return 0;
 }
-
-/* ---------------- main-thread bridge ---------------- */
 
 static void DirectGate_Desktop_WinEnc_Free(directgate_winenc_t *pEnc)
 {
@@ -1061,4 +1051,5 @@ int DirectGate_Desktop_WinEncoder_DrainMain(directgate_session_t *pSession)
     return DirectGate_Desktop_SendEncodedFrame(pSession, pEnc->drain.pData,
         pEnc->drain.nUsed, nWidth, nHeight, bKeyframe, nPtsUs);
 }
+
 #endif /* _WIN32 */
