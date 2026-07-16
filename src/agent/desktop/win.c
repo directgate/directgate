@@ -649,7 +649,7 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
      * applies and keep a guaranteed CPU slice. avrt.dll ships with every
      * desktop Windows; load it dynamically and fail soft. "Capture" is the
      * profile intended for real-time frame producers. */
-    HMODULE hAvrt = LoadLibraryW(L"avrt.dll");
+    HMODULE hAvrt = NULL;//LoadLibraryW(L"avrt.dll");
     HANDLE hMmcss = NULL;
     if (hAvrt != NULL)
     {
