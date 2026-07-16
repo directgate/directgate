@@ -98,8 +98,6 @@ typedef struct directgate_desktop_ {
     xbool_t bRunning;
     xbool_t bInputReady;
     xbool_t bCaptureReady;
-    /* POSIX: timerfd (Linux) / pipe read end (macOS); Windows: socket pair
-     * read end (XSOCKET == int on POSIX, SOCKET on Windows). */
     XSOCKET nTimerFd;
     uint32_t nSessionId;
     uint32_t nScreenWidth;
@@ -114,8 +112,6 @@ typedef struct directgate_desktop_ {
     uint32_t nTargetWidth;
     uint32_t nTargetHeight;
     xbool_t bDisplayModeChanged;
-    char sModeMonitorId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
-    char sModeDeviceId[DIRECTGATE_DESKTOP_DEVICE_ID_LEN];
     uint64_t nModeNativeId;
     uint64_t nOriginalModeId;
     int32_t nOriginalModeX;
@@ -124,7 +120,6 @@ typedef struct directgate_desktop_ {
     uint32_t nOriginalModeHeight;
     uint32_t nOriginalModeRefresh;
     uint32_t nOriginalModeRotation;
-    void *pOriginalDisplayMode;
     uint32_t nFps;
     uint32_t nPointerButtons;
     uint32_t nPointerSequence;
@@ -135,17 +130,20 @@ typedef struct directgate_desktop_ {
     char sReason[DIRECTGATE_DESKTOP_REASON_LEN];
     char sDisplay[DIRECTGATE_DESKTOP_DISPLAY_LEN];
     char sSelectedMonitor[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
-    void *pDisplay;
-    void *pXtst;
-    void *pFakeMotion;
+    char sModeMonitorId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
+    char sModeDeviceId[DIRECTGATE_DESKTOP_DEVICE_ID_LEN];
+    char sFallbackReason[DIRECTGATE_DESKTOP_REASON_LEN];
+    char sCodec[DIRECTGATE_DESKTOP_CODEC_LEN];
+    void *pOriginalDisplayMode;
     void *pFakeRelativeMotion;
+    void *pFakeMotion;
     void *pFakeButton;
     void *pFakeKey;
+    void *pDisplay;
+    void *pXtst;
     /* Encoded pipeline state */
     directgate_desktop_pipeline_t ePipeline;
     directgate_desktop_quality_t quality;
-    char sCodec[DIRECTGATE_DESKTOP_CODEC_LEN];
-    char sFallbackReason[DIRECTGATE_DESKTOP_REASON_LEN];
     xbool_t bForceRaw;       /* true when fallback raw RGBA path is forced */
     xbool_t bRequestKeyframe;/* set by preset change / drop recovery */
     xbool_t bWebRTCVideoFailed; /* suppress retry until track/ICE recovery */
@@ -183,11 +181,11 @@ void DirectGate_Desktop_DetachEvent(directgate_desktop_t *pDesktop);
 int DirectGate_Desktop_Start(directgate_session_t *pSession);
 int DirectGate_Desktop_Process(directgate_session_t *pSession);
 int DirectGate_Desktop_HandleInput(directgate_session_t *pSession,
-                                    const uint8_t *pPayload,
-                                    size_t nPayloadLength);
+                                   const uint8_t *pPayload,
+                                   size_t nPayloadLength);
 int DirectGate_Desktop_HandleControl(directgate_session_t *pSession,
-                                    const uint8_t *pPayload,
-                                    size_t nPayloadLength);
+                                     const uint8_t *pPayload,
+                                     size_t nPayloadLength);
 
 int DirectGate_Desktop_GetTimerFd(const directgate_desktop_t *pDesktop);
 xbool_t DirectGate_Desktop_IsRunning(const directgate_desktop_t *pDesktop);
@@ -235,8 +233,8 @@ int DirectGate_Desktop_MacEncoder_Start(directgate_session_t *pSession,
                                         int32_t nX, int32_t nY,
                                         uint32_t nWidth, uint32_t nHeight);
 int DirectGate_Desktop_MacEncoder_UpdateRect(directgate_session_t *pSession,
-                                            int32_t nX, int32_t nY,
-                                            uint32_t nWidth, uint32_t nHeight);
+                                             int32_t nX, int32_t nY,
+                                             uint32_t nWidth, uint32_t nHeight);
 void DirectGate_Desktop_MacEncoder_ApplyQuality(directgate_session_t *pSession);
 void DirectGate_Desktop_MacEncoder_SetBitrate(directgate_session_t *pSession, uint32_t nBitrateKbps);
 void DirectGate_Desktop_MacEncoder_RequestKeyframe(directgate_session_t *pSession);
@@ -253,8 +251,8 @@ int DirectGate_Desktop_MacEncoder_DrainMain(directgate_session_t *pSession);
 /* X11 (XShm) capture + OpenH264 encoder pipeline. Implemented in
  * linux.c and only called by desktop.c on Linux. */
 int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
-                                        int32_t nX, int32_t nY,
-                                        uint32_t nWidth, uint32_t nHeight);
+                                          int32_t nX, int32_t nY,
+                                          uint32_t nWidth, uint32_t nHeight);
 void DirectGate_Desktop_LinuxEncoder_ApplyQuality(directgate_session_t *pSession);
 void DirectGate_Desktop_LinuxEncoder_SetBitrate(directgate_session_t *pSession, uint32_t nBitrateKbps);
 void DirectGate_Desktop_LinuxEncoder_RequestKeyframe(directgate_session_t *pSession);
@@ -280,8 +278,8 @@ int DirectGate_Desktop_LinuxEncoder_ProcessTick(directgate_session_t *pSession);
  * mailbox drained by DirectGate_Desktop_WinEncoder_DrainMain on the main
  * loop after a timer-pair wake-up. */
 int DirectGate_Desktop_WinEncoder_Start(directgate_session_t *pSession,
-                                    int32_t nX, int32_t nY,
-                                    uint32_t nWidth, uint32_t nHeight);
+                                        int32_t nX, int32_t nY,
+                                        uint32_t nWidth, uint32_t nHeight);
 void DirectGate_Desktop_WinEncoder_ApplyQuality(directgate_session_t *pSession);
 void DirectGate_Desktop_WinEncoder_SetBitrate(directgate_session_t *pSession, uint32_t nBitrateKbps);
 void DirectGate_Desktop_WinEncoder_RequestKeyframe(directgate_session_t *pSession);

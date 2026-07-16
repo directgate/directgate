@@ -643,6 +643,32 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
     directgate_winenc_t *pEnc = (directgate_winenc_t*)pArg;
     HRESULT hrCom = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
+    /* Lift the capture/encode thread into the multimedia scheduler class so
+     * Game Mode cannot starve it behind the foreground game: MMCSS-registered
+     * threads are exempt from the background/EcoQoS throttling Game Mode
+     * applies and keep a guaranteed CPU slice. avrt.dll ships with every
+     * desktop Windows; load it dynamically and fail soft. "Capture" is the
+     * profile intended for real-time frame producers. */
+    HMODULE hAvrt = LoadLibraryW(L"avrt.dll");
+    HANDLE hMmcss = NULL;
+    if (hAvrt != NULL)
+    {
+        typedef HANDLE (WINAPI *directgate_av_set_fn)(LPCWSTR, LPDWORD);
+        typedef BOOL (WINAPI *directgate_av_prio_fn)(HANDLE, int);
+        directgate_av_set_fn pAvSet = (directgate_av_set_fn)(void*)GetProcAddress(hAvrt, "AvSetMmThreadCharacteristicsW");
+        directgate_av_prio_fn pAvPrio = (directgate_av_prio_fn)(void*)GetProcAddress(hAvrt, "AvSetMmThreadPriority");
+
+        DWORD nMmTaskIndex = 0;
+        if (pAvSet != NULL) hMmcss = pAvSet(L"Capture", &nMmTaskIndex);
+        if (hMmcss != NULL)
+        {
+            /* AVRT_PRIORITY_HIGH (1): top of the Capture task's band without
+             * the AVRT_PRIORITY_CRITICAL risk of monopolising a core. */
+            if (pAvPrio != NULL) pAvPrio(hMmcss, 1);
+        }
+        else xlogw("MMCSS registration failed for capture thread: err(%lu)", (unsigned long)GetLastError());
+    }
+
     /* Do not use TIME_CRITICAL: the agent main loop must still inject input
      * and drain RTP. ABOVE_NORMAL gives capture/encode an edge over ordinary
      * background work without starving those latency-critical consumers. */
@@ -784,7 +810,16 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
         pEnc->hWaitTimer = NULL;
     }
 
+    if (hMmcss != NULL)
+    {
+        typedef BOOL (WINAPI *directgate_av_revert_fn)(HANDLE);
+        directgate_av_revert_fn pAvRevert = (directgate_av_revert_fn)(void*)GetProcAddress(hAvrt, "AvRevertMmThreadCharacteristics");
+        if (pAvRevert != NULL) pAvRevert(hMmcss);
+    }
+
+    if (hAvrt != NULL) FreeLibrary(hAvrt);
     if (SUCCEEDED(hrCom)) CoUninitialize();
+
     return 0;
 }
 

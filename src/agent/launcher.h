@@ -42,6 +42,7 @@ extern "C" {
 #endif
 
 XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[]);
+void DirectGate_WinLauncher_BoostPriority(void);
 
 #ifdef __cplusplus
 }

@@ -2625,6 +2625,10 @@ int DirectGate_RunAgent(int argc, char* argv[])
     xlog_indent(XTRUE);
 
 #ifdef _WIN32
+    /* Escape Game Mode / EcoQoS background throttling so the desktop capture,
+     * encode and input path keep full performance while a game is foreground. */
+    DirectGate_WinLauncher_BoostPriority();
+
     /* No SIGPIPE on Windows; socket errors surface through WSA codes */
     int nSignals[2] = { SIGTERM, SIGINT };
     XSig_Register(nSignals, 2, DirectGate_SignalCallback);
