@@ -812,6 +812,7 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
         pEnc->hWaitTimer = NULL;
     }
 
+#ifdef DIRECTGATE_HAVE_AVRT_THREAD_PRIORITY
     if (hMmcss != NULL)
     {
         typedef BOOL (WINAPI *directgate_av_revert_fn)(HANDLE);
@@ -820,8 +821,9 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
     }
 
     if (hAvrt != NULL) FreeLibrary(hAvrt);
-    if (SUCCEEDED(hrCom)) CoUninitialize();
+#endif /* DIRECTGATE_HAVE_AVRT_THREAD_PRIORITY */
 
+    if (SUCCEEDED(hrCom)) CoUninitialize();
     return 0;
 }
 
