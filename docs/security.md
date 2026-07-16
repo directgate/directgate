@@ -35,6 +35,38 @@ This ensures:
 - Session integrity is maintained end-to-end regardless of the underlying transport
 - Replay attacks, reflected packets, message tampering, payload modification, and transport-level manipulation are mitigated
 
+## Remote desktop encryption
+
+Remote desktop is the one subsystem that does not carry its payload inside the AES-256-SIV envelope, and it is worth stating precisely what protects it.
+
+Desktop **control and input** messages (monitor selection, resize requests, mouse and keyboard events) are ordinary session traffic and are always AES-256-SIV encrypted like terminal and file data.
+
+Desktop **video** depends on the active pipeline:
+
+- **`webrtc-video`** (default, lowest latency) - H.264 is packetized into RTP and sent on a WebRTC media track, which is encrypted with **DTLS-SRTP** rather than AES-256-SIV. This is still end-to-end: the SRTP keys come from a DTLS handshake performed directly between the agent and the client, and the DTLS fingerprints that authenticate that handshake are exchanged inside the AES-SIV-protected signaling channel. A relay or TURN server therefore cannot substitute a fingerprint, insert itself into the handshake, or decrypt the stream - it sees only encrypted media.
+- **`h264-datachannel`** (fallback) - H.264 chunks travel over the WebRTC data channel and are AES-256-SIV encrypted like all other session data. The agent falls back to this pipeline automatically when the media track is unavailable or fails.
+
+The trade-off is that on the `webrtc-video` pipeline the confidentiality of the video stream rests on DTLS-SRTP (as implemented by libdatachannel) instead of the application-layer AES-SIV construction described above. The agent reports the active pipeline and its transport (`dtls-srtp` or `aes-siv-datachannel`) to the client, so you can always see which protection is in effect for a live session.
+
+## What a desktop session can do
+
+A desktop session necessarily has two capabilities, and it is worth being explicit about them rather than leaving them implied:
+
+- **Screen capture** - the agent captures the display the client selects (X11/XShm on Linux, DXGI Desktop Duplication with a GDI fallback on Windows, ScreenCaptureKit on macOS) for as long as the session is active.
+- **Input injection** - the agent injects the mouse and keyboard events the client sends (XTest on Linux, `SendInput` on Windows, `CGEvent` on macOS).
+
+Remote desktop cannot function without these; they are the feature, not a side effect. Both are constrained the same way as every other session capability:
+
+- They are reachable only after a completed SRP-6a or Ed25519 handshake. Neither the relay nor an unauthenticated peer can start a desktop session, capture a frame, or inject an event.
+- They are reachable only when the client explicitly requests desktop mode, and they stop when the session ends.
+- All desktop control and input traffic is AES-256-SIV encrypted; video is encrypted as described above.
+- They act as `shell.user`, the same account the terminal already runs as. A client that can start a desktop session can already run arbitrary commands as that user through the PTY, so desktop access grants no privilege that shell access does not.
+
+Two things to be aware of when deciding whether to enable it:
+
+- The agent does **not** display a local on-screen indicator while a desktop session is live. Someone physically at the machine has no built-in signal that a session is active. Treat desktop access exactly as you treat shell access, and be deliberate about enabling it on shared or multi-user machines where the person at the keyboard may not be the person who configured the agent.
+- On macOS the operating system enforces its own Screen Recording and Accessibility permissions, which must be granted to the agent before capture or input will work at all.
+
 ## SRP-6a authentication
 
 Authentication uses SRP-6a (Secure Remote Password). No password is ever transmitted in any form:
@@ -72,12 +104,14 @@ These operational messages do not contain terminal output, file contents, sessio
 - **TLS encryption** - all WebSocket connections use WSS
 - **WebRTC DTLS** - the P2P data channel is additionally secured by DTLS
 - **End-to-end encryption** - terminal data, file contents, and editor data is AES-256-SIV encrypted between agent and client; neither the relay nor any intermediary can access plaintext
+- **Remote desktop** - control and input are AES-256-SIV encrypted; video is end-to-end encrypted with DTLS-SRTP on the media channel (fingerprints authenticated over the AES-SIV channel), so the relay cannot decrypt it either
 - **SRP-6a auth** - password proof exchange without ever sending the plaintext password
 - **Continuity counter** - each encrypted packet carries a monotonic counter to prevent replay attacks
 - **Zero-knowledge payloads** - in relay mode, the server is cryptographically incapable of decrypting session data, but necessarily sees the routing and traffic metadata described above
 - **P2P bypass** - when the WebRTC channel is active, terminal data does not pass through the relay at all
 - The agent allows to set any password you want and it is up to you to use strong passwords for SRP credentials (according to NIST, 15+ characters is recommended)
 - Review the `shell.user` permissions in the agent configuration - the agent grants shell access as that user
+- A desktop session can capture the screen and inject mouse/keyboard input as `shell.user`, with no local on-screen indicator; it requires authentication, and grants no privilege the terminal does not already grant
 - Keep the agent updated through the package repositories (or build from source) so you receive security fixes
 
 ## Cloud side
