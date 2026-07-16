@@ -643,13 +643,14 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
     directgate_winenc_t *pEnc = (directgate_winenc_t*)pArg;
     HRESULT hrCom = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
+#ifdef DIRECTGATE_HAVE_AVRT_THREAD_PRIORITY
     /* Lift the capture/encode thread into the multimedia scheduler class so
      * Game Mode cannot starve it behind the foreground game: MMCSS-registered
      * threads are exempt from the background/EcoQoS throttling Game Mode
      * applies and keep a guaranteed CPU slice. avrt.dll ships with every
      * desktop Windows; load it dynamically and fail soft. "Capture" is the
      * profile intended for real-time frame producers. */
-    HMODULE hAvrt = NULL;//LoadLibraryW(L"avrt.dll");
+    HMODULE hAvrt = LoadLibraryW(L"avrt.dll");
     HANDLE hMmcss = NULL;
     if (hAvrt != NULL)
     {
@@ -668,6 +669,7 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
         }
         else xlogw("MMCSS registration failed for capture thread: err(%lu)", (unsigned long)GetLastError());
     }
+#endif /* DIRECTGATE_HAVE_AVRT_THREAD_PRIORITY */
 
     /* Do not use TIME_CRITICAL: the agent main loop must still inject input
      * and drain RTP. ABOVE_NORMAL gives capture/encode an edge over ordinary
