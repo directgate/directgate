@@ -29,8 +29,6 @@ This repository is the **agent**: the program you install on a machine you want 
 - Advanced file search, image/video playback, and drag-and-drop between devices
 - Multiple concurrent sessions multiplexed over one link
 
-**Beta access**: Remote desktop and other early features are currently available only for beta-enabled accounts. Installing the agent from the `dev` branch is not enough to unlock them in the web UI. To request access, email us at [support@directgate.io](mailto:support@directgate.io) using the same email address you used to register on [directgate.io](https://directgate.io/), and we’ll enable beta features for your account as soon as possible.
-
 ## Screenshots
 
 These are the experiences the agent powers once it is paired with your account.
