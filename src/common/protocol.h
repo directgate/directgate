@@ -262,6 +262,9 @@ xjson_obj_t* DirectGate_Proto_BuildFileCancel(const char *pTransferId, const cha
 
 xbool_t DirectGate_Proto_EncryptPackage(xbyte_buffer_t *pPkg, directgate_e2e_t *pE2E, uint32_t nSessionId);
 xbool_t DirectGate_Proto_DecryptPackage(xbyte_buffer_t *pOut, const directgate_pkg_t *pPkg, directgate_e2e_t *pE2E);
+xbool_t DirectGate_Proto_AddCC(xjson_obj_t *pHeader, directgate_e2e_t *pE2E,
+                              uint32_t nSessionEpoch);
+xbool_t DirectGate_Proto_CheckCC(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E);
 xbool_t DirectGate_Proto_BindInnerSessionId(uint32_t nOuterSessionId, directgate_pkg_t *pInnerPkg);
 
 #ifdef __cplusplus

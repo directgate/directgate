@@ -58,6 +58,65 @@ extern xbool_t g_bFinish;
 /* Real agent entrypoint from directgate.c */
 int DirectGate_RunAgent(int argc, char* argv[]);
 
+/* Windows Game Mode (and the modern power manager) push background services
+ * into EcoQoS - a reduced-frequency, low-scheduling-priority class - and hand
+ * the CPU/GPU scheduler to the foreground game. The desktop capture -> encode
+ * -> send pipeline is exactly the kind of background work that gets starved,
+ * so the remote FPS collapses whenever Game Mode is on. Opt the whole agent
+ * process out of that: raise the base priority class and clear the
+ * execution-speed power throttle so Windows keeps the process at full
+ * performance (HighQoS), regardless of Game Mode.
+ *
+ * HIGH_PRIORITY_CLASS (not REALTIME) is deliberate: realtime outranks kernel
+ * input, paging and disk threads and can freeze the machine. High is the
+ * highest class that is safe for a long-running, user-facing service. */
+void DirectGate_WinLauncher_BoostPriority(void)
+{
+    HANDLE hProcess = GetCurrentProcess();
+
+    if (SetPriorityClass(hProcess, HIGH_PRIORITY_CLASS))
+        xlogi("Agent process priority raised to HIGH_PRIORITY_CLASS");
+    else
+        xlogw("Failed to raise agent process priority class: err(%lu)", (unsigned long)GetLastError());
+
+    /* SetProcessInformation(ProcessPowerThrottling, ...) is Windows 10 1709+.
+     * Resolve it at runtime and describe the state struct locally so the build
+     * stays independent of the SDK version and still loads on older Windows
+     * (where Game Mode background throttling does not exist). ControlMask =
+     * EXECUTION_SPEED with StateMask = 0 means "I manage throttling and I want
+     * it off": the process runs at full speed / HighQoS. */
+    typedef struct {
+        ULONG Version;
+        ULONG ControlMask;
+        ULONG StateMask;
+    } directgate_power_throttling_t;
+
+    enum {
+        DIRECTGATE_POWER_THROTTLING_VERSION_1       = 1,
+        DIRECTGATE_POWER_THROTTLING_EXECUTION_SPEED = 0x1,
+        DIRECTGATE_PROCESS_POWER_THROTTLING         = 4 /* ProcessPowerThrottling */
+    };
+
+    typedef BOOL (WINAPI *directgate_set_process_info_fn)(HANDLE, int, LPVOID, DWORD);
+    HMODULE hKernel = GetModuleHandleW(L"kernel32.dll");
+    directgate_set_process_info_fn pSetProcessInformation = (hKernel != NULL)
+        ? (directgate_set_process_info_fn)(void*)GetProcAddress(hKernel, "SetProcessInformation")
+        : NULL;
+
+    if (pSetProcessInformation == NULL) return;
+
+    directgate_power_throttling_t state;
+    memset(&state, 0, sizeof(state));
+    state.Version = DIRECTGATE_POWER_THROTTLING_VERSION_1;
+    state.ControlMask = DIRECTGATE_POWER_THROTTLING_EXECUTION_SPEED;
+    state.StateMask = 0;
+
+    if (pSetProcessInformation(hProcess, DIRECTGATE_PROCESS_POWER_THROTTLING, &state, (DWORD)sizeof(state)))
+        xlogi("Agent power throttling disabled (HighQoS): immune to Game Mode background throttling");
+    else
+        xlogw("Failed to disable agent power throttling: err(%lu)", (unsigned long)GetLastError());
+}
+
 /* Resolve an account name (accepts "user", "DOMAIN\user" or ".\user") 
    to a SID copied into pSidBuf (SECURITY_MAX_SID_SIZE bytes). */
 static XSTATUS DirectGate_WinLauncher_LookupSid(const char *pShellUser, PSID pSidBuf)

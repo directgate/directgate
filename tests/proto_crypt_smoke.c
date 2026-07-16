@@ -41,7 +41,7 @@ static int build_encrypted(xbyte_buffer_t *pWire, directgate_e2e_t *pTx,
     CHECK(pHeader != NULL, "build inner header");
 
     if (bAddCC)
-        XJSON_AddU32(pHeader, "cc", ++pTx->nTxPacketId);
+        DirectGate_Proto_AddCC(pHeader, pTx, 0);
 
     XByteBuffer_Reset(pWire);
     xbool_t bOk = DirectGate_Proto_Build(pWire, pHeader, pPayload, nPayload, XFALSE);

@@ -10,12 +10,42 @@
 # directgate_smoke(<name> [extra .c sources ...])
 function(directgate_smoke name)
     add_executable(${name} "${CMAKE_CURRENT_SOURCE_DIR}/${name}.c" ${ARGN})
-    target_include_directories(${name} PRIVATE "${CMAKE_SOURCE_DIR}")
+    # Agent sources include their neighbour headers by bare name; keep both the
+    # agent root (session.h, openh264.h, ...) and the desktop module directory
+    # (desktop.h, priv.h) searchable, matching the agent binary's include path.
+    target_include_directories(${name} PRIVATE "${CMAKE_SOURCE_DIR}" "${AGENT_DIR}" "${AGENT_DIR}/desktop")
     target_link_libraries(${name} PRIVATE xcommon)
     if(UTIL_LIBRARY)
         target_link_libraries(${name} PRIVATE ${UTIL_LIBRARY})
     endif()
     add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+# Targets that compile session.c / directgate.c pull in the desktop module,
+# which needs the same platform sources and libraries as the agent binary
+# (see the matching block in the top-level CMakeLists).
+function(directgate_smoke_desktop name)
+    if(APPLE)
+        target_sources(${name} PRIVATE ${AGENT_DIR}/desktop/mac.m)
+        set_source_files_properties(${AGENT_DIR}/desktop/mac.m
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_link_libraries(${name} PRIVATE
+            "-framework ApplicationServices"
+            "-framework Carbon"
+            "-framework Foundation"
+            "-framework CoreMedia"
+            "-framework CoreVideo"
+            "-framework CoreGraphics"
+            "-framework VideoToolbox"
+            "-framework ScreenCaptureKit")
+    elseif(UNIX)
+        target_sources(${name} PRIVATE
+            ${AGENT_DIR}/desktop/linux.c
+            ${AGENT_DIR}/openh264.c
+            ${AGENT_DIR}/yuv.c)
+        target_include_directories(${name} PRIVATE ${X11_INCLUDE_DIR} ${AGENT_DIR}/openh264)
+        target_link_libraries(${name} PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS} Xrandr Xext)
+    endif()
 endfunction()
 
 # Tests that only need libxcommon.
@@ -28,6 +58,7 @@ foreach(test
         srp_smoke
         transfer_smoke
         webrtc_config_smoke
+        webrtc_rtcp_smoke
         api_invalid_role_smoke
         keyauth_smoke
         files_static_smoke
@@ -58,6 +89,13 @@ directgate_smoke(config_smoke        ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c
 directgate_smoke(config_extra_smoke  ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(keyfile_apply_smoke ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(search_smoke        ${AGENT_DIR}/search.c ${AGENT_DIR}/files.c)
+directgate_smoke(yuv_smoke   ${AGENT_DIR}/yuv.c)
+if(UNIX AND NOT APPLE)
+    directgate_smoke(openh264_smoke ${AGENT_DIR}/openh264.c)
+    target_include_directories(openh264_smoke PRIVATE ${AGENT_DIR}/openh264)
+    target_link_libraries(openh264_smoke PRIVATE ${CMAKE_DL_LIBS})
+    set_tests_properties(openh264_smoke PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 directgate_smoke(enroll_prompt_smoke ${AGENT_DIR}/enroll.c)
 directgate_smoke(files_smoke         ${AGENT_DIR}/files.c)
 directgate_smoke(session_smoke       ${AGENT_DIR}/session.c)
@@ -69,12 +107,17 @@ directgate_smoke(client_relay_smoke   ${CLIENT_DIR}/relay.c)
 
 directgate_smoke(connection_lifecycle_smoke
     ${AGENT_DIR}/config.c
+    ${AGENT_DIR}/desktop/desktop.c
+    ${AGENT_DIR}/desktop/display.c
+    ${AGENT_DIR}/desktop/input.c
+    ${AGENT_DIR}/desktop/stream.c
     ${AGENT_DIR}/enroll.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
     ${AGENT_DIR}/term.c
     ${AGENT_DIR}/directgate.c)
+directgate_smoke_desktop(connection_lifecycle_smoke)
 target_compile_definitions(connection_lifecycle_smoke PRIVATE DIRECTGATE_TESTING)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(connection_lifecycle_smoke PRIVATE -Wno-unused-function)

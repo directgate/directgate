@@ -29,6 +29,7 @@
 #define DIRECTGATE_KA_INTERVAL_SEC  25
 #define DIRECTGATE_MAX_ICE_SERVERS  8
 #define DIRECTGATE_ICE_URL_SIZE     256
+#define DIRECTGATE_RTC_VIDEO_MID_SIZE 32
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,7 +43,14 @@ typedef enum {
     DIRECTGATE_WEBRTC_OPEN = 0,
     DIRECTGATE_WEBRTC_CLOSED,
     DIRECTGATE_WEBRTC_DATA,
-    DIRECTGATE_WEBRTC_SIGNAL
+    DIRECTGATE_WEBRTC_SIGNAL,
+    DIRECTGATE_WEBRTC_INPUT_OPEN,
+    DIRECTGATE_WEBRTC_INPUT_CLOSED,
+    DIRECTGATE_WEBRTC_VIDEO_OPEN,
+    DIRECTGATE_WEBRTC_VIDEO_CLOSED,
+    DIRECTGATE_WEBRTC_VIDEO_KEYFRAME,
+    DIRECTGATE_WEBRTC_PENDING_DIRECT,
+    DIRECTGATE_WEBRTC_PENDING_FAILED
 } directgate_webrtc_event_type_t;
 
 typedef struct directgate_webrtc_event_ {
@@ -55,6 +63,7 @@ typedef struct directgate_webrtc_event_ {
 
 typedef struct directgate_pending_ice_ {
     struct directgate_pending_ice_ *pNext;
+    uint32_t nGeneration;
     char sCandidate[XSTR_SUB];
     char sMid[XSTR_PICO];
 } directgate_pending_ice_t;
@@ -62,7 +71,32 @@ typedef struct directgate_pending_ice_ {
 typedef struct directgate_webrtc_ {
     int nPeerConnectionID;      /* Peer connection ID (-1 if not created) */
     int nDataChannelID;         /* Data channel ID (-1 if not created) */
+    int nInputDataChannelID;    /* Unordered replaceable-input channel */
+    int nVideoTrackID;          /* Outbound desktop video track ID (-1 if unavailable) */
     xbool_t bConnected;         /* Data channel is open (main thread only) */
+    xbool_t bVideoEnabled;      /* Offer answers may include a desktop video track */
+    xbool_t bVideoTrackOpen;    /* Outbound media track is open */
+    xbool_t bVideoKeyframeRequested; /* new track or RTCP PLI/FIR needs an IDR */
+    uint32_t nSignalGeneration; /* Browser negotiation generation; rejects stale SDP/ICE */
+
+    /* Background P2P candidate. The active TURN peer remains untouched until
+     * this peer's reliable data channel and video track are both open. */
+    int nPendingPeerConnectionID;
+    int nPendingDataChannelID;
+    int nPendingInputDataChannelID;
+    int nPendingVideoTrackID;
+    uint32_t nPendingSignalGeneration;
+    xbool_t bPendingDataOpen;
+    xbool_t bPendingVideoOpen;
+    xbool_t bPendingDirect;
+    xbool_t bPendingReadySignaled;
+    uint8_t nPendingVideoPayloadType;
+    uint16_t nPendingVideoSeq;
+    uint32_t nPendingVideoSsrc;
+    uint32_t nPendingVideoTimestamp;
+    uint64_t nPendingVideoLastPtsUs;
+    xbool_t bPendingVideoHasTimestamp;
+    char sPendingVideoMid[DIRECTGATE_RTC_VIDEO_MID_SIZE];
     rtcLogLevel logLevel;       /* Log level for libdatachannel */
 
     /* Callbacks to send signaling messages via relay WebSocket */
@@ -92,6 +126,21 @@ typedef struct directgate_webrtc_ {
 
     /* Buffered remote ICE candidates received before peer connection exists */
     directgate_pending_ice_t *pPendingIce;
+
+    /* Outbound H.264 RTP track state */
+    uint8_t nVideoPayloadType;
+    uint16_t nVideoSeq;
+    uint32_t nVideoSsrc;
+    uint32_t nVideoTimestamp;
+    uint64_t nVideoLastPtsUs;
+    xbool_t bVideoHasTimestamp;
+    char sVideoMid[DIRECTGATE_RTC_VIDEO_MID_SIZE];
+
+    /* Latest RTCP receiver-report loss signal (fraction lost, 0..255).
+     * Written by the libdatachannel callback thread, consumed once by the
+     * main-loop bitrate controller via TakeVideoLossReport. */
+    volatile int nVideoFractionLost;
+    volatile xbool_t bVideoLossUpdated;
 } directgate_webrtc_t;
 
 void DirectGate_WebRTC_Init(directgate_webrtc_t *pRTC);
@@ -113,10 +162,17 @@ XSTATUS DirectGate_WebRTC_CreateOffer(directgate_webrtc_t *pRTC);
 XSTATUS DirectGate_WebRTC_HandleAnswer(directgate_webrtc_t *pRTC, const char *pSdp);
 
 /* Handle incoming SDP offer from client - creates peer connection and answer */
-XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSdp);
+XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSdp,
+                                      uint32_t nGeneration, xbool_t bBackgroundP2P);
 
 /* Handle incoming ICE candidate from remote peer */
-XSTATUS DirectGate_WebRTC_HandleIceCandidate(directgate_webrtc_t *pRTC, const char *pCandidate, const char *pMid);
+XSTATUS DirectGate_WebRTC_HandleIceCandidate(directgate_webrtc_t *pRTC,
+                                             const char *pCandidate,
+                                             const char *pMid,
+                                             uint32_t nGeneration);
+
+/* Atomically promote a fully ready background P2P peer. */
+XSTATUS DirectGate_WebRTC_CommitPending(directgate_webrtc_t *pRTC, uint32_t nGeneration);
 
 /* Send binary data over the data channel. Returns 0 on success, -1 on failure */
 XSTATUS DirectGate_WebRTC_Send(directgate_webrtc_t *pRTC, const uint8_t *pData, size_t nLen);
@@ -124,6 +180,30 @@ XSTATUS DirectGate_WebRTC_Send(directgate_webrtc_t *pRTC, const uint8_t *pData, 
 /* Check if the data channel is connected */
 xbool_t DirectGate_WebRTC_IsConnected(const directgate_webrtc_t *pRTC);
 int DirectGate_WebRTC_GetBufferedAmount(const directgate_webrtc_t *pRTC);
+
+/* Enable a send-only H.264 video track when answering a browser offer. */
+void DirectGate_WebRTC_SetVideoEnabled(directgate_webrtc_t *pRTC, xbool_t bEnabled);
+xbool_t DirectGate_WebRTC_HasVideoTrack(const directgate_webrtc_t *pRTC);
+xbool_t DirectGate_WebRTC_IsVideoOpen(const directgate_webrtc_t *pRTC);
+xbool_t DirectGate_WebRTC_TakeVideoKeyframeRequest(directgate_webrtc_t *pRTC);
+
+/* Consumes the latest RTCP receiver-report loss signal for the video track.
+ * Returns XTRUE when a new report arrived since the last call and stores
+ * the fraction-lost octet (lost packets * 256 / expected) in pFractionLost. */
+xbool_t DirectGate_WebRTC_TakeVideoLossReport(directgate_webrtc_t *pRTC, uint8_t *pFractionLost);
+
+/* Walks a compound RTCP datagram: reports whether it contains a keyframe
+ * request (PLI/FIR) and the highest fraction-lost across RR/SR report
+ * blocks (-1 when no report block is present). Exposed for tests. */
+void DirectGate_WebRTC_ParseRtcp(const uint8_t *pData, size_t nSize,
+                             xbool_t *pKeyframeRequest, int *pFractionLost);
+
+/* Send one Annex-B H.264 access unit over the negotiated WebRTC media track.
+ * Returns XSTDERR if no open video track is available or a packet send fails. */
+XSTATUS DirectGate_WebRTC_SendH264AnnexB(directgate_webrtc_t *pRTC,
+                                         const uint8_t *pData,
+                                         size_t nLen,
+                                         uint64_t nPtsUs);
 
 /* Drain queued events and dispatch callbacks on the calling (main) thread */
 void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC);

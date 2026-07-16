@@ -24,21 +24,29 @@ This repository is the **agent**: the program you install on a machine you want 
 - End-to-end encrypted (AES-256-SIV) at the application layer, independent of transport
 - Peer-to-peer over WebRTC whenever possible; the relay never sees plaintext
 - Terminal, file manager, and a browser-based code editor over a single connection
-- Ultra-low-latency remote desktop over WebRTC, with P2P when possible and TURN fallback <sup>beta</sup>
+- Ultra-low-latency remote desktop over WebRTC, with P2P when possible and TURN fallback beta <sup>beta</sup>
 - Full file manager experience with upload/download, rename, copy, move, and delete
 - Advanced file search, image/video playback, and drag-and-drop between devices
 - Multiple concurrent sessions multiplexed over one link
-
-**Beta access**: Remote desktop and other early features are currently available only for beta-enabled accounts. Installing the agent from the `dev` branch is not enough to unlock them in the web UI. To request access, email us at [support@directgate.io](mailto:support@directgate.io) using the same email address you used to register on [directgate.io](https://directgate.io/), and we’ll enable beta features for your account as soon as possible.
 
 ## Screenshots
 
 These are the experiences the agent powers once it is paired with your account.
 
+<p align="center">
+  <sub>
+    Ultra-low-latency remote desktop, responsive enough to play story-driven games directly in your browser.
+  </sub>
+</p>
+
+https://github.com/user-attachments/assets/5b57ef36-301b-494d-8fc8-561d4d2567b9
+
+<br />
+
 <table align="center">
   <tr>
     <td align="center">
-      <img src="misc/screens/workspace-split.png" alt="Split workspace: terminal, file manager, AI assistant and live agent logs" width="900" />
+      <img src="misc/screens/workspace-split.png" alt="Split workspace: terminal, file manager, AI assistant and live agent logs" width="960" />
       <br /><sub>A customizable window manager with multiple sessions in one workspace tab. Terminals, file managers, and code editors - each showing its own transport mode (P2P, TURN, or relayed) and end-to-end encryption status.</sub>
     </td>
   </tr>
@@ -109,10 +117,12 @@ The agent is the component that runs on your machine, so its cryptography is exa
 - **TLS (WSS)** on every signaling connection
 - **DTLS** on the WebRTC data channel
 - **End-to-end encryption** with AES-256-SIV at the application layer - keys derived from the SRP session key via HKDF-SHA256, separate per direction, with per-packet nonces and a monotonic replay counter
+- **Remote desktop video** is end-to-end encrypted with DTLS-SRTP on the WebRTC media channel rather than AES-SIV. Its DTLS fingerprints are exchanged inside the AES-SIV-protected signaling channel, so the relay can neither substitute them nor decrypt the stream. If the media channel is unavailable, video falls back to H.264 over the AES-SIV data channel. Desktop control and input messages are always AES-SIV encrypted
+- **Remote desktop capabilities** - a desktop session captures the selected display and injects the mouse and keyboard events the client sends. This is what remote desktop is; it cannot work without them. Both are available only to a client that has completed SRP or Ed25519 authentication, and all of it travels encrypted. The agent shows no local on-screen indicator while a desktop session is live, so grant desktop access on the same basis as shell access - anyone who can authenticate can already run commands as `shell.user`. On macOS, the OS additionally enforces Screen Recording and Accessibility permissions
 - **SRP-6a** authentication - the password is never transmitted in any form
 - **Optional Ed25519 key authorization** in addition to SRP
 
-The relay can never read terminal, file, editor, or signaling payloads. It does necessarily see routing metadata - device ID, source IPs, connection timing, and traffic volume - which is inherent to any relay.
+The relay can never read terminal, file, editor, desktop, or signaling payloads. It does necessarily see routing metadata - device ID, source IPs, connection timing, and traffic volume - which is inherent to any relay.
 
 See [Security model](docs/security.md) for the full design and trust assumptions, and [directgate.io/security](https://directgate.io/security) for the threat model and FAQ.
 

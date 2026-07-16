@@ -208,6 +208,9 @@ jobs:
         # Util extension provides WixShellExec, used to launch the GUI from the
         # installer's final page.
         & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.Util.wixext/5.0.2
+        # Firewall extension installs the program-scoped inbound UDP rule used
+        # by WebRTC P2P and removes it again on MSI uninstall.
+        & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.Firewall.wixext/5.0.2
 
     - name: Stage payload
       shell: pwsh
@@ -230,6 +233,7 @@ jobs:
           -d LicenseRtf=misc/win/License.rtf `
           -ext WixToolset.UI.wixext `
           -ext WixToolset.Util.wixext `
+          -ext WixToolset.Firewall.wixext `
           -culture en-us `
           -o $msi `
           misc/win/directgate.wxs

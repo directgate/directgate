@@ -752,6 +752,43 @@ xjson_obj_t* DirectGate_Proto_BuildVerify(const char *pAction, const char *pAcce
     return pHeader;
 }
 
+static xbool_t DirectGate_Proto_IsSignalScope(const char *pScope)
+{
+    return xstrused(pScope) && xstrcmp(pScope, "signal") ? XTRUE : XFALSE;
+}
+
+xbool_t DirectGate_Proto_AddCC(xjson_obj_t *pHeader, directgate_e2e_t *pE2E,
+                               uint32_t nSessionEpoch)
+{
+    XCHECK((pHeader != NULL), XFALSE);
+    XCHECK((pE2E != NULL), XFALSE);
+
+    const char *pType = XJSON_GetString(XJSON_GetObject(pHeader, "type"));
+    xbool_t bSignal = xstrused(pType) && xstrcmp(pType, "webrtc");
+    uint32_t *pScopedCounter;
+
+    if (bSignal)
+    {
+        pScopedCounter = &pE2E->nTxSignalPacketId;
+    }
+    else
+    {
+        if (pE2E->nTxSessionEpoch != nSessionEpoch)
+        {
+            pE2E->nTxSessionEpoch = nSessionEpoch;
+            pE2E->nTxSessionPacketId = 0;
+        }
+
+        pScopedCounter = &pE2E->nTxSessionPacketId;
+        XJSON_AddU32(pHeader, "ce", nSessionEpoch);
+    }
+
+    XJSON_AddString(pHeader, "ccScope", bSignal ? "signal" : "session");
+    XJSON_AddU32(pHeader, "sc", ++(*pScopedCounter));
+    XJSON_AddU32(pHeader, "cc", ++pE2E->nTxPacketId);
+    return XTRUE;
+}
+
 xbool_t DirectGate_Proto_CheckCC(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E)
 {
     XCHECK((pE2E != NULL), XFALSE);
@@ -770,10 +807,53 @@ xbool_t DirectGate_Proto_CheckCC(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E)
             XCHECK_CALL((nCC > 0), XJSON_Destroy, &json,
                 xthrowr(XFALSE, "Missing CC in the packet header"));
 
-            XCHECK_CALL((nCC > pE2E->nRxPacketId), XJSON_Destroy, &json,
-                xthrowr(XFALSE, "CC(%u) <= last(%u)", nCC, pE2E->nRxPacketId));
+            xjson_obj_t *pScopeObj = XJSON_GetObject(json.pRootObj, "ccScope");
+            const char *pScope = pScopeObj != NULL ? XJSON_GetString(pScopeObj) : NULL;
+            xbool_t bSignal = DirectGate_Proto_IsSignalScope(pScope);
 
-            pE2E->nRxPacketId = nCC;
+            XCHECK_CALL((!xstrused(pScope) || bSignal || xstrcmp(pScope, "session")),
+                XJSON_Destroy, &json, xthrowr(XFALSE, "Unknown CC scope: %s", pScope));
+
+            if (xstrused(pScope))
+            {
+                uint32_t nScopedCC = XJSON_GetU32(XJSON_GetObject(json.pRootObj, "sc"));
+                XCHECK_CALL((nScopedCC > 0), XJSON_Destroy, &json,
+                    xthrowr(XFALSE, "Missing scoped CC for scope(%s)", pScope));
+
+                uint32_t *pLast;
+                if (bSignal)
+                {
+                    pLast = &pE2E->nRxSignalPacketId;
+                }
+                else
+                {
+                    uint32_t nEpoch = XJSON_GetU32(XJSON_GetObject(json.pRootObj, "ce"));
+                    XCHECK_CALL((nEpoch >= pE2E->nRxSessionEpoch), XJSON_Destroy, &json,
+                        xthrowr(XFALSE, "Stale session CC epoch(%u) < active(%u)",
+                            nEpoch, pE2E->nRxSessionEpoch));
+                    if (nEpoch > pE2E->nRxSessionEpoch)
+                    {
+                        pE2E->nRxSessionEpoch = nEpoch;
+                        pE2E->nRxSessionPacketId = 0;
+                    }
+
+                    pLast = &pE2E->nRxSessionPacketId;
+                }
+
+                XCHECK_CALL((nScopedCC > *pLast), XJSON_Destroy, &json,
+                    xthrowr(XFALSE, "SC(%u) <= last(%u), scope(%s)",
+                    nScopedCC, *pLast, bSignal ? "signal" : "session"));
+
+                *pLast = nScopedCC;
+                if (nCC > pE2E->nRxPacketId) pE2E->nRxPacketId = nCC;
+            }
+            else
+            {
+                XCHECK_CALL((nCC > pE2E->nRxPacketId), XJSON_Destroy, &json,
+                    xthrowr(XFALSE, "CC(%u) <= last(%u)", nCC, pE2E->nRxPacketId));
+                pE2E->nRxPacketId = nCC;
+            }
+
             XJSON_Destroy(&json);
             return XTRUE;
         }

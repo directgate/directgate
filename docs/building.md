@@ -12,7 +12,10 @@ If your platform is not covered by the [package repositories](../README.md#insta
 - A C/C++ toolchain (GCC or Clang)
 - CMake ≥ 3.16
 - OpenSSL development headers (`libssl-dev` / `openssl-devel`, or `brew install openssl`)
+- On Linux: X11 development headers for desktop streaming - `libx11-dev`, `libxrandr-dev`, `libxext-dev` (Debian/Ubuntu) or `libX11-devel`, `libXrandr-devel`, `libXext-devel` (Fedora/RHEL)
 - `git` (the build pulls two submodules)
+
+For H.264 desktop streaming on Linux the agent loads `libopenh264.so` at runtime (it is not a build dependency - only the vendored API headers are compiled in). Install the [Cisco OpenH264](https://github.com/cisco/openh264) binary through your distribution (`openh264` on Fedora via the `fedora-cisco-openh264` repository) or point `DIRECTGATE_OPENH264_LIB` at the library path. Without it, desktop sessions fall back to the raw RGBA pipeline. On macOS and Windows desktop streaming uses only OS components (ScreenCaptureKit + VideoToolbox, and DXGI Desktop Duplication + Media Foundation respectively) - nothing extra to install; see [Building for Windows](windows.md#desktop-streaming) for the Windows specifics.
 
 [libxutils](https://github.com/kala13x/libxutils) and [libdatachannel](https://github.com/paullouisageneau/libdatachannel) are included as git submodules and built automatically - there is no separate system-wide WebRTC dependency to install. libdatachannel is linked **statically**, so the resulting binaries are self-contained.
 
@@ -42,7 +45,7 @@ This produces:
 sudo make -C build install
 ```
 
-This installs the `directgate` and `dgcli` binaries plus a system service that runs the agent **as the installing user** (not root). The user and home directory are detected at install time (`$SUDO_USER`, falling back to `$USER`) and substituted into the service template, so you never edit it by hand.
+This installs the `directgate` and `dgcli` binaries plus a system service that runs the agent **as the installing user** (not root). The user and home directory are detected at install time (`$SUDO_USER`, falling back to `$USER`) and substituted into the service template. On Linux, the installer also detects the active X11 authority file from the environment, GDM, LightDM, `~/.Xauthority`, or the user's graphical session, so the generated unit does not hardcode a display manager.
 
 **Linux** - binaries to `/usr/bin`, and a systemd unit from [misc/directgate-agent.service](../misc/directgate-agent.service):
 

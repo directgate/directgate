@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.21)
 project(directgate LANGUAGES C CXX)
 
 # ---------------------------------------------------------------------------
@@ -140,10 +140,19 @@ endif()
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
 set(NO_TESTS ON CACHE BOOL "" FORCE)
-# Data channels only (no RTP/SRTP or WebSocket). Matches build.sh / pkg install_libdatachannel
-# and avoids CMake 3.21+ required by bundled libsrtp when NO_MEDIA is off.
-set(NO_MEDIA ON CACHE BOOL "" FORCE)
+# Media transport (RTP/SRTP) is enabled so the desktop streaming pipeline can
+# push H.264 over a negotiated WebRTC video track (see desktop.c / webrtc.c
+# DirectGate_WebRTC_SendH264AnnexB). The bundled deps/libsrtp needs CMake >= 3.21,
+# which is also the minimum declared by this project. WebSocket stays off
+# because DirectGate does not use libdatachannel's WebSocket implementation.
+set(NO_MEDIA OFF CACHE BOOL "" FORCE)
 set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
+if(WIN32)
+    # The bundled libsrtp builds itself with -Werror and trips over benign
+    # format warnings on Windows (winsock's ntohl returns u_long). Vendor
+    # code must not fail our cross-build over its own warnings.
+    set(ENABLE_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+endif()
 add_subdirectory(${DATACHANNEL_DIR} EXCLUDE_FROM_ALL)
 
 # ---- libxutils (submodule) ------------------------------------------------
@@ -234,16 +243,67 @@ else()
 endif()
 
 # ---- agent binary: directgate --------------------------------------------------
+# The desktop controller lives under ${AGENT_DIR}/desktop and is cross-platform,
+# split by concern: desktop.c (shared state/geometry), display.c (monitor
+# enumeration + display mode), input.c (pointer/keyboard injection) and
+# stream.c (frame timer/capture/control) all carry the X11 (Linux), macOS,
+# Windows and a no-op fallback path inline behind #if guards. The platform
+# capture/encode pipelines live in mac.m (ScreenCaptureKit/VideoToolbox, Apple
+# only) and win.c (DXGI Desktop Duplication/Media Foundation, added below).
 add_executable(directgate
     ${AGENT_DIR}/config.c
+    ${AGENT_DIR}/desktop/desktop.c
+    ${AGENT_DIR}/desktop/display.c
+    ${AGENT_DIR}/desktop/input.c
+    ${AGENT_DIR}/desktop/stream.c
     ${AGENT_DIR}/enroll.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
     ${AGENT_DIR}/term.c
     ${AGENT_DIR}/directgate.c)
-target_include_directories(directgate PRIVATE ${AGENT_DIR})
+target_include_directories(directgate PRIVATE ${AGENT_DIR} ${AGENT_DIR}/desktop)
 target_link_libraries(directgate PRIVATE xcommon)
+
+# ---- desktop streaming backends (platform specific) -----------------------
+if(APPLE)
+    # macOS screen capture + VideoToolbox H.264 encoder. Compiled with ARC.
+    target_sources(directgate PRIVATE ${AGENT_DIR}/desktop/mac.m)
+    set_source_files_properties(${AGENT_DIR}/desktop/mac.m
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(directgate PRIVATE
+        "-framework ApplicationServices"
+        "-framework Carbon"
+        "-framework Foundation"
+        "-framework CoreMedia"
+        "-framework CoreVideo"
+        "-framework CoreGraphics"
+        "-framework VideoToolbox"
+        "-framework ScreenCaptureKit")
+elseif(UNIX)
+    # Linux X11 capture + XTest input (XTest is dlopen'd at runtime, hence dl).
+    # The H.264 pipeline lives in desktop/linux.c (XShm capture) with
+    # openh264.c (encoder, dlopen'd at runtime - only the vendored
+    # API headers under src/agent/openh264 are needed at build time) and
+    # yuv.c (BGRA scaling + I420 conversion). XShm needs Xext.
+    find_package(X11 REQUIRED)
+    target_sources(directgate PRIVATE
+        ${AGENT_DIR}/desktop/linux.c
+        ${AGENT_DIR}/openh264.c
+        ${AGENT_DIR}/yuv.c)
+    target_include_directories(directgate PRIVATE ${X11_INCLUDE_DIR} ${AGENT_DIR}/openh264)
+    target_link_libraries(directgate PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
+    if(X11_Xrandr_FOUND)
+        target_link_libraries(directgate PRIVATE ${X11_Xrandr_LIB})
+    else()
+        target_link_libraries(directgate PRIVATE Xrandr)
+    endif()
+    if(X11_Xext_FOUND)
+        target_link_libraries(directgate PRIVATE ${X11_Xext_LIB})
+    else()
+        target_link_libraries(directgate PRIVATE Xext)
+    endif()
+endif()
 
 if(WIN32)
     # Privilege-separation launcher (see src/agent/launcher.c): a tiny LocalSystem
@@ -253,6 +313,21 @@ if(WIN32)
     # advapi32: LookupAccountName + token queries. wtsapi32: WTSEnumerateSessions
     # / WTSQueryUserToken (shell.user logon token). userenv: CreateEnvironmentBlock.
     target_link_libraries(directgate PRIVATE advapi32 wtsapi32 userenv)
+
+    # Windows desktop streaming: DXGI Desktop Duplication capture (GDI
+    # fallback) in desktop/win.c with a Media Foundation H.264 encoder in
+    # mfenc.c (mfplat.dll is loaded at runtime - N editions ship without
+    # Media Foundation - so only static GUID archives are linked, no
+    # mfplat import) and yuv.c (BGRA scaling + NV12 conversion).
+    # user32/gdi32: monitors, SendInput, BitBlt. d3d11/dxgi: duplication.
+    # ole32/oleaut32: COM apartment + VARIANT for ICodecAPI.
+    # uuid/mfuuid/strmiids/dxguid: interface and media type GUIDs.
+    target_sources(directgate PRIVATE
+        ${AGENT_DIR}/desktop/win.c
+        ${AGENT_DIR}/mfenc.c
+        ${AGENT_DIR}/yuv.c)
+    target_link_libraries(directgate PRIVATE
+        user32 gdi32 d3d11 dxgi ole32 oleaut32 uuid mfuuid strmiids dxguid)
 
     # App manifest (UTF-8 active code page) + version / company metadata.
     enable_language(RC)
