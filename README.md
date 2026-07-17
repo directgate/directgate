@@ -41,16 +41,15 @@ These are the experiences the agent powers once it is paired with your account.
 
 https://github.com/user-attachments/assets/5b57ef36-301b-494d-8fc8-561d4d2567b9
 
-<br />
+<p align="center">
+  <sub>
+    A customizable window manager with multiple sessions in one workspace tab. Terminals, file managers, and code editors - each showing its own transport mode (P2P, TURN, or relayed) and end-to-end encryption status.
+  </sub>
+</p>
 
-<table align="center">
-  <tr>
-    <td align="center">
-      <img src="misc/screens/workspace-split.png" alt="Split workspace: terminal, file manager, AI assistant and live agent logs" width="960" />
-      <br /><sub>A customizable window manager with multiple sessions in one workspace tab. Terminals, file managers, and code editors - each showing its own transport mode (P2P, TURN, or relayed) and end-to-end encryption status.</sub>
-    </td>
-  </tr>
-</table>
+https://github.com/user-attachments/assets/8a9b366a-ff06-4817-920c-a49c9b30cbc7
+
+<br />
 
 <table align="center">
   <tr>
