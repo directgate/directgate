@@ -424,6 +424,13 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     if (pDesktop->pEncoder != NULL) DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
     DirectGate_Desktop_RestoreDisplayMode(pDesktop);
 
+    if (pDesktop->pDisplay != NULL && pDesktop->nScratchKeycode != 0U)
+    {
+        KeySym clearSyms[2] = { NoSymbol, NoSymbol };
+        XChangeKeyboardMapping((Display*)pDesktop->pDisplay, (int)pDesktop->nScratchKeycode, 2, clearSyms, 1);
+        XSync((Display*)pDesktop->pDisplay, XFALSE);
+    }
+
     if (pDesktop->pDisplay != NULL)
     {
         XCloseDisplay((Display*)pDesktop->pDisplay);
@@ -495,8 +502,19 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     pDesktop->nTargetHeight = 0;
     pDesktop->nPointerButtons = 0;
     pDesktop->nPointerSequence = 0;
+    pDesktop->nWheelAccumX = 0;
+    pDesktop->nWheelAccumY = 0;
+    pDesktop->nLastClickMs = 0;
+    pDesktop->nLastClickX = 0;
+    pDesktop->nLastClickY = 0;
+    pDesktop->nClickCount = 0;
+    pDesktop->nLastClickButton = 0;
+    pDesktop->nInputRecheckMs = 0;
+    pDesktop->nScratchKeycode = 0;
+    pDesktop->nScratchKeysym = 0;
     pDesktop->nMonitorCount = 0;
     pDesktop->sSelectedMonitor[0] = '\0';
+    pDesktop->sInputReason[0] = '\0';
     pDesktop->sFallbackReason[0] = '\0';
     memset(pDesktop->monitors, 0, sizeof(pDesktop->monitors));
     xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "raw-rgba");
@@ -544,25 +562,27 @@ int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const char *pS
     XJSON_AddString(pRoot, "status", xstrused(pStatus) ? pStatus : "unknown");
     XJSON_AddString(pRoot, "backend", xstrused(pSession->desktop.sBackend) ? pSession->desktop.sBackend : "unknown");
     XJSON_AddString(pRoot, "display", xstrused(pSession->desktop.sDisplay) ? pSession->desktop.sDisplay : "");
-    XJSON_AddBool(pRoot, "input", pSession->desktop.bInputReady);
-    XJSON_AddU32(pRoot, "screenWidth", pSession->desktop.nScreenWidth);
-    XJSON_AddU32(pRoot, "screenHeight", pSession->desktop.nScreenHeight);
-    XJSON_AddBool(pRoot, "captureReady", pSession->desktop.bCaptureReady);
-    XJSON_AddBool(pRoot, "cursorSync", XTRUE);
-    XJSON_AddBool(pRoot, "p2pMigration", XTRUE);
-    XJSON_AddStrIfUsed(pRoot, "selectedMonitor", pSession->desktop.sSelectedMonitor);
-    XJSON_AddString(pRoot, "pipeline", DirectGate_Desktop_PipelineName(pSession->desktop.ePipeline));
     XJSON_AddString(pRoot, "codec", xstrused(pSession->desktop.sCodec) ? pSession->desktop.sCodec : "raw-rgba");
+    XJSON_AddString(pRoot, "pipeline", DirectGate_Desktop_PipelineName(pSession->desktop.ePipeline));
     XJSON_AddString(pRoot, "preset", DirectGate_Desktop_PresetName(pSession->desktop.quality.ePreset));
     XJSON_AddString(pRoot, "transport", DirectGate_Desktop_TransportName(pSession->desktop.ePipeline));
+    XJSON_AddString(pRoot, "resizeMode", DirectGate_Desktop_ResizeModeName(pSession->desktop.eResizeMode));
+    XJSON_AddStrIfUsed(pRoot, "inputReason", pSession->desktop.sInputReason);
+    XJSON_AddStrIfUsed(pRoot, "fallbackReason", pSession->desktop.sFallbackReason);
+    XJSON_AddStrIfUsed(pRoot, "selectedMonitor", pSession->desktop.sSelectedMonitor);
+    XJSON_AddBool(pRoot, "input", pSession->desktop.bInputReady);
+    XJSON_AddBool(pRoot, "textInput", XTRUE);
+    XJSON_AddBool(pRoot, "cursorSync", XTRUE);
+    XJSON_AddBool(pRoot, "p2pMigration", XTRUE);
+    XJSON_AddBool(pRoot, "captureReady", pSession->desktop.bCaptureReady);
+    XJSON_AddBool(pRoot, "fallbackRaw", pSession->desktop.bForceRaw);
+    XJSON_AddU32(pRoot, "fps", pSession->desktop.quality.nFps);
     XJSON_AddU32(pRoot, "frameWidth", pSession->desktop.nFrameWidth);
     XJSON_AddU32(pRoot, "frameHeight", pSession->desktop.nFrameHeight);
-    XJSON_AddString(pRoot, "resizeMode", DirectGate_Desktop_ResizeModeName(pSession->desktop.eResizeMode));
     XJSON_AddU32(pRoot, "targetWidth", pSession->desktop.nTargetWidth);
     XJSON_AddU32(pRoot, "targetHeight", pSession->desktop.nTargetHeight);
-    XJSON_AddU32(pRoot, "fps", pSession->desktop.quality.nFps);
-    XJSON_AddBool(pRoot, "fallbackRaw", pSession->desktop.bForceRaw);
-    XJSON_AddStrIfUsed(pRoot, "fallbackReason", pSession->desktop.sFallbackReason);
+    XJSON_AddU32(pRoot, "screenWidth", pSession->desktop.nScreenWidth);
+    XJSON_AddU32(pRoot, "screenHeight", pSession->desktop.nScreenHeight);
     XJSON_AddU32(pRoot, "bitrateKbps", pSession->desktop.nCurrentBitrateKbps ?
         pSession->desktop.nCurrentBitrateKbps : pSession->desktop.quality.nBitrateKbps);
 

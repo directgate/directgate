@@ -123,11 +123,32 @@ typedef struct directgate_desktop_ {
     uint32_t nFps;
     uint32_t nPointerButtons;
     uint32_t nPointerSequence;
+    /* Browsers report wheel motion in pixels (trackpads emit many small
+     * samples); the accumulators collect them into whole wheel notches on
+     * the platforms that inject discrete wheel clicks (X11 / Windows). */
+    int32_t nWheelAccumX;
+    int32_t nWheelAccumY;
+    /* Double/triple click tracking for platforms where the injected event
+     * must carry an explicit click count (macOS kCGMouseEventClickState). */
+    uint64_t nLastClickMs;
+    int32_t nLastClickX;
+    int32_t nLastClickY;
+    uint32_t nClickCount;
+    uint32_t nLastClickButton;
+    /* macOS: last accessibility-permission recheck while input is disabled. */
+    uint64_t nInputRecheckMs;
+    /* X11: spare keycode temporarily bound to keysyms missing from the
+     * active layout (e.g. non-Latin text typed from the browser). */
+    uint32_t nScratchKeycode;
+    uint64_t nScratchKeysym;
     uint64_t nFrameId;
     uint32_t nMonitorCount;
     directgate_desktop_monitor_t monitors[DIRECTGATE_DESKTOP_MAX_MONITORS];
     char sBackend[DIRECTGATE_DESKTOP_BACKEND_LEN];
     char sReason[DIRECTGATE_DESKTOP_REASON_LEN];
+    /* Why bInputReady is false (surfaced to the browser in desktop-status
+     * as `inputReason`, e.g. a missing macOS Accessibility permission). */
+    char sInputReason[DIRECTGATE_DESKTOP_REASON_LEN];
     char sDisplay[DIRECTGATE_DESKTOP_DISPLAY_LEN];
     char sSelectedMonitor[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
     char sModeMonitorId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];

@@ -234,6 +234,9 @@ static void DirectGate_Desktop_LoadXTest(directgate_desktop_t *pDesktop)
     if (pDesktop->pXtst == NULL)
     {
         xlogw("Desktop input disabled: libXtst.so.6 not found");
+        xstrncpy(pDesktop->sInputReason, sizeof(pDesktop->sInputReason),
+            "Remote control is disabled: the XTest library (libXtst) is not "
+            "installed on this host. Install it and restart the agent.");
         return;
     }
 
@@ -247,7 +250,12 @@ static void DirectGate_Desktop_LoadXTest(directgate_desktop_t *pDesktop)
                             pDesktop->pFakeKey != NULL);
 
     if (!pDesktop->bInputReady)
+    {
         xlogw("Desktop input disabled: XTest symbols are unavailable");
+        xstrncpy(pDesktop->sInputReason, sizeof(pDesktop->sInputReason),
+            "Remote control is disabled: the XTest extension is unavailable "
+            "on this host's X server.");
+    }
 }
 
 static const char* DirectGate_Desktop_FindX11Display(char *pBuf, size_t nBufSize)
@@ -437,7 +445,27 @@ int DirectGate_Desktop_OpenMacOS(directgate_session_t *pSession)
 #endif
 
     pDesktop->bInputReady = AXIsProcessTrusted() ? XTRUE : XFALSE;
-    if (!pDesktop->bInputReady) xlogw("macOS desktop input disabled: grant Accessibility permission to directgate");
+    if (!pDesktop->bInputReady)
+    {
+        xlogw("macOS desktop input disabled: grant Accessibility permission to directgate");
+        xstrncpy(pDesktop->sInputReason, sizeof(pDesktop->sInputReason),
+            "macOS blocks remote control until the DirectGate agent has Accessibility "
+            "permission. Grant it in System Settings > Privacy & Security > Accessibility.");
+
+        /* Fire the system permission prompt so the person at the host (or the
+         * remote user watching the stream) sees the request immediately.
+         * Input recovers without a restart: the input handler rechecks
+         * AXIsProcessTrusted once the permission is granted. */
+        const void *pKeys[] = { (const void*)kAXTrustedCheckOptionPrompt };
+        const void *pValues[] = { (const void*)kCFBooleanTrue };
+        CFDictionaryRef pOptions = CFDictionaryCreate(kCFAllocatorDefault, pKeys, pValues, 1,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        if (pOptions != NULL)
+        {
+            (void)AXIsProcessTrustedWithOptions(pOptions);
+            CFRelease(pOptions);
+        }
+    }
 
     return XSTDOK;
 }

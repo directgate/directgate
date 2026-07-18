@@ -95,6 +95,12 @@ if(UNIX AND NOT APPLE)
     target_include_directories(openh264_smoke PRIVATE ${AGENT_DIR}/openh264)
     target_link_libraries(openh264_smoke PRIVATE ${CMAKE_DL_LIBS})
     set_tests_properties(openh264_smoke PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Compiles the X11 input unit directly (like files_static_smoke) to test
+    # the browser-key -> keysym mapping; needs Xlib but no running X server.
+    directgate_smoke(desktop_input_smoke)
+    target_include_directories(desktop_input_smoke PRIVATE ${X11_INCLUDE_DIR})
+    target_link_libraries(desktop_input_smoke PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
 endif()
 directgate_smoke(enroll_prompt_smoke ${AGENT_DIR}/enroll.c)
 directgate_smoke(files_smoke         ${AGENT_DIR}/files.c)

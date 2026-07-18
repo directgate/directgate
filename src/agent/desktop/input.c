@@ -26,6 +26,7 @@
 #if defined(__linux__)
 #include <ctype.h>
 #include <X11/Xlib.h>
+#include <X11/XKBlib.h>
 #include <X11/keysym.h>
 
 typedef Bool (*directgate_xtest_motion_fn)(Display*, int, int, int, unsigned long);
@@ -64,9 +65,101 @@ static int DirectGate_Desktop_FrameToScreenY(const directgate_desktop_t *pDeskto
     return pDesktop->nCaptureY + (int)(((uint64_t)(uint32_t)nY * pDesktop->nCaptureHeight) / pDesktop->nFrameHeight);
 }
 
+#if defined(__linux__) || defined(_WIN32)
+/* Browsers report wheel motion in pixels: a discrete mouse notch is ~100px
+ * while trackpads emit a stream of 1-10px samples. Platforms that inject
+ * discrete wheel clicks (X11 buttons 4-7, Windows WHEEL_DELTA) accumulate
+ * the pixels and emit whole notches, so a trackpad swipe no longer turns
+ * every sample into a full click. (macOS scrolls in pixel units natively.) */
+static int DirectGate_Desktop_WheelNotches(int32_t *pAccum, int nDelta)
+{
+    /* A direction flip discards the leftover from the previous direction
+     * so scrolling reverses immediately instead of eating the first input. */
+    if ((nDelta > 0 && *pAccum < 0) || (nDelta < 0 && *pAccum > 0)) *pAccum = 0;
+    *pAccum += nDelta;
+
+    int nNotches = *pAccum / 100;
+    *pAccum -= nNotches * 100;
+    return nNotches;
+}
+#endif /* __linux__ || _WIN32 */
+
 #endif /* __linux__ || __APPLE__ || _WIN32 */
 
 #if defined(__linux__)
+
+/* Decodes exactly one UTF-8 codepoint. Returns consumed bytes, 0 on error. */
+static size_t DirectGate_Desktop_UTF8Decode(const char *pText, uint32_t *pCodepoint)
+{
+    const uint8_t *pBytes = (const uint8_t*)pText;
+    if (pBytes[0] < 0x80U)
+    {
+        *pCodepoint = pBytes[0];
+        return 1;
+    }
+
+    size_t nLength = 0;
+    uint32_t nCodepoint = 0;
+
+    if ((pBytes[0] & 0xE0U) == 0xC0U) { nLength = 2; nCodepoint = pBytes[0] & 0x1FU; }
+    else if ((pBytes[0] & 0xF0U) == 0xE0U) { nLength = 3; nCodepoint = pBytes[0] & 0x0FU; }
+    else if ((pBytes[0] & 0xF8U) == 0xF0U) { nLength = 4; nCodepoint = pBytes[0] & 0x07U; }
+    else return 0;
+
+    for (size_t i = 1; i < nLength; i++)
+    {
+        if ((pBytes[i] & 0xC0U) != 0x80U) return 0;
+        nCodepoint = (nCodepoint << 6) | (pBytes[i] & 0x3FU);
+    }
+
+    *pCodepoint = nCodepoint;
+    return nLength;
+}
+
+/* X11 keysym for one Unicode codepoint: Latin-1 keysyms equal the codepoint,
+ * everything else uses the standard 0x01000000 Unicode keysym offset. This is
+ * what makes punctuation (".", ",", "!") and non-Latin characters work — the
+ * previous XStringToKeysym(".") lookup expected keysym *names* ("period") and
+ * silently failed for every non-alphanumeric key. */
+static KeySym DirectGate_Desktop_KeySymFromCodepoint(uint32_t nCodepoint)
+{
+    if (nCodepoint == (uint32_t)'\n' || nCodepoint == (uint32_t)'\r') return XK_Return;
+    if (nCodepoint == (uint32_t)'\t') return XK_Tab;
+    if (nCodepoint < 0x20U || nCodepoint == 0x7FU) return NoSymbol;
+    if (nCodepoint < 0x100U) return (KeySym)nCodepoint;
+    return (KeySym)(nCodepoint | 0x01000000UL);
+}
+
+typedef struct directgate_x11_key_ {
+    const char *pName;
+    KeySym sym;
+} directgate_x11_key_t;
+
+static const directgate_x11_key_t g_X11NamedKeys[] = {
+    { "Enter", XK_Return }, { "NumpadEnter", XK_KP_Enter },
+    { "Backspace", XK_BackSpace }, { "Tab", XK_Tab },
+    { "Escape", XK_Escape }, { "Delete", XK_Delete },
+    { "Insert", XK_Insert }, { "Home", XK_Home }, { "End", XK_End },
+    { "PageUp", XK_Page_Up }, { "PageDown", XK_Page_Down },
+    { "ArrowLeft", XK_Left }, { "ArrowRight", XK_Right },
+    { "ArrowUp", XK_Up }, { "ArrowDown", XK_Down },
+    { "CapsLock", XK_Caps_Lock }, { "NumLock", XK_Num_Lock },
+    { "ScrollLock", XK_Scroll_Lock }, { "PrintScreen", XK_Print },
+    { "Pause", XK_Pause }, { "ContextMenu", XK_Menu },
+    { "AltGraph", XK_ISO_Level3_Shift },
+};
+
+/* Modifier side (left/right) comes from the physical `code`; the `key`
+ * value is just "Shift"/"Control"/"Alt"/"Meta" for both sides. */
+static KeySym DirectGate_Desktop_ModifierKeySym(const char *pKey, const char *pCode)
+{
+    xbool_t bRight = xstrused(pCode) && strstr(pCode, "Right") != NULL;
+    if (xstrcmp(pKey, "Shift")) return bRight ? XK_Shift_R : XK_Shift_L;
+    if (xstrcmp(pKey, "Control")) return bRight ? XK_Control_R : XK_Control_L;
+    if (xstrcmp(pKey, "Alt")) return bRight ? XK_Alt_R : XK_Alt_L;
+    if (xstrcmp(pKey, "Meta")) return bRight ? XK_Super_R : XK_Super_L;
+    return NoSymbol;
+}
 
 static KeySym DirectGate_Desktop_KeySymFromJson(xjson_obj_t *pRoot)
 {
@@ -75,33 +168,28 @@ static KeySym DirectGate_Desktop_KeySymFromJson(xjson_obj_t *pRoot)
 
     if (xstrused(pKey))
     {
-        if (strlen(pKey) == 1)
+        KeySym sym = DirectGate_Desktop_ModifierKeySym(pKey, pCode);
+        if (sym != NoSymbol) return sym;
+
+        uint32_t nCodepoint = 0;
+        size_t nUsed = DirectGate_Desktop_UTF8Decode(pKey, &nCodepoint);
+        if (nUsed > 0 && pKey[nUsed] == '\0')
+            return DirectGate_Desktop_KeySymFromCodepoint(nCodepoint);
+
+        for (size_t i = 0; i < sizeof(g_X11NamedKeys) / sizeof(g_X11NamedKeys[0]); i++)
         {
-            char sKey[2] = { pKey[0], '\0' };
-            KeySym sym = XStringToKeysym(sKey);
-            if (sym != NoSymbol) return sym;
+            if (xstrcmp(g_X11NamedKeys[i].pName, pKey))
+                return g_X11NamedKeys[i].sym;
         }
 
-        if (xstrcmp(pKey, " ")) return XK_space;
-        if (xstrcmp(pKey, "Enter")) return XK_Return;
-        if (xstrcmp(pKey, "Backspace")) return XK_BackSpace;
-        if (xstrcmp(pKey, "Tab")) return XK_Tab;
-        if (xstrcmp(pKey, "Escape")) return XK_Escape;
-        if (xstrcmp(pKey, "Delete")) return XK_Delete;
-        if (xstrcmp(pKey, "Home")) return XK_Home;
-        if (xstrcmp(pKey, "End")) return XK_End;
-        if (xstrcmp(pKey, "PageUp")) return XK_Page_Up;
-        if (xstrcmp(pKey, "PageDown")) return XK_Page_Down;
-        if (xstrcmp(pKey, "ArrowLeft")) return XK_Left;
-        if (xstrcmp(pKey, "ArrowRight")) return XK_Right;
-        if (xstrcmp(pKey, "ArrowUp")) return XK_Up;
-        if (xstrcmp(pKey, "ArrowDown")) return XK_Down;
-        if (xstrcmp(pKey, "Shift")) return XK_Shift_L;
-        if (xstrcmp(pKey, "Control")) return XK_Control_L;
-        if (xstrcmp(pKey, "Alt")) return XK_Alt_L;
-        if (xstrcmp(pKey, "Meta")) return XK_Super_L;
+        /* Function keys and other W3C names that match keysym names
+         * ("F1".."F24", "Cancel", ...) resolve directly. */
+        KeySym named = XStringToKeysym(pKey);
+        if (named != NoSymbol) return named;
     }
 
+    /* Fallback when `key` is unusable ("Unidentified", "Dead", IME): use the
+     * physical code for the alphanumeric block. */
     if (xstrused(pCode) && strlen(pCode) == 4 && !strncmp(pCode, "Key", 3))
     {
         char sKey[2] = { (char)tolower((unsigned char)pCode[3]), '\0' };
@@ -115,6 +203,156 @@ static KeySym DirectGate_Desktop_KeySymFromJson(xjson_obj_t *pRoot)
     }
 
     return NoSymbol;
+}
+
+/* Finds (or creates) a spare keycode and binds the requested keysym to it.
+ * Used for keysyms missing from the active host layout, e.g. typing Georgian
+ * text into a host that only has a US keymap. The binding is cached until a
+ * different keysym needs the slot and restored in DirectGate_Desktop_Clear. */
+static KeyCode DirectGate_Desktop_X11BindScratch(directgate_desktop_t *pDesktop, KeySym sym)
+{
+    Display *pDisplay = (Display*)pDesktop->pDisplay;
+
+    if (pDesktop->nScratchKeycode == 0U)
+    {
+        int nMinCode = 0, nMaxCode = 0, nSymsPerCode = 0;
+        XDisplayKeycodes(pDisplay, &nMinCode, &nMaxCode);
+
+        KeySym *pMap = XGetKeyboardMapping(pDisplay, (KeyCode)nMinCode,
+            nMaxCode - nMinCode + 1, &nSymsPerCode);
+        if (pMap == NULL || nSymsPerCode <= 0)
+        {
+            if (pMap != NULL) XFree(pMap);
+            return 0;
+        }
+
+        for (int i = nMaxCode; i >= nMinCode && pDesktop->nScratchKeycode == 0U; i--)
+        {
+            xbool_t bFree = XTRUE;
+            for (int j = 0; j < nSymsPerCode; j++)
+            {
+                if (pMap[(i - nMinCode) * nSymsPerCode + j] != NoSymbol)
+                {
+                    bFree = XFALSE;
+                    break;
+                }
+            }
+
+            if (bFree) pDesktop->nScratchKeycode = (uint32_t)i;
+        }
+
+        XFree(pMap);
+        if (pDesktop->nScratchKeycode == 0U) return 0;
+    }
+
+    if (pDesktop->nScratchKeysym != (uint64_t)sym)
+    {
+        KeySym syms[2] = { sym, sym };
+        XChangeKeyboardMapping(pDisplay, (int)pDesktop->nScratchKeycode, 2, syms, 1);
+        XSync(pDisplay, XFALSE);
+        pDesktop->nScratchKeysym = (uint64_t)sym;
+    }
+
+    return (KeyCode)pDesktop->nScratchKeycode;
+}
+
+/* Resolves a keysym to a keycode reachable in the ACTIVE layout group.
+ * Injected keycodes are interpreted with the host's current group, so a
+ * match found in another group (e.g. a Georgian symbol on a host whose
+ * active layout is US) would type the wrong character — such keysyms go
+ * through the scratch binding instead. When the keysym only exists on the
+ * shifted level (e.g. "!" on the "1" key), *pNeedShift is set so the
+ * caller can synthesize Shift when the client is not physically holding it. */
+static KeyCode DirectGate_Desktop_X11ResolveKeysym(directgate_desktop_t *pDesktop,
+                                                   KeySym sym, xbool_t *pNeedShift)
+{
+    Display *pDisplay = (Display*)pDesktop->pDisplay;
+    *pNeedShift = XFALSE;
+
+    int nGroup = 0;
+    XkbStateRec state;
+    if (XkbGetState(pDisplay, XkbUseCoreKbd, &state) == Success)
+        nGroup = state.group;
+
+    int nMinCode = 0, nMaxCode = 0;
+    XDisplayKeycodes(pDisplay, &nMinCode, &nMaxCode);
+
+    KeyCode shiftedMatch = 0;
+    for (int i = nMinCode; i <= nMaxCode; i++)
+    {
+        /* XkbKeycodeToKeysym wraps the group for single-group keys, so
+         * Return/arrows/modifiers resolve in every layout group. */
+        if (XkbKeycodeToKeysym(pDisplay, (KeyCode)i, nGroup, 0) == sym)
+            return (KeyCode)i;
+
+        if (shiftedMatch == 0 &&
+            XkbKeycodeToKeysym(pDisplay, (KeyCode)i, nGroup, 1) == sym)
+            shiftedMatch = (KeyCode)i;
+    }
+
+    if (shiftedMatch != 0)
+    {
+        *pNeedShift = XTRUE;
+        return shiftedMatch;
+    }
+
+    return DirectGate_Desktop_X11BindScratch(pDesktop, sym);
+}
+
+static xbool_t DirectGate_Desktop_X11ShiftDown(Display *pDisplay)
+{
+    Window rootReturn, childReturn;
+    int nRootX = 0, nRootY = 0, nWindowX = 0, nWindowY = 0;
+    unsigned int nMask = 0;
+
+    XQueryPointer(pDisplay, DefaultRootWindow(pDisplay), &rootReturn, &childReturn,
+        &nRootX, &nRootY, &nWindowX, &nWindowY, &nMask);
+    return (nMask & ShiftMask) ? XTRUE : XFALSE;
+}
+
+static void DirectGate_Desktop_X11SendKeysym(directgate_desktop_t *pDesktop,
+                                             KeySym sym, xbool_t bDown)
+{
+    Display *pDisplay = (Display*)pDesktop->pDisplay;
+    xbool_t bNeedShift = XFALSE;
+
+    KeyCode code = DirectGate_Desktop_X11ResolveKeysym(pDesktop, sym, &bNeedShift);
+    if (code == 0) return;
+
+    directgate_xtest_key_fn pKeyFn = (directgate_xtest_key_fn)pDesktop->pFakeKey;
+    KeyCode shiftCode = XKeysymToKeycode(pDisplay, XK_Shift_L);
+
+    /* Wrap only the press: the character is produced at press time, and a
+     * physically held client Shift already arrives as its own key event. */
+    xbool_t bWrapShift = bDown && bNeedShift && shiftCode != 0 &&
+        !DirectGate_Desktop_X11ShiftDown(pDisplay);
+
+    if (bWrapShift) pKeyFn(pDisplay, shiftCode, XTRUE, CurrentTime);
+    pKeyFn(pDisplay, code, bDown ? XTRUE : XFALSE, CurrentTime);
+    if (bWrapShift) pKeyFn(pDisplay, shiftCode, XFALSE, CurrentTime);
+}
+
+/* Types a UTF-8 string by pressing one key per codepoint. Used by the
+ * browser's text input path (mobile on-screen keyboards / IME input that
+ * never produces usable KeyboardEvent codes). */
+static void DirectGate_Desktop_X11TypeText(directgate_desktop_t *pDesktop, const char *pText)
+{
+    size_t nOffset = 0;
+    size_t nLength = strlen(pText);
+
+    while (nOffset < nLength)
+    {
+        uint32_t nCodepoint = 0;
+        size_t nUsed = DirectGate_Desktop_UTF8Decode(pText + nOffset, &nCodepoint);
+        if (nUsed == 0) break;
+        nOffset += nUsed;
+
+        KeySym sym = DirectGate_Desktop_KeySymFromCodepoint(nCodepoint);
+        if (sym == NoSymbol) continue;
+
+        DirectGate_Desktop_X11SendKeysym(pDesktop, sym, XTRUE);
+        DirectGate_Desktop_X11SendKeysym(pDesktop, sym, XFALSE);
+    }
 }
 
 int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t *pPayload, size_t nPayloadLength)
@@ -191,15 +429,33 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         {
             uint32_t nButton = XJSON_GetU32(XJSON_GetObject(pRoot, "button"));
             xbool_t bDown = XJSON_GetBool(XJSON_GetObject(pRoot, "down"));
-            if (nButton >= 1 && nButton <= 5)
+
+            /* 1-3 = left/middle/right, 8/9 = back/forward (X11 button ids;
+             * 4-7 are reserved for wheel emulation below). */
+            if ((nButton >= 1 && nButton <= 3) || nButton == 8 || nButton == 9)
                 ((directgate_xtest_button_fn)pDesktop->pFakeButton)(pDisplay, nButton, bDown ? XTRUE : XFALSE, CurrentTime);
         }
         else if (xstrcmp(pEvent, "wheel"))
         {
+            directgate_xtest_button_fn pButtonFn = (directgate_xtest_button_fn)pDesktop->pFakeButton;
             int nDeltaY = XJSON_GetInt(XJSON_GetObject(pRoot, "deltaY"));
-            uint32_t nButton = nDeltaY < 0 ? 4U : 5U;
-            ((directgate_xtest_button_fn)pDesktop->pFakeButton)(pDisplay, nButton, XTRUE, CurrentTime);
-            ((directgate_xtest_button_fn)pDesktop->pFakeButton)(pDisplay, nButton, XFALSE, CurrentTime);
+            int nDeltaX = XJSON_GetInt(XJSON_GetObject(pRoot, "deltaX"));
+            int nNotchesY = DirectGate_Desktop_WheelNotches(&pDesktop->nWheelAccumY, nDeltaY);
+            int nNotchesX = DirectGate_Desktop_WheelNotches(&pDesktop->nWheelAccumX, nDeltaX);
+
+            uint32_t nButtonY = nNotchesY < 0 ? 4U : 5U;
+            for (int i = 0; i < abs(nNotchesY); i++)
+            {
+                pButtonFn(pDisplay, nButtonY, XTRUE, CurrentTime);
+                pButtonFn(pDisplay, nButtonY, XFALSE, CurrentTime);
+            }
+
+            uint32_t nButtonX = nNotchesX < 0 ? 6U : 7U;
+            for (int i = 0; i < abs(nNotchesX); i++)
+            {
+                pButtonFn(pDisplay, nButtonX, XTRUE, CurrentTime);
+                pButtonFn(pDisplay, nButtonX, XFALSE, CurrentTime);
+            }
         }
 
         if (bRelative)
@@ -230,10 +486,14 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         KeySym sym = DirectGate_Desktop_KeySymFromJson(pRoot);
         if (sym != NoSymbol)
         {
-            KeyCode code = XKeysymToKeycode(pDisplay, sym);
             xbool_t bDown = XJSON_GetBool(XJSON_GetObject(pRoot, "down"));
-            if (code != 0) ((directgate_xtest_key_fn)pDesktop->pFakeKey)(pDisplay, code, bDown ? XTRUE : XFALSE, CurrentTime);
+            DirectGate_Desktop_X11SendKeysym(pDesktop, sym, bDown);
         }
+    }
+    else if (xstrcmp(pAction, "text"))
+    {
+        const char *pText = XJSON_GetString(XJSON_GetObject(pRoot, "text"));
+        if (xstrused(pText)) DirectGate_Desktop_X11TypeText(pDesktop, pText);
     }
 
     XFlush(pDisplay);
@@ -247,7 +507,8 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
 static CGEventType DirectGate_Desktop_MacMouseEvent(uint32_t nButton, xbool_t bDown)
 {
     if (nButton == 3) return bDown ? kCGEventRightMouseDown : kCGEventRightMouseUp;
-    if (nButton == 2) return bDown ? kCGEventOtherMouseDown : kCGEventOtherMouseUp;
+    if (nButton == 2 || nButton == 8 || nButton == 9)
+        return bDown ? kCGEventOtherMouseDown : kCGEventOtherMouseUp;
     return bDown ? kCGEventLeftMouseDown : kCGEventLeftMouseUp;
 }
 
@@ -263,7 +524,38 @@ static CGMouseButton DirectGate_Desktop_MacMouseButton(uint32_t nButton)
 {
     if (nButton == 3) return kCGMouseButtonRight;
     if (nButton == 2) return kCGMouseButtonCenter;
+    /* Back/forward map to the HID button numbers apps expect (3/4). */
+    if (nButton == 8) return (CGMouseButton)3;
+    if (nButton == 9) return (CGMouseButton)4;
     return kCGMouseButtonLeft;
+}
+
+/* macOS applications only treat a click sequence as a double/triple click
+ * when the event carries kCGMouseEventClickState; without it every injected
+ * click is a fresh single click and double-click never registers. */
+static uint32_t DirectGate_Desktop_MacClickCount(directgate_desktop_t *pDesktop,
+                                                 uint32_t nButton, CGPoint point,
+                                                 xbool_t bDown)
+{
+    if (!bDown) return pDesktop->nClickCount ? pDesktop->nClickCount : 1U;
+
+    uint64_t nNowMs = XTime_GetMs();
+    int nX = (int)point.x, nY = (int)point.y;
+
+    xbool_t bNearby = abs(nX - (int)pDesktop->nLastClickX) <= 5 &&
+                      abs(nY - (int)pDesktop->nLastClickY) <= 5;
+
+    if (nButton == pDesktop->nLastClickButton && bNearby &&
+        pDesktop->nLastClickMs != 0 && nNowMs - pDesktop->nLastClickMs <= 500)
+        pDesktop->nClickCount++;
+    else
+        pDesktop->nClickCount = 1U;
+
+    pDesktop->nLastClickMs = nNowMs;
+    pDesktop->nLastClickX = (int32_t)nX;
+    pDesktop->nLastClickY = (int32_t)nY;
+    pDesktop->nLastClickButton = nButton;
+    return pDesktop->nClickCount;
 }
 
 static CGPoint DirectGate_Desktop_MacRelativePoint(int nDx, int nDy)
@@ -328,6 +620,16 @@ static const directgate_mac_key_t g_MacKeys[] = {
     { "F1", kVK_F1 }, { "F2", kVK_F2 }, { "F3", kVK_F3 }, { "F4", kVK_F4 },
     { "F5", kVK_F5 }, { "F6", kVK_F6 }, { "F7", kVK_F7 }, { "F8", kVK_F8 },
     { "F9", kVK_F9 }, { "F10", kVK_F10 }, { "F11", kVK_F11 }, { "F12", kVK_F12 },
+    { "CapsLock", kVK_CapsLock },
+    { "Numpad0", kVK_ANSI_Keypad0 }, { "Numpad1", kVK_ANSI_Keypad1 },
+    { "Numpad2", kVK_ANSI_Keypad2 }, { "Numpad3", kVK_ANSI_Keypad3 },
+    { "Numpad4", kVK_ANSI_Keypad4 }, { "Numpad5", kVK_ANSI_Keypad5 },
+    { "Numpad6", kVK_ANSI_Keypad6 }, { "Numpad7", kVK_ANSI_Keypad7 },
+    { "Numpad8", kVK_ANSI_Keypad8 }, { "Numpad9", kVK_ANSI_Keypad9 },
+    { "NumpadDecimal", kVK_ANSI_KeypadDecimal }, { "NumpadAdd", kVK_ANSI_KeypadPlus },
+    { "NumpadSubtract", kVK_ANSI_KeypadMinus }, { "NumpadMultiply", kVK_ANSI_KeypadMultiply },
+    { "NumpadDivide", kVK_ANSI_KeypadDivide }, { "NumpadEqual", kVK_ANSI_KeypadEquals },
+    { "NumLock", kVK_ANSI_KeypadClear },
 };
 
 static CGKeyCode DirectGate_Desktop_MacKeyCodeFromJson(xjson_obj_t *pRoot, xbool_t *pFound)
@@ -369,12 +671,121 @@ static CGKeyCode DirectGate_Desktop_MacKeyCodeFromJson(xjson_obj_t *pRoot, xbool
     return 0;
 }
 
+/* Sends one keyboard event pair carrying a literal UTF-16 chunk. Keycode 0
+ * with an attached unicode string is the standard CGEvent "type text" path
+ * and works for any script without depending on the host keyboard layout. */
+static void DirectGate_Desktop_MacTypeChunk(const UniChar *pChunk, size_t nLength)
+{
+    if (nLength == 0) return;
+
+    CGEventRef down = CGEventCreateKeyboardEvent(NULL, 0, true);
+    if (down != NULL)
+    {
+        CGEventKeyboardSetUnicodeString(down, nLength, pChunk);
+        CGEventPost(kCGHIDEventTap, down);
+        CFRelease(down);
+    }
+
+    CGEventRef up = CGEventCreateKeyboardEvent(NULL, 0, false);
+    if (up != NULL)
+    {
+        CGEventKeyboardSetUnicodeString(up, nLength, pChunk);
+        CGEventPost(kCGHIDEventTap, up);
+        CFRelease(up);
+    }
+}
+
+static void DirectGate_Desktop_MacTapKey(CGKeyCode keyCode)
+{
+    CGEventRef down = CGEventCreateKeyboardEvent(NULL, keyCode, true);
+    if (down != NULL)
+    {
+        CGEventPost(kCGHIDEventTap, down);
+        CFRelease(down);
+    }
+
+    CGEventRef up = CGEventCreateKeyboardEvent(NULL, keyCode, false);
+    if (up != NULL)
+    {
+        CGEventPost(kCGHIDEventTap, up);
+        CFRelease(up);
+    }
+}
+
+static void DirectGate_Desktop_MacTypeText(const char *pText)
+{
+    CFStringRef pString = CFStringCreateWithCString(kCFAllocatorDefault, pText,
+        kCFStringEncodingUTF8);
+    if (pString == NULL) return;
+
+    CFIndex nLength = CFStringGetLength(pString);
+    /* CGEventKeyboardSetUnicodeString caps a single event at 20 UTF-16
+     * units; batch printable runs and press real keys for control chars. */
+    UniChar chunk[20];
+    size_t nChunkLen = 0;
+
+    for (CFIndex i = 0; i < nLength; i++)
+    {
+        UniChar ch = CFStringGetCharacterAtIndex(pString, i);
+
+        if (ch == (UniChar)'\n' || ch == (UniChar)'\r' || ch == (UniChar)'\t')
+        {
+            DirectGate_Desktop_MacTypeChunk(chunk, nChunkLen);
+            nChunkLen = 0;
+
+            if (ch == (UniChar)'\t') DirectGate_Desktop_MacTapKey(kVK_Tab);
+            else DirectGate_Desktop_MacTapKey(kVK_Return);
+
+            /* Swallow the LF of a CRLF pair. */
+            if (ch == (UniChar)'\r' && i + 1 < nLength &&
+                CFStringGetCharacterAtIndex(pString, i + 1) == (UniChar)'\n') i++;
+            continue;
+        }
+
+        /* Flush at 19 of 20 units, except when the next unit is a low
+         * surrogate: the reserved slot keeps its pair in one event. */
+        xbool_t bLowSurrogate = (ch >= 0xDC00U && ch <= 0xDFFFU) ? XTRUE : XFALSE;
+        if (nChunkLen >= sizeof(chunk) / sizeof(chunk[0]) - 1U && !bLowSurrogate)
+        {
+            DirectGate_Desktop_MacTypeChunk(chunk, nChunkLen);
+            nChunkLen = 0;
+        }
+
+        chunk[nChunkLen++] = ch;
+    }
+
+    DirectGate_Desktop_MacTypeChunk(chunk, nChunkLen);
+    CFRelease(pString);
+}
+
+/* Accessibility permission can be granted while a session is already
+ * streaming; recheck lazily (rate limited) so input starts working without
+ * an agent restart, and push a status update so the browser clears its
+ * "input disabled" notice. */
+static xbool_t DirectGate_Desktop_MacEnsureInput(directgate_session_t *pSession)
+{
+    directgate_desktop_t *pDesktop = &pSession->desktop;
+    if (pDesktop->bInputReady) return XTRUE;
+
+    uint64_t nNowMs = XTime_GetMs();
+    if (pDesktop->nInputRecheckMs != 0 && nNowMs - pDesktop->nInputRecheckMs < 2000) return XFALSE;
+    pDesktop->nInputRecheckMs = nNowMs;
+
+    if (!AXIsProcessTrusted()) return XFALSE;
+
+    pDesktop->bInputReady = XTRUE;
+    pDesktop->sInputReason[0] = '\0';
+    DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
+    return XTRUE;
+}
+
 int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t *pPayload, size_t nPayloadLength)
 {
     XCHECK((pSession != NULL), XAPI_DISCONNECT);
     directgate_desktop_t *pDesktop = &pSession->desktop;
 
-    if (!pDesktop->bRunning || !pDesktop->bInputReady) return XAPI_CONTINUE;
+    if (!pDesktop->bRunning) return XAPI_CONTINUE;
+    if (!DirectGate_Desktop_MacEnsureInput(pSession)) return XAPI_CONTINUE;
     if (pPayload == NULL || !nPayloadLength) return XAPI_CONTINUE;
 
     char *pJsonText = (char*)calloc(1, nPayloadLength + 1U);
@@ -438,7 +849,7 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
             uint32_t nButton = XJSON_GetU32(XJSON_GetObject(pRoot, "button"));
             xbool_t bDown = XJSON_GetBool(XJSON_GetObject(pRoot, "down"));
 
-            if (nButton >= 1 && nButton <= 3)
+            if ((nButton >= 1 && nButton <= 3) || nButton == 8 || nButton == 9)
             {
                 if (bDown) pDesktop->nPointerButtons |= (1U << (nButton - 1U));
                 else pDesktop->nPointerButtons &= ~(1U << (nButton - 1U));
@@ -449,6 +860,8 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
 
                 if (event != NULL)
                 {
+                    uint32_t nClicks = DirectGate_Desktop_MacClickCount(pDesktop, nButton, point, bDown);
+                    CGEventSetIntegerValueField(event, kCGMouseEventClickState, (int64_t)nClicks);
                     if (bRelative) DirectGate_Desktop_MacSetRelativeDelta(event, nDx, nDy);
                     CGEventPost(kCGHIDEventTap, event);
                     CFRelease(event);
@@ -458,8 +871,8 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         else if (xstrcmp(pEvent, "wheel"))
         {
             int nDeltaY = XJSON_GetInt(XJSON_GetObject(pRoot, "deltaY"));
-            CGEventRef event = CGEventCreateScrollWheelEvent(NULL,
-                kCGScrollEventUnitPixel, 1, -nDeltaY);
+            int nDeltaX = XJSON_GetInt(XJSON_GetObject(pRoot, "deltaX"));
+            CGEventRef event = CGEventCreateScrollWheelEvent(NULL, kCGScrollEventUnitPixel, 2, -nDeltaY, -nDeltaX);
             if (event != NULL)
             {
                 CGEventPost(kCGHIDEventTap, event);
@@ -499,6 +912,11 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
                 CFRelease(event);
             }
         }
+    }
+    else if (xstrcmp(pAction, "text"))
+    {
+        const char *pText = XJSON_GetString(XJSON_GetObject(pRoot, "text"));
+        if (xstrused(pText)) DirectGate_Desktop_MacTypeText(pText);
     }
 
     XJSON_Destroy(&json);
@@ -541,10 +959,18 @@ static void DirectGate_Desktop_SendMouseRelative(DWORD nFlags, DWORD nMouseData,
     SendInput(1, &input, sizeof(input));
 }
 
-static DWORD DirectGate_Desktop_MouseButtonFlag(uint32_t nButton, xbool_t bDown)
+static DWORD DirectGate_Desktop_MouseButtonFlag(uint32_t nButton, xbool_t bDown, DWORD *pMouseData)
 {
+    *pMouseData = 0;
     if (nButton == 3) return bDown ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
     if (nButton == 2) return bDown ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
+
+    if (nButton == 8 || nButton == 9)
+    {
+        *pMouseData = (nButton == 8) ? XBUTTON1 : XBUTTON2;
+        return bDown ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
+    }
+
     return bDown ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
 }
 
@@ -591,6 +1017,16 @@ static const directgate_win_key_t g_WinKeys[] = {
     { "F4", VK_F4, XFALSE }, { "F5", VK_F5, XFALSE }, { "F6", VK_F6, XFALSE },
     { "F7", VK_F7, XFALSE }, { "F8", VK_F8, XFALSE }, { "F9", VK_F9, XFALSE },
     { "F10", VK_F10, XFALSE }, { "F11", VK_F11, XFALSE }, { "F12", VK_F12, XFALSE },
+    { "Numpad0", VK_NUMPAD0, XFALSE }, { "Numpad1", VK_NUMPAD1, XFALSE },
+    { "Numpad2", VK_NUMPAD2, XFALSE }, { "Numpad3", VK_NUMPAD3, XFALSE },
+    { "Numpad4", VK_NUMPAD4, XFALSE }, { "Numpad5", VK_NUMPAD5, XFALSE },
+    { "Numpad6", VK_NUMPAD6, XFALSE }, { "Numpad7", VK_NUMPAD7, XFALSE },
+    { "Numpad8", VK_NUMPAD8, XFALSE }, { "Numpad9", VK_NUMPAD9, XFALSE },
+    { "NumpadDecimal", VK_DECIMAL, XFALSE }, { "NumpadAdd", VK_ADD, XFALSE },
+    { "NumpadSubtract", VK_SUBTRACT, XFALSE }, { "NumpadMultiply", VK_MULTIPLY, XFALSE },
+    { "NumpadDivide", VK_DIVIDE, XTRUE },
+    { "NumLock", VK_NUMLOCK, XFALSE }, { "ScrollLock", VK_SCROLL, XFALSE },
+    { "PrintScreen", VK_SNAPSHOT, XTRUE }, { "Pause", VK_PAUSE, XFALSE },
 };
 
 static WORD DirectGate_Desktop_WinKeyFromJson(xjson_obj_t *pRoot, xbool_t *pExtended, xbool_t *pFound)
@@ -649,6 +1085,51 @@ static void DirectGate_Desktop_SendKeyInput(WORD nVirtualKey, xbool_t bExtended,
     SendInput(1, &input, sizeof(input));
 }
 
+/* Types a UTF-8 string via KEYEVENTF_UNICODE, which delivers literal
+ * characters to the focused window regardless of the host keyboard layout.
+ * Surrogate halves are sent as-is; the input system reassembles them. */
+static void DirectGate_Desktop_WinTypeText(const char *pText)
+{
+    int nWide = MultiByteToWideChar(CP_UTF8, 0, pText, -1, NULL, 0);
+    if (nWide <= 1) return;
+
+    WCHAR *pWide = (WCHAR*)malloc((size_t)nWide * sizeof(WCHAR));
+    if (pWide == NULL) return;
+
+    if (!MultiByteToWideChar(CP_UTF8, 0, pText, -1, pWide, nWide))
+    {
+        free(pWide);
+        return;
+    }
+
+    for (int i = 0; pWide[i] != L'\0'; i++)
+    {
+        WCHAR wch = pWide[i];
+
+        if (wch == L'\n' || wch == L'\r' || wch == L'\t')
+        {
+            WORD nVirtualKey = (wch == L'\t') ? VK_TAB : VK_RETURN;
+            DirectGate_Desktop_SendKeyInput(nVirtualKey, XFALSE, XTRUE);
+            DirectGate_Desktop_SendKeyInput(nVirtualKey, XFALSE, XFALSE);
+
+            /* Swallow the LF of a CRLF pair. */
+            if (wch == L'\r' && pWide[i + 1] == L'\n') i++;
+            continue;
+        }
+
+        INPUT inputs[2];
+        memset(inputs, 0, sizeof(inputs));
+        inputs[0].type = INPUT_KEYBOARD;
+        inputs[0].ki.wScan = (WORD)wch;
+        inputs[0].ki.dwFlags = KEYEVENTF_UNICODE;
+        inputs[1] = inputs[0];
+        inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        SendInput(2, inputs, sizeof(INPUT));
+    }
+
+    free(pWide);
+}
+
 int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t *pPayload, size_t nPayloadLength)
 {
     XCHECK((pSession != NULL), XAPI_DISCONNECT);
@@ -704,21 +1185,35 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         {
             uint32_t nButton = XJSON_GetU32(XJSON_GetObject(pRoot, "button"));
             xbool_t bDown = XJSON_GetBool(XJSON_GetObject(pRoot, "down"));
-            if (nButton >= 1 && nButton <= 3)
+            if ((nButton >= 1 && nButton <= 3) || nButton == 8 || nButton == 9)
             {
-                DWORD nFlag = DirectGate_Desktop_MouseButtonFlag(nButton, bDown);
-                if (bRelative) DirectGate_Desktop_SendMouseRelative(nFlag, 0, nDx, nDy);
-                else DirectGate_Desktop_SendMouseInput(nFlag, 0, nScreenX, nScreenY);
+                DWORD nMouseData = 0;
+                DWORD nFlag = DirectGate_Desktop_MouseButtonFlag(nButton, bDown, &nMouseData);
+                if (bRelative) DirectGate_Desktop_SendMouseRelative(nFlag, nMouseData, nDx, nDy);
+                else DirectGate_Desktop_SendMouseInput(nFlag, nMouseData, nScreenX, nScreenY);
             }
         }
         else if (xstrcmp(pEvent, "wheel"))
         {
-            /* One notch per event, like the Linux X11 button-4/5 mapping. */
+            /* Same pixel->notch accumulation as the X11 button-4..7 mapping. */
             int nDeltaY = XJSON_GetInt(XJSON_GetObject(pRoot, "deltaY"));
-            DWORD nWheel = (DWORD)(nDeltaY < 0 ? WHEEL_DELTA : -WHEEL_DELTA);
+            int nDeltaX = XJSON_GetInt(XJSON_GetObject(pRoot, "deltaX"));
+            int nNotchesY = DirectGate_Desktop_WheelNotches(&pDesktop->nWheelAccumY, nDeltaY);
+            int nNotchesX = DirectGate_Desktop_WheelNotches(&pDesktop->nWheelAccumX, nDeltaX);
 
-            if (bRelative) DirectGate_Desktop_SendMouseRelative(MOUSEEVENTF_WHEEL, nWheel, nDx, nDy);
-            else DirectGate_Desktop_SendMouseInput(MOUSEEVENTF_WHEEL, nWheel, nScreenX, nScreenY);
+            if (nNotchesY != 0)
+            {
+                DWORD nWheel = (DWORD)(-nNotchesY * WHEEL_DELTA);
+                if (bRelative) DirectGate_Desktop_SendMouseRelative(MOUSEEVENTF_WHEEL, nWheel, nDx, nDy);
+                else DirectGate_Desktop_SendMouseInput(MOUSEEVENTF_WHEEL, nWheel, nScreenX, nScreenY);
+            }
+
+            if (nNotchesX != 0)
+            {
+                DWORD nWheel = (DWORD)(nNotchesX * WHEEL_DELTA);
+                if (bRelative) DirectGate_Desktop_SendMouseRelative(MOUSEEVENTF_HWHEEL, nWheel, nDx, nDy);
+                else DirectGate_Desktop_SendMouseInput(MOUSEEVENTF_HWHEEL, nWheel, nScreenX, nScreenY);
+            }
         }
         else
         {
@@ -750,6 +1245,11 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
             xbool_t bDown = XJSON_GetBool(XJSON_GetObject(pRoot, "down"));
             DirectGate_Desktop_SendKeyInput(nVirtualKey, bExtended, bDown);
         }
+    }
+    else if (xstrcmp(pAction, "text"))
+    {
+        const char *pText = XJSON_GetString(XJSON_GetObject(pRoot, "text"));
+        if (xstrused(pText)) DirectGate_Desktop_WinTypeText(pText);
     }
 
     XJSON_Destroy(&json);
