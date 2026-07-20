@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/desktop/win.c
+ * @file directgate-agent/src/agent/desktop/desktop_win.c
  * @brief Windows DXGI Desktop Duplication capture + Media Foundation H.264 encoder.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
@@ -31,7 +31,7 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 
-/* Counterpart of mac.m: a push-model pipeline on a dedicated
+/* Counterpart of desktop_mac.m: a push-model pipeline on a dedicated
  * capture thread (the main loop must not block in AcquireNextFrame or the
  * hardware encoder), publishing into a single-slot mailbox:
  *

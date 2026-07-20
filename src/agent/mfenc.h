@@ -40,7 +40,7 @@ extern "C" {
  * are handled internally so the caller sees one synchronous Encode call.
  *
  * Not thread-safe: every function including Load must be called from the
- * single capture/encode thread that owns the encoder (win.c). */
+ * single capture/encode thread that owns the encoder (desktop_win.c). */
 
 typedef struct directgate_mfenc_ directgate_mfenc_t;
 

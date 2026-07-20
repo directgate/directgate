@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/desktop/mac.m
+ * @file directgate-agent/src/agent/desktop/desktop_mac.m
  * @brief macOS ScreenCaptureKit + VideoToolbox H.264 encoder for desktop streaming.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.

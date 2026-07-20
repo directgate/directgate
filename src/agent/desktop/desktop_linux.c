@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/desktop/linux.c
+ * @file directgate-agent/src/agent/desktop/desktop_linux.c
  * @brief Linux X11 (XShm) capture + OpenH264 encoder for desktop streaming.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
@@ -32,7 +32,7 @@
 #include <X11/Xutil.h>
 #include <X11/extensions/XShm.h>
 
-/* Counterpart of mac.m: desktop.c drives this pipeline from the
+/* Counterpart of desktop_mac.m: desktop.c drives this pipeline from the
  * main loop. Unlike ScreenCaptureKit there is no push-style capture on
  * Linux, so everything runs synchronously per timer tick:
  *
@@ -88,8 +88,8 @@ static directgate_x11enc_t* DirectGate_Desktop_X11Enc(const directgate_desktop_t
 }
 
 static void DirectGate_Desktop_X11Enc_SetError(directgate_x11enc_t *pEnc,
-                                                directgate_desktop_t *pDesktop,
-                                                const char *pError)
+                                               directgate_desktop_t *pDesktop,
+                                               const char *pError)
 {
     XCHECK_VOID_NL((xstrused(pError)));
     if (pEnc != NULL) xstrncpy(pEnc->sLastError, sizeof(pEnc->sLastError), pError);

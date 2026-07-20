@@ -248,8 +248,8 @@ endif()
 # enumeration + display mode), input.c (pointer/keyboard injection) and
 # stream.c (frame timer/capture/control) all carry the X11 (Linux), macOS,
 # Windows and a no-op fallback path inline behind #if guards. The platform
-# capture/encode pipelines live in mac.m (ScreenCaptureKit/VideoToolbox, Apple
-# only) and win.c (DXGI Desktop Duplication/Media Foundation, added below).
+# capture/encode pipelines live in desktop_mac.m (ScreenCaptureKit/VideoToolbox, Apple
+# only) and desktop_win.c (DXGI Desktop Duplication/Media Foundation, added below).
 add_executable(directgate
     ${AGENT_DIR}/config.c
     ${AGENT_DIR}/desktop/desktop.c
@@ -268,8 +268,8 @@ target_link_libraries(directgate PRIVATE xcommon)
 # ---- desktop streaming backends (platform specific) -----------------------
 if(APPLE)
     # macOS screen capture + VideoToolbox H.264 encoder. Compiled with ARC.
-    target_sources(directgate PRIVATE ${AGENT_DIR}/desktop/mac.m)
-    set_source_files_properties(${AGENT_DIR}/desktop/mac.m
+    target_sources(directgate PRIVATE ${AGENT_DIR}/desktop/desktop_mac.m)
+    set_source_files_properties(${AGENT_DIR}/desktop/desktop_mac.m
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(directgate PRIVATE
         "-framework ApplicationServices"
@@ -282,15 +282,23 @@ if(APPLE)
         "-framework ScreenCaptureKit")
 elseif(UNIX)
     # Linux X11 capture + XTest input (XTest is dlopen'd at runtime, hence dl).
-    # The H.264 pipeline lives in desktop/linux.c (XShm capture) with
+    # The H.264 pipeline lives in desktop/desktop_linux.c (XShm capture) with
     # openh264.c (encoder, dlopen'd at runtime - only the vendored
     # API headers under src/agent/openh264 are needed at build time) and
     # yuv.c (BGRA scaling + I420 conversion). XShm needs Xext.
     find_package(X11 REQUIRED)
     target_sources(directgate PRIVATE
-        ${AGENT_DIR}/desktop/linux.c
+        ${AGENT_DIR}/desktop/desktop_linux.c
         ${AGENT_DIR}/openh264.c
         ${AGENT_DIR}/yuv.c)
+    # System-audio streaming: Opus encoder (opus.c, libopus dlopen'd at runtime)
+    # + cross-platform orchestrator (desktop/audio.c) + PulseAudio/PipeWire
+    # monitor capture (desktop/audio_linux.c, libpulse-simple dlopen'd). All
+    # runtime-only deps, so a host without them still streams video.
+    target_sources(directgate PRIVATE
+        ${AGENT_DIR}/opus.c
+        ${AGENT_DIR}/desktop/audio.c
+        ${AGENT_DIR}/desktop/audio_linux.c)
     target_include_directories(directgate PRIVATE ${X11_INCLUDE_DIR} ${AGENT_DIR}/openh264)
     target_link_libraries(directgate PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
     if(X11_Xrandr_FOUND)
@@ -315,7 +323,7 @@ if(WIN32)
     target_link_libraries(directgate PRIVATE advapi32 wtsapi32 userenv)
 
     # Windows desktop streaming: DXGI Desktop Duplication capture (GDI
-    # fallback) in desktop/win.c with a Media Foundation H.264 encoder in
+    # fallback) in desktop/desktop_win.c with a Media Foundation H.264 encoder in
     # mfenc.c (mfplat.dll is loaded at runtime - N editions ship without
     # Media Foundation - so only static GUID archives are linked, no
     # mfplat import) and yuv.c (BGRA scaling + NV12 conversion).
@@ -323,7 +331,7 @@ if(WIN32)
     # ole32/oleaut32: COM apartment + VARIANT for ICodecAPI.
     # uuid/mfuuid/strmiids/dxguid: interface and media type GUIDs.
     target_sources(directgate PRIVATE
-        ${AGENT_DIR}/desktop/win.c
+        ${AGENT_DIR}/desktop/desktop_win.c
         ${AGENT_DIR}/mfenc.c
         ${AGENT_DIR}/yuv.c)
     target_link_libraries(directgate PRIVATE

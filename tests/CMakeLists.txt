@@ -26,8 +26,8 @@ endfunction()
 # (see the matching block in the top-level CMakeLists).
 function(directgate_smoke_desktop name)
     if(APPLE)
-        target_sources(${name} PRIVATE ${AGENT_DIR}/desktop/mac.m)
-        set_source_files_properties(${AGENT_DIR}/desktop/mac.m
+        target_sources(${name} PRIVATE ${AGENT_DIR}/desktop/desktop_mac.m)
+        set_source_files_properties(${AGENT_DIR}/desktop/desktop_mac.m
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
         target_link_libraries(${name} PRIVATE
             "-framework ApplicationServices"
@@ -40,9 +40,12 @@ function(directgate_smoke_desktop name)
             "-framework ScreenCaptureKit")
     elseif(UNIX)
         target_sources(${name} PRIVATE
-            ${AGENT_DIR}/desktop/linux.c
+            ${AGENT_DIR}/desktop/desktop_linux.c
             ${AGENT_DIR}/openh264.c
-            ${AGENT_DIR}/yuv.c)
+            ${AGENT_DIR}/yuv.c
+            ${AGENT_DIR}/opus.c
+            ${AGENT_DIR}/desktop/audio.c
+            ${AGENT_DIR}/desktop/audio_linux.c)
         target_include_directories(${name} PRIVATE ${X11_INCLUDE_DIR} ${AGENT_DIR}/openh264)
         target_link_libraries(${name} PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS} Xrandr Xext)
     endif()
@@ -59,6 +62,7 @@ foreach(test
         transfer_smoke
         webrtc_config_smoke
         webrtc_rtcp_smoke
+        webrtc_audio_smoke
         api_invalid_role_smoke
         keyauth_smoke
         files_static_smoke
@@ -95,6 +99,11 @@ if(UNIX AND NOT APPLE)
     target_include_directories(openh264_smoke PRIVATE ${AGENT_DIR}/openh264)
     target_link_libraries(openh264_smoke PRIVATE ${CMAKE_DL_LIBS})
     set_tests_properties(openh264_smoke PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Opus encoder wrapper: skips (77) when libopus is absent, like openh264.
+    directgate_smoke(opus_smoke ${AGENT_DIR}/opus.c)
+    target_link_libraries(opus_smoke PRIVATE ${CMAKE_DL_LIBS} m)
+    set_tests_properties(opus_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
     # Compiles the X11 input unit directly (like files_static_smoke) to test
     # the browser-key -> keysym mapping; needs Xlib but no running X server.

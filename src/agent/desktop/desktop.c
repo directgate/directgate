@@ -381,6 +381,11 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
 {
     XCHECK_VOID_NL((pDesktop != NULL));
 
+#ifdef DIRECTGATE_DESKTOP_HAS_AUDIO
+    /* Stop the capture/encode thread before the rest of the desktop teardown. */
+    DirectGate_Desktop_AudioStop(pDesktop);
+#endif
+
 #if defined(__APPLE__)
     if (pDesktop->pEncoder != NULL)
     {
@@ -585,6 +590,15 @@ int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const char *pS
     XJSON_AddU32(pRoot, "screenHeight", pSession->desktop.nScreenHeight);
     XJSON_AddU32(pRoot, "bitrateKbps", pSession->desktop.nCurrentBitrateKbps ?
         pSession->desktop.nCurrentBitrateKbps : pSession->desktop.quality.nBitrateKbps);
+
+    /* System-audio state for the viewer's mute control. "capturing" once the
+     * opt-in Opus stream is live, "unavailable" when it was requested but could
+     * not start (reason attached), "off" otherwise. */
+    const char *pAudioState = pSession->desktop.bAudioReady ? "capturing" :
+                              (pSession->desktop.bAudioRequested ? "unavailable" : "off");
+
+    XJSON_AddString(pRoot, "audio", pAudioState);
+    XJSON_AddStrIfUsed(pRoot, "audioReason", pSession->desktop.sAudioReason);
 
 #if defined(_WIN32)
     XJSON_AddBool(pRoot, "fastInput", XTRUE);

@@ -48,12 +48,15 @@ Desktop **video** depends on the active pipeline:
 
 The trade-off is that on the `webrtc-video` pipeline the confidentiality of the video stream rests on DTLS-SRTP (as implemented by libdatachannel) instead of the application-layer AES-SIV construction described above. The agent reports the active pipeline and its transport (`dtls-srtp` or `aes-siv-datachannel`) to the client, so you can always see which protection is in effect for a live session.
 
+Desktop **audio** (the host's system output, when enabled) is carried the same way as `webrtc-video`: a send-only Opus track on the same DTLS-SRTP connection, so it inherits the identical end-to-end guarantee and a relay sees only encrypted media. Audio is **opt-in** - the host captures nothing until the client explicitly enables it, and only ever captures the default output device's loopback, never a microphone.
+
 ## What a desktop session can do
 
 A desktop session necessarily has two capabilities, and it is worth being explicit about them rather than leaving them implied:
 
 - **Screen capture** - the agent captures the display the client selects (X11/XShm on Linux, DXGI Desktop Duplication with a GDI fallback on Windows, ScreenCaptureKit on macOS) for as long as the session is active.
 - **Input injection** - the agent injects the mouse and keyboard events the client sends (XTest on Linux, `SendInput` on Windows, `CGEvent` on macOS).
+- **System-audio capture** (opt-in, off by default) - when the client enables it, the agent captures the default output device's loopback (the PulseAudio / PipeWire monitor on Linux) for as long as it stays enabled. It is never a microphone, and it stops the moment the client disables it or the session ends.
 
 Remote desktop cannot function without these; they are the feature, not a side effect. Both are constrained the same way as every other session capability:
 

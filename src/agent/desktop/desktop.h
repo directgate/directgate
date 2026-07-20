@@ -178,8 +178,16 @@ typedef struct directgate_desktop_ {
     /* Platform encoder state (opaque to cross-platform code): the macOS
      * ScreenCaptureKit/VideoToolbox encoder, the Linux X11/OpenH264
      * pipeline or the Windows DXGI/MediaFoundation pipeline, owned by
-     * mac.m / linux.c / win.c respectively. */
+     * desktop_mac.m / desktop_linux.c / desktop_win.c respectively. */
     void *pEncoder;
+    /* System-audio capture -> Opus -> WebRTC audio track (opaque
+     * directgate_audio_t*, owned by desktop/audio.c). Strictly additive to the
+     * video pipeline; opt-in via desktop-control so nothing is captured until
+     * the viewer enables sound. */
+    void *pAudio;
+    xbool_t bAudioRequested;  /* browser opted in to system audio */
+    xbool_t bAudioReady;      /* capture + encode thread is live */
+    char sAudioReason[DIRECTGATE_DESKTOP_REASON_LEN]; /* why audio is unavailable */
 #if defined(__APPLE__) || defined(_WIN32)
     /* macOS and Windows have no timerfd: a pipe/socket pair plus a timer
      * thread emulate the periodic wake-up (write end below, read end in
@@ -240,6 +248,28 @@ void DirectGate_Desktop_ComputeOutputSize(const directgate_desktop_t *pDesktop,
  * another frame; platform encoders skip the capture entirely in that case. */
 xbool_t DirectGate_Desktop_ShouldSkipForBackpressure(const directgate_session_t *pSession);
 
+/* System-audio streaming (desktop/audio.c + per-platform capture backend).
+ * DIRECTGATE_DESKTOP_HAS_AUDIO gates the call sites so platforms without a
+ * capture backend yet still link (audio simply stays "unavailable"). Grows to
+ * `|| defined(_WIN32) || defined(__APPLE__)` as those backends land. */
+#if defined(__linux__)
+#define DIRECTGATE_DESKTOP_HAS_AUDIO 1
+#endif
+
+#ifdef DIRECTGATE_DESKTOP_HAS_AUDIO
+/* Starts opt-in system-audio capture: creates the Opus encoder, opens the
+ * platform loopback source and spawns the capture/encode thread. Returns
+ * XSTDOK, or XSTDERR with pDesktop->sAudioReason set (video is untouched). */
+int  DirectGate_Desktop_AudioStart(directgate_session_t *pSession);
+/* Stops capture and tears down the thread/encoder/backend (idempotent). Takes
+ * the desktop struct so it can run from DirectGate_Desktop_Clear. */
+void DirectGate_Desktop_AudioStop(directgate_desktop_t *pDesktop);
+/* Drains the encoded-Opus mailbox on the main loop and sends each frame over
+ * the WebRTC audio track. Called from DirectGate_Desktop_Process every tick;
+ * a no-op unless the audio track is open. */
+void DirectGate_Desktop_AudioDrainMain(directgate_session_t *pSession);
+#endif
+
 #if defined(__APPLE__)
 /* Returns an owned CGImageRef as an opaque pointer. The caller must release it
  * with CGImageRelease. Keeping the CoreGraphics type out of this header avoids
@@ -249,7 +279,7 @@ void* DirectGate_Desktop_MacCaptureImage(int32_t nX, int32_t nY,
                                      char *pError, size_t nErrorSize);
 
 /* ScreenCaptureKit + VideoToolbox encoder lifecycle. Implemented in
- * mac.m and only called by desktop.c on Darwin. */
+ * desktop_mac.m and only called by desktop.c on Darwin. */
 int DirectGate_Desktop_MacEncoder_Start(directgate_session_t *pSession,
                                         int32_t nX, int32_t nY,
                                         uint32_t nWidth, uint32_t nHeight);
@@ -270,7 +300,7 @@ int DirectGate_Desktop_MacEncoder_DrainMain(directgate_session_t *pSession);
 
 #if defined(__linux__)
 /* X11 (XShm) capture + OpenH264 encoder pipeline. Implemented in
- * linux.c and only called by desktop.c on Linux. */
+ * desktop_linux.c and only called by desktop.c on Linux. */
 int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
                                           int32_t nX, int32_t nY,
                                           uint32_t nWidth, uint32_t nHeight);
@@ -293,9 +323,9 @@ int DirectGate_Desktop_LinuxEncoder_ProcessTick(directgate_session_t *pSession);
 
 #if defined(_WIN32)
 /* DXGI Desktop Duplication (GDI fallback) capture + Media Foundation H.264
- * encoder pipeline. Implemented in win.c and only called by
+ * encoder pipeline. Implemented in desktop_win.c and only called by
  * desktop.c on Windows. Capture and encode run on a dedicated thread (the
- * push model of mac.m); encoded frames land in a single-slot
+ * push model of desktop_mac.m); encoded frames land in a single-slot
  * mailbox drained by DirectGate_Desktop_WinEncoder_DrainMain on the main
  * loop after a timer-pair wake-up. */
 int DirectGate_Desktop_WinEncoder_Start(directgate_session_t *pSession,

@@ -380,6 +380,13 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
         while (read(pDesktop->nTimerFd, &nTicks, sizeof(nTicks)) > 0) {}
     }
 
+#ifdef DIRECTGATE_DESKTOP_HAS_AUDIO
+    /* Ship any encoded Opus frames the capture thread queued. Runs before the
+     * video encode so audio is never delayed by this tick's frame, and is a
+     * no-op unless the audio track is open. */
+    DirectGate_Desktop_AudioDrainMain(pSession);
+#endif
+
     /* The H.264 pipeline captures + encodes synchronously on each tick;
      * the raw path keeps the legacy pull-per-tick behavior. */
     if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||
@@ -582,6 +589,18 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
     {
         if (DirectGate_Desktop_FallbackToDataChannel(pSession))
             DirectGate_Desktop_LinuxEncoder_RequestKeyframe(pSession);
+    }
+    else if (xstrcmp(pAction, "audio"))
+    {
+        /* Opt-in system-audio toggle. Capture never runs until the viewer asks
+         * for it; a failed start reports "unavailable" and leaves video alone. */
+        xbool_t bEnable = XJSON_GetBool(XJSON_GetObject(pRoot, "enabled")) ? XTRUE : XFALSE;
+        pDesktop->bAudioRequested = bEnable;
+
+        if (bEnable) (void)DirectGate_Desktop_AudioStart(pSession);
+        else DirectGate_Desktop_AudioStop(pDesktop);
+
+        DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
     }
 
     XJSON_Destroy(&json);

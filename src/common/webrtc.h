@@ -26,10 +26,10 @@
 #include <pthread.h>
 #include <rtc/rtc.h>
 
-#define DIRECTGATE_KA_INTERVAL_SEC  25
-#define DIRECTGATE_MAX_ICE_SERVERS  8
-#define DIRECTGATE_ICE_URL_SIZE     256
-#define DIRECTGATE_RTC_VIDEO_MID_SIZE 32
+#define DIRECTGATE_KA_INTERVAL_SEC      25
+#define DIRECTGATE_MAX_ICE_SERVERS      8
+#define DIRECTGATE_ICE_URL_SIZE         256
+#define DIRECTGATE_RTC_VIDEO_MID_SIZE   32
 
 #ifdef __cplusplus
 extern "C" {
@@ -49,6 +49,8 @@ typedef enum {
     DIRECTGATE_WEBRTC_VIDEO_OPEN,
     DIRECTGATE_WEBRTC_VIDEO_CLOSED,
     DIRECTGATE_WEBRTC_VIDEO_KEYFRAME,
+    DIRECTGATE_WEBRTC_AUDIO_OPEN,
+    DIRECTGATE_WEBRTC_AUDIO_CLOSED,
     DIRECTGATE_WEBRTC_PENDING_DIRECT,
     DIRECTGATE_WEBRTC_PENDING_FAILED
 } directgate_webrtc_event_type_t;
@@ -141,6 +143,32 @@ typedef struct directgate_webrtc_ {
      * main-loop bitrate controller via TakeVideoLossReport. */
     volatile int nVideoFractionLost;
     volatile xbool_t bVideoLossUpdated;
+
+    /* Outbound desktop audio (Opus) track. Strictly additive to the video
+     * track: it rides the same DTLS-SRTP connection with an identical
+     * send-only / manual-RTP model. Promotion readiness never depends on the
+     * audio track (audio is opt-in), so a missing or unopened audio track
+     * never blocks the TURN->P2P upgrade or the video pipeline. */
+    xbool_t bAudioEnabled;      /* Offer answers may include a desktop audio track */
+    int nAudioTrackID;          /* Outbound audio track ID (-1 if unavailable) */
+    xbool_t bAudioTrackOpen;    /* Outbound audio track is open */
+    uint8_t nAudioPayloadType;
+    uint16_t nAudioSeq;
+    uint32_t nAudioSsrc;
+    uint32_t nAudioTimestamp;   /* 48 kHz Opus RTP clock */
+    uint64_t nAudioLastPtsUs;
+    xbool_t bAudioHasTimestamp;
+    char sAudioMid[DIRECTGATE_RTC_VIDEO_MID_SIZE];
+
+    int nPendingAudioTrackID;
+    xbool_t bPendingAudioOpen;
+    uint8_t nPendingAudioPayloadType;
+    uint16_t nPendingAudioSeq;
+    uint32_t nPendingAudioSsrc;
+    uint32_t nPendingAudioTimestamp;
+    uint64_t nPendingAudioLastPtsUs;
+    xbool_t bPendingAudioHasTimestamp;
+    char sPendingAudioMid[DIRECTGATE_RTC_VIDEO_MID_SIZE];
 } directgate_webrtc_t;
 
 void DirectGate_WebRTC_Init(directgate_webrtc_t *pRTC);
@@ -187,6 +215,13 @@ xbool_t DirectGate_WebRTC_HasVideoTrack(const directgate_webrtc_t *pRTC);
 xbool_t DirectGate_WebRTC_IsVideoOpen(const directgate_webrtc_t *pRTC);
 xbool_t DirectGate_WebRTC_TakeVideoKeyframeRequest(directgate_webrtc_t *pRTC);
 
+/* Enable a send-only Opus audio track when answering a browser offer. The
+ * track is negotiated whenever the offer advertises Opus, but nothing is sent
+ * until the capture backend feeds frames (opt-in via desktop-control). */
+void DirectGate_WebRTC_SetAudioEnabled(directgate_webrtc_t *pRTC, xbool_t bEnabled);
+xbool_t DirectGate_WebRTC_HasAudioTrack(const directgate_webrtc_t *pRTC);
+xbool_t DirectGate_WebRTC_IsAudioOpen(const directgate_webrtc_t *pRTC);
+
 /* Consumes the latest RTCP receiver-report loss signal for the video track.
  * Returns XTRUE when a new report arrived since the last call and stores
  * the fraction-lost octet (lost packets * 256 / expected) in pFractionLost. */
@@ -196,7 +231,13 @@ xbool_t DirectGate_WebRTC_TakeVideoLossReport(directgate_webrtc_t *pRTC, uint8_t
  * request (PLI/FIR) and the highest fraction-lost across RR/SR report
  * blocks (-1 when no report block is present). Exposed for tests. */
 void DirectGate_WebRTC_ParseRtcp(const uint8_t *pData, size_t nSize,
-                             xbool_t *pKeyframeRequest, int *pFractionLost);
+                                 xbool_t *pKeyframeRequest, int *pFractionLost);
+
+/* Locates the browser offer's recv-only Opus audio m-line and reports its
+ * payload type and mid. Returns XFALSE when the offer advertises no Opus audio.
+ * Exposed for tests. */
+xbool_t DirectGate_WebRTC_ParseRemoteOpus(const char *pSdp, uint8_t *pPayloadType,
+                                          char *pMid, size_t nMidSize);
 
 /* Send one Annex-B H.264 access unit over the negotiated WebRTC media track.
  * Returns XSTDERR if no open video track is available or a packet send fails. */
@@ -204,6 +245,16 @@ XSTATUS DirectGate_WebRTC_SendH264AnnexB(directgate_webrtc_t *pRTC,
                                          const uint8_t *pData,
                                          size_t nLen,
                                          uint64_t nPtsUs);
+
+/* Send one encoded Opus frame over the negotiated WebRTC audio track as a
+ * single RTP packet (Opus frames stay under the RTP payload limit, so no
+ * fragmentation). nPtsUs anchors the 48 kHz timestamp so audio and video
+ * presentation stay aligned. Returns XSTDERR if no open audio track is
+ * available or the packet send fails. */
+XSTATUS DirectGate_WebRTC_SendOpus(directgate_webrtc_t *pRTC,
+                                   const uint8_t *pData,
+                                   size_t nLen,
+                                   uint64_t nPtsUs);
 
 /* Drain queued events and dispatch callbacks on the calling (main) thread */
 void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC);
