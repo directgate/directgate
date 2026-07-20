@@ -1079,11 +1079,135 @@ static int DirectGate_HandleCmd(xapi_session_t *pApiSession, directgate_pkg_t *p
     return XAPI_CONTINUE;
 }
 
-static int DirectGate_Admin_SendResp(directgate_session_t *pSession, const char *pStatus, const char *pReason)
+static void DirectGate_TemporaryDesktopShare_Clear(directgate_temporary_desktop_share_t *pShare)
+{
+    XCHECK_VOID_NL((pShare != NULL));
+    OPENSSL_cleanse(pShare, sizeof(*pShare));
+}
+
+static void DirectGate_TemporaryDesktopShares_Cleanup(directgate_conn_t *pConn, uint64_t nNowMs)
+{
+    XCHECK_VOID_NL((pConn != NULL));
+
+    for (int i = 0; i < DIRECTGATE_MAX_TEMPORARY_DESKTOP_SHARES; i++)
+    {
+        directgate_temporary_desktop_share_t *pShare = &pConn->temporaryDesktopShares[i];
+        if (xstrused(pShare->sShareId) && (pShare->bUsed || nNowMs >= pShare->nExpiresMs))
+            DirectGate_TemporaryDesktopShare_Clear(pShare);
+    }
+}
+
+static directgate_temporary_desktop_share_t* DirectGate_TemporaryDesktopShare_Find(directgate_conn_t *pConn, const char *pShareId, uint64_t nNowMs)
+{
+    XCHECK_NL((pConn != NULL), NULL);
+    XCHECK_NL((xstrused(pShareId)), NULL);
+    DirectGate_TemporaryDesktopShares_Cleanup(pConn, nNowMs);
+
+    for (int i = 0; i < DIRECTGATE_MAX_TEMPORARY_DESKTOP_SHARES; i++)
+    {
+        directgate_temporary_desktop_share_t *pShare = &pConn->temporaryDesktopShares[i];
+        if (!pShare->bUsed && pShare->nExpiresMs > nNowMs && xstrcmp(pShare->sShareId, pShareId)) return pShare;
+    }
+
+    return NULL;
+}
+
+static xbool_t DirectGate_TemporaryDesktopShare_Provision(directgate_conn_t *pConn, const directgate_pkg_admin_t *pAdminPkg)
+{
+    XCHECK_NL((pConn != NULL), XFALSE);
+    XCHECK_NL((pAdminPkg != NULL), XFALSE);
+
+    if (!xstrused(pAdminPkg->pShareId) || strlen(pAdminPkg->pShareId) >= XSTR_MID ||
+        !xstrused(pAdminPkg->pSalt) || !xstrused(pAdminPkg->pVerifier) ||
+        strlen(pAdminPkg->pSalt) >= DIRECTGATE_AUTH_SALT_HEX_SIZE ||
+        strlen(pAdminPkg->pVerifier) >= DIRECTGATE_AUTH_VERIFIER_HEX_SIZE ||
+        pAdminPkg->nTtlSeconds < 300 || pAdminPkg->nTtlSeconds > 28800)
+        return XFALSE;
+
+    directgate_auth_t auth;
+    DirectGate_AuthInit(&auth);
+    xstrncpy(auth.sSaltHex, sizeof(auth.sSaltHex), pAdminPkg->pSalt);
+    xstrncpy(auth.sVerifierHex, sizeof(auth.sVerifierHex), pAdminPkg->pVerifier);
+    auth.nSuite = DIRECTGATE_SRP_SUITE;
+
+    uint8_t salt[DIRECTGATE_SRP_SALT_SIZE];
+    directgate_srp_t validation;
+    memset(&validation, 0, sizeof(validation));
+
+    xbool_t bValid = DirectGate_AuthSaltHexToBytes(auth.sSaltHex, salt, sizeof(salt)) &&
+        DirectGate_SRP_Init(&validation) &&
+        DirectGate_SRP_LoadVerifier(&validation, salt, sizeof(salt), auth.sVerifierHex);
+
+    OPENSSL_cleanse(salt, sizeof(salt));
+    DirectGate_SRP_Destroy(&validation);
+
+    if (!bValid)
+    {
+        OPENSSL_cleanse(&auth, sizeof(auth));
+        return XFALSE;
+    }
+
+    uint64_t nNowMs = XTime_GetMs();
+    DirectGate_TemporaryDesktopShares_Cleanup(pConn, nNowMs);
+    directgate_temporary_desktop_share_t *pSlot = NULL;
+
+    for (int i = 0; i < DIRECTGATE_MAX_TEMPORARY_DESKTOP_SHARES; i++)
+    {
+        directgate_temporary_desktop_share_t *pCandidate = &pConn->temporaryDesktopShares[i];
+        if (xstrcmp(pCandidate->sShareId, pAdminPkg->pShareId))
+        {
+            pSlot = pCandidate;
+            break;
+        }
+
+        if (pSlot == NULL && !xstrused(pCandidate->sShareId)) pSlot = pCandidate;
+    }
+
+    if (pSlot == NULL)
+    {
+        OPENSSL_cleanse(&auth, sizeof(auth));
+        return XFALSE;
+    }
+
+    DirectGate_TemporaryDesktopShare_Clear(pSlot);
+    pSlot->auth = auth;
+
+    xstrncpy(pSlot->sShareId, sizeof(pSlot->sShareId), pAdminPkg->pShareId);
+    pSlot->nExpiresMs = nNowMs + ((uint64_t)pAdminPkg->nTtlSeconds * 1000ULL);
+
+    return XTRUE;
+}
+
+static xbool_t DirectGate_TemporaryDesktopShare_Revoke(directgate_conn_t *pConn, const char *pShareId)
+{
+    XCHECK_NL((pConn != NULL), XFALSE);
+    XCHECK_NL((xstrused(pShareId) && strlen(pShareId) < XSTR_MID), XFALSE);
+
+    for (int i = 0; i < DIRECTGATE_MAX_TEMPORARY_DESKTOP_SHARES; i++)
+    {
+        directgate_temporary_desktop_share_t *pShare = &pConn->temporaryDesktopShares[i];
+        if (xstrcmp(pShare->sShareId, pShareId)) DirectGate_TemporaryDesktopShare_Clear(pShare);
+    }
+
+    for (int i = 0; i < DIRECTGATE_MAX_SESSIONS; i++)
+    {
+        directgate_session_t *pSession = pConn->mgr.pSessions[i];
+
+        if (pSession != NULL && pSession->bDesktopShare &&
+            xstrcmp(pSession->sDesktopShareId, pShareId))
+            DirectGate_Session_Close(pSession, "temporary desktop share revoked");
+    }
+    return XTRUE;
+}
+
+static int DirectGate_Admin_SendActionResp(directgate_session_t *pSession,
+                                           const char *pAction,
+                                           const char *pStatus,
+                                           const char *pReason)
 {
     XCHECK_NL((pSession != NULL), XAPI_CONTINUE);
 
-    xjson_obj_t *pHeader = DirectGate_Proto_BuildAdmin("add-key-result", NULL, pStatus, pReason, pSession->nSessionId);
+    xjson_obj_t *pHeader = DirectGate_Proto_BuildAdmin(pAction, NULL, pStatus, pReason, pSession->nSessionId);
     XCHECK_NL((pHeader != NULL), xthrowr(XAPI_DISCONNECT, "Proto: Failed to build admin response header"));
 
     int nStatus = DirectGate_Session_Send(pSession, pHeader, NULL, XSTDNON);
@@ -1107,12 +1231,44 @@ static int DirectGate_HandleAdmin(xapi_session_t *pApiSession, directgate_pkg_t 
         return XAPI_CONTINUE;
     }
 
+    if (pSession->bDesktopShare)
+    {
+        xlogw("Admin message rejected for temporary desktop share: sid(%u), action(%s)",
+            pSession->nSessionId, pAdminPkg->pAction ? pAdminPkg->pAction : "N/A");
+
+        return DirectGate_Admin_SendActionResp(pSession, "admin-result", "error",
+            "temporary share cannot perform admin actions");
+    }
+
     if (!xstrused(pAdminPkg->pAction))
     {
         xlogw("Admin message is missing action: sid(%u), wsfd(%d)",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
 
-        return DirectGate_Admin_SendResp(pSession, "error", "missing-action");
+        return DirectGate_Admin_SendActionResp(pSession, "admin-result", "error", "missing-action");
+    }
+
+    if (xstrcmp(pAdminPkg->pAction, "desktop-share-provision"))
+    {
+        if (pSession->eActiveMode != DIRECTGATE_SESSION_MODE_DESKTOP)
+            return DirectGate_Admin_SendActionResp(pSession, "desktop-share-result", "error", "desktop session required");
+
+        if (!DirectGate_TemporaryDesktopShare_Provision(pConn, pAdminPkg))
+            return DirectGate_Admin_SendActionResp(pSession, "desktop-share-result", "error", "invalid-or-capacity");
+
+        xlogi("Temporary desktop share provisioned: sid(%u), share(%s), ttl(%u)",
+            pSession->nSessionId, pAdminPkg->pShareId, pAdminPkg->nTtlSeconds);
+
+        return DirectGate_Admin_SendActionResp(pSession, "desktop-share-result", "ok", NULL);
+    }
+
+    if (xstrcmp(pAdminPkg->pAction, "desktop-share-revoke"))
+    {
+        if (!DirectGate_TemporaryDesktopShare_Revoke(pConn, pAdminPkg->pShareId))
+            return DirectGate_Admin_SendActionResp(pSession, "desktop-share-result", "error", "invalid-share-id");
+
+        xlogi("Temporary desktop share revoked: sid(%u), share(%s)", pSession->nSessionId, pAdminPkg->pShareId);
+        return DirectGate_Admin_SendActionResp(pSession, "desktop-share-result", "ok", NULL);
     }
 
     if (xstrcmp(pAdminPkg->pAction, "add-key"))
@@ -1122,7 +1278,7 @@ static int DirectGate_HandleAdmin(xapi_session_t *pApiSession, directgate_pkg_t 
             xlogw("admin/add-key missing clientPub: sid(%u), wsfd(%d)",
                 pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
 
-            return DirectGate_Admin_SendResp(pSession, "error", "missing-client-pub");
+            return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "error", "missing-client-pub");
         }
 
         directgate_add_key_result_t eResult = DirectGate_AddAuthorizedKey(pConn->pCfg, pAdminPkg->pClientPub);
@@ -1132,7 +1288,7 @@ static int DirectGate_HandleAdmin(xapi_session_t *pApiSession, directgate_pkg_t 
             xlogw("admin/add-key rejected invalid pubkey: sid(%u), wsfd(%d)",
                 pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
 
-            return DirectGate_Admin_SendResp(pSession, "error", "invalid-key");
+            return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "error", "invalid-key");
         }
 
         if (eResult == DIRECTGATE_ADD_KEY_FULL)
@@ -1140,7 +1296,7 @@ static int DirectGate_HandleAdmin(xapi_session_t *pApiSession, directgate_pkg_t 
             xloge("admin/add-key rejected, authorizedKeys full: sid(%u), wsfd(%d), max(%d)",
                 pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), DIRECTGATE_MAX_AUTHORIZED_KEYS);
 
-            return DirectGate_Admin_SendResp(pSession, "error", "capacity-full");
+            return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "error", "capacity-full");
         }
 
         if (eResult == DIRECTGATE_ADD_KEY_ALREADY)
@@ -1148,7 +1304,7 @@ static int DirectGate_HandleAdmin(xapi_session_t *pApiSession, directgate_pkg_t 
             xlogi("admin/add-key already present: sid(%u), wsfd(%d)",
                 pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
 
-            return DirectGate_Admin_SendResp(pSession, "already", NULL);
+            return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "already", NULL);
         }
 
         if (!DirectGate_SaveConfig(pConn->pCfg))
@@ -1157,20 +1313,20 @@ static int DirectGate_HandleAdmin(xapi_session_t *pApiSession, directgate_pkg_t 
                 pSession->nSessionId, DirectGate_Session_GetWsFd(pSession),
                 pConn->pCfg->sCfgPath);
 
-            return DirectGate_Admin_SendResp(pSession, "error", "persist-failed");
+            return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "error", "persist-failed");
         }
 
         xlogi("admin/add-key appended authorized key: sid(%u), wsfd(%d), count(%u)",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession),
             (unsigned)pConn->pCfg->keyauth.nAuthorizedKeyCount);
 
-        return DirectGate_Admin_SendResp(pSession, "ok", NULL);
+        return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "ok", NULL);
     }
 
     xlogw("Unknown admin action: sid(%u), wsfd(%d), action(%s)",
         pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), pAdminPkg->pAction);
 
-    return DirectGate_Admin_SendResp(pSession, "error", "unknown-action");
+    return DirectGate_Admin_SendActionResp(pSession, "admin-result", "error", "unknown-action");
 }
 
 static int DirectGate_HandleData(xapi_session_t *pApiSession, directgate_pkg_t *pPkg)
@@ -1187,8 +1343,7 @@ static int DirectGate_HandleData(xapi_session_t *pApiSession, directgate_pkg_t *
         if (!pDataPkg->pPayloadType) return XAPI_CONTINUE;
 
         if (xstrcmp(pDataPkg->pPayloadType, "desktop-control/json"))
-            return DirectGate_Desktop_HandleControl(pSession,
-                pDataPkg->pPayload, pDataPkg->nPayloadLength);
+            return DirectGate_Desktop_HandleControl(pSession, pDataPkg->pPayload, pDataPkg->nPayloadLength);
 
         if (!xstrcmp(pDataPkg->pPayloadType, "desktop-input/json"))
             return XAPI_CONTINUE;
@@ -1455,6 +1610,12 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
 
     xbool_t bKeyMethod = (xstrused(pAuth->pMethod) && xstrcmp(pAuth->pMethod, "key"));
 
+    if (bKeyMethod && xstrused(pAuth->pDesktopShareId))
+    {
+        DirectGate_Session_SendAuthResp(pSession, "failed", NULL, "temporary desktop shares require SRP");
+        return DirectGate_Session_Close(pSession, "invalid temporary share auth method");
+    }
+
     if (bKeyMethod && xstrcmp(pAuth->pAction, "hello") && pSession->bKeyAuthActive)
     {
         xlogw("Ignoring duplicate key-auth hello while challenge is pending: sid(%u), wsfd(%d), state(%s)",
@@ -1659,7 +1820,37 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
 
     if (xstrcmp(pAuth->pAction, "hello"))
     {
-        if (!DirectGate_AuthIsConfigured(&pCfg->auth))
+        const directgate_auth_t *pSrpAuth = &pCfg->auth;
+
+        if (xstrused(pAuth->pDesktopShareId))
+        {
+            directgate_temporary_desktop_share_t *pShare;
+            pShare = DirectGate_TemporaryDesktopShare_Find(pConn, pAuth->pDesktopShareId, XTime_GetMs());
+            if (pShare == NULL)
+            {
+                DirectGate_Session_SendAuthResp(pSession, "failed", NULL, "temporary desktop share is invalid or expired");
+                return DirectGate_Session_Close(pSession, "invalid temporary desktop share");
+            }
+
+            uint8_t shareSalt[DIRECTGATE_SRP_SALT_SIZE];
+            DirectGate_SRP_Destroy(&pSession->srp);
+
+            if (!DirectGate_SRP_Init(&pSession->srp) ||
+                !DirectGate_AuthSaltHexToBytes(pShare->auth.sSaltHex, shareSalt, sizeof(shareSalt)) ||
+                !DirectGate_SRP_LoadVerifier(&pSession->srp, shareSalt, sizeof(shareSalt), pShare->auth.sVerifierHex))
+            {
+                OPENSSL_cleanse(shareSalt, sizeof(shareSalt));
+                DirectGate_Session_SendAuthResp(pSession, "failed", NULL, "agent error");
+                return DirectGate_Session_Close(pSession, "temporary share verifier load failed");
+            }
+
+            OPENSSL_cleanse(shareSalt, sizeof(shareSalt));
+            pSrpAuth = &pShare->auth;
+            pSession->bDesktopSharePending = XTRUE;
+            xstrncpy(pSession->sDesktopShareId, sizeof(pSession->sDesktopShareId), pAuth->pDesktopShareId);
+        }
+
+        if (!DirectGate_AuthIsConfigured(pSrpAuth))
         {
             xlogw("SRP hello received but SRP is not configured: sid(%u), wsfd(%d)",
                 pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
@@ -1738,7 +1929,7 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
             return XAPI_CONTINUE;
         }
 
-        xjson_obj_t *pChal = DirectGate_Proto_BuildAuthChallenge(pCfg->auth.sSaltHex, sBHex, sNonceHex, pCfg->auth.nSuite, nSessId);
+        xjson_obj_t *pChal = DirectGate_Proto_BuildAuthChallenge(pSrpAuth->sSaltHex, sBHex, sNonceHex, pSrpAuth->nSuite, nSessId);
         XCHECK((pChal != NULL), xthrowr(XAPI_DISCONNECT, "SRP: Failed to build auth challenge header"));
 
         XCHECK_CALL((DirectGate_Session_Send(pSession, pChal, NULL, 0) >= 0),
@@ -1750,6 +1941,17 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
 
     if (xstrcmp(pAuth->pAction, "proof"))
     {
+        directgate_temporary_desktop_share_t *pTemporaryShare = NULL;
+        if (pSession->bDesktopSharePending)
+        {
+            pTemporaryShare = DirectGate_TemporaryDesktopShare_Find(pConn, pSession->sDesktopShareId, XTime_GetMs());
+            if (pTemporaryShare == NULL)
+            {
+                DirectGate_Session_SendAuthResp(pSession, "failed", NULL, "temporary desktop share is invalid or expired");
+                return DirectGate_Session_Close(pSession, "temporary desktop share expired");
+            }
+        }
+
         if (!xstrused(pAuth->pM1))
         {
             xloge("SRP proof is missing M1: sid(%u), wsfd(%d)",
@@ -1765,8 +1967,24 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
             xloge("SRP proof verification failed: sid(%u), wsfd(%d)",
                 pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
 
+            if (pTemporaryShare != NULL)
+            {
+                ++pTemporaryShare->nFailedAttempts;
+                if (pTemporaryShare->nFailedAttempts >= DIRECTGATE_TEMPORARY_DESKTOP_SHARE_MAX_FAILURES)
+                    pTemporaryShare->bUsed = XTRUE;
+            }
+
             DirectGate_Session_SendAuthResp(pSession, "failed", NULL, "invalid proof");
             return DirectGate_Session_Close(pSession, "SRP proof failed");
+        }
+
+        if (pTemporaryShare != NULL)
+        {
+            /* Consume before acknowledging success. Even if the transport
+             * dies immediately afterwards, this credential cannot replay. */
+            pSession->bDesktopShare = XTRUE;
+            pSession->nDesktopShareExpiresMs = pTemporaryShare->nExpiresMs;
+            pTemporaryShare->bUsed = XTRUE;
         }
 
         xlogn("SRP authentication completed: sid(%u), wsfd(%d)",
@@ -1881,11 +2099,57 @@ static int DirectGate_HandleKeepalive(xapi_session_t *pApiSession, directgate_pk
     return XAPI_CONTINUE;
 }
 
+static xbool_t DirectGate_TemporaryDesktopShare_AllowsPackage(const directgate_session_t *pSession, const directgate_pkg_t *pPkg)
+{
+    if (pSession == NULL || !pSession->bDesktopShare) return XTRUE;
+
+    if (xstrcmp(pPkg->header.pType, "error") ||
+        xstrcmp(pPkg->header.pType, "status") ||
+        xstrcmp(pPkg->header.pType, "webrtc") ||
+        xstrcmp(pPkg->header.pType, "keepalive"))
+        return XTRUE;
+
+    if (xstrcmp(pPkg->header.pType, "cmd"))
+    {
+        const directgate_pkg_cmd_t *pCmd = (const directgate_pkg_cmd_t*)pPkg->pPackage;
+
+        if (pCmd == NULL || !xstrused(pCmd->pAction)) return XFALSE;
+        if (xstrcmp(pCmd->pAction, "stop")) return XTRUE;
+
+        return xstrcmp(pCmd->pAction, "start") &&
+               xstrused(pCmd->pMode) &&
+               xstrcmp(pCmd->pMode, "desktop");
+    }
+
+    if (xstrcmp(pPkg->header.pType, "data"))
+    {
+        const directgate_pkg_data_t *pData = (const directgate_pkg_data_t*)pPkg->pPackage;
+
+        return pData != NULL && xstrused(pData->pPayloadType) &&
+            (xstrcmp(pData->pPayloadType, "desktop-control/json") ||
+             xstrcmp(pData->pPayloadType, "desktop-input/json"));
+    }
+
+    return XFALSE;
+}
+
 static int DirectGate_DispatchMessage(xapi_session_t *pApiSession, directgate_pkg_t *pPkg)
 {
     XCHECK((pPkg != NULL), XAPI_DISCONNECT);
     XCHECK((pApiSession != NULL), XAPI_DISCONNECT);
     XCHECK((pPkg->pPackage != NULL), XAPI_DISCONNECT);
+
+    directgate_conn_t *pConn = (directgate_conn_t*)pApiSession->pSessionData;
+    directgate_session_t *pSession = pConn != NULL ? DirectGate_SessionMgr_Find(&pConn->mgr, pPkg->header.nSessionId) : NULL;
+
+    if (!DirectGate_TemporaryDesktopShare_AllowsPackage(pSession, pPkg))
+    {
+        xlogw("Temporary desktop share rejected protocol capability: sid(%u), type(%s)",
+            pPkg->header.nSessionId, pPkg->header.pType);
+
+        DirectGate_Session_SendErrorMsg(pSession, "temporary share allows desktop only");
+        return DirectGate_Session_Close(pSession, "temporary share capability violation");
+    }
 
     if (xstrcmp(pPkg->header.pType, "error")) return DirectGate_HandleError(pApiSession, pPkg);
     if (xstrcmp(pPkg->header.pType, "auth")) return DirectGate_HandleAuth(pApiSession, pPkg);
@@ -1900,7 +2164,6 @@ static int DirectGate_DispatchMessage(xapi_session_t *pApiSession, directgate_pk
     if (xstrcmp(pPkg->header.pType, "admin")) return DirectGate_HandleAdmin(pApiSession, pPkg);
     if (xstrcmp(pPkg->header.pType, "keepalive")) return DirectGate_HandleKeepalive(pApiSession, pPkg);
 
-    directgate_conn_t *pConn = (directgate_conn_t*)pApiSession->pSessionData;
     xlogw("Unknown protocol message type: id(%u), fd(%d), type(%s), sid(%u)",
         DirectGate_Conn_GetID(pConn, pApiSession),
         DirectGate_Conn_GetFD(pConn, pApiSession),
@@ -1909,8 +2172,7 @@ static int DirectGate_DispatchMessage(xapi_session_t *pApiSession, directgate_pk
     return XAPI_CONTINUE;
 }
 
-static int DirectGate_HandleEncryptedMsg(xapi_session_t *pApiSession, directgate_pkg_t *pPkg,
-                                     const char *pTransport)
+static int DirectGate_HandleEncryptedMsg(xapi_session_t *pApiSession, directgate_pkg_t *pPkg, const char *pTransport)
 {
     directgate_conn_t *pConn = (directgate_conn_t*)pApiSession->pSessionData;
     XCHECK((pConn != NULL), xthrowr(XAPI_DISCONNECT, "Invalid connection"));
@@ -2322,7 +2584,19 @@ static void DirectGate_CheckRelayKeepalive(directgate_conn_t *pConn)
 static void DirectGate_CheckAuthTimeouts(directgate_conn_t *pConn)
 {
     XCHECK_VOID((pConn != NULL));
-    DirectGate_SessionMgr_ExpireUnauthenticated(&pConn->mgr, XTime_GetMs());
+    uint64_t nNowMs = XTime_GetMs();
+
+    DirectGate_SessionMgr_ExpireUnauthenticated(&pConn->mgr, nNowMs);
+    DirectGate_TemporaryDesktopShares_Cleanup(pConn, nNowMs);
+
+    for (int i = 0; i < DIRECTGATE_MAX_SESSIONS; i++)
+    {
+        directgate_session_t *pSession = pConn->mgr.pSessions[i];
+        if (pSession != NULL && pSession->bDesktopShare &&
+            pSession->nDesktopShareExpiresMs > 0 &&
+            nNowMs >= pSession->nDesktopShareExpiresMs)
+            DirectGate_Session_Close(pSession, "temporary desktop share expired");
+    }
 }
 
 static void DirectGate_CheckWebRTCKeepalive(directgate_conn_t *pConn)

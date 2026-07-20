@@ -30,6 +30,19 @@ extern "C" {
 #include "session.h"
 #include "config.h"
 
+#define DIRECTGATE_TEMPORARY_DESKTOP_SHARE_MAX_FAILURES 5
+#define DIRECTGATE_MAX_TEMPORARY_DESKTOP_SHARES         8
+
+typedef char xstr_tiny_t[XSTR_TINY];
+
+typedef struct directgate_temporary_desktop_share_ {
+    directgate_auth_t auth;
+    xstr_mid_t sShareId;
+    uint64_t nExpiresMs;
+    uint8_t nFailedAttempts;
+    xbool_t bUsed;
+} directgate_temporary_desktop_share_t;
+
 typedef struct directgate_conn_ {
     xlink_t relayLink;
     directgate_cfg_t *pCfg;
@@ -49,6 +62,9 @@ typedef struct directgate_conn_ {
     xstr_tiny_t sDisconnectReason;
     xbool_t bReconnectSuppressed;
     xbool_t bRoleSent;
+
+    /* Temporary desktop share with one time access, limited fail attempts and expiration time window */
+    directgate_temporary_desktop_share_t temporaryDesktopShares[DIRECTGATE_MAX_TEMPORARY_DESKTOP_SHARES];
 } directgate_conn_t;
 
 #ifdef DIRECTGATE_TESTING

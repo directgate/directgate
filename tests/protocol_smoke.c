@@ -128,6 +128,41 @@ int main(void)
     DirectGate_Package_Clear(&pkg);
 
     XByteBuffer_Reset(&packet);
+    pHeader = DirectGate_Proto_BuildAuthHello("device-1", "client-public", "nonce", 78);
+    CHECK(pHeader != NULL, "build temporary share auth hello");
+    XJSON_AddString(pHeader, "desktopShareId", "share-1");
+    CHECK(build_packet(&packet, pHeader, NULL, 0, XFALSE) == 0,
+        "build temporary share auth packet");
+    CHECK(DirectGate_Package_Parse(&pkg, packet.pData, packet.nUsed),
+        "parse temporary share auth packet");
+    pAuth = (directgate_pkg_auth_t*)pkg.pPackage;
+    CHECK(pAuth != NULL && pAuth->pDesktopShareId != NULL &&
+        strcmp(pAuth->pDesktopShareId, "share-1") == 0,
+        "temporary share id");
+    DirectGate_Package_Clear(&pkg);
+
+    XByteBuffer_Reset(&packet);
+    pHeader = DirectGate_Proto_NewHeader("admin", 79);
+    CHECK(pHeader != NULL, "build temporary share admin header");
+    XJSON_AddString(pHeader, "action", "desktop-share-provision");
+    XJSON_AddString(pHeader, "shareId", "share-1");
+    XJSON_AddString(pHeader, "salt", "salt-1");
+    XJSON_AddString(pHeader, "verifier", "verifier-1");
+    XJSON_AddU32(pHeader, "ttlSeconds", 1800);
+    CHECK(build_packet(&packet, pHeader, NULL, 0, XFALSE) == 0,
+        "build temporary share admin packet");
+    CHECK(DirectGate_Package_Parse(&pkg, packet.pData, packet.nUsed),
+        "parse temporary share admin packet");
+    directgate_pkg_admin_t *pAdmin = (directgate_pkg_admin_t*)pkg.pPackage;
+    CHECK(pAdmin != NULL && strcmp(pAdmin->pShareId, "share-1") == 0,
+        "temporary share provision id");
+    CHECK(strcmp(pAdmin->pSalt, "salt-1") == 0 &&
+        strcmp(pAdmin->pVerifier, "verifier-1") == 0,
+        "temporary share SRP verifier fields");
+    CHECK(pAdmin->nTtlSeconds == 1800, "temporary share TTL");
+    DirectGate_Package_Clear(&pkg);
+
+    XByteBuffer_Reset(&packet);
     pHeader = DirectGate_Proto_BuildManager("search", "ok", "/tmp", NULL, 88);
     CHECK(pHeader != NULL, "build manager header");
     XJSON_AddString(pHeader, "fileName", "*.c");

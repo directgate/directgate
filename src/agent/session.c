@@ -235,6 +235,10 @@ directgate_session_t* DirectGate_SessionMgr_Create(directgate_session_mgr_t *pMg
     pSession->eActiveMode = DIRECTGATE_SESSION_MODE_NONE;
     pSession->bKeyAuthActive = XFALSE;
     pSession->bAuthenticated = XFALSE;
+    pSession->bDesktopShare = XFALSE;
+    pSession->bDesktopSharePending = XFALSE;
+    pSession->nDesktopShareExpiresMs = 0;
+    pSession->sDesktopShareId[0] = XSTR_NUL;
     pSession->bSaveForce = XFALSE;
     pSession->bClosing = XFALSE;
     pSession->pSearchSession = NULL;
@@ -767,6 +771,15 @@ int DirectGate_Session_StartTerminal(directgate_session_t *pSession)
 int DirectGate_Session_StartMode(directgate_session_t *pSession, directgate_session_mode_t eMode)
 {
     XCHECK((pSession != NULL), XAPI_DISCONNECT);
+
+    if (pSession->bDesktopShare && eMode != DIRECTGATE_SESSION_MODE_DESKTOP)
+    {
+        xlogw("Temporary desktop share rejected non-desktop mode: sid(%u), requested(%s)",
+            pSession->nSessionId, DirectGate_SessionMode_ToString(eMode));
+
+        DirectGate_Session_SendErrorMsg(pSession, "temporary share allows desktop only");
+        return DirectGate_Session_Close(pSession, "temporary share capability violation");
+    }
 
     if (eMode == DIRECTGATE_SESSION_MODE_NONE)
         return XAPI_CONTINUE;

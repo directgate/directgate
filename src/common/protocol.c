@@ -196,6 +196,7 @@ static void DirectGate_Package_ParseAuthPkg(directgate_pkg_auth_t *pPkg, xjson_o
     pPkg->pChallenge = XJSON_GetString(XJSON_GetObject(pHdr, "challenge"));
     pPkg->pAgentSig = XJSON_GetString(XJSON_GetObject(pHdr, "agentSig"));
     pPkg->pClientSig = XJSON_GetString(XJSON_GetObject(pHdr, "clientSig"));
+    pPkg->pDesktopShareId = XJSON_GetString(XJSON_GetObject(pHdr, "desktopShareId"));
 }
 
 static void DirectGate_Package_ParseCmdPkg(directgate_pkg_cmd_t *pPkg, xjson_obj_t *pHdr)
@@ -228,8 +229,12 @@ static void DirectGate_Package_ParseAdminPkg(directgate_pkg_admin_t *pPkg, xjson
 {
     pPkg->pAction = XJSON_GetString(XJSON_GetObject(pHdr, "action"));
     pPkg->pClientPub = XJSON_GetString(XJSON_GetObject(pHdr, "clientPub"));
+    pPkg->nTtlSeconds = XJSON_GetU32(XJSON_GetObject(pHdr, "ttlSeconds"));
     pPkg->pStatus = XJSON_GetString(XJSON_GetObject(pHdr, "status"));
     pPkg->pReason = XJSON_GetString(XJSON_GetObject(pHdr, "reason"));
+    pPkg->pShareId = XJSON_GetString(XJSON_GetObject(pHdr, "shareId"));
+    pPkg->pVerifier = XJSON_GetString(XJSON_GetObject(pHdr, "verifier"));
+    pPkg->pSalt = XJSON_GetString(XJSON_GetObject(pHdr, "salt"));
 }
 
 static void DirectGate_Package_ParseManagerPkg(directgate_pkg_manager_t *pPkg, xjson_obj_t *pHdr)

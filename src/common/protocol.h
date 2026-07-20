@@ -75,13 +75,14 @@ typedef struct directgate_pkg_auth_ {
     const char *pStatus;
     const char *pReason;
     /* Key-auth specific (base64 for binary, hex for 32-byte scalars). */
-    const char *pClientPub;    /* Ed25519 client identity pubkey, base64 */
-    const char *pAgentPub;     /* Ed25519 agent identity pubkey, base64 */
-    const char *pClientEph;    /* X25519 client ephemeral pubkey, base64 */
-    const char *pAgentEph;     /* X25519 agent ephemeral pubkey, base64 */
-    const char *pChallenge;    /* 32-byte challenge, hex */
-    const char *pAgentSig;     /* Ed25519 signature from agent, base64 */
-    const char *pClientSig;    /* Ed25519 signature from client, base64 */
+    const char *pClientPub;      /* Ed25519 client identity pubkey, base64 */
+    const char *pAgentPub;       /* Ed25519 agent identity pubkey, base64 */
+    const char *pClientEph;      /* X25519 client ephemeral pubkey, base64 */
+    const char *pAgentEph;       /* X25519 agent ephemeral pubkey, base64 */
+    const char *pChallenge;      /* 32-byte challenge, hex */
+    const char *pAgentSig;       /* Ed25519 signature from agent, base64 */
+    const char *pClientSig;      /* Ed25519 signature from client, base64 */
+    const char *pDesktopShareId; /* Ephemeral desktop-only SRP credential. */
 } directgate_pkg_auth_t;
 
 typedef struct directgate_pkg_verify_ {
@@ -175,6 +176,10 @@ typedef struct directgate_pkg_admin_ {
     const char *pClientPub;
     const char *pStatus;
     const char *pReason;
+    const char *pShareId;
+    const char *pSalt;
+    const char *pVerifier;
+    uint32_t nTtlSeconds;
 } directgate_pkg_admin_t;
 
 typedef struct directgate_pkg_ {

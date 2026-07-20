@@ -77,7 +77,11 @@ typedef struct directgate_session_ {
     uint64_t nLastKAPongMs;
     uint8_t nAuthMessages;
     xbool_t bAuthenticated;
+    xbool_t bDesktopShare;
+    xbool_t bDesktopSharePending;
+    uint64_t nDesktopShareExpiresMs;
     xbool_t bClosing;
+    char sDesktopShareId[XSTR_MID];
     char sSavePath[XFILE_PATH_SIZE];
     char sSaveTempPath[XFILE_PATH_SIZE];
     char sSavePermissions[XPERM_LEN + 1];
