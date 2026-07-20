@@ -249,10 +249,10 @@ void DirectGate_Desktop_ComputeOutputSize(const directgate_desktop_t *pDesktop,
 xbool_t DirectGate_Desktop_ShouldSkipForBackpressure(const directgate_session_t *pSession);
 
 /* System-audio streaming (desktop/audio.c + per-platform capture backend).
- * DIRECTGATE_DESKTOP_HAS_AUDIO gates the call sites so platforms without a
- * capture backend yet still link (audio simply stays "unavailable"). Grows to
- * `|| defined(_WIN32) || defined(__APPLE__)` as those backends land. */
-#if defined(__linux__)
+ * DIRECTGATE_DESKTOP_HAS_AUDIO gates the call sites; every desktop platform now
+ * ships a backend (PulseAudio/PipeWire on Linux, WASAPI on Windows,
+ * ScreenCaptureKit on macOS). */
+#if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)
 #define DIRECTGATE_DESKTOP_HAS_AUDIO 1
 #endif
 

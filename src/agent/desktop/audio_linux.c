@@ -122,19 +122,16 @@ static int DirectGate_Audio_LoadPulse(char *pErr, size_t nErrSize)
     return XSTDOK;
 }
 
-void* DirectGate_Audio_BackendOpen(uint32_t nSampleRate, uint32_t nChannels,
-                                   char *pErr, size_t nErrSize)
+void* DirectGate_Audio_BackendOpen(uint32_t nSampleRate, uint32_t nChannels, char *pErr, size_t nErrSize)
 {
-    if (DirectGate_Audio_LoadPulse(pErr, nErrSize) != XSTDOK)
-        return NULL;
+    if (DirectGate_Audio_LoadPulse(pErr, nErrSize) != XSTDOK) return NULL;
 
     dg_pa_sample_spec spec;
     spec.format = DG_PA_SAMPLE_S16LE;
     spec.rate = nSampleRate;
     spec.channels = (uint8_t)nChannels;
 
-    /* Small fragment (one frame) for low capture latency; leave the rest at the
-     * server default (-1). */
+    /* Small fragment (one frame) for low capture latency; leave the rest at the server default (-1). */
     dg_pa_buffer_attr attr;
     attr.maxlength = (uint32_t)-1;
     attr.tlength = (uint32_t)-1;
@@ -157,6 +154,7 @@ void* DirectGate_Audio_BackendOpen(uint32_t nSampleRate, uint32_t nChannels,
 
     char sServer[192];
     const char *pServer = getenv("DIRECTGATE_AUDIO_SERVER");
+
     if (!xstrused(pServer))
     {
         if (xstrused(getenv("PULSE_SERVER")))
@@ -173,7 +171,7 @@ void* DirectGate_Audio_BackendOpen(uint32_t nSampleRate, uint32_t nChannels,
 
     int nError = 0;
     pa_simple *pSimple = g_pulse.simpleNew(pServer, "directgate", DG_PA_STREAM_RECORD,
-        pDevice, "desktop", &spec, NULL, &attr, &nError);
+                                           pDevice, "desktop", &spec, NULL, &attr, &nError);
 
     if (pSimple == NULL)
     {
@@ -190,18 +188,17 @@ void* DirectGate_Audio_BackendOpen(uint32_t nSampleRate, uint32_t nChannels,
     return (void*)pSimple;
 }
 
-int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf,
-                                 uint32_t nFrames, uint32_t nChannels)
+int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames, uint32_t nChannels)
 {
     XCHECK((pBackend != NULL && pBuf != NULL), XSTDERR);
     XCHECK((nFrames > 0 && nChannels > 0), XSTDERR);
 
-    size_t nBytes = (size_t)nFrames * nChannels * sizeof(int16_t);
     int nError = 0;
+    size_t nBytes = (size_t)nFrames * nChannels * sizeof(int16_t);
+
     if (g_pulse.simpleRead((pa_simple*)pBackend, pBuf, nBytes, &nError) < 0)
     {
-        xlogw("Desktop audio read failed: %s",
-            (g_pulse.strError != NULL) ? g_pulse.strError(nError) : "error");
+        xlogw("Desktop audio read failed: %s", (g_pulse.strError != NULL) ? g_pulse.strError(nError) : "error");
         return XSTDERR;
     }
 

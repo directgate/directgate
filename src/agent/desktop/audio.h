@@ -38,24 +38,22 @@ extern "C" {
  * stereo S16 in 20 ms frames matches the WebRTC Opus RTP clock and needs no
  * resampling from the common desktop mix rate. */
 #define DIRECTGATE_AUDIO_SAMPLE_RATE   48000U
-#define DIRECTGATE_AUDIO_CHANNELS      2U
 #define DIRECTGATE_AUDIO_FRAME_MS      20U
 #define DIRECTGATE_AUDIO_FRAME_SAMPLES ((DIRECTGATE_AUDIO_SAMPLE_RATE / 1000U) * DIRECTGATE_AUDIO_FRAME_MS)
 #define DIRECTGATE_AUDIO_BITRATE_KBPS  128U
+#define DIRECTGATE_AUDIO_CHANNELS      2U
 
 /* Opens the platform's system-output loopback source at the requested format
  * (always 48 kHz stereo S16). Returns an opaque backend handle, or NULL with a
  * human-readable reason written into pErr. The backend must deliver only the
  * default output device's mix (never a microphone). */
-void* DirectGate_Audio_BackendOpen(uint32_t nSampleRate, uint32_t nChannels,
-                                   char *pErr, size_t nErrSize);
+void* DirectGate_Audio_BackendOpen(uint32_t nSampleRate, uint32_t nChannels, char *pErr, size_t nErrSize);
 
 /* Blocking read of exactly nFrames samples per channel (interleaved S16) into
  * pBuf. Returns XSTDOK on a full frame, or XSTDERR on a fatal source error
  * (the capture thread then exits and audio is marked unavailable). Should
  * return roughly every frame period so the thread can observe a stop request. */
-int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf,
-                                 uint32_t nFrames, uint32_t nChannels);
+int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames, uint32_t nChannels);
 
 void DirectGate_Audio_BackendClose(void *pBackend);
 

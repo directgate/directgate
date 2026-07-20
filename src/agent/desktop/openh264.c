@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/openh264.c
+ * @file directgate-agent/src/agent/desktop/openh264.c
  * @brief Runtime-loaded OpenH264 encoder wrapper for desktop streaming.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
@@ -180,6 +180,7 @@ int DirectGate_OpenH264_Load(char *pErrBuf, size_t nErrSize)
         DirectGate_OpenH264_SetError(pErrBuf, nErrSize,
             "OpenH264 %u.%u is incompatible with this build (need major %u).",
             version.uMajor, version.uMinor, (unsigned)OPENH264_MAJOR);
+
         return XSTDERR;
     }
 
@@ -203,11 +204,9 @@ const char* DirectGate_OpenH264_Version(void)
     return g_openh264.bLoaded ? g_openh264.sVersion : "unloaded";
 }
 
-directgate_openh264_t* DirectGate_OpenH264_Create(uint32_t nWidth,
-                                          uint32_t nHeight,
-                                          const directgate_desktop_quality_t *pQuality,
-                                          char *pErrBuf,
-                                          size_t nErrSize)
+directgate_openh264_t* DirectGate_OpenH264_Create(uint32_t nWidth, uint32_t nHeight,
+                                                  const directgate_desktop_quality_t *pQuality,
+                                                  char *pErrBuf, size_t nErrSize)
 {
     XCHECK_NL((pQuality != NULL), NULL);
     XCHECK_NL((nWidth >= 16 && nHeight >= 16), NULL);
@@ -225,6 +224,7 @@ directgate_openh264_t* DirectGate_OpenH264_Create(uint32_t nWidth,
 
     SEncParamExt param;
     memset(&param, 0, sizeof(param));
+
     if ((*pWels)->GetDefaultParams(pWels, &param) != 0)
     {
         g_openh264.destroyEncoder(pWels);
@@ -295,6 +295,7 @@ directgate_openh264_t* DirectGate_OpenH264_Create(uint32_t nWidth,
     {
         (*pWels)->Uninitialize(pWels);
         g_openh264.destroyEncoder(pWels);
+
         DirectGate_OpenH264_SetError(pErrBuf, nErrSize, "Failed to allocate encoder context.");
         return NULL;
     }
@@ -321,11 +322,11 @@ void DirectGate_OpenH264_Destroy(directgate_openh264_t *pEncoder)
 }
 
 int DirectGate_OpenH264_Encode(directgate_openh264_t *pEncoder,
-                                const uint8_t *pI420,
-                                uint64_t nPtsUs,
-                                xbool_t bForceKeyframe,
-                                xbyte_buffer_t *pOut,
-                                xbool_t *pKeyframe)
+                               const uint8_t *pI420,
+                               uint64_t nPtsUs,
+                               xbool_t bForceKeyframe,
+                               xbyte_buffer_t *pOut,
+                               xbool_t *pKeyframe)
 {
     XCHECK((pEncoder != NULL && pEncoder->pEncoder != NULL), XSTDERR);
     XCHECK((pI420 != NULL && pOut != NULL), XSTDERR);
@@ -379,12 +380,9 @@ int DirectGate_OpenH264_Encode(directgate_openh264_t *pEncoder,
 
     for (int i = 0; i < nLayerNum; i++)
     {
-        int nNalCount = bPre26 ? info.pre26.sLayerInfo[i].iNalCount :
-            info.current.sLayerInfo[i].iNalCount;
-        int *pNalLengths = bPre26 ? info.pre26.sLayerInfo[i].pNalLengthInByte :
-            info.current.sLayerInfo[i].pNalLengthInByte;
-        unsigned char *pBitstream = bPre26 ? info.pre26.sLayerInfo[i].pBsBuf :
-            info.current.sLayerInfo[i].pBsBuf;
+        int nNalCount = bPre26 ? info.pre26.sLayerInfo[i].iNalCount : info.current.sLayerInfo[i].iNalCount;
+        int *pNalLengths = bPre26 ? info.pre26.sLayerInfo[i].pNalLengthInByte : info.current.sLayerInfo[i].pNalLengthInByte;
+        unsigned char *pBitstream = bPre26 ? info.pre26.sLayerInfo[i].pBsBuf : info.current.sLayerInfo[i].pBsBuf;
 
         if (nNalCount < 0 || (nNalCount > 0 && (pNalLengths == NULL || pBitstream == NULL)))
         {
@@ -448,8 +446,7 @@ int DirectGate_OpenH264_SetBitrate(directgate_openh264_t *pEncoder, uint32_t nBi
     return XSTDOK;
 }
 
-int DirectGate_OpenH264_ApplyQuality(directgate_openh264_t *pEncoder,
-                                 const directgate_desktop_quality_t *pQuality)
+int DirectGate_OpenH264_ApplyQuality(directgate_openh264_t *pEncoder, const directgate_desktop_quality_t *pQuality)
 {
     XCHECK((pEncoder != NULL && pEncoder->pEncoder != NULL), XSTDERR);
     XCHECK((pQuality != NULL), XSTDERR);

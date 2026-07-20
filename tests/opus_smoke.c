@@ -1,11 +1,11 @@
-/* Runtime Opus encoder smoke test (src/agent/opus.c).
+/* Runtime Opus encoder smoke test (src/agent/desktop/opus.c).
  *
  * Skips (exit 77) when libopus is not installed, matching openh264_smoke. Set
  * DIRECTGATE_OPUS_LIB to run against a specific library. Encodes a couple of
  * 20 ms 48 kHz stereo frames of a sine tone and checks the wrapper produces a
  * non-empty Opus packet and reports a sane sample rate / channel count. */
 
-#include "src/agent/opus.h"
+#include "src/agent/desktop/opus.h"
 
 #include <math.h>
 

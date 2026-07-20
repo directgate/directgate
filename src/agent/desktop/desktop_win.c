@@ -179,6 +179,7 @@ static void DirectGate_Desktop_WinEnc_SleepUs(directgate_winenc_t *pEnc, uint64_
     {
         LARGE_INTEGER due;
         due.QuadPart = -(LONGLONG)(nUs * 10ULL); /* relative, 100 ns units */
+
         if (SetWaitableTimer(pEnc->hWaitTimer, &due, 0, NULL, NULL, FALSE))
         {
             WaitForSingleObject(pEnc->hWaitTimer, (DWORD)(nUs / 1000ULL) + 20U);
@@ -244,8 +245,7 @@ static int DirectGate_Desktop_WinEnc_Duplicate(directgate_winenc_t *pEnc)
     DirectGate_Desktop_WinEnc_ReleaseDuplication(pEnc);
     XCHECK_NL((pEnc->pOutput != NULL && pEnc->pDevice != NULL), XSTDERR);
 
-    HRESULT hr = IDXGIOutput1_DuplicateOutput(pEnc->pOutput,
-        (IUnknown*)pEnc->pDevice, &pEnc->pDuplication);
+    HRESULT hr = IDXGIOutput1_DuplicateOutput(pEnc->pOutput, (IUnknown*)pEnc->pDevice, &pEnc->pDuplication);
     if (FAILED(hr) || pEnc->pDuplication == NULL)
     {
         pEnc->pDuplication = NULL;
@@ -255,6 +255,7 @@ static int DirectGate_Desktop_WinEnc_Duplicate(directgate_winenc_t *pEnc)
     DXGI_OUTDUPL_DESC desc;
     memset(&desc, 0, sizeof(desc));
     IDXGIOutputDuplication_GetDesc(pEnc->pDuplication, &desc);
+
     if (desc.Rotation != DXGI_MODE_ROTATION_IDENTITY &&
         desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED)
     {
@@ -535,6 +536,7 @@ static int DirectGate_Desktop_WinEnc_EncodeFrame(directgate_winenc_t *pEnc, xboo
 
     uint64_t nCapturedUs = pEnc->nFrameCapturedUs ? pEnc->nFrameCapturedUs :
         DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
+
     uint64_t nPtsUs = nCapturedUs - pEnc->nStartUs;
     xbool_t bKeyframe = XFALSE;
 
@@ -581,10 +583,8 @@ static int DirectGate_Desktop_WinEnc_InitPipeline(directgate_winenc_t *pEnc)
 
     /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Win10 1803+) gives sub-ms
      * pacing; older systems silently fall back to the regular timer. */
-    pEnc->hWaitTimer = CreateWaitableTimerExW(NULL, NULL,
-        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (pEnc->hWaitTimer == NULL)
-        pEnc->hWaitTimer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+    pEnc->hWaitTimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (pEnc->hWaitTimer == NULL) pEnc->hWaitTimer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
 
     char sError[DIRECTGATE_DESKTOP_REASON_LEN] = { 0 };
     pEnc->pEncoder = DirectGate_MFEnc_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
@@ -628,8 +628,7 @@ static int DirectGate_Desktop_WinEnc_InitPipeline(directgate_winenc_t *pEnc)
 static void DirectGate_Desktop_WinEnc_ApplyPendingControls(directgate_winenc_t *pEnc)
 {
     LONG nBitrateKbps = InterlockedExchange(&pEnc->nPendingBitrateKbps, 0);
-    if (nBitrateKbps > 0)
-        DirectGate_MFEnc_SetBitrate(pEnc->pEncoder, (uint32_t)nBitrateKbps);
+    if (nBitrateKbps > 0) DirectGate_MFEnc_SetBitrate(pEnc->pEncoder, (uint32_t)nBitrateKbps);
 
     if (InterlockedExchange(&pEnc->bApplyQuality, 0))
     {
@@ -716,12 +715,10 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
              * Wait to the pacing boundary first, then acquire the newest
              * accumulated desktop image. A one-frame timeout preserves the
              * event-driven low-latency path when no image is pending yet. */
-            if (nNextDueUs > nNowUs)
-                DirectGate_Desktop_WinEnc_SleepUs(pEnc, nNextDueUs - nNowUs);
+            if (nNextDueUs > nNowUs) DirectGate_Desktop_WinEnc_SleepUs(pEnc, nNextDueUs - nNowUs);
             nNowUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
             uint32_t nTimeoutMs = (uint32_t)(nIntervalUs / 1000ULL);
-            nCapture = DirectGate_Desktop_WinEnc_CaptureDxgi(pEnc,
-                nTimeoutMs ? nTimeoutMs : 1U);
+            nCapture = DirectGate_Desktop_WinEnc_CaptureDxgi(pEnc, nTimeoutMs ? nTimeoutMs : 1U);
 
             if (nCapture == XSTDERR)
             {
@@ -737,11 +734,9 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
                 {
                     pEnc->nDxgiReinitFails = 0;
                 }
-                else if (++pEnc->nDxgiReinitFails >=
-                    (pEnc->nFps ? pEnc->nFps : 30U) * DIRECTGATE_WINENC_REINIT_SECONDS)
+                else if (++pEnc->nDxgiReinitFails >= (pEnc->nFps ? pEnc->nFps : 30U) * DIRECTGATE_WINENC_REINIT_SECONDS)
                 {
-                    xlogw("Desktop Duplication lost for good, switching to GDI capture: sid(%u)",
-                        pEnc->pDesktop->nSessionId);
+                    xlogw("Desktop Duplication lost for good, switching to GDI capture: sid(%u)", pEnc->pDesktop->nSessionId);
                     DirectGate_Desktop_WinEnc_ReleaseDxgi(pEnc);
                     pEnc->bUseGdi = XTRUE;
                 }
@@ -754,8 +749,7 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
         {
             /* GDI has no change notification: sleep to the deadline, then
              * capture and skip unchanged frames via memcmp (Linux model). */
-            if (nNextDueUs > nNowUs)
-                DirectGate_Desktop_WinEnc_SleepUs(pEnc, nNextDueUs - nNowUs);
+            if (nNextDueUs > nNowUs) DirectGate_Desktop_WinEnc_SleepUs(pEnc, nNextDueUs - nNowUs);
             nCapture = DirectGate_Desktop_WinEnc_CaptureGdi(pEnc, bForceKeyframe);
         }
 
@@ -816,7 +810,8 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
     if (hMmcss != NULL)
     {
         typedef BOOL (WINAPI *directgate_av_revert_fn)(HANDLE);
-        directgate_av_revert_fn pAvRevert = (directgate_av_revert_fn)(void*)GetProcAddress(hAvrt, "AvRevertMmThreadCharacteristics");
+        directgate_av_revert_fn pAvRevert;
+        pAvRevert = (directgate_av_revert_fn)(void*)GetProcAddress(hAvrt, "AvRevertMmThreadCharacteristics");
         if (pAvRevert != NULL) pAvRevert(hMmcss);
     }
 
@@ -845,6 +840,7 @@ static void DirectGate_Desktop_WinEnc_Free(directgate_winenc_t *pEnc)
         {
             xloge("Desktop capture thread is not responding, leaking its pipeline: sid(%u)",
                 pEnc->pDesktop != NULL ? pEnc->pDesktop->nSessionId : 0U);
+
             CloseHandle(pEnc->hThread);
             return;
         }
@@ -880,8 +876,8 @@ void DirectGate_Desktop_WinEncoder_StopDesktop(directgate_desktop_t *pDesktop)
 }
 
 int DirectGate_Desktop_WinEncoder_Start(directgate_session_t *pSession,
-                                    int32_t nX, int32_t nY,
-                                    uint32_t nWidth, uint32_t nHeight)
+                                        int32_t nX, int32_t nY,
+                                        uint32_t nWidth, uint32_t nHeight)
 {
     XCHECK((pSession != NULL), XSTDERR);
     directgate_desktop_t *pDesktop = &pSession->desktop;
@@ -934,8 +930,7 @@ int DirectGate_Desktop_WinEncoder_Start(directgate_session_t *pSession,
         return XSTDERR;
     }
 
-    if (WaitForSingleObject(pEnc->hInitDone, DIRECTGATE_WINENC_INIT_WAIT_MS) != WAIT_OBJECT_0 ||
-        !pEnc->bInitOk)
+    if (WaitForSingleObject(pEnc->hInitDone, DIRECTGATE_WINENC_INIT_WAIT_MS) != WAIT_OBJECT_0 || !pEnc->bInitOk)
     {
         xstrncpy(pDesktop->sReason, sizeof(pDesktop->sReason),
             xstrused(pEnc->sLastError) ? pEnc->sLastError :
@@ -971,16 +966,14 @@ void DirectGate_Desktop_WinEncoder_ApplyQuality(directgate_session_t *pSession)
 
     /* A resolution change needs a full pipeline rebuild; bitrate and GOP
      * updates are marshalled to the capture thread and applied live. */
-    if (nWidth != pEnc->nEncodeWidth || nHeight != pEnc->nEncodeHeight ||
-        pEnc->nFps != pDesktop->quality.nFps)
+    if (nWidth != pEnc->nEncodeWidth || nHeight != pEnc->nEncodeHeight || pEnc->nFps != pDesktop->quality.nFps)
     {
         int32_t nX = pEnc->nCaptureX;
         int32_t nY = pEnc->nCaptureY;
         uint32_t nCaptureWidth = pEnc->nCaptureWidth;
         uint32_t nCaptureHeight = pEnc->nCaptureHeight;
 
-        if (DirectGate_Desktop_WinEncoder_Start(pSession, nX, nY,
-            nCaptureWidth, nCaptureHeight) != XSTDOK)
+        if (DirectGate_Desktop_WinEncoder_Start(pSession, nX, nY, nCaptureWidth, nCaptureHeight) != XSTDOK)
         {
             xlogw("Failed to rebuild Windows H.264 pipeline for preset change: sid(%u), reason(%s)",
                 pSession->nSessionId, DirectGate_Desktop_GetReason(pDesktop));
@@ -1026,8 +1019,8 @@ xbool_t DirectGate_Desktop_WinEncoder_HasFailed(const directgate_session_t *pSes
     XCHECK_NL((pSession != NULL), XFALSE);
     const directgate_winenc_t *pEnc = DirectGate_Desktop_WinEnc(&pSession->desktop);
     if (pEnc == NULL) return XTRUE;
-    LONG nMaxFailures = (LONG)((pEnc->nFps ? pEnc->nFps : 30U) *
-        DIRECTGATE_WINENC_FAILURE_SECONDS);
+
+    LONG nMaxFailures = (LONG)((pEnc->nFps ? pEnc->nFps : 30U) * DIRECTGATE_WINENC_FAILURE_SECONDS);
     return (pEnc->nFailures >= nMaxFailures) ? XTRUE : XFALSE;
 }
 
@@ -1073,6 +1066,7 @@ int DirectGate_Desktop_WinEncoder_DrainMain(directgate_session_t *pSession)
             nPtsUs = pEnc->nMailboxPtsUs;
             bHasFrame = XTRUE;
         }
+
         pEnc->bMailboxHasFrame = XFALSE;
     }
 

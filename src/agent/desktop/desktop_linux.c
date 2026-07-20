@@ -195,8 +195,11 @@ static void DirectGate_Desktop_X11Enc_Normalize(const directgate_x11enc_t *pEnc,
     if (pEnc->bDirectBGRA)
     {
         for (uint32_t y = 0; y < nHeight; y++)
+        {
             memcpy(pDst + (size_t)y * nDstStride,
                 (const uint8_t*)pImage->data + (size_t)y * nSrcStride, nDstStride);
+        }
+
         return;
     }
 
@@ -355,8 +358,7 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     pEnc->nCaptureWidth = nWidth;
     pEnc->nCaptureHeight = nHeight;
 
-    DirectGate_Desktop_X11Enc_PickSize(pDesktop, nWidth, nHeight,
-        &pEnc->nEncodeWidth, &pEnc->nEncodeHeight);
+    DirectGate_Desktop_X11Enc_PickSize(pDesktop, nWidth, nHeight, &pEnc->nEncodeWidth, &pEnc->nEncodeHeight);
 
     char sError[DIRECTGATE_DESKTOP_REASON_LEN] = {0};
     pEnc->pEncoder = DirectGate_OpenH264_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
@@ -387,8 +389,7 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     }
 
     if (DirectGate_Desktop_X11Enc_SetupShm(pEnc, pDisplay) == XSTDNON)
-        xlogw("MIT-SHM unavailable for desktop capture, using XGetImage: sid(%u)",
-            pSession->nSessionId);
+        xlogw("MIT-SHM unavailable for desktop capture, using XGetImage: sid(%u)", pSession->nSessionId);
 
     /* Probe one capture now so a broken setup fails at start (and desktop.c
      * falls back to raw RGBA) instead of during the streaming loop. */
@@ -396,8 +397,7 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     if (pEnc->pShmImage != NULL)
     {
         if (XShmGetImage(pDisplay, DefaultRootWindow(pDisplay), pEnc->pShmImage,
-            pEnc->nCaptureX, pEnc->nCaptureY, AllPlanes))
-            pProbe = pEnc->pShmImage;
+            pEnc->nCaptureX, pEnc->nCaptureY, AllPlanes)) pProbe = pEnc->pShmImage;
     }
     else
     {
@@ -535,9 +535,9 @@ int DirectGate_Desktop_LinuxEncoder_ProcessTick(directgate_session_t *pSession)
 
     if (pImage == NULL)
     {
-        pEnc->nFailures++;
         xlogw("Failed to capture X11 frame: sid(%u), failures(%u)",
-            pSession->nSessionId, pEnc->nFailures);
+            pSession->nSessionId, ++pEnc->nFailures);
+
         return XAPI_CONTINUE;
     }
 

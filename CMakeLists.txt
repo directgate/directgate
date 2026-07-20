@@ -268,8 +268,15 @@ target_link_libraries(directgate PRIVATE xcommon)
 # ---- desktop streaming backends (platform specific) -----------------------
 if(APPLE)
     # macOS screen capture + VideoToolbox H.264 encoder. Compiled with ARC.
-    target_sources(directgate PRIVATE ${AGENT_DIR}/desktop/desktop_mac.m)
-    set_source_files_properties(${AGENT_DIR}/desktop/desktop_mac.m
+    # System-audio streaming: Opus encoder (opus.c, libopus dlopen'd) + the
+    # cross-platform orchestrator (desktop/audio.c) + ScreenCaptureKit audio
+    # capture (desktop/audio_mac.m, also ARC).
+    target_sources(directgate PRIVATE
+        ${AGENT_DIR}/desktop/desktop_mac.m
+        ${AGENT_DIR}/desktop/opus.c
+        ${AGENT_DIR}/desktop/audio.c
+        ${AGENT_DIR}/desktop/audio_mac.m)
+    set_source_files_properties(${AGENT_DIR}/desktop/desktop_mac.m ${AGENT_DIR}/desktop/audio_mac.m
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(directgate PRIVATE
         "-framework ApplicationServices"
@@ -289,14 +296,14 @@ elseif(UNIX)
     find_package(X11 REQUIRED)
     target_sources(directgate PRIVATE
         ${AGENT_DIR}/desktop/desktop_linux.c
-        ${AGENT_DIR}/openh264.c
+        ${AGENT_DIR}/desktop/openh264.c
         ${AGENT_DIR}/yuv.c)
     # System-audio streaming: Opus encoder (opus.c, libopus dlopen'd at runtime)
     # + cross-platform orchestrator (desktop/audio.c) + PulseAudio/PipeWire
     # monitor capture (desktop/audio_linux.c, libpulse-simple dlopen'd). All
     # runtime-only deps, so a host without them still streams video.
     target_sources(directgate PRIVATE
-        ${AGENT_DIR}/opus.c
+        ${AGENT_DIR}/desktop/opus.c
         ${AGENT_DIR}/desktop/audio.c
         ${AGENT_DIR}/desktop/audio_linux.c)
     target_include_directories(directgate PRIVATE ${X11_INCLUDE_DIR} ${AGENT_DIR}/openh264)
@@ -332,8 +339,16 @@ if(WIN32)
     # uuid/mfuuid/strmiids/dxguid: interface and media type GUIDs.
     target_sources(directgate PRIVATE
         ${AGENT_DIR}/desktop/desktop_win.c
-        ${AGENT_DIR}/mfenc.c
+        ${AGENT_DIR}/desktop/mfenc.c
         ${AGENT_DIR}/yuv.c)
+    # System-audio streaming: Opus encoder (opus.c, opus.dll dlopen'd) + the
+    # cross-platform orchestrator (desktop/audio.c) + WASAPI loopback capture
+    # (desktop/audio_win.c). WASAPI GUIDs are instantiated locally via
+    # initguid.h, so ole32 (already linked) is enough.
+    target_sources(directgate PRIVATE
+        ${AGENT_DIR}/desktop/opus.c
+        ${AGENT_DIR}/desktop/audio.c
+        ${AGENT_DIR}/desktop/audio_win.c)
     target_link_libraries(directgate PRIVATE
         user32 gdi32 d3d11 dxgi ole32 oleaut32 uuid mfuuid strmiids dxguid)
 

@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/opus.h
+ * @file directgate-agent/src/agent/desktop/opus.h
  * @brief Runtime-loaded Opus audio encoder wrapper for desktop streaming.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.

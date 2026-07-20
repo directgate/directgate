@@ -20,8 +20,8 @@
  */
 
 #include "desktop.h"
-#include "priv.h"
 #include "session.h"
+#include "priv.h"
 
 #if defined(__linux__)
 #include <ctype.h>

@@ -23,11 +23,10 @@
 
 #ifdef DIRECTGATE_DESKTOP_HAS_AUDIO
 
-#include "priv.h"
 #include "session.h"
 #include "webrtc.h"
 #include "opus.h"
-#include "thread.h"
+#include "priv.h"
 
 /* Largest byte count a 20 ms stereo Opus frame can occupy (RFC 6716 upper
  * bound); the RTP payload limit is larger so a whole frame is always one

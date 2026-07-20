@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/openh264.h
+ * @file directgate-agent/src/agent/desktop/openh264.h
  * @brief Runtime-loaded OpenH264 encoder wrapper for desktop streaming.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.

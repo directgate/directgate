@@ -20,10 +20,10 @@
  */
 
 #include "desktop.h"
-#include "priv.h"
 #include "session.h"
 #include "protocol.h"
 #include "webrtc.h"
+#include "priv.h"
 
 #if defined(__linux__)
 #include <sys/timerfd.h>
@@ -821,6 +821,12 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
         while (read(pDesktop->nTimerFd, sBuf, sizeof(sBuf)) > 0) {}
     }
 
+#ifdef DIRECTGATE_DESKTOP_HAS_AUDIO
+    /* Ship any encoded Opus frames the capture thread queued (no-op unless the
+     * audio track is open). */
+    DirectGate_Desktop_AudioDrainMain(pSession);
+#endif
+
     /* The H.264 pipeline pushes frames from the SCK delegate; the timer
      * wake-up is just a signal to drain the encoder mailbox. The raw
      * path still pulls per tick. */
@@ -1028,6 +1034,18 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
     {
         if (DirectGate_Desktop_FallbackToDataChannel(pSession))
             DirectGate_Desktop_MacEncoder_RequestKeyframe(pSession);
+    }
+    else if (xstrcmp(pAction, "audio"))
+    {
+        /* Opt-in system-audio toggle. Capture never runs until the viewer asks
+         * for it; a failed start reports "unavailable" and leaves video alone. */
+        xbool_t bEnable = XJSON_GetBool(XJSON_GetObject(pRoot, "enabled")) ? XTRUE : XFALSE;
+        pDesktop->bAudioRequested = bEnable;
+
+        if (bEnable) (void)DirectGate_Desktop_AudioStart(pSession);
+        else DirectGate_Desktop_AudioStop(pDesktop);
+
+        DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
     }
 
     XJSON_Destroy(&json);
@@ -1237,6 +1255,12 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
         char sBuf[128];
         while (recv(pDesktop->nTimerFd, sBuf, sizeof(sBuf), 0) > 0) {}
     }
+
+#ifdef DIRECTGATE_DESKTOP_HAS_AUDIO
+    /* Ship any encoded Opus frames the capture thread queued (no-op unless the
+     * audio track is open). */
+    DirectGate_Desktop_AudioDrainMain(pSession);
+#endif
 
     /* The H.264 pipeline pushes frames from the capture thread; the wake-up
      * is just a signal to drain the encoder mailbox. The raw path still
@@ -1458,6 +1482,18 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
     {
         if (DirectGate_Desktop_FallbackToDataChannel(pSession))
             DirectGate_Desktop_WinEncoder_RequestKeyframe(pSession);
+    }
+    else if (xstrcmp(pAction, "audio"))
+    {
+        /* Opt-in system-audio toggle. Capture never runs until the viewer asks
+         * for it; a failed start reports "unavailable" and leaves video alone. */
+        xbool_t bEnable = XJSON_GetBool(XJSON_GetObject(pRoot, "enabled")) ? XTRUE : XFALSE;
+        pDesktop->bAudioRequested = bEnable;
+
+        if (bEnable) (void)DirectGate_Desktop_AudioStart(pSession);
+        else DirectGate_Desktop_AudioStop(pDesktop);
+
+        DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
     }
 
     XJSON_Destroy(&json);

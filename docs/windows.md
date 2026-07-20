@@ -193,6 +193,8 @@ extra to install:
 
 Desktop streaming requires the interactive session the launcher starts the agent in (see [As a Windows service](#as-a-windows-service)); a UAC secure-desktop prompt pauses duplication until it is dismissed, and the lock screen cannot be captured by design.
 
+**System audio** (opt-in) is captured with WASAPI loopback on the default render endpoint, on a dedicated capture thread that resamples the shared mix to 48 kHz stereo and hands it to the Opus encoder (`opus.dll`, loaded at runtime). If `opus.dll` is absent or no output device is present, audio reports `unavailable` and video is unaffected. See [Desktop audio track](webrtc.md#desktop-audio-track).
+
 ---
 
 ## Security notes specific to Windows

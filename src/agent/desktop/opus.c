@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/opus.c
+ * @file directgate-agent/src/agent/desktop/opus.c
  * @brief Runtime-loaded Opus audio encoder wrapper for desktop streaming.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
@@ -35,9 +35,9 @@
 typedef struct DirectGateOpusEncoder DirectGateOpusEncoder;
 
 typedef DirectGateOpusEncoder* (*directgate_opus_create_fn)(int32_t, int, int, int*);
-typedef void   (*directgate_opus_destroy_fn)(DirectGateOpusEncoder*);
+typedef void (*directgate_opus_destroy_fn)(DirectGateOpusEncoder*);
 typedef int32_t(*directgate_opus_encode_fn)(DirectGateOpusEncoder*, const int16_t*, int, unsigned char*, int32_t);
-typedef int    (*directgate_opus_ctl_fn)(DirectGateOpusEncoder*, int, ...);
+typedef int (*directgate_opus_ctl_fn)(DirectGateOpusEncoder*, int, ...);
 typedef const char* (*directgate_opus_strerror_fn)(int);
 typedef const char* (*directgate_opus_version_fn)(void);
 

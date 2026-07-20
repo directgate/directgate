@@ -56,7 +56,7 @@ A desktop session necessarily has two capabilities, and it is worth being explic
 
 - **Screen capture** - the agent captures the display the client selects (X11/XShm on Linux, DXGI Desktop Duplication with a GDI fallback on Windows, ScreenCaptureKit on macOS) for as long as the session is active.
 - **Input injection** - the agent injects the mouse and keyboard events the client sends (XTest on Linux, `SendInput` on Windows, `CGEvent` on macOS).
-- **System-audio capture** (opt-in, off by default) - when the client enables it, the agent captures the default output device's loopback (the PulseAudio / PipeWire monitor on Linux) for as long as it stays enabled. It is never a microphone, and it stops the moment the client disables it or the session ends.
+- **System-audio capture** (opt-in, off by default) - when the client enables it, the agent captures the default output device's loopback (the PulseAudio / PipeWire monitor on Linux, WASAPI loopback on Windows, ScreenCaptureKit on macOS) for as long as it stays enabled. It is never a microphone, it excludes the agent's own output where the platform allows, and it stops the moment the client disables it or the session ends.
 
 Remote desktop cannot function without these; they are the feature, not a side effect. Both are constrained the same way as every other session capability:
 

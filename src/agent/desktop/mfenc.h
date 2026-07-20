@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/mfenc.h
+ * @file directgate-agent/src/agent/desktop/mfenc.h
  * @brief Runtime-loaded Media Foundation H.264 encoder wrapper for desktop streaming.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
