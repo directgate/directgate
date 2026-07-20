@@ -103,19 +103,11 @@ void DirectGate_Desktop_ApplyPreset(directgate_desktop_t *pDesktop, directgate_d
             pDesktop->quality.bRealtime = XFALSE;
             break;
         case DIRECTGATE_DESKTOP_PRESET_LOW_LATENCY:
+            /* The gaming-grade preset: 720p60 tuned for motion clarity and responsiveness */
             pDesktop->quality.nMaxEdge = 1280U;
-#if defined(_WIN32)
-            /* Windows has an event-driven DXGI capture thread and a hardware
-             * Media Foundation path, so make Low the first gaming-grade
-             * preset. Keeping Linux/macOS at 30 here preserves the requested
-             * Windows-first rollout until their pipelines are tuned next. */
             pDesktop->quality.nFps = 60U;
-            pDesktop->quality.nBitrateKbps = 6000U;
-#else
-            pDesktop->quality.nFps = 30U;
-            pDesktop->quality.nBitrateKbps = 4000U;
-#endif
-            pDesktop->quality.nKeyframeFrames = 300U;
+            pDesktop->quality.nBitrateKbps = 8000U;
+            pDesktop->quality.nKeyframeFrames = 600U; /* 10s GOP at 60 fps */
             pDesktop->quality.bRealtime = XTRUE;
             break;
         case DIRECTGATE_DESKTOP_PRESET_BALANCED:

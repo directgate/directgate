@@ -60,7 +60,7 @@ typedef enum {
 typedef enum {
     DIRECTGATE_DESKTOP_PRESET_BALANCED = 0, /* 1080p 30fps 8 Mbps (default) */
     DIRECTGATE_DESKTOP_PRESET_QUALITY,      /* 1080p 30fps 12 Mbps */
-    DIRECTGATE_DESKTOP_PRESET_LOW_LATENCY   /*  720p; Windows gaming path runs at 60fps */
+    DIRECTGATE_DESKTOP_PRESET_LOW_LATENCY   /*  gaming: 720p60 on all platforms */
 } directgate_desktop_preset_t;
 
 typedef enum {

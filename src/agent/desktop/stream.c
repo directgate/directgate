@@ -256,6 +256,21 @@ static int DirectGate_Desktop_StartTimer(directgate_desktop_t *pDesktop)
     return XSTDOK;
 }
 
+static void DirectGate_Desktop_RearmTimer(directgate_desktop_t *pDesktop)
+{
+    if (pDesktop == NULL || pDesktop->nTimerFd == XSOCK_INVALID) return;
+
+    uint32_t nFps = pDesktop->nFps ? pDesktop->nFps : DIRECTGATE_DESKTOP_DEFAULT_FPS;
+    uint64_t nNs = 1000000000ULL / nFps;
+
+    struct itimerspec spec;
+    memset(&spec, 0, sizeof(spec));
+    spec.it_interval.tv_sec = (time_t)(nNs / 1000000000ULL);
+    spec.it_interval.tv_nsec = (long)(nNs % 1000000000ULL);
+    spec.it_value = spec.it_interval;
+    (void)timerfd_settime(pDesktop->nTimerFd, 0, &spec, NULL);
+}
+
 /* Mirrors DirectGate_Desktop_StartMacPipeline: prefer the H.264 pipeline and
  * demote to raw RGBA when the encoder cannot start (missing OpenH264
  * library, unsupported pixel format, capture probe failure, ...). */
@@ -563,6 +578,8 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
         else if (xstrcmp(pPreset, "balanced")) eNext = DIRECTGATE_DESKTOP_PRESET_BALANCED;
 
         DirectGate_Desktop_ApplyPreset(pDesktop, eNext);
+        DirectGate_Desktop_RearmTimer(pDesktop);
+
         if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||
             pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
         {
