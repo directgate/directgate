@@ -24,6 +24,7 @@
 #ifdef DIRECTGATE_DESKTOP_HAS_AUDIO
 
 #include <dlfcn.h>
+#include <unistd.h>
 
 /* libpulse-simple is dlopen'd at runtime (like OpenH264 and libopus): the
  * agent must keep streaming video on hosts without PulseAudio/PipeWire. The
@@ -144,19 +145,47 @@ void* DirectGate_Audio_BackendOpen(uint32_t nSampleRate, uint32_t nChannels,
     const char *pDevice = getenv("DIRECTGATE_AUDIO_SOURCE");
     if (!xstrused(pDevice)) pDevice = "@DEFAULT_MONITOR@";
 
+    char sRuntimeDir[128];
+    const char *pRuntimeDir = getenv("XDG_RUNTIME_DIR");
+
+    if (!xstrused(pRuntimeDir))
+    {
+        snprintf(sRuntimeDir, sizeof(sRuntimeDir), "/run/user/%u", (unsigned)getuid());
+        pRuntimeDir = sRuntimeDir;
+        setenv("XDG_RUNTIME_DIR", pRuntimeDir, 0);
+    }
+
+    char sServer[192];
+    const char *pServer = getenv("DIRECTGATE_AUDIO_SERVER");
+    if (!xstrused(pServer))
+    {
+        if (xstrused(getenv("PULSE_SERVER")))
+        {
+            /* libpulse reads PULSE_SERVER itself */
+            pServer = NULL;
+        }
+        else
+        {
+            snprintf(sServer, sizeof(sServer), "unix:%s/pulse/native", pRuntimeDir);
+            pServer = sServer;
+        }
+    }
+
     int nError = 0;
-    pa_simple *pSimple = g_pulse.simpleNew(NULL, "directgate", DG_PA_STREAM_RECORD,
+    pa_simple *pSimple = g_pulse.simpleNew(pServer, "directgate", DG_PA_STREAM_RECORD,
         pDevice, "desktop", &spec, NULL, &attr, &nError);
 
     if (pSimple == NULL)
     {
-        DirectGate_Audio_SetError(pErr, nErrSize, "Failed to open system audio source %s (%s).",
-            pDevice, (g_pulse.strError != NULL) ? g_pulse.strError(nError) : "error");
+        DirectGate_Audio_SetError(pErr, nErrSize, "Failed to open system audio source %s via %s (%s).",
+            pDevice, xstrused(pServer) ? pServer : "default server",
+            (g_pulse.strError != NULL) ? g_pulse.strError(nError) : "error");
+
         return NULL;
     }
 
-    xlogi("Opened desktop audio monitor source: device(%s), rate(%u), channels(%u)",
-        pDevice, nSampleRate, nChannels);
+    xlogi("Opened desktop audio monitor source: device(%s), server(%s), rate(%u), channels(%u)",
+        pDevice, xstrused(pServer) ? pServer : "default", nSampleRate, nChannels);
 
     return (void*)pSimple;
 }
