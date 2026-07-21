@@ -98,8 +98,6 @@ typedef struct directgate_wasapi_ {
     LONGLONG nNextDueQpc;
 } directgate_wasapi_t;
 
-/* -- format handling ------------------------------------------------------ */
-
 static xbool_t DirectGate_WASAPI_IsFloat(const WAVEFORMATEX *pFmt)
 {
     if (pFmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return XTRUE;
@@ -109,6 +107,7 @@ static xbool_t DirectGate_WASAPI_IsFloat(const WAVEFORMATEX *pFmt)
         const WAVEFORMATEXTENSIBLE *pExt = (const WAVEFORMATEXTENSIBLE*)pFmt;
         return IsEqualGUID(&pExt->SubFormat, &g_DirectGateSubtypeFloat) ? XTRUE : XFALSE;
     }
+
     return XFALSE;
 }
 
@@ -118,24 +117,28 @@ static float DirectGate_WASAPI_Sample(const BYTE *pData, uint32_t nFrame, uint32
 {
     size_t nSampleBytes = (size_t)(nBits / 8U);
     const BYTE *p = pData + ((size_t)nFrame * nInChannels + nCh) * nSampleBytes;
+
     if (bFloat && nBits == 32U)
     {
         float f;
         memcpy(&f, p, sizeof(f));
         return f;
     }
+
     if (nBits == 16U)
     {
         int16_t s;
         memcpy(&s, p, sizeof(s));
         return (float)s / 32768.0f;
     }
+
     if (nBits == 32U)
     {
         int32_t s;
         memcpy(&s, p, sizeof(s));
         return (float)s / 2147483648.0f;
     }
+
     return 0.0f;
 }
 
@@ -156,6 +159,7 @@ static void DirectGate_WASAPI_CarryPush(directgate_wasapi_t *pCtx, int16_t nL, i
         memmove(pCtx->pCarry, pCtx->pCarry + 2U, (size_t)(pCtx->nCarryCount - 2U) * sizeof(int16_t));
         pCtx->nCarryCount -= 2U;
     }
+
     pCtx->pCarry[pCtx->nCarryCount++] = nL;
     pCtx->pCarry[pCtx->nCarryCount++] = nR;
 }
@@ -201,8 +205,6 @@ static void DirectGate_WASAPI_Resample(directgate_wasapi_t *pCtx, const BYTE *pD
         pCtx->fPrevR = fR;
     }
 }
-
-/* -- WASAPI open / teardown (main thread) --------------------------------- */
 
 static void DirectGate_Audio_SetError(char *pErr, size_t nErrSize, const char *pFmt, ...)
 {
@@ -253,6 +255,7 @@ static int DirectGate_WASAPI_Open(directgate_wasapi_t *pCtx, char *pErr, size_t 
         CoTaskMemFree(pFmt);
         if (pDevice != NULL) pDevice->lpVtbl->Release(pDevice);
         if (pEnum != NULL) pEnum->lpVtbl->Release(pEnum);
+
         return XSTDOK;
     } while (0);
 
@@ -314,7 +317,7 @@ static void DirectGate_WASAPI_PollWait(directgate_wasapi_t *pCtx)
     if (pCtx->hTimer != NULL)
     {
         LARGE_INTEGER due;
-        due.QuadPart = -(LONGLONG)DIRECTGATE_WASAPI_POLL_MS * 10000LL; /* ms -> negative 100 ns = relative */
+        due.QuadPart = -(LONGLONG)DIRECTGATE_WASAPI_POLL_MS * 10000LL;
 
         if (SetWaitableTimer(pCtx->hTimer, &due, 0, NULL, NULL, FALSE))
         {
@@ -362,6 +365,7 @@ void* DirectGate_Audio_BackendOpen(uint32_t nSampleRate, uint32_t nChannels, cha
 
     xlogi("Opened desktop audio WASAPI loopback (direct read): rate(%u), channels(%u)",
         DIRECTGATE_AUDIO_SAMPLE_RATE, DIRECTGATE_AUDIO_CHANNELS);
+
     return pCtx;
 }
 
