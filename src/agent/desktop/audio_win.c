@@ -39,75 +39,66 @@
 static const GUID g_DirectGateSubtypeFloat =
     { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
 
-/* All WASAPI work runs on a private capture thread that owns its own MTA COM
- * apartment: loopback capture on the default render endpoint, converted to the
- * fixed 48 kHz stereo S16 the Opus encoder wants and pushed into a ring that
- * DirectGate_Audio_BackendRead drains. Keeping COM off the shared audio worker
- * thread avoids cross-apartment marshalling of the capture client. */
+/* WASAPI has no separate capture thread here: the shared audio worker calls
+ * BackendRead, which drains the loopback endpoint directly (like Linux's
+ * blocking pa_simple_read) and resamples to 48 kHz stereo S16 on the fly. That
+ * removes the extra producer thread and its ring buffer, whose FIFO backlog
+ * used to sit between capture and encode as constant audio-behind-video delay.
+ * The IAudioClient is created in the (COM-free) main thread's MTA at open and
+ * used from the worker thread, which joins the same process MTA - both legal in
+ * the multi-threaded apartment, no marshalling.
+ *
+ * Loopback capture cannot use event-driven notifications, so BackendRead polls;
+ * a high-resolution waitable timer keeps the poll wait near 2 ms (a plain
+ * Sleep would round up to the ~15 ms system tick and add latency). */
 
-#define DIRECTGATE_WASAPI_RING_FRAMES  (DIRECTGATE_AUDIO_SAMPLE_RATE * 2U) /* ~2 s of stereo S16 */
-#define DIRECTGATE_WASAPI_POLL_MS      8U      /* loopback packet poll cadence */
-#define DIRECTGATE_WASAPI_INIT_WAIT_MS 3000U   /* how long BackendOpen waits for readiness */
-/* Max audio the consumer lets pool in the ring before dropping the stale head.
- * The WASAPI producer and the encode consumer both run at real time, so any
- * backlog formed at startup persists as constant latency (FIFO) and drifts
- * audio behind video. 2 frames (~40 ms) keeps a small jitter margin while
- * staying tight enough for A/V sync. */
+#define DIRECTGATE_WASAPI_POLL_MS       2U    /* inter-poll wait while a frame fills */
+#define DIRECTGATE_WASAPI_BUFFER_100NS  500000LL /* 50 ms shared capture buffer */
+/* Freshest-audio cap: if the consumer briefly falls behind, drop the stale head
+ * so latency never accumulates. 2 frames (~40 ms) keeps a small jitter margin.
+ * With direct reads paced by the encoder this almost never triggers. */
 #define DIRECTGATE_WASAPI_MAX_BACKLOG_FRAMES 2U
+/* Carry buffer capacity (resampled S16 not yet returned): sized for a worst-case
+ * loopback burst plus margin; the backlog cap keeps the live level tiny. */
+#define DIRECTGATE_WASAPI_CARRY_FRAMES  32U
 
 typedef struct directgate_wasapi_ {
-    uint32_t nChannels;            /* output channel count (matches request) */
+    /* WASAPI objects (created in BackendOpen on the main thread's MTA). */
+    IAudioClient *pClient;
+    IAudioCaptureClient *pCapture;
+    xbool_t bMainCom;              /* main-thread CoInitialize succeeded */
 
-    HANDLE hThread;
-    HANDLE hStopEvent;             /* signalled to stop the capture thread */
-    volatile LONG bReady;          /* capture thread initialised successfully */
-    volatile LONG bFailed;         /* capture thread hit a fatal init error */
-    HANDLE hInitEvent;             /* set once bReady/bFailed is known */
-    char sInitError[160];
+    /* Source mix format (resolved once at open). */
+    uint32_t nInChannels;
+    uint16_t nBits;
+    xbool_t bFloat;
+    double dRatio;                 /* input samples per 48 kHz output sample */
 
-    CRITICAL_SECTION lock;         /* guards the ring below */
-    CONDITION_VARIABLE dataCv;     /* signalled when samples are pushed */
-    int16_t *pRing;                /* interleaved S16 output samples */
-    uint32_t nRingCap;             /* capacity in samples (frames * channels) */
-    uint32_t nRingHead;
-    uint32_t nRingTail;
-    uint32_t nRingCount;
-
-    /* Linear-resampler state (mix rate -> 48 kHz), owned by the capture thread. */
-    double dRatio;                 /* input samples consumed per output sample */
-    double dFrac;                  /* fractional input position in [0,1) */
+    /* Linear-resampler state + output carry, owned by the worker (BackendRead). */
+    double dFrac;
     float fPrevL;
     float fPrevR;
     xbool_t bPrimed;
+    int16_t *pCarry;               /* interleaved S16 awaiting return */
+    uint32_t nCarryCap;
+    uint32_t nCarryCount;
+
+    /* Worker-thread one-time setup. */
+    xbool_t bWorkerInit;
+    xbool_t bWorkerCom;
+    HANDLE hTimer;                 /* high-resolution poll timer */
+    HMODULE hAvrt;                 /* MMCSS lib (freed at close) */
+    HANDLE hMmcss;
+
+    /* Real-time frame pacing. Unlike a PulseAudio monitor (which streams silence
+     * as real samples at the sink rate), WASAPI loopback delivers nothing during
+     * silence, so silent frames must be emitted on a wall clock or the audio
+     * timeline would drift behind video the longer it stays quiet. */
+    LONGLONG nQpcFreq;
+    LONGLONG nNextDueQpc;
 } directgate_wasapi_t;
 
-static void DirectGate_WASAPI_Push(directgate_wasapi_t *pCtx, int16_t nL, int16_t nR)
-{
-    EnterCriticalSection(&pCtx->lock);
-
-    /* Drop the oldest stereo pair when full so latency stays bounded. */
-    if (pCtx->nRingCount + 2U > pCtx->nRingCap)
-    {
-        pCtx->nRingTail = (pCtx->nRingTail + 2U) % pCtx->nRingCap;
-        pCtx->nRingCount -= 2U;
-    }
-
-    pCtx->pRing[pCtx->nRingHead] = nL;
-    pCtx->pRing[(pCtx->nRingHead + 1U) % pCtx->nRingCap] = nR;
-    pCtx->nRingHead = (pCtx->nRingHead + 2U) % pCtx->nRingCap;
-    pCtx->nRingCount += 2U;
-
-    LeaveCriticalSection(&pCtx->lock);
-    WakeConditionVariable(&pCtx->dataCv);
-}
-
-static int16_t DirectGate_WASAPI_ClampS16(float fSample)
-{
-    float fScaled = fSample * 32767.0f;
-    if (fScaled > 32767.0f) fScaled = 32767.0f;
-    else if (fScaled < -32768.0f) fScaled = -32768.0f;
-    return (int16_t)fScaled;
-}
+/* -- format handling ------------------------------------------------------ */
 
 static xbool_t DirectGate_WASAPI_IsFloat(const WAVEFORMATEX *pFmt)
 {
@@ -118,7 +109,6 @@ static xbool_t DirectGate_WASAPI_IsFloat(const WAVEFORMATEX *pFmt)
         const WAVEFORMATEXTENSIBLE *pExt = (const WAVEFORMATEXTENSIBLE*)pFmt;
         return IsEqualGUID(&pExt->SubFormat, &g_DirectGateSubtypeFloat) ? XTRUE : XFALSE;
     }
-
     return XFALSE;
 }
 
@@ -128,35 +118,51 @@ static float DirectGate_WASAPI_Sample(const BYTE *pData, uint32_t nFrame, uint32
 {
     size_t nSampleBytes = (size_t)(nBits / 8U);
     const BYTE *p = pData + ((size_t)nFrame * nInChannels + nCh) * nSampleBytes;
-
     if (bFloat && nBits == 32U)
     {
         float f;
         memcpy(&f, p, sizeof(f));
         return f;
     }
-
     if (nBits == 16U)
     {
         int16_t s;
         memcpy(&s, p, sizeof(s));
         return (float)s / 32768.0f;
     }
-
     if (nBits == 32U)
     {
         int32_t s;
         memcpy(&s, p, sizeof(s));
         return (float)s / 2147483648.0f;
     }
-
     return 0.0f;
 }
 
-/* Resamples one input packet (mix rate) to 48 kHz stereo S16 into the ring. */
+static int16_t DirectGate_WASAPI_ClampS16(float fSample)
+{
+    float fScaled = fSample * 32767.0f;
+    if (fScaled > 32767.0f) fScaled = 32767.0f;
+    else if (fScaled < -32768.0f) fScaled = -32768.0f;
+    return (int16_t)fScaled;
+}
+
+/* Appends one interleaved stereo pair to the carry, dropping the oldest if the
+ * buffer is somehow full (the read-time backlog cap normally prevents this). */
+static void DirectGate_WASAPI_CarryPush(directgate_wasapi_t *pCtx, int16_t nL, int16_t nR)
+{
+    if (pCtx->nCarryCount + 2U > pCtx->nCarryCap)
+    {
+        memmove(pCtx->pCarry, pCtx->pCarry + 2U, (size_t)(pCtx->nCarryCount - 2U) * sizeof(int16_t));
+        pCtx->nCarryCount -= 2U;
+    }
+    pCtx->pCarry[pCtx->nCarryCount++] = nL;
+    pCtx->pCarry[pCtx->nCarryCount++] = nR;
+}
+
+/* Resamples one input packet (mix rate) to 48 kHz stereo S16 into the carry. */
 static void DirectGate_WASAPI_Resample(directgate_wasapi_t *pCtx, const BYTE *pData,
-                                       uint32_t nFrames, uint32_t nInChannels,
-                                       uint16_t nBits, xbool_t bFloat, xbool_t bSilent)
+                                       uint32_t nFrames, xbool_t bSilent)
 {
     for (uint32_t i = 0; i < nFrames; i++)
     {
@@ -168,9 +174,9 @@ static void DirectGate_WASAPI_Resample(directgate_wasapi_t *pCtx, const BYTE *pD
         }
         else
         {
-            fL = DirectGate_WASAPI_Sample(pData, i, 0, nInChannels, nBits, bFloat);
-            fR = (nInChannels >= 2U)
-                ? DirectGate_WASAPI_Sample(pData, i, 1, nInChannels, nBits, bFloat)
+            fL = DirectGate_WASAPI_Sample(pData, i, 0, pCtx->nInChannels, pCtx->nBits, pCtx->bFloat);
+            fR = (pCtx->nInChannels >= 2U)
+                ? DirectGate_WASAPI_Sample(pData, i, 1, pCtx->nInChannels, pCtx->nBits, pCtx->bFloat)
                 : fL;
         }
 
@@ -181,13 +187,12 @@ static void DirectGate_WASAPI_Resample(directgate_wasapi_t *pCtx, const BYTE *pD
             pCtx->bPrimed = XTRUE;
         }
 
-        /* Emit every output sample whose position falls inside [prev, cur). */
         while (pCtx->dFrac < 1.0)
         {
             float t = (float)pCtx->dFrac;
             float oL = pCtx->fPrevL + (fL - pCtx->fPrevL) * t;
             float oR = pCtx->fPrevR + (fR - pCtx->fPrevR) * t;
-            DirectGate_WASAPI_Push(pCtx, DirectGate_WASAPI_ClampS16(oL), DirectGate_WASAPI_ClampS16(oR));
+            DirectGate_WASAPI_CarryPush(pCtx, DirectGate_WASAPI_ClampS16(oL), DirectGate_WASAPI_ClampS16(oR));
             pCtx->dFrac += pCtx->dRatio;
         }
 
@@ -197,185 +202,165 @@ static void DirectGate_WASAPI_Resample(directgate_wasapi_t *pCtx, const BYTE *pD
     }
 }
 
-static void DirectGate_WASAPI_SignalInit(directgate_wasapi_t *pCtx, xbool_t bOk, const char *pErr)
-{
-    if (!bOk)
-    {
-        InterlockedExchange(&pCtx->bFailed, 1);
-        if (pErr != NULL) xstrncpy(pCtx->sInitError, sizeof(pCtx->sInitError), pErr);
-    }
-    else
-    {
-        InterlockedExchange(&pCtx->bReady, 1);
-    }
+/* -- WASAPI open / teardown (main thread) --------------------------------- */
 
-    SetEvent(pCtx->hInitEvent);
+static void DirectGate_Audio_SetError(char *pErr, size_t nErrSize, const char *pFmt, ...)
+{
+    if (pErr == NULL || !nErrSize) return;
+    va_list args;
+    va_start(args, pFmt);
+    vsnprintf(pErr, nErrSize, pFmt, args);
+    va_end(args);
 }
 
-static DWORD WINAPI DirectGate_WASAPI_Thread(LPVOID pArg)
+static int DirectGate_WASAPI_Open(directgate_wasapi_t *pCtx, char *pErr, size_t nErrSize)
 {
-    directgate_wasapi_t *pCtx = (directgate_wasapi_t*)pArg;
-
-    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    xbool_t bCoInit = (hr == S_OK || hr == S_FALSE) ? XTRUE : XFALSE;
-
-#ifdef DIRECTGATE_HAVE_AVRT_THREAD_PRIORITY
-    /* Register with MMCSS so a CPU-bound foreground game cannot starve audio
-     * capture: dropouts are more noticeable than a late video frame, so audio
-     * gets the "Pro Audio" real-time band (above the video "Capture" thread).
-     * avrt.dll is loaded at runtime and fails soft. */
-    HMODULE hAvrt = LoadLibraryW(L"avrt.dll");
-    HANDLE hMmcss = NULL;
-    if (hAvrt != NULL)
-    {
-        typedef HANDLE (WINAPI *directgate_av_set_fn)(LPCWSTR, LPDWORD);
-        typedef BOOL (WINAPI *directgate_av_prio_fn)(HANDLE, int);
-
-        directgate_av_set_fn pAvSet = (directgate_av_set_fn)(void*)GetProcAddress(hAvrt, "AvSetMmThreadCharacteristicsW");
-        directgate_av_prio_fn pAvPrio = (directgate_av_prio_fn)(void*)GetProcAddress(hAvrt, "AvSetMmThreadPriority");
-        DWORD nMmTaskIndex = 0;
-
-        if (pAvSet != NULL) hMmcss = pAvSet(L"Pro Audio", &nMmTaskIndex);
-        if (hMmcss != NULL && pAvPrio != NULL) pAvPrio(hMmcss, 1); /* AVRT_PRIORITY_HIGH */
-    }
-#endif
-
     IMMDeviceEnumerator *pEnum = NULL;
     IMMDevice *pDevice = NULL;
-    IAudioClient *pClient = NULL;
-    IAudioCaptureClient *pCapture = NULL;
     WAVEFORMATEX *pFmt = NULL;
+    HRESULT hr;
 
     do
     {
         hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &IID_IMMDeviceEnumerator, (void**)&pEnum);
-        if (FAILED(hr)) { DirectGate_WASAPI_SignalInit(pCtx, XFALSE, "no audio device enumerator"); break; }
+        if (FAILED(hr)) { DirectGate_Audio_SetError(pErr, nErrSize, "no audio device enumerator."); break; }
 
         hr = pEnum->lpVtbl->GetDefaultAudioEndpoint(pEnum, eRender, eConsole, &pDevice);
-        if (FAILED(hr)) { DirectGate_WASAPI_SignalInit(pCtx, XFALSE, "no default output device"); break; }
+        if (FAILED(hr)) { DirectGate_Audio_SetError(pErr, nErrSize, "no default output device."); break; }
 
-        hr = pDevice->lpVtbl->Activate(pDevice, &IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&pClient);
-        if (FAILED(hr)) { DirectGate_WASAPI_SignalInit(pCtx, XFALSE, "failed to activate audio client"); break; }
+        hr = pDevice->lpVtbl->Activate(pDevice, &IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&pCtx->pClient);
+        if (FAILED(hr)) { DirectGate_Audio_SetError(pErr, nErrSize, "failed to activate audio client."); break; }
 
-        hr = pClient->lpVtbl->GetMixFormat(pClient, &pFmt);
-        if (FAILED(hr) || pFmt == NULL) { DirectGate_WASAPI_SignalInit(pCtx, XFALSE, "no mix format"); break; }
+        hr = pCtx->pClient->lpVtbl->GetMixFormat(pCtx->pClient, &pFmt);
+        if (FAILED(hr) || pFmt == NULL) { DirectGate_Audio_SetError(pErr, nErrSize, "no mix format."); break; }
 
-        uint32_t nInChannels = pFmt->nChannels ? pFmt->nChannels : 2U;
-        uint16_t nBits = pFmt->wBitsPerSample ? pFmt->wBitsPerSample : 32U;
-        xbool_t bFloat = DirectGate_WASAPI_IsFloat(pFmt);
+        pCtx->nInChannels = pFmt->nChannels ? pFmt->nChannels : 2U;
+        pCtx->nBits = pFmt->wBitsPerSample ? pFmt->wBitsPerSample : 32U;
+        pCtx->bFloat = DirectGate_WASAPI_IsFloat(pFmt);
         pCtx->dRatio = (double)pFmt->nSamplesPerSec / (double)DIRECTGATE_AUDIO_SAMPLE_RATE;
         if (pCtx->dRatio <= 0.0) pCtx->dRatio = 1.0;
 
-        /* 200 ms shared-mode loopback buffer, timer-driven (no event handle). */
-        REFERENCE_TIME nBufDuration = 2000000; /* 100-ns units */
-        hr = pClient->lpVtbl->Initialize(pClient, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, nBufDuration, 0, pFmt, NULL);
-        if (FAILED(hr)) { DirectGate_WASAPI_SignalInit(pCtx, XFALSE, "failed to initialise loopback capture"); break; }
+        hr = pCtx->pClient->lpVtbl->Initialize(pCtx->pClient, AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK, DIRECTGATE_WASAPI_BUFFER_100NS, 0, pFmt, NULL);
+        if (FAILED(hr)) { DirectGate_Audio_SetError(pErr, nErrSize, "failed to initialise loopback capture."); break; }
 
-        hr = pClient->lpVtbl->GetService(pClient, &IID_IAudioCaptureClient, (void**)&pCapture);
-        if (FAILED(hr)) { DirectGate_WASAPI_SignalInit(pCtx, XFALSE, "no capture service"); break; }
+        hr = pCtx->pClient->lpVtbl->GetService(pCtx->pClient, &IID_IAudioCaptureClient, (void**)&pCtx->pCapture);
+        if (FAILED(hr)) { DirectGate_Audio_SetError(pErr, nErrSize, "no capture service."); break; }
 
-        hr = pClient->lpVtbl->Start(pClient);
-        if (FAILED(hr)) { DirectGate_WASAPI_SignalInit(pCtx, XFALSE, "failed to start capture"); break; }
+        hr = pCtx->pClient->lpVtbl->Start(pCtx->pClient);
+        if (FAILED(hr)) { DirectGate_Audio_SetError(pErr, nErrSize, "failed to start capture."); break; }
 
-        DirectGate_WASAPI_SignalInit(pCtx, XTRUE, NULL);
-
-        while (WaitForSingleObject(pCtx->hStopEvent, DIRECTGATE_WASAPI_POLL_MS) == WAIT_TIMEOUT)
-        {
-            UINT32 nPacket = 0;
-            while (SUCCEEDED(pCapture->lpVtbl->GetNextPacketSize(pCapture, &nPacket)) && nPacket > 0)
-            {
-                BYTE *pData = NULL;
-                UINT32 nFrames = 0;
-                DWORD nFlags = 0;
-                if (FAILED(pCapture->lpVtbl->GetBuffer(pCapture, &pData, &nFrames, &nFlags, NULL, NULL))) break;
-
-                xbool_t bSilent = (nFlags & AUDCLNT_BUFFERFLAGS_SILENT) ? XTRUE : XFALSE;
-                if (nFrames > 0) DirectGate_WASAPI_Resample(pCtx, pData, nFrames, nInChannels, nBits, bFloat, bSilent);
-
-                pCapture->lpVtbl->ReleaseBuffer(pCapture, nFrames);
-            }
-        }
+        CoTaskMemFree(pFmt);
+        if (pDevice != NULL) pDevice->lpVtbl->Release(pDevice);
+        if (pEnum != NULL) pEnum->lpVtbl->Release(pEnum);
+        return XSTDOK;
     } while (0);
 
-    if (pClient != NULL) pClient->lpVtbl->Stop(pClient);
     if (pFmt != NULL) CoTaskMemFree(pFmt);
-    if (pCapture != NULL) pCapture->lpVtbl->Release(pCapture);
-    if (pClient != NULL) pClient->lpVtbl->Release(pClient);
     if (pDevice != NULL) pDevice->lpVtbl->Release(pDevice);
     if (pEnum != NULL) pEnum->lpVtbl->Release(pEnum);
+    if (pCtx->pCapture != NULL) { pCtx->pCapture->lpVtbl->Release(pCtx->pCapture); pCtx->pCapture = NULL; }
+    if (pCtx->pClient != NULL) { pCtx->pClient->lpVtbl->Release(pCtx->pClient); pCtx->pClient = NULL; }
+    return XSTDERR;
+}
+
+static void DirectGate_WASAPI_WorkerInit(directgate_wasapi_t *pCtx)
+{
+    pCtx->bWorkerInit = XTRUE;
+
+    /* Join the process MTA so the worker can call the capture client that the
+     * main thread created. No CoUninitialize: balanced by the thread exit. */
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    pCtx->bWorkerCom = (hr == S_OK || hr == S_FALSE) ? XTRUE : XFALSE;
 
 #ifdef DIRECTGATE_HAVE_AVRT_THREAD_PRIORITY
-    if (hMmcss != NULL)
+    /* MMCSS so a CPU-bound foreground game cannot starve audio (dropouts are
+     * more noticeable than a late video frame). "Pro Audio" is the real-time
+     * audio band; avrt.dll is loaded at runtime and fails soft. */
+    pCtx->hAvrt = LoadLibraryW(L"avrt.dll");
+    if (pCtx->hAvrt != NULL)
     {
-        typedef BOOL (WINAPI *directgate_av_revert_fn)(HANDLE);
-        directgate_av_revert_fn pAvRevert = (directgate_av_revert_fn)(void*)GetProcAddress(hAvrt, "AvRevertMmThreadCharacteristics");
-        if (pAvRevert != NULL) pAvRevert(hMmcss);
+        typedef HANDLE (WINAPI *directgate_av_set_fn)(LPCWSTR, LPDWORD);
+        typedef BOOL (WINAPI *directgate_av_prio_fn)(HANDLE, int);
+
+        directgate_av_set_fn pAvSet = (directgate_av_set_fn)(void*)GetProcAddress(pCtx->hAvrt, "AvSetMmThreadCharacteristicsW");
+        directgate_av_prio_fn pAvPrio = (directgate_av_prio_fn)(void*)GetProcAddress(pCtx->hAvrt, "AvSetMmThreadPriority");
+        DWORD nMmTaskIndex = 0;
+
+        if (pAvSet != NULL) pCtx->hMmcss = pAvSet(L"Pro Audio", &nMmTaskIndex);
+        if (pCtx->hMmcss != NULL && pAvPrio != NULL) pAvPrio(pCtx->hMmcss, 1); /* AVRT_PRIORITY_HIGH */
     }
-    if (hAvrt != NULL) FreeLibrary(hAvrt);
 #endif
 
-    if (bCoInit) CoUninitialize();
+    /* High-resolution timer so the poll wait is ~2 ms, not the ~15 ms a plain
+     * Sleep rounds to. Falls back to a normal timer on pre-1803 Windows. */
+    pCtx->hTimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (pCtx->hTimer == NULL) pCtx->hTimer = CreateWaitableTimerW(NULL, FALSE, NULL);
 
-    /* Make sure a caller blocked in BackendOpen is always released. */
-    if (!InterlockedCompareExchange(&pCtx->bReady, 0, 0) &&
-        !InterlockedCompareExchange(&pCtx->bFailed, 0, 0))
-        DirectGate_WASAPI_SignalInit(pCtx, XFALSE, "audio capture thread exited");
+    LARGE_INTEGER nFreq;
+    if (QueryPerformanceFrequency(&nFreq)) pCtx->nQpcFreq = nFreq.QuadPart;
+}
 
-    (void)bCoInit;
-    return 0;
+static LONGLONG DirectGate_WASAPI_QpcNow(void)
+{
+    LARGE_INTEGER n;
+    QueryPerformanceCounter(&n);
+    return n.QuadPart;
+}
+
+static void DirectGate_WASAPI_PollWait(directgate_wasapi_t *pCtx)
+{
+    if (pCtx->hTimer != NULL)
+    {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)DIRECTGATE_WASAPI_POLL_MS * 10000LL; /* ms -> negative 100 ns = relative */
+
+        if (SetWaitableTimer(pCtx->hTimer, &due, 0, NULL, NULL, FALSE))
+        {
+            WaitForSingleObject(pCtx->hTimer, DIRECTGATE_WASAPI_POLL_MS + 5U);
+            return;
+        }
+    }
+
+    Sleep(DIRECTGATE_WASAPI_POLL_MS);
 }
 
 void* DirectGate_Audio_BackendOpen(uint32_t nSampleRate, uint32_t nChannels, char *pErr, size_t nErrSize)
 {
     (void)nSampleRate; /* always resampled to DIRECTGATE_AUDIO_SAMPLE_RATE */
+    (void)nChannels;
 
     directgate_wasapi_t *pCtx = (directgate_wasapi_t*)calloc(1, sizeof(*pCtx));
     if (pCtx == NULL)
     {
-        if (pErr != NULL) xstrncpy(pErr, nErrSize, "Out of memory starting audio.");
+        DirectGate_Audio_SetError(pErr, nErrSize, "Out of memory starting audio.");
         return NULL;
     }
 
-    pCtx->nChannels = nChannels;
-    pCtx->nRingCap = DIRECTGATE_WASAPI_RING_FRAMES * DIRECTGATE_AUDIO_CHANNELS;
-    pCtx->pRing = (int16_t*)malloc((size_t)pCtx->nRingCap * sizeof(int16_t));
-
-    InitializeCriticalSection(&pCtx->lock);
-    InitializeConditionVariable(&pCtx->dataCv);
-
-    pCtx->hStopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-    pCtx->hInitEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-
-    if (pCtx->pRing == NULL || pCtx->hStopEvent == NULL || pCtx->hInitEvent == NULL)
+    pCtx->nCarryCap = DIRECTGATE_WASAPI_CARRY_FRAMES * DIRECTGATE_AUDIO_FRAME_SAMPLES * DIRECTGATE_AUDIO_CHANNELS;
+    pCtx->pCarry = (int16_t*)malloc((size_t)pCtx->nCarryCap * sizeof(int16_t));
+    if (pCtx->pCarry == NULL)
     {
-        if (pErr != NULL) xstrncpy(pErr, nErrSize, "Failed to allocate audio capture resources.");
+        DirectGate_Audio_SetError(pErr, nErrSize, "Failed to allocate audio capture buffer.");
+        free(pCtx);
+        return NULL;
+    }
+
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    pCtx->bMainCom = (hr == S_OK || hr == S_FALSE) ? XTRUE : XFALSE;
+
+    char sWhy[128];
+    sWhy[0] = '\0';
+
+    if (DirectGate_WASAPI_Open(pCtx, sWhy, sizeof(sWhy)) != XSTDOK)
+    {
+        DirectGate_Audio_SetError(pErr, nErrSize, "Failed to open WASAPI loopback capture (%s).", sWhy[0] ? sWhy : "unknown error");
         DirectGate_Audio_BackendClose(pCtx);
         return NULL;
     }
 
-    pCtx->hThread = CreateThread(NULL, 0, DirectGate_WASAPI_Thread, pCtx, 0, NULL);
-    if (pCtx->hThread == NULL)
-    {
-        if (pErr != NULL) xstrncpy(pErr, nErrSize, "Failed to start audio capture thread.");
-        DirectGate_Audio_BackendClose(pCtx);
-        return NULL;
-    }
-
-    /* Report device/init failures synchronously, like the other backends. */
-    WaitForSingleObject(pCtx->hInitEvent, DIRECTGATE_WASAPI_INIT_WAIT_MS);
-    if (!InterlockedCompareExchange(&pCtx->bReady, 0, 0))
-    {
-        if (pErr != NULL)
-        {
-            xstrncpy(pErr, nErrSize, pCtx->sInitError[0] ?
-                pCtx->sInitError : "WASAPI loopback capture did not start.");
-        }
-
-        DirectGate_Audio_BackendClose(pCtx);
-        return NULL;
-    }
-
-    xlogi("Opened desktop audio WASAPI loopback: rate(%u), channels(%u)", DIRECTGATE_AUDIO_SAMPLE_RATE, nChannels);
+    xlogi("Opened desktop audio WASAPI loopback (direct read): rate(%u), channels(%u)",
+        DIRECTGATE_AUDIO_SAMPLE_RATE, DIRECTGATE_AUDIO_CHANNELS);
     return pCtx;
 }
 
@@ -385,45 +370,76 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames
     XCHECK((pCtx != NULL && pBuf != NULL), XSTDERR);
     XCHECK((nFrames > 0 && nChannels > 0), XSTDERR);
 
+    if (!pCtx->bWorkerInit) DirectGate_WASAPI_WorkerInit(pCtx);
+
     uint32_t nNeeded = nFrames * nChannels;
-    uint32_t nGot = 0;
-
-    EnterCriticalSection(&pCtx->lock);
-
-    /* Drop any stale backlog first so we always encode the freshest audio and
-     * stay in sync with video. A backlog only forms once (the producer starts
-     * ahead of the consumer at capture start); after this catch-up the two run
-     * lock-step at real time, so no further dropping occurs. Dropped counts are
-     * whole stereo pairs, keeping L/R alignment. */
     uint32_t nMaxBacklog = nNeeded * DIRECTGATE_WASAPI_MAX_BACKLOG_FRAMES;
-    if (pCtx->nRingCount > nMaxBacklog)
+
+    /* Real-time cadence: one frame every DIRECTGATE_AUDIO_FRAME_MS of wall time.
+     * Returning on a wall-clock deadline (not just on data) makes silent frames
+     * track real time, so the stream never drifts behind video during quiet
+     * stretches - matching how a PulseAudio monitor paces silence. */
+    LONGLONG nFrameTicks = pCtx->nQpcFreq ? (pCtx->nQpcFreq * (LONGLONG)DIRECTGATE_AUDIO_FRAME_MS) / 1000LL : 0;
+    LONGLONG nNow = pCtx->nQpcFreq ? DirectGate_WASAPI_QpcNow() : 0;
+
+    if (nFrameTicks > 0 && (pCtx->nNextDueQpc == 0 || pCtx->nNextDueQpc > nNow + 4 * nFrameTicks))
+        pCtx->nNextDueQpc = nNow + nFrameTicks; /* (re)anchor the clock */
+
+    /* Pull directly from the loopback endpoint (no lock: capture + resample both
+     * run on this worker thread) until the frame is due. */
+    for (;;)
     {
-        uint32_t nDrop = pCtx->nRingCount - nMaxBacklog;
-        pCtx->nRingTail = (pCtx->nRingTail + nDrop) % pCtx->nRingCap;
-        pCtx->nRingCount -= nDrop;
+        UINT32 nPacket = 0;
+        while (SUCCEEDED(pCtx->pCapture->lpVtbl->GetNextPacketSize(pCtx->pCapture, &nPacket)) && nPacket > 0)
+        {
+            BYTE *pData = NULL;
+            UINT32 nAvail = 0;
+            DWORD nFlags = 0;
+
+            if (FAILED(pCtx->pCapture->lpVtbl->GetBuffer(pCtx->pCapture, &pData, &nAvail, &nFlags, NULL, NULL))) break;
+            if (nAvail > 0) DirectGate_WASAPI_Resample(pCtx, pData, nAvail, (nFlags & AUDCLNT_BUFFERFLAGS_SILENT) ? XTRUE : XFALSE);
+            pCtx->pCapture->lpVtbl->ReleaseBuffer(pCtx->pCapture, nAvail);
+        }
+
+        /* Keep only the freshest audio so latency never accumulates. */
+        if (pCtx->nCarryCount > nMaxBacklog)
+        {
+            uint32_t nDrop = pCtx->nCarryCount - nMaxBacklog;
+            memmove(pCtx->pCarry, pCtx->pCarry + nDrop, (size_t)(pCtx->nCarryCount - nDrop) * sizeof(int16_t));
+            pCtx->nCarryCount -= nDrop;
+        }
+
+        if (nFrameTicks <= 0)
+        {
+            /* No high-res clock: fall back to data-or-one-frame-timeout. */
+            if (pCtx->nCarryCount >= nNeeded) break;
+        }
+        else
+        {
+            nNow = DirectGate_WASAPI_QpcNow();
+            if (nNow >= pCtx->nNextDueQpc) break; /* frame is due: return real audio or pad */
+        }
+
+        DirectGate_WASAPI_PollWait(pCtx);
+        if (nFrameTicks <= 0 && pCtx->nCarryCount >= nNeeded) break;
     }
 
-    /* Wait up to two frame periods for real samples; loopback delivers nothing
-     * during silence, so pad the remainder with silence to keep a continuous
-     * 20 ms cadence (and let the worker observe a stop between reads). */
-    uint32_t nWaited = 0;
-
-    while (pCtx->nRingCount < nNeeded && nWaited < 2U * DIRECTGATE_AUDIO_FRAME_MS)
+    /* Advance the deadline by exactly one frame; re-anchor if we fell behind
+     * (a burst of real audio can push us past the due time). */
+    if (nFrameTicks > 0)
     {
-        if (!SleepConditionVariableCS(&pCtx->dataCv, &pCtx->lock, DIRECTGATE_AUDIO_FRAME_MS))
-            nWaited += DIRECTGATE_AUDIO_FRAME_MS;
+        pCtx->nNextDueQpc += nFrameTicks;
+        nNow = DirectGate_WASAPI_QpcNow();
+        if (pCtx->nNextDueQpc < nNow) pCtx->nNextDueQpc = nNow + nFrameTicks;
     }
 
-    while (nGot < nNeeded && pCtx->nRingCount > 0)
-    {
-        pBuf[nGot++] = pCtx->pRing[pCtx->nRingTail];
-        pCtx->nRingTail = (pCtx->nRingTail + 1U) % pCtx->nRingCap;
-        pCtx->nRingCount--;
-    }
+    uint32_t nGot = (pCtx->nCarryCount < nNeeded) ? pCtx->nCarryCount : nNeeded;
+    memcpy(pBuf, pCtx->pCarry, (size_t)nGot * sizeof(int16_t));
+    if (pCtx->nCarryCount > nGot)
+        memmove(pCtx->pCarry, pCtx->pCarry + nGot, (size_t)(pCtx->nCarryCount - nGot) * sizeof(int16_t));
+    pCtx->nCarryCount -= nGot;
 
-    LeaveCriticalSection(&pCtx->lock);
-
-    while (nGot < nNeeded) pBuf[nGot++] = 0; /* silence pad */
+    for (uint32_t i = nGot; i < nNeeded; i++) pBuf[i] = 0; /* silence pad */
     return XSTDOK;
 }
 
@@ -432,18 +448,19 @@ void DirectGate_Audio_BackendClose(void *pBackend)
     directgate_wasapi_t *pCtx = (directgate_wasapi_t*)pBackend;
     if (pCtx == NULL) return;
 
-    if (pCtx->hThread != NULL)
-    {
-        if (pCtx->hStopEvent != NULL) SetEvent(pCtx->hStopEvent);
-        WaitForSingleObject(pCtx->hThread, INFINITE);
-        CloseHandle(pCtx->hThread);
-    }
+    /* The worker has already joined by the time AudioStop calls this, so all
+     * WASAPI objects (created on the main thread's MTA) are released here. */
+    if (pCtx->pClient != NULL) pCtx->pClient->lpVtbl->Stop(pCtx->pClient);
+    if (pCtx->pCapture != NULL) pCtx->pCapture->lpVtbl->Release(pCtx->pCapture);
+    if (pCtx->pClient != NULL) pCtx->pClient->lpVtbl->Release(pCtx->pClient);
 
-    if (pCtx->hStopEvent != NULL) CloseHandle(pCtx->hStopEvent);
-    if (pCtx->hInitEvent != NULL) CloseHandle(pCtx->hInitEvent);
+    if (pCtx->hTimer != NULL) CloseHandle(pCtx->hTimer);
+#ifdef DIRECTGATE_HAVE_AVRT_THREAD_PRIORITY
+    if (pCtx->hAvrt != NULL) FreeLibrary(pCtx->hAvrt);
+#endif
 
-    DeleteCriticalSection(&pCtx->lock);
-    free(pCtx->pRing);
+    if (pCtx->bMainCom) CoUninitialize();
+    free(pCtx->pCarry);
     free(pCtx);
 }
 

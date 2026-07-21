@@ -208,7 +208,7 @@ extra to install:
 
 Desktop streaming requires the interactive session the launcher starts the agent in (see [As a Windows service](#as-a-windows-service)); a UAC secure-desktop prompt pauses duplication until it is dismissed, and the lock screen cannot be captured by design.
 
-**System audio** (opt-in) is captured with WASAPI loopback on the default render endpoint, on a dedicated capture thread that resamples the shared mix to 48 kHz stereo and hands it to the Opus encoder. libopus is linked **statically** into the exe (see [Opus for Windows](#opus-for-windows-one-time)), so no runtime DLL is needed and audio always works when an output device is present. See [Desktop audio track](webrtc.md#desktop-audio-track).
+**System audio** (opt-in) is captured with WASAPI loopback on the default render endpoint. The encode worker drains the endpoint directly (no separate capture thread or ring buffer, so audio stays tight to video), resamples the shared mix to 48 kHz stereo, and pads silent stretches on a high-resolution wall clock (loopback delivers nothing during silence). libopus is linked **statically** into the exe (see [Opus for Windows](#opus-for-windows-one-time)), so no runtime DLL is needed and audio always works when an output device is present. See [Desktop audio track](webrtc.md#desktop-audio-track).
 
 ---
 
