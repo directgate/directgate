@@ -12,6 +12,9 @@ LogsDirectoryMode=0755
 
 Environment=DISPLAY=:0
 Environment="XAUTHORITY=<xauthority>"
+# Lets desktop system-audio capture reach the user's PulseAudio/PipeWire socket
+# at $XDG_RUNTIME_DIR/pulse/native (the agent also derives this from its uid).
+Environment="XDG_RUNTIME_DIR=<runtimedir>"
 
 ExecStartPre=/bin/sh -c 'test -f "<home>/.config/directgate/agent.json"'
 ExecStart=<exec>

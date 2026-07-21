@@ -719,12 +719,12 @@ int DirectGate_Search_Start(directgate_search_t *pSearch, const directgate_pkg_m
     DirectGate_Search_NormalizePath(pSearch->sRootPath, sizeof(pSearch->sRootPath), pMgrPkg->pPath);
     xstrncpy(pSearch->sFileName, sizeof(pSearch->sFileName), xstrused(pMgrPkg->pFileName) ? pMgrPkg->pFileName : "");
     xstrncpy(pSearch->sText, sizeof(pSearch->sText), xstrused(pMgrPkg->pText) ? pMgrPkg->pText : "");
-    xstrncpy(pSearch->sPermissions, sizeof(pSearch->sPermissions), xstrused(pMgrPkg->pPermissions) ? pMgrPkg->pPermissions : "");
     xstrncpy(pSearch->sTypes, sizeof(pSearch->sTypes), xstrused(pMgrPkg->pTypes) ? pMgrPkg->pTypes : "");
     xstrncpy(pSearch->sMinSize, sizeof(pSearch->sMinSize), xstrused(pMgrPkg->pMinSize) ? pMgrPkg->pMinSize : "");
     xstrncpy(pSearch->sMaxSize, sizeof(pSearch->sMaxSize), xstrused(pMgrPkg->pMaxSize) ? pMgrPkg->pMaxSize : "");
     xstrncpy(pSearch->sFileSize, sizeof(pSearch->sFileSize), xstrused(pMgrPkg->pFileSize) ? pMgrPkg->pFileSize : "");
     xstrncpy(pSearch->sLinkCount, sizeof(pSearch->sLinkCount), xstrused(pMgrPkg->pLinkCount) ? pMgrPkg->pLinkCount : "");
+    xstrncpy(pSearch->sPermissions, sizeof(pSearch->sPermissions), xstrused(pMgrPkg->pPermissions) ? pMgrPkg->pPermissions : "");
 
     pSearch->bRecursive = pMgrPkg->bRecursive;
     pSearch->bInsensitive = pMgrPkg->bInsensitive;

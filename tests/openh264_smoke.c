@@ -4,7 +4,7 @@
  * layouts selected by openh264.c. Set DIRECTGATE_OPENH264_LIB to run the
  * same binary against a specific distro library. */
 
-#include "src/agent/openh264.h"
+#include "src/agent/desktop/openh264.h"
 
 static int fail(const char *pMessage)
 {

@@ -1,5 +1,5 @@
 /*!
- * @file directgate-agent/src/agent/mfenc.c
+ * @file directgate-agent/src/agent/desktop/mfenc.c
  * @brief Runtime-loaded Media Foundation H.264 encoder wrapper for desktop streaming.
  *
  *  Copyright (c) 2025-2026 DirectGate. All rights reserved.
@@ -140,8 +140,7 @@ int DirectGate_MFEnc_Load(char *pErrBuf, size_t nErrSize)
         pLib->createMemoryBuffer == NULL)
     {
         FreeLibrary(hModule);
-        DirectGate_MFEnc_SetError(pErrBuf, nErrSize,
-            "mfplat.dll is missing required Media Foundation entry points.");
+        DirectGate_MFEnc_SetError(pErrBuf, nErrSize, "mfplat.dll is missing required Media Foundation entry points.");
         return XSTDERR;
     }
 
@@ -149,8 +148,7 @@ int DirectGate_MFEnc_Load(char *pErrBuf, size_t nErrSize)
     if (FAILED(hr))
     {
         FreeLibrary(hModule);
-        DirectGate_MFEnc_SetError(pErrBuf, nErrSize,
-            "MFStartup failed (hr=0x%08lX).", (unsigned long)hr);
+        DirectGate_MFEnc_SetError(pErrBuf, nErrSize, "MFStartup failed (hr=0x%08lX).", (unsigned long)hr);
         return XSTDERR;
     }
 
@@ -188,7 +186,7 @@ static HRESULT DirectGate_MFEnc_SetCodecBool(directgate_mfenc_t *pEnc, const GUI
 /* Caches the Annex-B SPS/PPS blob the encoder attached to its output media
  * type; prepended to IDR payloads that arrive without in-band parameter
  * sets so every keyframe stays self-contained (matching OpenH264 and the
- * mac.m Annex-B emitter). */
+ * desktop_mac.m Annex-B emitter). */
 static void DirectGate_MFEnc_CacheSeqHeader(directgate_mfenc_t *pEnc)
 {
     IMFMediaType *pType = NULL;
@@ -199,8 +197,7 @@ static void DirectGate_MFEnc_CacheSeqHeader(directgate_mfenc_t *pEnc)
     if (SUCCEEDED(IMFMediaType_GetBlobSize(pType, &MF_MT_MPEG_SEQUENCE_HEADER, &nSize)) && nSize > 0)
     {
         uint8_t *pBlob = (uint8_t*)malloc(nSize);
-        if (pBlob != NULL &&
-            SUCCEEDED(IMFMediaType_GetBlob(pType, &MF_MT_MPEG_SEQUENCE_HEADER, pBlob, nSize, &nSize)))
+        if (pBlob != NULL && SUCCEEDED(IMFMediaType_GetBlob(pType, &MF_MT_MPEG_SEQUENCE_HEADER, pBlob, nSize, &nSize)))
         {
             free(pEnc->pSeqHeader);
             pEnc->pSeqHeader = pBlob;
@@ -246,7 +243,7 @@ static xbool_t DirectGate_MFEnc_HasParameterSets(const uint8_t *pData, size_t nS
 /* Builds an H.264 or NV12 video media type shared by the output/input
  * configuration below. */
 static HRESULT DirectGate_MFEnc_BuildType(IMFMediaType **ppType, const GUID *pSubtype,
-                                      uint32_t nWidth, uint32_t nHeight, uint32_t nFps)
+                                          uint32_t nWidth, uint32_t nHeight, uint32_t nFps)
 {
     IMFMediaType *pType = NULL;
     HRESULT hr = g_mfplat.createMediaType(&pType);
@@ -266,8 +263,8 @@ static HRESULT DirectGate_MFEnc_BuildType(IMFMediaType **ppType, const GUID *pSu
  * input media type (that order is mandatory for encoders), streaming
  * start. Returns XSTDOK when the MFT is ready to encode. */
 static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
-                                  const directgate_desktop_quality_t *pQuality,
-                                  char *pErrBuf, size_t nErrSize)
+                                      const directgate_desktop_quality_t *pQuality,
+                                      char *pErrBuf, size_t nErrSize)
 {
     IMFTransform *pTransform = pEnc->pTransform;
     uint32_t nBitrateKbps = pQuality->nBitrateKbps ? pQuality->nBitrateKbps : 4000U;
@@ -288,8 +285,7 @@ static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
         IMFAttributes_Release(pAttrs);
     }
 
-    if (FAILED(IMFTransform_GetStreamIDs(pTransform, 1, &pEnc->nInputStreamId,
-        1, &pEnc->nOutputStreamId)))
+    if (FAILED(IMFTransform_GetStreamIDs(pTransform, 1, &pEnc->nInputStreamId, 1, &pEnc->nOutputStreamId)))
     {
         /* E_NOTIMPL: the MFT uses fixed stream identifiers 0/0. */
         pEnc->nInputStreamId = 0;
@@ -311,12 +307,10 @@ static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
     if (pQuality->bRealtime) DirectGate_MFEnc_SetCodecBool(pEnc, &g_MFEncCommonRealTime, XTRUE);
 
     IMFMediaType *pOutType = NULL;
-    HRESULT hr = DirectGate_MFEnc_BuildType(&pOutType, &MFVideoFormat_H264,
-        pEnc->nWidth, pEnc->nHeight, pEnc->nFps);
+    HRESULT hr = DirectGate_MFEnc_BuildType(&pOutType, &MFVideoFormat_H264, pEnc->nWidth, pEnc->nHeight, pEnc->nFps);
     if (FAILED(hr))
     {
-        DirectGate_MFEnc_SetError(pErrBuf, nErrSize,
-            "MFCreateMediaType failed (hr=0x%08lX).", (unsigned long)hr);
+        DirectGate_MFEnc_SetError(pErrBuf, nErrSize, "MFCreateMediaType failed (hr=0x%08lX).", (unsigned long)hr);
         return XSTDERR;
     }
 
@@ -328,48 +322,50 @@ static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
 
     hr = IMFTransform_SetOutputType(pTransform, pEnc->nOutputStreamId, pOutType, 0);
     IMFMediaType_Release(pOutType);
+
     if (FAILED(hr))
     {
         DirectGate_MFEnc_SetError(pErrBuf, nErrSize,
             "H.264 output type rejected: size(%ux%u), hr(0x%08lX)",
             pEnc->nWidth, pEnc->nHeight, (unsigned long)hr);
+
         return XSTDERR;
     }
 
     IMFMediaType *pInType = NULL;
-    hr = DirectGate_MFEnc_BuildType(&pInType, &MFVideoFormat_NV12,
-        pEnc->nWidth, pEnc->nHeight, pEnc->nFps);
+    hr = DirectGate_MFEnc_BuildType(&pInType, &MFVideoFormat_NV12, pEnc->nWidth, pEnc->nHeight, pEnc->nFps);
     if (FAILED(hr))
     {
         DirectGate_MFEnc_SetError(pErrBuf, nErrSize,
             "MFCreateMediaType failed (hr=0x%08lX).", (unsigned long)hr);
+
         return XSTDERR;
     }
 
     hr = IMFTransform_SetInputType(pTransform, pEnc->nInputStreamId, pInType, 0);
     IMFMediaType_Release(pInType);
+
     if (FAILED(hr))
     {
         DirectGate_MFEnc_SetError(pErrBuf, nErrSize,
             "NV12 input type rejected: size(%ux%u), hr(0x%08lX)",
             pEnc->nWidth, pEnc->nHeight, (unsigned long)hr);
+
         return XSTDERR;
     }
 
     MFT_OUTPUT_STREAM_INFO streamInfo;
     memset(&streamInfo, 0, sizeof(streamInfo));
+
     if (SUCCEEDED(IMFTransform_GetOutputStreamInfo(pTransform, pEnc->nOutputStreamId, &streamInfo)))
         pEnc->bProvidesSamples = (streamInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) ? XTRUE : XFALSE;
 
     pEnc->nOutputBufferSize = streamInfo.cbSize ? streamInfo.cbSize :
         (DWORD)(pEnc->nWidth * pEnc->nHeight * 2U);
 
-    if (pEnc->bAsync &&
-        FAILED(IMFTransform_QueryInterface(pTransform, &IID_IMFMediaEventGenerator,
-            (void**)&pEnc->pEventGen)))
+    if (pEnc->bAsync && FAILED(IMFTransform_QueryInterface(pTransform, &IID_IMFMediaEventGenerator, (void**)&pEnc->pEventGen)))
     {
-        DirectGate_MFEnc_SetError(pErrBuf, nErrSize,
-            "Asynchronous encoder MFT has no event generator.");
+        DirectGate_MFEnc_SetError(pErrBuf, nErrSize, "Asynchronous encoder MFT has no event generator.");
         return XSTDERR;
     }
 
@@ -410,11 +406,9 @@ static void DirectGate_MFEnc_ReleaseTransform(directgate_mfenc_t *pEnc)
 
 /* Tries every MFT the enumeration returned (best match first thanks to
  * MFT_ENUM_FLAG_SORTANDFILTER) until one activates and configures. */
-static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc,
-                                           UINT32 nFlags,
-                                           xbool_t bHardware,
-                                           const directgate_desktop_quality_t *pQuality,
-                                           char *pErrBuf, size_t nErrSize)
+static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 nFlags, xbool_t bHardware,
+                                               const directgate_desktop_quality_t *pQuality,
+                                               char *pErrBuf, size_t nErrSize)
 {
     MFT_REGISTER_TYPE_INFO inputInfo = { { 0 }, { 0 } };
     MFT_REGISTER_TYPE_INFO outputInfo = { { 0 }, { 0 } };
@@ -425,9 +419,11 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc,
 
     IMFActivate **ppActivate = NULL;
     UINT32 nCount = 0;
+
     HRESULT hr = g_mfplat.enumEx(MFT_CATEGORY_VIDEO_ENCODER,
         nFlags | MFT_ENUM_FLAG_SORTANDFILTER, &inputInfo, &outputInfo,
         &ppActivate, &nCount);
+
     if (FAILED(hr) || nCount == 0)
     {
         if (ppActivate != NULL) CoTaskMemFree(ppActivate);
@@ -455,6 +451,7 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc,
         WCHAR wsName[64] = { 0 };
         char sName[sizeof(pEnc->sName)] = { 0 };
         UINT32 nNameLen = 0;
+
         if (SUCCEEDED(IMFActivate_GetString(ppActivate[i], &MFT_FRIENDLY_NAME_Attribute,
             wsName, (UINT32)(sizeof(wsName) / sizeof(wsName[0])), &nNameLen)) && nNameLen > 0)
             WideCharToMultiByte(CP_UTF8, 0, wsName, -1, sName, sizeof(sName) - 1, NULL, NULL);
@@ -466,16 +463,14 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc,
 
     for (UINT32 i = 0; i < nCount; i++)
         IMFActivate_Release(ppActivate[i]);
-    CoTaskMemFree(ppActivate);
 
+    CoTaskMemFree(ppActivate);
     return nStatus;
 }
 
-directgate_mfenc_t* DirectGate_MFEnc_Create(uint32_t nWidth,
-                                    uint32_t nHeight,
-                                    const directgate_desktop_quality_t *pQuality,
-                                    char *pErrBuf,
-                                    size_t nErrSize)
+directgate_mfenc_t* DirectGate_MFEnc_Create(uint32_t nWidth, uint32_t nHeight,
+                                            const directgate_desktop_quality_t *pQuality,
+                                            char *pErrBuf, size_t nErrSize)
 {
     XCHECK_NL((pQuality != NULL), NULL);
     XCHECK_NL((nWidth >= 16 && nHeight >= 16), NULL);
@@ -546,9 +541,7 @@ static int DirectGate_MFEnc_PumpEvent(directgate_mfenc_t *pEnc)
 
 /* Pumps until at least one credit of the requested kind is pending or the
  * deadline passes. pCounter points at nNeedInput or nHaveOutput. */
-static int DirectGate_MFEnc_WaitCredit(directgate_mfenc_t *pEnc,
-                                   const uint32_t *pCounter,
-                                   uint32_t nTimeoutMs)
+static int DirectGate_MFEnc_WaitCredit(directgate_mfenc_t *pEnc, const uint32_t *pCounter, uint32_t nTimeoutMs)
 {
     ULONGLONG nDeadline = GetTickCount64() + nTimeoutMs;
     while (*pCounter == 0)
@@ -567,9 +560,7 @@ static int DirectGate_MFEnc_WaitCredit(directgate_mfenc_t *pEnc,
  * pOut (keyframes are made self-contained first). Returns XSTDOK on a
  * produced frame, XSTDNON when the MFT needs more input, XSTDERR on
  * failure. */
-static int DirectGate_MFEnc_ProcessOutput(directgate_mfenc_t *pEnc,
-                                      xbyte_buffer_t *pOut,
-                                      xbool_t *pKeyframe)
+static int DirectGate_MFEnc_ProcessOutput(directgate_mfenc_t *pEnc, xbyte_buffer_t *pOut, xbool_t *pKeyframe)
 {
     MFT_OUTPUT_DATA_BUFFER outputData;
     memset(&outputData, 0, sizeof(outputData));
@@ -632,13 +623,13 @@ static int DirectGate_MFEnc_ProcessOutput(directgate_mfenc_t *pEnc,
 
     int nResult = XSTDERR;
     IMFMediaBuffer *pContiguous = NULL;
-    if (SUCCEEDED(IMFSample_ConvertToContiguousBuffer(pProduced, &pContiguous)) &&
-        pContiguous != NULL)
+
+    if (SUCCEEDED(IMFSample_ConvertToContiguousBuffer(pProduced, &pContiguous)) && pContiguous != NULL)
     {
         BYTE *pData = NULL;
         DWORD nLength = 0;
-        if (SUCCEEDED(IMFMediaBuffer_Lock(pContiguous, &pData, NULL, &nLength)) &&
-            pData != NULL && nLength > 0)
+
+        if (SUCCEEDED(IMFMediaBuffer_Lock(pContiguous, &pData, NULL, &nLength)) && pData != NULL && nLength > 0)
         {
             if (nCleanPoint && !DirectGate_MFEnc_HasParameterSets(pData, nLength))
             {
@@ -662,9 +653,7 @@ static int DirectGate_MFEnc_ProcessOutput(directgate_mfenc_t *pEnc,
 /* Wraps one tightly packed NV12 frame into an IMFSample (one copy: the MFT
  * keeps a reference to the buffer while encoding, so the caller's frame
  * buffer must stay reusable). */
-static IMFSample* DirectGate_MFEnc_BuildInputSample(directgate_mfenc_t *pEnc,
-                                                const uint8_t *pNV12,
-                                                uint64_t nPtsUs)
+static IMFSample* DirectGate_MFEnc_BuildInputSample(directgate_mfenc_t *pEnc, const uint8_t *pNV12, uint64_t nPtsUs)
 {
     DWORD nFrameBytes = (DWORD)((size_t)pEnc->nWidth * pEnc->nHeight * 3U / 2U);
     IMFSample *pSample = NULL;
@@ -706,6 +695,7 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
 {
     XCHECK((pEncoder != NULL && pEncoder->pTransform != NULL), XSTDERR);
     XCHECK((pNV12 != NULL && pOut != NULL), XSTDERR);
+
     if (pKeyframe != NULL) *pKeyframe = XFALSE;
     pOut->nUsed = 0;
 
@@ -725,8 +715,7 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
         /* Asynchronous (hardware) model: input goes in only against a
          * METransformNeedInput credit, output comes out only after a
          * METransformHaveOutput event. */
-        int nStatus = DirectGate_MFEnc_WaitCredit(pEncoder, &pEncoder->nNeedInput,
-            DIRECTGATE_MFENC_INPUT_WAIT_MS);
+        int nStatus = DirectGate_MFEnc_WaitCredit(pEncoder, &pEncoder->nNeedInput, DIRECTGATE_MFENC_INPUT_WAIT_MS);
         if (nStatus != XSTDOK)
         {
             IMFSample_Release(pSample);
@@ -734,8 +723,7 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
             return XSTDERR;
         }
 
-        HRESULT hr = IMFTransform_ProcessInput(pEncoder->pTransform,
-            pEncoder->nInputStreamId, pSample, 0);
+        HRESULT hr = IMFTransform_ProcessInput(pEncoder->pTransform, pEncoder->nInputStreamId, pSample, 0);
         IMFSample_Release(pSample);
         pEncoder->nNeedInput--;
 
@@ -761,8 +749,7 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
         /* Leftover output from the previous frame blocks the input queue. */
         DirectGate_MFEnc_ProcessOutput(pEncoder, pOut, pKeyframe);
         pOut->nUsed = 0;
-        hr = IMFTransform_ProcessInput(pEncoder->pTransform,
-            pEncoder->nInputStreamId, pSample, 0);
+        hr = IMFTransform_ProcessInput(pEncoder->pTransform, pEncoder->nInputStreamId, pSample, 0);
     }
 
     IMFSample_Release(pSample);
@@ -795,8 +782,7 @@ int DirectGate_MFEnc_SetBitrate(directgate_mfenc_t *pEncoder, uint32_t nBitrateK
     return SUCCEEDED(hr) ? XSTDOK : XSTDERR;
 }
 
-int DirectGate_MFEnc_ApplyQuality(directgate_mfenc_t *pEncoder,
-                              const directgate_desktop_quality_t *pQuality)
+int DirectGate_MFEnc_ApplyQuality(directgate_mfenc_t *pEncoder, const directgate_desktop_quality_t *pQuality)
 {
     XCHECK((pEncoder != NULL && pQuality != NULL), XSTDERR);
 

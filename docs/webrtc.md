@@ -69,12 +69,21 @@ The pipeline degrades in this order, and the desktop status payload reports whic
 
 Desktop input, control, status, terminal, file-manager, and file-transfer messages all stay on the encrypted DirectGate protocol over the DataChannel. TURN relays forward only encrypted WebRTC media/DataChannel packets - they never see plaintext desktop video or control messages.
 
-Desktop status is a `type: "data"` packet with `payloadType: "desktop-status"`
-and a JSON payload; key fields are `status`, `pipeline`
+Desktop status is a `type: "data"` packet with `payloadType: "desktop-status"` and a JSON payload; key fields are `status`, `pipeline`
 (`webrtc-video` / `h264-datachannel` / `raw-rgba`), `codec`, `preset`
 (`quality` / `balanced` / `low-latency`), `fps`, `bitrateKbps`, `transport`
-(`dtls-srtp` for the media track, `aes-siv-datachannel` for DataChannel
-fallbacks), and an optional `fallbackReason`.
+(`dtls-srtp` for the media track, `aes-siv-datachannel` for DataChannel fallbacks), an optional `fallbackReason`, and the audio fields `audio`
+(`off` / `capturing` / `unavailable`) with an optional `audioReason`.
+
+## Desktop audio track
+
+Desktop sessions can also carry the host's **system output audio** as a second send-only **Opus media track** on the same peer connection. It is strictly additive to the video track and shares its security and latency model: the same DTLS-SRTP transport (TURN relays still see only ciphertext), the same manual RTP packetization (`rtcAddTrackEx` with `RTC_CODEC_OPUS` / `rtcSendMessage`), and the same `msid` (`directgate-desktop`) so the browser groups audio and video into one `MediaStream` and plays both from the `<video>` element.
+
+The browser offer adds a **recv-only Opus audio transceiver** alongside the video one; when the session mode is `desktop` the agent answers with a matching send-only Opus track. Audio and video are independent - a missing or unopened audio track never blocks the answer, the video pipeline, or the background TURN->P2P upgrade (audio rides through promotion but never gates it).
+
+Audio is **opt-in**. The track is negotiated up front so the viewer can unmute instantly, but the host does not capture anything until the browser sends a `desktop-control` `{ "action": "audio", "enabled": true }` message; `enabled: false` stops capture. Capture runs on a dedicated thread (48 kHz stereo, 20 ms frames, ~128 kbps Opus with in-band FEC) and the encoded frames are drained onto the main loop and sent over the track, so audio never gates the video encode.
+
+The source is always the default output device's loopback, never a microphone, and every platform feeds the same encode/RTP path. Linux captures the PulseAudio / PipeWire default-sink monitor (`libpulse` dlopen'd, the `@DEFAULT_MONITOR@` special device, or the `DIRECTGATE_AUDIO_SOURCE` override); Windows captures the default render endpoint via WASAPI loopback on a dedicated MTA capture thread (resampled to 48 kHz); macOS captures the system mix via ScreenCaptureKit (`SCStreamConfiguration.capturesAudio`, macOS 13+, with `excludesCurrentProcessAudio` so the agent never records itself). The Opus encoder is `libopus`: dlopen'd at session start on Linux/macOS (`DIRECTGATE_OPUS_LIB` overrides the search) and linked statically into the exe on Windows (which has no package manager), so it is always present there. When the encoder or the capture source is unavailable, audio reports `audio: "unavailable"` with an `audioReason` and the video stream is untouched.
 
 ## See also
 

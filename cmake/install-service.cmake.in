@@ -143,6 +143,15 @@ else()
     "installing the unit without an XAUTHORITY override")
 endif()
 
+# XDG_RUNTIME_DIR points desktop audio capture at the user's PulseAudio/PipeWire
+# socket. Only meaningful for a real (non-root) login session; when the uid is
+# unknown the agent still derives /run/user/<uid> from getuid() at runtime.
+if(_uid MATCHES "^[0-9]+$")
+  string(REPLACE "<runtimedir>" "/run/user/${_uid}" _content "${_content}")
+else()
+  string(REPLACE "Environment=\"XDG_RUNTIME_DIR=<runtimedir>\"\n" "" _content "${_content}")
+endif()
+
 get_filename_component(_dest_dir "${_dest}" DIRECTORY)
 file(MAKE_DIRECTORY "${_dest_dir}")
 file(WRITE "${_dest}" "${_content}")

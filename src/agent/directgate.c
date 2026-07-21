@@ -1521,8 +1521,9 @@ static int DirectGate_HandleWebRTC(xapi_session_t *pApiSession, directgate_pkg_t
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), nGeneration);
         xlogd("WebRTC offer SDP: sid(%u), wsfd(%d), sdp(%s)", pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), pSdp);
 
-        DirectGate_WebRTC_SetVideoEnabled(pRTC,
-            pSession->eActiveMode == DIRECTGATE_SESSION_MODE_DESKTOP ? XTRUE : XFALSE);
+        xbool_t bDesktopMode = pSession->eActiveMode == DIRECTGATE_SESSION_MODE_DESKTOP ? XTRUE : XFALSE;
+        DirectGate_WebRTC_SetVideoEnabled(pRTC, bDesktopMode);
+        DirectGate_WebRTC_SetAudioEnabled(pRTC, bDesktopMode);
 
         if (DirectGate_WebRTC_HandleOffer(pRTC, pSdp, nGeneration, bBackgroundP2P) < 0)
         {

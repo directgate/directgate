@@ -45,8 +45,9 @@ struct winsize {
 #include "sys/cli.h"
 #include "sys/cpu.h"
 #include "sys/sync.h"
-#include "sys/xtime.h"
 #include "sys/srch.h"
+#include "sys/xtime.h"
+#include "sys/thread.h"
 
 #include "net/addr.h"
 #include "net/mdtp.h"

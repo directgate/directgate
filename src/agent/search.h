@@ -24,7 +24,6 @@
 
 #include "includes.h"
 #include "protocol.h"
-#include "thread.h"
 
 #ifdef __cplusplus
 extern "C" {
