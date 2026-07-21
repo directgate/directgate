@@ -93,12 +93,20 @@ extern int opus_encoder_ctl(DirectGateOpusEncoder *st, int request, ...);
 extern const char* opus_strerror(int error);
 extern const char* opus_get_version_string(void);
 #else
-/* Sonames libopus binary releases ship under, newest first. macOS resolves the
- * versioned dylib through dlopen too. */
+/* Sonames libopus binary releases ship under, newest first. On macOS the bare
+ * leaf names only resolve when the library sits in a default dyld search path
+ * (`/usr/local/lib`, i.e. Intel Homebrew). Apple Silicon Homebrew installs to
+ * `/opt/homebrew`, which dyld does not search, so the absolute Homebrew paths
+ * are listed explicitly - an absolute dlopen bypasses the search path entirely.
+ * DIRECTGATE_OPUS_LIB still overrides everything for non-standard prefixes. */
 static const char *g_pOpusNames[] = {
 #if defined(__APPLE__)
     "libopus.0.dylib",
     "libopus.dylib",
+    "/opt/homebrew/lib/libopus.0.dylib",           /* Apple Silicon Homebrew */
+    "/opt/homebrew/opt/opus/lib/libopus.0.dylib",
+    "/usr/local/lib/libopus.0.dylib",              /* Intel Homebrew */
+    "/usr/local/opt/opus/lib/libopus.0.dylib",
 #else
     "libopus.so.0",
     "libopus.so",
