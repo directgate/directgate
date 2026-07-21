@@ -39,6 +39,11 @@
  * handler is registered, so no frames are processed. */
 
 #define DIRECTGATE_SCK_RING_FRAMES  (DIRECTGATE_AUDIO_SAMPLE_RATE * 2U) /* ~2 s */
+/* Max audio pooled before dropping the stale head. SCK producer and the encode
+ * consumer both run at real time, so a startup backlog would persist as a
+ * constant delay (FIFO) and drift audio behind video. 2 frames (~40 ms) keeps a
+ * small jitter margin while staying tight for A/V sync. */
+#define DIRECTGATE_SCK_MAX_BACKLOG_FRAMES 2U
 
 @interface DirectGateAudioCapture : NSObject <SCStreamDelegate, SCStreamOutput>
 {
@@ -315,6 +320,17 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf,
     uint32_t nGot = 0;
 
     pthread_mutex_lock(&pCapture->lock);
+
+    /* Drop stale backlog first so audio stays in sync with video. A backlog only
+     * forms once (producer ahead of consumer at capture start); after catch-up
+     * they run lock-step. Dropped counts are whole stereo pairs. */
+    uint32_t nMaxBacklog = nNeeded * DIRECTGATE_SCK_MAX_BACKLOG_FRAMES;
+    if (pCapture->nRingCount > nMaxBacklog)
+    {
+        uint32_t nDrop = pCapture->nRingCount - nMaxBacklog;
+        pCapture->nRingTail = (pCapture->nRingTail + nDrop) % pCapture->nRingCap;
+        pCapture->nRingCount -= nDrop;
+    }
 
     /* Wait up to two frame periods for real samples; SCK pushes continuously
      * during playback, so a timeout only happens on silence - pad with silence

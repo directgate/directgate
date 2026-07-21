@@ -48,6 +48,12 @@ static const GUID g_DirectGateSubtypeFloat =
 #define DIRECTGATE_WASAPI_RING_FRAMES  (DIRECTGATE_AUDIO_SAMPLE_RATE * 2U) /* ~2 s of stereo S16 */
 #define DIRECTGATE_WASAPI_POLL_MS      8U      /* loopback packet poll cadence */
 #define DIRECTGATE_WASAPI_INIT_WAIT_MS 3000U   /* how long BackendOpen waits for readiness */
+/* Max audio the consumer lets pool in the ring before dropping the stale head.
+ * The WASAPI producer and the encode consumer both run at real time, so any
+ * backlog formed at startup persists as constant latency (FIFO) and drifts
+ * audio behind video. 2 frames (~40 ms) keeps a small jitter margin while
+ * staying tight enough for A/V sync. */
+#define DIRECTGATE_WASAPI_MAX_BACKLOG_FRAMES 2U
 
 typedef struct directgate_wasapi_ {
     uint32_t nChannels;            /* output channel count (matches request) */
@@ -351,6 +357,19 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames
     uint32_t nGot = 0;
 
     EnterCriticalSection(&pCtx->lock);
+
+    /* Drop any stale backlog first so we always encode the freshest audio and
+     * stay in sync with video. A backlog only forms once (the producer starts
+     * ahead of the consumer at capture start); after this catch-up the two run
+     * lock-step at real time, so no further dropping occurs. Dropped counts are
+     * whole stereo pairs, keeping L/R alignment. */
+    uint32_t nMaxBacklog = nNeeded * DIRECTGATE_WASAPI_MAX_BACKLOG_FRAMES;
+    if (pCtx->nRingCount > nMaxBacklog)
+    {
+        uint32_t nDrop = pCtx->nRingCount - nMaxBacklog;
+        pCtx->nRingTail = (pCtx->nRingTail + nDrop) % pCtx->nRingCap;
+        pCtx->nRingCount -= nDrop;
+    }
 
     /* Wait up to two frame periods for real samples; loopback delivers nothing
      * during silence, so pad the remainder with silence to keep a continuous
