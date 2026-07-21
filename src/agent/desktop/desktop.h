@@ -28,9 +28,9 @@
 extern "C" {
 #endif
 
-#define DIRECTGATE_DESKTOP_BACKEND_LEN 16
-#define DIRECTGATE_DESKTOP_REASON_LEN  160
-#define DIRECTGATE_DESKTOP_DISPLAY_LEN 128
+#define DIRECTGATE_DESKTOP_BACKEND_LEN      16
+#define DIRECTGATE_DESKTOP_REASON_LEN       160
+#define DIRECTGATE_DESKTOP_DISPLAY_LEN      128
 #define DIRECTGATE_DESKTOP_MONITOR_ID_LEN   32
 #define DIRECTGATE_DESKTOP_MONITOR_NAME_LEN 96
 #define DIRECTGATE_DESKTOP_MAX_MONITORS     16
@@ -50,6 +50,9 @@ extern "C" {
  * frames; going above ~128 KB starts head-of-line-blocking smaller
  * messages on the data channel. */
 #define DIRECTGATE_DESKTOP_CHUNK_BYTES      (64U * 1024U)
+
+/* Enable thread priority so we will get CPU slice even on high load */
+#define DIRECTGATE_HAVE_AVRT_THREAD_PRIORITY 1
 
 typedef enum {
     DIRECTGATE_DESKTOP_PIPELINE_RAW = 0,    /* legacy raw RGBA fallback/debug */
