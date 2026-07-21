@@ -341,16 +341,28 @@ if(WIN32)
         ${AGENT_DIR}/desktop/desktop_win.c
         ${AGENT_DIR}/desktop/mfenc.c
         ${AGENT_DIR}/yuv.c)
-    # System-audio streaming: Opus encoder (opus.c, opus.dll dlopen'd) + the
-    # cross-platform orchestrator (desktop/audio.c) + WASAPI loopback capture
+    # System-audio streaming: Opus encoder (opus.c) + the cross-platform
+    # orchestrator (desktop/audio.c) + WASAPI loopback capture
     # (desktop/audio_win.c). WASAPI GUIDs are instantiated locally via
-    # initguid.h, so ole32 (already linked) is enough.
+    # initguid.h, so ole32 (already linked) is enough. Unlike Linux/macOS (which
+    # dlopen libopus), Windows links it statically from the toolchain prefix
+    # (like OpenSSL) so the self-contained exe never needs a runtime opus.dll -
+    # DIRECTGATE_OPUS_STATIC switches opus.c to direct calls.
+    # Force the static libopus.a: MSYS2 also ships an import lib (libopus.dll.a)
+    # that find_library would otherwise prefer, reintroducing a runtime DLL and
+    # breaking the self-contained-exe guarantee.
+    set(_dg_saved_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+    find_library(DIRECTGATE_OPUS_LIB NAMES opus REQUIRED)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES "${_dg_saved_suffixes}")
     target_sources(directgate PRIVATE
         ${AGENT_DIR}/desktop/opus.c
         ${AGENT_DIR}/desktop/audio.c
         ${AGENT_DIR}/desktop/audio_win.c)
+    target_compile_definitions(directgate PRIVATE DIRECTGATE_OPUS_STATIC=1)
     target_link_libraries(directgate PRIVATE
-        user32 gdi32 d3d11 dxgi ole32 oleaut32 uuid mfuuid strmiids dxguid)
+        user32 gdi32 d3d11 dxgi ole32 oleaut32 uuid mfuuid strmiids dxguid
+        ${DIRECTGATE_OPUS_LIB})
 
     # App manifest (UTF-8 active code page) + version / company metadata.
     enable_language(RC)

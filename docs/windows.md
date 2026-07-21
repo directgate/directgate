@@ -39,6 +39,21 @@ make -j"$(nproc)" && make install_sw
 
 Stay on the OpenSSL 3.x LTS line: the SRP authentication layer uses `openssl/srp.h`, which OpenSSL 4.x removed.
 
+### Opus for Windows (one-time)
+
+Desktop system audio encodes with libopus. Linux/macOS dlopen it at runtime, but Windows has no package manager, so the agent links it **statically** (like OpenSSL) into the self-contained exe. Cross-build it once into the same prefix:
+
+```sh
+git clone --depth 1 --branch v1.5.2 https://github.com/xiph/opus.git && cd opus
+cmake -B build-win64 -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE=/path/to/agent/cmake/toolchain-mingw-w64.cmake \
+    -DCMAKE_INSTALL_PREFIX="$HOME/win64-prefix" \
+    -DOPUS_BUILD_SHARED_LIBRARY=OFF -DOPUS_BUILD_TESTING=OFF -DBUILD_TESTING=OFF
+cmake --build build-win64 -j"$(nproc)" && cmake --install build-win64
+```
+
+The agent's CMake finds `libopus.a` in the prefix, defines `DIRECTGATE_OPUS_STATIC`, and calls libopus directly (no runtime `opus.dll`). Without it the WIN32 `find_library(... REQUIRED)` fails at configure time.
+
 ### Build directgate
 
 ```sh
@@ -193,7 +208,7 @@ extra to install:
 
 Desktop streaming requires the interactive session the launcher starts the agent in (see [As a Windows service](#as-a-windows-service)); a UAC secure-desktop prompt pauses duplication until it is dismissed, and the lock screen cannot be captured by design.
 
-**System audio** (opt-in) is captured with WASAPI loopback on the default render endpoint, on a dedicated capture thread that resamples the shared mix to 48 kHz stereo and hands it to the Opus encoder (`opus.dll`, loaded at runtime). If `opus.dll` is absent or no output device is present, audio reports `unavailable` and video is unaffected. See [Desktop audio track](webrtc.md#desktop-audio-track).
+**System audio** (opt-in) is captured with WASAPI loopback on the default render endpoint, on a dedicated capture thread that resamples the shared mix to 48 kHz stereo and hands it to the Opus encoder. libopus is linked **statically** into the exe (see [Opus for Windows](#opus-for-windows-one-time)), so no runtime DLL is needed and audio always works when an output device is present. See [Desktop audio track](webrtc.md#desktop-audio-track).
 
 ---
 

@@ -33,6 +33,7 @@ jobs:
           mingw-w64-ucrt-x86_64-cmake
           mingw-w64-ucrt-x86_64-ninja
           mingw-w64-ucrt-x86_64-openssl
+          mingw-w64-ucrt-x86_64-opus
 
     - name: Configure
       # Static OpenSSL so the artifact has no DLL dependencies beyond the
@@ -47,7 +48,7 @@ jobs:
       # output at all, so fail the build if any non-system import sneaks in.
       run: |
         objdump -p build/directgate.exe | grep "DLL Name" | tee imports.txt
-        ! grep -iE "libstdc|libgcc|libwinpthread|libc\+\+|libunwind|libssl|libcrypto" imports.txt
+        ! grep -iE "libstdc|libgcc|libwinpthread|libc\+\+|libunwind|libssl|libcrypto|libopus" imports.txt
 
     - name: Smoke run
       shell: pwsh
@@ -71,20 +72,21 @@ jobs:
     env:
       LLVM_MINGW_VERSION: "20260602"
       OPENSSL_VERSION: "3.5.7"
+      OPUS_VERSION: "1.5.2"
 
     steps:
     - uses: actions/checkout@v4
       with:
         submodules: recursive
 
-    - name: Cache toolchain and OpenSSL
+    - name: Cache toolchain, OpenSSL and Opus
       id: cache-toolchain
       uses: actions/cache@v4
       with:
         path: |
           ~/llvm-mingw
           ~/win64-prefix
-        key: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}-openssl-${{ env.OPENSSL_VERSION }}
+        key: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}-openssl-${{ env.OPENSSL_VERSION }}-opus-${{ env.OPUS_VERSION }}
 
     - name: Install llvm-mingw
       if: steps.cache-toolchain.outputs.cache-hit != 'true'
@@ -107,6 +109,23 @@ jobs:
           --cross-compile-prefix=x86_64-w64-mingw32-
         make -j"$(nproc)"
         make install_sw
+
+    - name: Cross-compile Opus
+      # Static libopus for the desktop audio encoder; Windows links it into the
+      # exe (DIRECTGATE_OPUS_STATIC) instead of dlopen'ing it like Linux/macOS.
+      if: steps.cache-toolchain.outputs.cache-hit != 'true'
+      run: |
+        export PATH="$HOME/llvm-mingw/bin:$PATH"
+        curl -sL -o opus.tar.gz \
+          "https://github.com/xiph/opus/releases/download/v${OPUS_VERSION}/opus-${OPUS_VERSION}.tar.gz"
+        tar xzf opus.tar.gz
+        cd "opus-${OPUS_VERSION}"
+        cmake -B build-win64 \
+          -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/cmake/toolchain-mingw-w64.cmake" \
+          -DCMAKE_INSTALL_PREFIX="$HOME/win64-prefix" \
+          -DOPUS_BUILD_SHARED_LIBRARY=OFF -DOPUS_BUILD_TESTING=OFF -DBUILD_TESTING=OFF
+        cmake --build build-win64 -j"$(nproc)"
+        cmake --install build-win64
 
     - name: Configure
       run: |
@@ -147,6 +166,7 @@ jobs:
           mingw-w64-ucrt-x86_64-cmake
           mingw-w64-ucrt-x86_64-ninja
           mingw-w64-ucrt-x86_64-openssl
+          mingw-w64-ucrt-x86_64-opus
 
     - name: Build agent and CLI
       shell: msys2 {0}
@@ -161,7 +181,7 @@ jobs:
       shell: msys2 {0}
       run: |
         objdump -p build/directgate.exe | grep "DLL Name" | tee imports.txt
-        ! grep -iE "libstdc|libgcc|libwinpthread|libc\+\+|libunwind|libssl|libcrypto" imports.txt
+        ! grep -iE "libstdc|libgcc|libwinpthread|libc\+\+|libunwind|libssl|libcrypto|libopus" imports.txt
 
     - name: Set up Node.js
       uses: actions/setup-node@v4

@@ -21,10 +21,14 @@
 
 #include "opus.h"
 
+/* Windows links libopus statically (like OpenSSL) so the self-contained exe
+ * never needs a runtime opus.dll; other platforms dlopen it. */
+#ifndef DIRECTGATE_OPUS_STATIC
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#endif
 #endif
 
 /* ---- minimal libopus ABI ------------------------------------------------
@@ -77,14 +81,22 @@ struct directgate_opus_ {
 
 static directgate_opus_lib_t g_opus;
 
-/* Sonames libopus binary releases ship under, newest first. Windows uses the
- * plain "opus.dll"; macOS resolves the versioned dylib through dlopen too. */
+#ifdef DIRECTGATE_OPUS_STATIC
+/* Real libopus symbols (statically linked). The opaque encoder typedef differs
+ * in name from libopus's OpusEncoder but is ABI-identical (a pointer to an
+ * opaque struct), and the linker binds these by symbol name. */
+extern DirectGateOpusEncoder* opus_encoder_create(int32_t Fs, int channels, int application, int *error);
+extern void opus_encoder_destroy(DirectGateOpusEncoder *st);
+extern int32_t opus_encode(DirectGateOpusEncoder *st, const int16_t *pcm, int frame_size,
+                           unsigned char *data, int32_t max_data_bytes);
+extern int opus_encoder_ctl(DirectGateOpusEncoder *st, int request, ...);
+extern const char* opus_strerror(int error);
+extern const char* opus_get_version_string(void);
+#else
+/* Sonames libopus binary releases ship under, newest first. macOS resolves the
+ * versioned dylib through dlopen too. */
 static const char *g_pOpusNames[] = {
-#ifdef _WIN32
-    "opus.dll",
-    "libopus-0.dll",
-    "libopus.dll",
-#elif defined(__APPLE__)
+#if defined(__APPLE__)
     "libopus.0.dylib",
     "libopus.dylib",
 #else
@@ -93,6 +105,7 @@ static const char *g_pOpusNames[] = {
 #endif
     NULL
 };
+#endif
 
 static void DirectGate_Opus_SetError(char *pErrBuf, size_t nErrSize, const char *pFmt, ...)
 {
@@ -103,6 +116,7 @@ static void DirectGate_Opus_SetError(char *pErrBuf, size_t nErrSize, const char 
     va_end(args);
 }
 
+#ifndef DIRECTGATE_OPUS_STATIC
 #ifdef _WIN32
 static void* DirectGate_Opus_DlOpen(const char *pName) { return (void*)LoadLibraryA(pName); }
 static void* DirectGate_Opus_DlSym(void *pHandle, const char *pSym)
@@ -113,6 +127,7 @@ static void* DirectGate_Opus_DlOpen(const char *pName) { return dlopen(pName, RT
 static void* DirectGate_Opus_DlSym(void *pHandle, const char *pSym) { return dlsym(pHandle, pSym); }
 static void DirectGate_Opus_DlClose(void *pHandle) { if (pHandle) dlclose(pHandle); }
 #endif
+#endif /* !DIRECTGATE_OPUS_STATIC */
 
 int DirectGate_Opus_Load(char *pErrBuf, size_t nErrSize)
 {
@@ -125,6 +140,23 @@ int DirectGate_Opus_Load(char *pErrBuf, size_t nErrSize)
         return XSTDERR;
     }
 
+#ifdef DIRECTGATE_OPUS_STATIC
+    /* Statically linked: bind directly to the real symbols, always available. */
+    pLib->bLoadAttempted = XTRUE;
+    pLib->createEncoder = opus_encoder_create;
+    pLib->destroyEncoder = opus_encoder_destroy;
+    pLib->encode = opus_encode;
+    pLib->ctl = opus_encoder_ctl;
+    pLib->strError = opus_strerror;
+    pLib->version = opus_get_version_string;
+    pLib->bLoaded = XTRUE;
+
+    const char *pStaticVersion = pLib->version ? pLib->version() : NULL;
+    xstrncpy(pLib->sVersion, sizeof(pLib->sVersion), xstrused(pStaticVersion) ? pStaticVersion : "libopus");
+
+    xlogi("Linked Opus encoder library (static): version(%s)", pLib->sVersion);
+    return XSTDOK;
+#else
     pLib->bLoadAttempted = XTRUE;
     void *pHandle = NULL;
     const char *pLoadedName = NULL;
@@ -134,6 +166,7 @@ int DirectGate_Opus_Load(char *pErrBuf, size_t nErrSize)
     {
         pHandle = DirectGate_Opus_DlOpen(pEnvPath);
         pLoadedName = pEnvPath;
+
         if (pHandle == NULL)
         {
             DirectGate_Opus_SetError(pErrBuf, nErrSize,
@@ -170,11 +203,13 @@ int DirectGate_Opus_Load(char *pErrBuf, size_t nErrSize)
 
     pLib->pHandle = pHandle;
     pLib->bLoaded = XTRUE;
+
     const char *pVersion = (pLib->version != NULL) ? pLib->version() : NULL;
     xstrncpy(pLib->sVersion, sizeof(pLib->sVersion), xstrused(pVersion) ? pVersion : "libopus");
 
     xlogi("Loaded Opus encoder library: name(%s), version(%s)", pLoadedName, pLib->sVersion);
     return XSTDOK;
+#endif /* DIRECTGATE_OPUS_STATIC */
 }
 
 const char* DirectGate_Opus_Version(void)
