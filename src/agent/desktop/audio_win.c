@@ -259,6 +259,7 @@ static int DirectGate_WASAPI_Open(directgate_wasapi_t *pCtx, char *pErr, size_t 
     if (pFmt != NULL) CoTaskMemFree(pFmt);
     if (pDevice != NULL) pDevice->lpVtbl->Release(pDevice);
     if (pEnum != NULL) pEnum->lpVtbl->Release(pEnum);
+
     if (pCtx->pCapture != NULL) { pCtx->pCapture->lpVtbl->Release(pCtx->pCapture); pCtx->pCapture = NULL; }
     if (pCtx->pClient != NULL) { pCtx->pClient->lpVtbl->Release(pCtx->pClient); pCtx->pClient = NULL; }
     return XSTDERR;
