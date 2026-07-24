@@ -118,11 +118,58 @@ int main(void)
     CHECK(MapKey("Meta", "MetaLeft") == XK_Super_L, "MetaLeft did not map");
     CHECK(MapKey("AltGraph", "AltRight") == XK_ISO_Level3_Shift, "AltGraph did not map");
 
+    /* Modifiers must also resolve from their `code` spelling: a client that
+     * lets go of every held key after the browser swallowed a keyup has no
+     * `key` value to report. Dropping those releases left the modifier
+     * latched down for the rest of the session. */
+    CHECK(MapKey("ControlLeft", "ControlLeft") == XK_Control_L, "code-named ControlLeft did not map");
+    CHECK(MapKey("ShiftRight", "ShiftRight") == XK_Shift_R, "code-named ShiftRight did not map");
+    CHECK(MapKey("AltLeft", "AltLeft") == XK_Alt_L, "code-named AltLeft did not map");
+    CHECK(MapKey("MetaRight", "MetaRight") == XK_Super_R, "code-named MetaRight did not map");
+    CHECK(MapKey(NULL, "ControlRight") == XK_Control_R, "code-only ControlRight did not map");
+    CHECK(MapKey("Unidentified", "ShiftLeft") == XK_Shift_L, "code-only ShiftLeft did not map");
+
     /* Unusable key values fall back to the physical code. */
     CHECK(MapKey("Unidentified", "KeyQ") == XK_q, "code fallback KeyQ failed");
     CHECK(MapKey("Unidentified", "Digit3") == XK_3, "code fallback Digit3 failed");
     CHECK(MapKey("Unidentified", "F24") == NoSymbol, "unexpected mapping for unknown code");
     CHECK(MapKey(NULL, NULL) == NoSymbol, "empty event mapped to a keysym");
+
+    /* Held-key bookkeeping: a release must target the keycode the press
+     * used, keyed by the physical `code`, so a shifted press and unshifted
+     * release cannot leave the key stuck and auto-repeating. */
+    directgate_desktop_t desktop;
+    memset(&desktop, 0, sizeof(desktop));
+    DirectGate_Desktop_X11RememberKey(&desktop, "ShiftRight", 62);
+    DirectGate_Desktop_X11RememberKey(&desktop, "KeyA", 38);
+    CHECK(desktop.nHeldKeyCount == 2, "held keys not tracked");
+    /* A repeat press of the same code overwrites, never grows the table. */
+    DirectGate_Desktop_X11RememberKey(&desktop, "KeyA", 38);
+    CHECK(desktop.nHeldKeyCount == 2, "repeat press grew the held-key table");
+    /* Release resolves to the exact keycode the press recorded. */
+    CHECK(DirectGate_Desktop_X11ForgetKey(&desktop, "KeyA") == 38, "wrong keycode for release");
+    CHECK(desktop.nHeldKeyCount == 1, "released key still tracked");
+    CHECK(DirectGate_Desktop_X11ForgetKey(&desktop, "KeyA") == 0, "double release returned a keycode");
+    /* An unknown code (press never seen) reports no keycode. */
+    CHECK(DirectGate_Desktop_X11ForgetKey(&desktop, "KeyZ") == 0, "unknown code returned a keycode");
+    CHECK(DirectGate_Desktop_X11ForgetKey(&desktop, "ShiftRight") == 62, "wrong keycode for ShiftRight");
+    CHECK(desktop.nHeldKeyCount == 0, "held-key table not empty after releases");
+    /* No display attached: teardown release is a guarded no-op, not a crash,
+     * and cannot inject, so it leaves the table for the real teardown. */
+    DirectGate_Desktop_X11RememberKey(&desktop, "ShiftLeft", 50);
+    DirectGate_Desktop_ReleaseHeldKeys(&desktop);
+    CHECK(desktop.nHeldKeyCount == 1, "guarded teardown must not drop untracked keys");
+
+    /* The table drops the oldest entry instead of overflowing. */
+    memset(&desktop, 0, sizeof(desktop));
+    for (int i = 0; i < DIRECTGATE_DESKTOP_MAX_HELD_KEYS + 4; i++)
+    {
+        char sCode[DIRECTGATE_DESKTOP_KEY_CODE_LEN];
+        snprintf(sCode, sizeof(sCode), "K%d", i);
+        DirectGate_Desktop_X11RememberKey(&desktop, sCode, (KeyCode)(8 + (i & 0xFF)));
+    }
+    CHECK(desktop.nHeldKeyCount == DIRECTGATE_DESKTOP_MAX_HELD_KEYS,
+        "held-key table overflowed its bound");
 
     /* Wheel accumulation: trackpad samples collect into whole notches. */
     int32_t nAccum = 0;

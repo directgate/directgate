@@ -318,11 +318,16 @@ void DirectGate_Desktop_ReadResizeRequest(directgate_desktop_t *pDesktop, xjson_
 {
     XCHECK_VOID_NL((pDesktop != NULL && pRoot != NULL));
     const char *pMode = XJSON_GetString(XJSON_GetObject(pRoot, "mode"));
+    const char *pResolution = XJSON_GetString(XJSON_GetObject(pRoot, "resolution"));
+    uint32_t nSettingsRevision = XJSON_GetU32(XJSON_GetObject(pRoot, "settingsRevision"));
     uint32_t nWidth = XJSON_GetU32(XJSON_GetObject(pRoot, "width"));
     uint32_t nHeight = XJSON_GetU32(XJSON_GetObject(pRoot, "height"));
 
     if (xstrcmp(pMode, "display")) pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_DISPLAY;
     else if (xstrcmp(pMode, "scale")) pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_SCALE;
+
+    if (xstrused(pResolution)) xstrncpy(pDesktop->sResolution, sizeof(pDesktop->sResolution), pResolution);
+    if (nSettingsRevision > 0U) pDesktop->nSettingsRevision = nSettingsRevision;
 
     /* Bound allocations and reject partial sizes. 8K on either axis is well
      * beyond current browser viewports while still allowing native 8K hosts. */
@@ -345,12 +350,14 @@ void DirectGate_Desktop_Init(directgate_desktop_t *pDesktop)
     pDesktop->nFps = DIRECTGATE_DESKTOP_DEFAULT_FPS;
     pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_RAW;
     pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_SCALE;
+    pDesktop->nSettingsRevision = 0U;
     pDesktop->pEncoder = NULL;
     pDesktop->bForceRaw = XFALSE;
     pDesktop->bRequestKeyframe = XFALSE;
     pDesktop->bWebRTCVideoFailed = XFALSE;
     pDesktop->bPreferDataChannel = XFALSE;
     pDesktop->sFallbackReason[0] = '\0';
+    xstrncpy(pDesktop->sResolution, sizeof(pDesktop->sResolution), "original");
     xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "raw-rgba");
     DirectGate_Desktop_ApplyPreset(pDesktop, DIRECTGATE_DESKTOP_PRESET_BALANCED);
 
@@ -419,7 +426,9 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
 #if defined(__linux__)
     /* Detaches the XShm segment, so it must run before the display closes. */
     if (pDesktop->pEncoder != NULL) DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
+
     DirectGate_Desktop_RestoreDisplayMode(pDesktop);
+    DirectGate_Desktop_ReleaseHeldKeys(pDesktop);
 
     if (pDesktop->pDisplay != NULL && pDesktop->nScratchKeycode != 0U)
     {
@@ -472,6 +481,7 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
 #endif
 
     pDesktop->eResizeMode = DIRECTGATE_DESKTOP_RESIZE_SCALE;
+    pDesktop->nSettingsRevision = 0U;
     pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_RAW;
     pDesktop->bRunning = XFALSE;
     pDesktop->bInputReady = XFALSE;
@@ -513,6 +523,7 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     pDesktop->sSelectedMonitor[0] = '\0';
     pDesktop->sInputReason[0] = '\0';
     pDesktop->sFallbackReason[0] = '\0';
+    xstrncpy(pDesktop->sResolution, sizeof(pDesktop->sResolution), "original");
     memset(pDesktop->monitors, 0, sizeof(pDesktop->monitors));
     xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "raw-rgba");
 }
@@ -564,11 +575,16 @@ int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const char *pS
     XJSON_AddString(pRoot, "preset", DirectGate_Desktop_PresetName(pSession->desktop.quality.ePreset));
     XJSON_AddString(pRoot, "transport", DirectGate_Desktop_TransportName(pSession->desktop.ePipeline));
     XJSON_AddString(pRoot, "resizeMode", DirectGate_Desktop_ResizeModeName(pSession->desktop.eResizeMode));
+    XJSON_AddString(pRoot, "resolution", xstrused(pSession->desktop.sResolution) ? pSession->desktop.sResolution : "original");
+    XJSON_AddU32(pRoot, "settingsRevision", pSession->desktop.nSettingsRevision);
     XJSON_AddStrIfUsed(pRoot, "inputReason", pSession->desktop.sInputReason);
     XJSON_AddStrIfUsed(pRoot, "fallbackReason", pSession->desktop.sFallbackReason);
     XJSON_AddStrIfUsed(pRoot, "selectedMonitor", pSession->desktop.sSelectedMonitor);
     XJSON_AddBool(pRoot, "input", pSession->desktop.bInputReady);
     XJSON_AddBool(pRoot, "textInput", XTRUE);
+#if defined(__linux__) || defined(_WIN32)
+    XJSON_AddBool(pRoot, "lockSync", XTRUE);
+#endif
     XJSON_AddBool(pRoot, "cursorSync", XTRUE);
     XJSON_AddBool(pRoot, "p2pMigration", XTRUE);
     XJSON_AddBool(pRoot, "captureReady", pSession->desktop.bCaptureReady);

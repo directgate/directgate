@@ -149,16 +149,33 @@ static const directgate_x11_key_t g_X11NamedKeys[] = {
     { "AltGraph", XK_ISO_Level3_Shift },
 };
 
+static xbool_t DirectGate_Desktop_IsModifierName(const char *pName, const char *pBase)
+{
+    size_t nBase;
+    if (!xstrused(pName)) return XFALSE;
+    if (xstrcmp(pName, pBase)) return XTRUE;
+
+    nBase = strlen(pBase);
+    if (strncmp(pName, pBase, nBase) != 0) return XFALSE;
+    return (xstrcmp(pName + nBase, "Left") || xstrcmp(pName + nBase, "Right")) ? XTRUE : XFALSE;
+}
+
+static KeySym DirectGate_Desktop_ModifierKeySymFor(const char *pName, xbool_t bRight)
+{
+    if (DirectGate_Desktop_IsModifierName(pName, "Shift")) return bRight ? XK_Shift_R : XK_Shift_L;
+    if (DirectGate_Desktop_IsModifierName(pName, "Control")) return bRight ? XK_Control_R : XK_Control_L;
+    if (DirectGate_Desktop_IsModifierName(pName, "Alt")) return bRight ? XK_Alt_R : XK_Alt_L;
+    if (DirectGate_Desktop_IsModifierName(pName, "Meta")) return bRight ? XK_Super_R : XK_Super_L;
+    return NoSymbol;
+}
+
 /* Modifier side (left/right) comes from the physical `code`; the `key`
  * value is just "Shift"/"Control"/"Alt"/"Meta" for both sides. */
 static KeySym DirectGate_Desktop_ModifierKeySym(const char *pKey, const char *pCode)
 {
-    xbool_t bRight = xstrused(pCode) && strstr(pCode, "Right") != NULL;
-    if (xstrcmp(pKey, "Shift")) return bRight ? XK_Shift_R : XK_Shift_L;
-    if (xstrcmp(pKey, "Control")) return bRight ? XK_Control_R : XK_Control_L;
-    if (xstrcmp(pKey, "Alt")) return bRight ? XK_Alt_R : XK_Alt_L;
-    if (xstrcmp(pKey, "Meta")) return bRight ? XK_Super_R : XK_Super_L;
-    return NoSymbol;
+    const char *pSide = xstrused(pCode) ? pCode : pKey;
+    xbool_t bRight = xstrused(pSide) && strstr(pSide, "Right") != NULL;
+    return DirectGate_Desktop_ModifierKeySymFor(pKey, bRight);
 }
 
 static KeySym DirectGate_Desktop_KeySymFromJson(xjson_obj_t *pRoot)
@@ -186,6 +203,12 @@ static KeySym DirectGate_Desktop_KeySymFromJson(xjson_obj_t *pRoot)
          * ("F1".."F24", "Cancel", ...) resolve directly. */
         KeySym named = XStringToKeysym(pKey);
         if (named != NoSymbol) return named;
+    }
+
+    if (xstrused(pCode))
+    {
+        KeySym sym = DirectGate_Desktop_ModifierKeySymFor(pCode, strstr(pCode, "Right") != NULL);
+        if (sym != NoSymbol) return sym;
     }
 
     /* Fallback when `key` is unusable ("Unidentified", "Dead", IME): use the
@@ -310,14 +333,59 @@ static xbool_t DirectGate_Desktop_X11ShiftDown(Display *pDisplay)
     return (nMask & ShiftMask) ? XTRUE : XFALSE;
 }
 
-static void DirectGate_Desktop_X11SendKeysym(directgate_desktop_t *pDesktop,
-                                             KeySym sym, xbool_t bDown)
+static void DirectGate_Desktop_X11RememberKey(directgate_desktop_t *pDesktop,
+                                              const char *pCode, KeyCode code)
+{
+    if (!xstrused(pCode)) return;
+
+    for (uint32_t i = 0; i < pDesktop->nHeldKeyCount; i++)
+    {
+        if (xstrcmp(pDesktop->heldKeys[i].sCode, pCode))
+        {
+            pDesktop->heldKeys[i].nKeycode = code;
+            return;
+        }
+    }
+
+    if (pDesktop->nHeldKeyCount >= DIRECTGATE_DESKTOP_MAX_HELD_KEYS)
+    {
+        memmove(&pDesktop->heldKeys[0], &pDesktop->heldKeys[1],
+            sizeof(pDesktop->heldKeys[0]) * (DIRECTGATE_DESKTOP_MAX_HELD_KEYS - 1U));
+        pDesktop->nHeldKeyCount = DIRECTGATE_DESKTOP_MAX_HELD_KEYS - 1U;
+    }
+
+    directgate_desktop_held_key_t *pSlot = &pDesktop->heldKeys[pDesktop->nHeldKeyCount++];
+    xstrncpy(pSlot->sCode, sizeof(pSlot->sCode), pCode);
+    pSlot->nKeycode = code;
+}
+
+static KeyCode DirectGate_Desktop_X11ForgetKey(directgate_desktop_t *pDesktop,
+                                               const char *pCode)
+{
+    if (!xstrused(pCode)) return 0;
+
+    for (uint32_t i = 0; i < pDesktop->nHeldKeyCount; i++)
+    {
+        if (!xstrcmp(pDesktop->heldKeys[i].sCode, pCode)) continue;
+
+        KeyCode code = (KeyCode)pDesktop->heldKeys[i].nKeycode;
+        memmove(&pDesktop->heldKeys[i], &pDesktop->heldKeys[i + 1U],
+            sizeof(pDesktop->heldKeys[0]) * (pDesktop->nHeldKeyCount - i - 1U));
+        pDesktop->nHeldKeyCount--;
+        return code;
+    }
+
+    return 0;
+}
+
+static KeyCode DirectGate_Desktop_X11SendKeysym(directgate_desktop_t *pDesktop,
+                                                KeySym sym, xbool_t bDown)
 {
     Display *pDisplay = (Display*)pDesktop->pDisplay;
     xbool_t bNeedShift = XFALSE;
 
     KeyCode code = DirectGate_Desktop_X11ResolveKeysym(pDesktop, sym, &bNeedShift);
-    if (code == 0) return;
+    if (code == 0) return 0;
 
     directgate_xtest_key_fn pKeyFn = (directgate_xtest_key_fn)pDesktop->pFakeKey;
     KeyCode shiftCode = XKeysymToKeycode(pDisplay, XK_Shift_L);
@@ -330,6 +398,58 @@ static void DirectGate_Desktop_X11SendKeysym(directgate_desktop_t *pDesktop,
     if (bWrapShift) pKeyFn(pDisplay, shiftCode, XTRUE, CurrentTime);
     pKeyFn(pDisplay, code, bDown ? XTRUE : XFALSE, CurrentTime);
     if (bWrapShift) pKeyFn(pDisplay, shiftCode, XFALSE, CurrentTime);
+
+    return code;
+}
+
+static void DirectGate_Desktop_X11HandleKey(directgate_desktop_t *pDesktop,
+                                            xjson_obj_t *pRoot)
+{
+    const char *pCode = XJSON_GetString(XJSON_GetObject(pRoot, "code"));
+    xbool_t bDown = XJSON_GetBool(XJSON_GetObject(pRoot, "down"));
+
+    if (!bDown)
+    {
+        KeyCode tracked = DirectGate_Desktop_X11ForgetKey(pDesktop, pCode);
+        if (tracked != 0)
+        {
+            ((directgate_xtest_key_fn)pDesktop->pFakeKey)(
+                (Display*)pDesktop->pDisplay, tracked, XFALSE, CurrentTime);
+            return;
+        }
+    }
+
+    KeySym sym = DirectGate_Desktop_KeySymFromJson(pRoot);
+    if (sym == NoSymbol) return;
+
+    KeyCode used = DirectGate_Desktop_X11SendKeysym(pDesktop, sym, bDown);
+    if (bDown && used != 0) DirectGate_Desktop_X11RememberKey(pDesktop, pCode, used);
+}
+
+void DirectGate_Desktop_ReleaseHeldKeys(directgate_desktop_t *pDesktop)
+{
+    XCHECK_VOID_NL((pDesktop != NULL));
+    if (pDesktop->pDisplay == NULL || pDesktop->pFakeKey == NULL) return;
+
+    Display *pDisplay = (Display*)pDesktop->pDisplay;
+    directgate_xtest_key_fn pKeyFn = (directgate_xtest_key_fn)pDesktop->pFakeKey;
+
+    for (uint32_t i = 0; i < pDesktop->nHeldKeyCount; i++)
+        pKeyFn(pDisplay, (KeyCode)pDesktop->heldKeys[i].nKeycode, XFALSE, CurrentTime);
+
+    pDesktop->nHeldKeyCount = 0;
+    XFlush(pDisplay);
+}
+
+static void DirectGate_Desktop_X11SetLock(Display *pDisplay, KeySym sym, xjson_obj_t *pValue)
+{
+    if (pValue == NULL) return;
+
+    unsigned int nMask = XkbKeysymToModifiers(pDisplay, sym);
+    if (nMask == 0U) return;
+
+    XkbLockModifiers(pDisplay, XkbUseCoreKbd, nMask,
+        XJSON_GetBool(pValue) ? nMask : 0U);
 }
 
 /* Types a UTF-8 string by pressing one key per codepoint. Used by the
@@ -483,17 +603,17 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
     }
     else if (xstrcmp(pAction, "key"))
     {
-        KeySym sym = DirectGate_Desktop_KeySymFromJson(pRoot);
-        if (sym != NoSymbol)
-        {
-            xbool_t bDown = XJSON_GetBool(XJSON_GetObject(pRoot, "down"));
-            DirectGate_Desktop_X11SendKeysym(pDesktop, sym, bDown);
-        }
+        DirectGate_Desktop_X11HandleKey(pDesktop, pRoot);
     }
     else if (xstrcmp(pAction, "text"))
     {
         const char *pText = XJSON_GetString(XJSON_GetObject(pRoot, "text"));
         if (xstrused(pText)) DirectGate_Desktop_X11TypeText(pDesktop, pText);
+    }
+    else if (xstrcmp(pAction, "lock"))
+    {
+        DirectGate_Desktop_X11SetLock(pDisplay, XK_Caps_Lock, XJSON_GetObject(pRoot, "caps"));
+        DirectGate_Desktop_X11SetLock(pDisplay, XK_Num_Lock, XJSON_GetObject(pRoot, "num"));
     }
 
     XFlush(pDisplay);
@@ -1085,9 +1205,18 @@ static void DirectGate_Desktop_SendKeyInput(WORD nVirtualKey, xbool_t bExtended,
     SendInput(1, &input, sizeof(input));
 }
 
-/* Types a UTF-8 string via KEYEVENTF_UNICODE, which delivers literal
- * characters to the focused window regardless of the host keyboard layout.
- * Surrogate halves are sent as-is; the input system reassembles them. */
+static void DirectGate_Desktop_WinSetLock(WORD nVirtualKey, xjson_obj_t *pValue)
+{
+    if (pValue == NULL) return;
+
+    xbool_t bWanted = XJSON_GetBool(pValue);
+    xbool_t bCurrent = (GetKeyState(nVirtualKey) & 1) ? XTRUE : XFALSE;
+    if (bWanted == bCurrent) return;
+
+    DirectGate_Desktop_SendKeyInput(nVirtualKey, XFALSE, XTRUE);
+    DirectGate_Desktop_SendKeyInput(nVirtualKey, XFALSE, XFALSE);
+}
+
 static void DirectGate_Desktop_WinTypeText(const char *pText)
 {
     int nWide = MultiByteToWideChar(CP_UTF8, 0, pText, -1, NULL, 0);
@@ -1250,6 +1379,11 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
     {
         const char *pText = XJSON_GetString(XJSON_GetObject(pRoot, "text"));
         if (xstrused(pText)) DirectGate_Desktop_WinTypeText(pText);
+    }
+    else if (xstrcmp(pAction, "lock"))
+    {
+        DirectGate_Desktop_WinSetLock(VK_CAPITAL, XJSON_GetObject(pRoot, "caps"));
+        DirectGate_Desktop_WinSetLock(VK_NUMLOCK, XJSON_GetObject(pRoot, "num"));
     }
 
     XJSON_Destroy(&json);

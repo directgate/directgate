@@ -470,6 +470,14 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
             xstrncpy(sSelectedId, sizeof(sSelectedId), pSelected->sId);
             const char *pResizeReason = NULL;
 
+            if (pDesktop->bDisplayModeChanged &&
+                (pDesktop->eResizeMode != DIRECTGATE_DESKTOP_RESIZE_DISPLAY ||
+                 !xstrcmp(pDesktop->sModeMonitorId, sSelectedId)))
+            {
+                DirectGate_Desktop_RestoreDisplayMode(pDesktop);
+                pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+            }
+
             if (pDesktop->eResizeMode == DIRECTGATE_DESKTOP_RESIZE_DISPLAY &&
                 DirectGate_Desktop_SetDisplayResolution(pDesktop, pSelected,
                 pDesktop->nTargetWidth, pDesktop->nTargetHeight) != XSTDOK)
@@ -904,6 +912,14 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
             char sSelectedId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
             xstrncpy(sSelectedId, sizeof(sSelectedId), pSelected->sId);
             const char *pResizeReason = NULL;
+
+            if (pDesktop->bDisplayModeChanged &&
+                (pDesktop->eResizeMode != DIRECTGATE_DESKTOP_RESIZE_DISPLAY ||
+                 !xstrcmp(pDesktop->sModeMonitorId, sSelectedId)))
+            {
+                DirectGate_Desktop_RestoreDisplayMode(pDesktop);
+                pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+            }
 
             if (pDesktop->eResizeMode == DIRECTGATE_DESKTOP_RESIZE_DISPLAY &&
                 DirectGate_Desktop_SetDisplayResolution(pDesktop, pSelected,
@@ -1347,6 +1363,14 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
             char sSelectedId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
             xstrncpy(sSelectedId, sizeof(sSelectedId), pSelected->sId);
             const char *pResizeReason = NULL;
+
+            if (pDesktop->bDisplayModeChanged &&
+                (pDesktop->eResizeMode != DIRECTGATE_DESKTOP_RESIZE_DISPLAY ||
+                 !xstrcmp(pDesktop->sModeMonitorId, sSelectedId)))
+            {
+                DirectGate_Desktop_RestoreDisplayMode(pDesktop);
+                pSelected = DirectGate_Desktop_FindMonitor(pDesktop, sSelectedId);
+            }
 
             if (pDesktop->eResizeMode == DIRECTGATE_DESKTOP_RESIZE_DISPLAY &&
                 DirectGate_Desktop_SetDisplayResolution(pDesktop, pSelected,

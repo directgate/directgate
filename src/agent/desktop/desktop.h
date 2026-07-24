@@ -35,6 +35,9 @@ extern "C" {
 #define DIRECTGATE_DESKTOP_MONITOR_NAME_LEN 96
 #define DIRECTGATE_DESKTOP_MAX_MONITORS     16
 #define DIRECTGATE_DESKTOP_CODEC_LEN        16
+#define DIRECTGATE_DESKTOP_RESOLUTION_LEN   16
+#define DIRECTGATE_DESKTOP_KEY_CODE_LEN     24
+#define DIRECTGATE_DESKTOP_MAX_HELD_KEYS    32
 #define DIRECTGATE_DESKTOP_PRESET_LEN       16
 #define DIRECTGATE_DESKTOP_PIPELINE_LEN     24
 #define DIRECTGATE_DESKTOP_TRANSPORT_LEN    32
@@ -97,6 +100,11 @@ typedef struct directgate_desktop_monitor_ {
     uint64_t nNativeId;
 } directgate_desktop_monitor_t;
 
+typedef struct directgate_desktop_held_key_ {
+    char sCode[DIRECTGATE_DESKTOP_KEY_CODE_LEN];
+    uint32_t nKeycode;
+} directgate_desktop_held_key_t;
+
 typedef struct directgate_desktop_ {
     xbool_t bRunning;
     xbool_t bInputReady;
@@ -112,6 +120,8 @@ typedef struct directgate_desktop_ {
     uint32_t nFrameWidth;
     uint32_t nFrameHeight;
     directgate_desktop_resize_mode_t eResizeMode;
+    char sResolution[DIRECTGATE_DESKTOP_RESOLUTION_LEN];
+    uint32_t nSettingsRevision;
     uint32_t nTargetWidth;
     uint32_t nTargetHeight;
     xbool_t bDisplayModeChanged;
@@ -144,8 +154,10 @@ typedef struct directgate_desktop_ {
      * active layout (e.g. non-Latin text typed from the browser). */
     uint32_t nScratchKeycode;
     uint64_t nScratchKeysym;
+    uint32_t nHeldKeyCount;
     uint64_t nFrameId;
     uint32_t nMonitorCount;
+    directgate_desktop_held_key_t heldKeys[DIRECTGATE_DESKTOP_MAX_HELD_KEYS];
     directgate_desktop_monitor_t monitors[DIRECTGATE_DESKTOP_MAX_MONITORS];
     char sBackend[DIRECTGATE_DESKTOP_BACKEND_LEN];
     char sReason[DIRECTGATE_DESKTOP_REASON_LEN];
@@ -218,6 +230,12 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession,
 int DirectGate_Desktop_HandleControl(directgate_session_t *pSession,
                                      const uint8_t *pPayload,
                                      size_t nPayloadLength);
+
+#if defined(__linux__)
+/* Releases every key the session still holds on the X server. Must run
+ * while the display is open, or the keys stay latched for other clients. */
+void DirectGate_Desktop_ReleaseHeldKeys(directgate_desktop_t *pDesktop);
+#endif
 
 int DirectGate_Desktop_GetTimerFd(const directgate_desktop_t *pDesktop);
 xbool_t DirectGate_Desktop_IsRunning(const directgate_desktop_t *pDesktop);
