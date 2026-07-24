@@ -48,6 +48,8 @@ typedef struct directgate_e2e_ {
     uint32_t nRxPacketId;
     uint32_t nTxSessionPacketId;
     uint32_t nRxSessionPacketId;
+    uint32_t nTxInputPacketId;
+    uint32_t nRxInputPacketId;
     uint32_t nTxSessionEpoch;
     uint32_t nRxSessionEpoch;
     uint32_t nTxSignalPacketId;

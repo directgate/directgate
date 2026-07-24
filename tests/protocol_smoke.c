@@ -33,7 +33,8 @@ static xbool_t check_scoped_cc(directgate_e2e_t *pE2E, const char *pScope,
     XJSON_AddString(pHeader, "ccScope", pScope);
     XJSON_AddU32(pHeader, "sc", nScopedCC);
     XJSON_AddU32(pHeader, "cc", nGlobalCC);
-    if (strcmp(pScope, "session") == 0) XJSON_AddU32(pHeader, "ce", nEpoch);
+    if (strcmp(pScope, "session") == 0 || strcmp(pScope, "input") == 0)
+        XJSON_AddU32(pHeader, "ce", nEpoch);
 
     xbool_t bBuilt = DirectGate_Proto_Build(&packet, pHeader, NULL, 0, XFALSE);
     XJSON_FreeObject(pHeader);
@@ -46,19 +47,23 @@ int main(void)
 {
     directgate_e2e_t ccState;
     DirectGate_E2E_Init(&ccState);
+    CHECK(check_scoped_cc(&ccState, "input", 1, 1, 2),
+        "unordered input packet accepted before older reliable packet");
     CHECK(check_scoped_cc(&ccState, "session", 1, 1, 1),
         "first TURN generation packet accepted");
-    CHECK(check_scoped_cc(&ccState, "signal", 0, 1, 2),
+    CHECK(!check_scoped_cc(&ccState, "input", 1, 1, 3),
+        "duplicate input packet rejected inside input scope");
+    CHECK(check_scoped_cc(&ccState, "signal", 0, 1, 4),
         "signaling has an independent strict counter");
-    CHECK(check_scoped_cc(&ccState, "session", 2, 1, 3),
+    CHECK(check_scoped_cc(&ccState, "session", 2, 1, 5),
         "first P2P generation packet accepted after counter restart");
-    CHECK(!check_scoped_cc(&ccState, "session", 1, 2, 4),
+    CHECK(!check_scoped_cc(&ccState, "session", 1, 2, 6),
         "late TURN packet rejected after P2P generation activates");
-    CHECK(!check_scoped_cc(&ccState, "session", 2, 1, 5),
+    CHECK(!check_scoped_cc(&ccState, "session", 2, 1, 7),
         "duplicate packet rejected inside active P2P generation");
-    CHECK(check_scoped_cc(&ccState, "session", 2, 2, 6),
+    CHECK(check_scoped_cc(&ccState, "session", 2, 2, 8),
         "next P2P generation packet accepted");
-    CHECK(!check_scoped_cc(&ccState, "signal", 0, 1, 7),
+    CHECK(!check_scoped_cc(&ccState, "signal", 0, 1, 9),
         "duplicate signaling packet rejected");
     DirectGate_E2E_Clear(&ccState);
 

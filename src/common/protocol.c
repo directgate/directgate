@@ -815,8 +815,9 @@ xbool_t DirectGate_Proto_CheckCC(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E)
             xjson_obj_t *pScopeObj = XJSON_GetObject(json.pRootObj, "ccScope");
             const char *pScope = pScopeObj != NULL ? XJSON_GetString(pScopeObj) : NULL;
             xbool_t bSignal = DirectGate_Proto_IsSignalScope(pScope);
+            xbool_t bInput = xstrused(pScope) && xstrcmp(pScope, "input");
 
-            XCHECK_CALL((!xstrused(pScope) || bSignal || xstrcmp(pScope, "session")),
+            XCHECK_CALL((!xstrused(pScope) || bSignal || bInput || xstrcmp(pScope, "session")),
                 XJSON_Destroy, &json, xthrowr(XFALSE, "Unknown CC scope: %s", pScope));
 
             if (xstrused(pScope))
@@ -840,14 +841,17 @@ xbool_t DirectGate_Proto_CheckCC(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E)
                     {
                         pE2E->nRxSessionEpoch = nEpoch;
                         pE2E->nRxSessionPacketId = 0;
+                        pE2E->nRxInputPacketId = 0;
                     }
 
-                    pLast = &pE2E->nRxSessionPacketId;
+                    pLast = bInput ?
+                        &pE2E->nRxInputPacketId :
+                        &pE2E->nRxSessionPacketId;
                 }
 
                 XCHECK_CALL((nScopedCC > *pLast), XJSON_Destroy, &json,
                     xthrowr(XFALSE, "SC(%u) <= last(%u), scope(%s)",
-                    nScopedCC, *pLast, bSignal ? "signal" : "session"));
+                    nScopedCC, *pLast, bSignal ? "signal" : (bInput ? "input" : "session")));
 
                 *pLast = nScopedCC;
                 if (nCC > pE2E->nRxPacketId) pE2E->nRxPacketId = nCC;

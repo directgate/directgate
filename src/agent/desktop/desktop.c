@@ -613,6 +613,7 @@ int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const char *pS
 #else
     XJSON_AddBool(pRoot, "fastInput", XFALSE);
 #endif
+    XJSON_AddBool(pRoot, "inputCounterScope", XTRUE);
 
     if (xstrused(pReason)) XJSON_AddString(pRoot, "reason", pReason);
     else if (xstrused(pSession->desktop.sReason)) XJSON_AddString(pRoot, "reason", pSession->desktop.sReason);
