@@ -86,6 +86,9 @@ int main(void)
     CHECK(MapKey("?", "Slash") == XK_question, "key '?' did not map");
     CHECK(MapKey("-", "Minus") == XK_minus, "key '-' did not map");
     CHECK(MapKey("'", "Quote") == XK_apostrophe, "key '\\'' did not map");
+    CHECK(MapKey("\"", "Quote") == XK_quotedbl, "key '\"' did not map");
+    CHECK(MapKey("Dead", "Quote") == XK_apostrophe,
+        "dead Quote key did not fall back to its physical key");
 
     /* Letters, digits, space keep working. */
     CHECK(MapKey("a", "KeyA") == XK_a, "key 'a' did not map");

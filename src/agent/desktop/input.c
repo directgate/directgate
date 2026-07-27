@@ -149,6 +149,20 @@ static const directgate_x11_key_t g_X11NamedKeys[] = {
     { "AltGraph", XK_ISO_Level3_Shift },
 };
 
+/* Physical-code fallback for punctuation keys whose browser `key` value is
+ * unusable (most notably `Dead`). The active Shift key still determines the
+ * shifted symbol, so Quote resolves to apostrophe / double quote exactly like
+ * the physical key on a standard layout instead of dropping the event. */
+static const directgate_x11_key_t g_X11CodeFallbackKeys[] = {
+    { "Backquote", XK_grave },
+    { "Minus", XK_minus }, { "Equal", XK_equal },
+    { "BracketLeft", XK_bracketleft }, { "BracketRight", XK_bracketright },
+    { "Backslash", XK_backslash }, { "Semicolon", XK_semicolon },
+    { "Quote", XK_apostrophe }, { "Comma", XK_comma },
+    { "Period", XK_period }, { "Slash", XK_slash },
+    { "Space", XK_space },
+};
+
 static xbool_t DirectGate_Desktop_IsModifierName(const char *pName, const char *pBase)
 {
     size_t nBase;
@@ -223,6 +237,15 @@ static KeySym DirectGate_Desktop_KeySymFromJson(xjson_obj_t *pRoot)
     {
         char sKey[2] = { pCode[5], '\0' };
         return XStringToKeysym(sKey);
+    }
+
+    if (xstrused(pCode))
+    {
+        for (size_t i = 0; i < sizeof(g_X11CodeFallbackKeys) / sizeof(g_X11CodeFallbackKeys[0]); i++)
+        {
+            if (xstrcmp(g_X11CodeFallbackKeys[i].pName, pCode))
+                return g_X11CodeFallbackKeys[i].sym;
+        }
     }
 
     return NoSymbol;
