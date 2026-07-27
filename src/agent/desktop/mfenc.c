@@ -57,6 +57,14 @@ DIRECTGATE_MFENC_GUID(g_MFEncBPictureCount, STATIC_CODECAPI_AVEncMPVDefaultBPict
 #define DIRECTGATE_MFENC_INPUT_WAIT_MS  250U
 #define DIRECTGATE_MFENC_OUTPUT_WAIT_MS 100U
 
+/* Poll interval while waiting for an MFT event credit. Sleep(1) cannot be
+ * used here: it is quantised to the system timer period, which is ~15.6 ms
+ * unless some other process happens to have raised the global resolution.
+ * A hardware MFT answers in single-digit milliseconds, so that quantisation
+ * alone would add up to a full 60 fps frame of latency to every encode and
+ * cap the achievable frame rate at ~64. */
+#define DIRECTGATE_MFENC_POLL_US        200ULL
+
 typedef HRESULT (WINAPI *directgate_mf_startup_fn)(ULONG, DWORD);
 typedef HRESULT (WINAPI *directgate_mf_enum_fn)(GUID, UINT32,
     const MFT_REGISTER_TYPE_INFO*, const MFT_REGISTER_TYPE_INFO*,
@@ -95,6 +103,7 @@ struct directgate_mfenc_ {
     uint32_t nFps;
     uint8_t *pSeqHeader;                 /* cached Annex-B SPS/PPS */
     size_t nSeqHeaderSize;
+    HANDLE hPollTimer;                   /* sub-ms waits for MFT event credits */
     char sName[96];
 };
 
@@ -490,6 +499,12 @@ directgate_mfenc_t* DirectGate_MFEnc_Create(uint32_t nWidth, uint32_t nHeight,
     pEnc->nHeight = nHeight;
     pEnc->nFps = pQuality->nFps ? pQuality->nFps : 30U;
 
+    /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Win10 1803+) is what makes the
+     * sub-millisecond credit polling actually sub-millisecond; older systems
+     * fall back to yielding. */
+    pEnc->hPollTimer = CreateWaitableTimerExW(NULL, NULL,
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+
     /* GPU vendor encoder first (Quick Sync / NVENC / AMF), Microsoft
      * software H.264 encoder as the fallback. */
     if (DirectGate_MFEnc_CreateFromCategory(pEnc, MFT_ENUM_FLAG_HARDWARE, XTRUE,
@@ -499,6 +514,7 @@ directgate_mfenc_t* DirectGate_MFEnc_Create(uint32_t nWidth, uint32_t nHeight,
             XFALSE, pQuality, pErrBuf, nErrSize) == XSTDOK)
         return pEnc;
 
+    if (pEnc->hPollTimer != NULL) CloseHandle(pEnc->hPollTimer);
     free(pEnc);
     return NULL;
 }
@@ -511,6 +527,7 @@ void DirectGate_MFEnc_Destroy(directgate_mfenc_t *pEncoder)
         IMFTransform_ProcessMessage(pEncoder->pTransform, MFT_MESSAGE_COMMAND_FLUSH, 0);
 
     DirectGate_MFEnc_ReleaseTransform(pEncoder);
+    if (pEncoder->hPollTimer != NULL) CloseHandle(pEncoder->hPollTimer);
     free(pEncoder);
 }
 
@@ -539,6 +556,24 @@ static int DirectGate_MFEnc_PumpEvent(directgate_mfenc_t *pEnc)
     return XSTDOK;
 }
 
+/* Sub-millisecond backoff between event pumps. See
+ * DIRECTGATE_MFENC_POLL_US for why Sleep() is not usable here. */
+static void DirectGate_MFEnc_PollWait(directgate_mfenc_t *pEnc)
+{
+    if (pEnc->hPollTimer != NULL)
+    {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)(DIRECTGATE_MFENC_POLL_US * 10ULL); /* 100 ns units */
+
+        if (SetWaitableTimer(pEnc->hPollTimer, &due, 0, NULL, NULL, FALSE) &&
+            WaitForSingleObject(pEnc->hPollTimer, 2U) == WAIT_OBJECT_0) return;
+    }
+
+    /* No high-resolution timer (pre-1803, or handle creation failed): yield
+     * the remaining slice rather than sleeping a whole timer period. */
+    SwitchToThread();
+}
+
 /* Pumps until at least one credit of the requested kind is pending or the
  * deadline passes. pCounter points at nNeedInput or nHaveOutput. */
 static int DirectGate_MFEnc_WaitCredit(directgate_mfenc_t *pEnc, const uint32_t *pCounter, uint32_t nTimeoutMs)
@@ -550,7 +585,7 @@ static int DirectGate_MFEnc_WaitCredit(directgate_mfenc_t *pEnc, const uint32_t 
         if (nStatus == XSTDERR) return XSTDERR;
         if (nStatus == XSTDOK) continue;
         if (GetTickCount64() >= nDeadline) return XSTDNON;
-        Sleep(1);
+        DirectGate_MFEnc_PollWait(pEnc);
     }
 
     return XSTDOK;
@@ -746,10 +781,26 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
     HRESULT hr = IMFTransform_ProcessInput(pEncoder->pTransform, pEncoder->nInputStreamId, pSample, 0);
     if (hr == MF_E_NOTACCEPTING)
     {
-        /* Leftover output from the previous frame blocks the input queue. */
-        DirectGate_MFEnc_ProcessOutput(pEncoder, pOut, pKeyframe);
-        pOut->nUsed = 0;
+        xbool_t bPendingKeyframe = XFALSE;
+        int nPending = DirectGate_MFEnc_ProcessOutput(pEncoder, pOut, &bPendingKeyframe);
+
         hr = IMFTransform_ProcessInput(pEncoder->pTransform, pEncoder->nInputStreamId, pSample, 0);
+        IMFSample_Release(pSample);
+
+        if (nPending == XSTDOK && pOut->nUsed > 0)
+        {
+            if (pKeyframe != NULL) *pKeyframe = bPendingKeyframe;
+            return XSTDOK;
+        }
+
+        pOut->nUsed = 0;
+        if (FAILED(hr))
+        {
+            xloge("MF encoder ProcessInput failed: hr(0x%08lX)", (unsigned long)hr);
+            return XSTDERR;
+        }
+
+        return XSTDNON;
     }
 
     IMFSample_Release(pSample);
@@ -789,8 +840,6 @@ int DirectGate_MFEnc_ApplyQuality(directgate_mfenc_t *pEncoder, const directgate
     DirectGate_MFEnc_SetBitrate(pEncoder, pQuality->nBitrateKbps ? pQuality->nBitrateKbps : 4000U);
     DirectGate_MFEnc_SetCodecU32(pEncoder, &g_MFEncGopSize, pQuality->nKeyframeFrames ? pQuality->nKeyframeFrames : 60U);
 
-    /* All presets run 30 fps, so the input media type's frame rate is left
-     * untouched; a dimension change rebuilds the encoder anyway. */
     return XSTDOK;
 }
 

@@ -397,13 +397,14 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
 
 #ifdef DIRECTGATE_DESKTOP_HAS_AUDIO
     /* Ship any encoded Opus frames the capture thread queued. Runs before the
-     * video encode so audio is never delayed by this tick's frame, and is a
+     * video drain so audio is never delayed by this tick's frame, and is a
      * no-op unless the audio track is open. */
     DirectGate_Desktop_AudioDrainMain(pSession);
 #endif
 
-    /* The H.264 pipeline captures + encodes synchronously on each tick;
-     * the raw path keeps the legacy pull-per-tick behavior. */
+    /* The H.264 pipeline pushes frames from its capture thread; the wake-up
+     * is just a signal to drain the encoder mailbox. The raw path still
+     * pulls per tick. */
     if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||
         pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
     {
@@ -423,7 +424,7 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
             return XAPI_CONTINUE;
         }
 
-        return DirectGate_Desktop_LinuxEncoder_ProcessTick(pSession);
+        return DirectGate_Desktop_LinuxEncoder_DrainMain(pSession);
     }
 
     return DirectGate_Desktop_CaptureFrame(pSession);
@@ -647,16 +648,22 @@ static int DirectGate_Desktop_SetFdNonBlocking(int nFd)
 static void* DirectGate_Desktop_TimerThread(void *pArg)
 {
     directgate_desktop_t *pDesktop = (directgate_desktop_t*)pArg;
-    uint32_t nFps = pDesktop->nFps ? pDesktop->nFps : DIRECTGATE_DESKTOP_DEFAULT_FPS;
-    uint64_t nNs = 1000000000ULL / nFps;
-
-    struct timespec delay;
-    memset(&delay, 0, sizeof(delay));
-    delay.tv_sec = (time_t)(nNs / 1000000000ULL);
-    delay.tv_nsec = (long)(nNs % 1000000000ULL);
 
     while (pDesktop->bTimerThreadRunning)
     {
+        /* Re-read the rate every iteration: a set-preset control message
+         * changes nFps live, and a tick period frozen at the rate the
+         * session started with would leave the bitrate controller, the
+         * audio drain and the raw fallback running at the wrong cadence
+         * (the Linux path re-arms its timerfd for the same reason). */
+        uint32_t nFps = pDesktop->nFps ? pDesktop->nFps : DIRECTGATE_DESKTOP_DEFAULT_FPS;
+        uint64_t nNs = 1000000000ULL / nFps;
+
+        struct timespec delay;
+        memset(&delay, 0, sizeof(delay));
+        delay.tv_sec = (time_t)(nNs / 1000000000ULL);
+        delay.tv_nsec = (long)(nNs % 1000000000ULL);
+
         nanosleep(&delay, NULL);
         if (!pDesktop->bTimerThreadRunning) break;
         if (pDesktop->nTimerWriteFd != XSOCK_INVALID)
@@ -1091,9 +1098,6 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
 static DWORD WINAPI DirectGate_Desktop_TimerThread(LPVOID pArg)
 {
     directgate_desktop_t *pDesktop = (directgate_desktop_t*)pArg;
-    uint32_t nFps = pDesktop->nFps ? pDesktop->nFps : DIRECTGATE_DESKTOP_DEFAULT_FPS;
-    DWORD nDelayMs = 1000U / nFps;
-    if (!nDelayMs) nDelayMs = 1U;
 
     /* Sleep granularity (~16 ms) is fine here: on the H.264 pipeline these
      * ticks only drive the bitrate controller and drain fallback (frames
@@ -1101,6 +1105,12 @@ static DWORD WINAPI DirectGate_Desktop_TimerThread(LPVOID pArg)
      * a fallback anyway. */
     while (pDesktop->bTimerThreadRunning)
     {
+        /* Re-read the rate every iteration - a set-preset control message
+         * changes nFps live and the period must follow it. */
+        uint32_t nFps = pDesktop->nFps ? pDesktop->nFps : DIRECTGATE_DESKTOP_DEFAULT_FPS;
+        DWORD nDelayMs = 1000U / nFps;
+        if (!nDelayMs) nDelayMs = 1U;
+
         Sleep(nDelayMs);
         if (!pDesktop->bTimerThreadRunning) break;
         if (pDesktop->nTimerWriteFd != XSOCK_INVALID)

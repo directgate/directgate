@@ -407,6 +407,13 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     }
 #endif
 
+#if defined(__linux__)
+    /* Stop the capture thread before the timer descriptor goes away: it
+     * holds its own dup of that timerfd to wake the loop, and it detaches
+     * the XShm segment on its private display. */
+    if (pDesktop->pEncoder != NULL) DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
+#endif
+
 #if defined(__linux__) || defined(__APPLE__)
     if (pDesktop->nTimerFd != XSOCK_INVALID)
     {
@@ -424,9 +431,6 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
 #endif
 
 #if defined(__linux__)
-    /* Detaches the XShm segment, so it must run before the display closes. */
-    if (pDesktop->pEncoder != NULL) DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
-
     DirectGate_Desktop_RestoreDisplayMode(pDesktop);
     DirectGate_Desktop_ReleaseHeldKeys(pDesktop);
 

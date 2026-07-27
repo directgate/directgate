@@ -114,8 +114,12 @@ typedef struct directgate_winenc_ {
     xbyte_buffer_t encoded;             /* encoder output scratch */
 
     /* Single-slot mailbox: capture thread (producer) -> main loop
-     * (consumer). Buffers are swapped under the lock, never copied. */
+     * (consumer). Buffers are swapped under the lock, never copied.
+     * hMailboxFree is signalled by the main loop after it takes a frame so
+     * the capture thread resumes immediately instead of sleeping out a
+     * fixed poll interval. */
     SRWLOCK mailboxLock;
+    HANDLE hMailboxFree;
     xbyte_buffer_t mailbox;
     xbyte_buffer_t drain;
     uint32_t nMailboxWidth;
@@ -371,8 +375,18 @@ static int DirectGate_Desktop_WinEnc_CaptureDxgi(directgate_winenc_t *pEnc, uint
     D3D11_TEXTURE2D_DESC desc;
     ID3D11Texture2D_GetDesc(pTexture, &desc);
 
-    /* The staging texture is created lazily from the first frame's
-     * descriptor so mode changes never leave a mismatched copy target. */
+    if (pEnc->pStaging != NULL)
+    {
+        D3D11_TEXTURE2D_DESC staging;
+        ID3D11Texture2D_GetDesc(pEnc->pStaging, &staging);
+
+        if (staging.Width != desc.Width || staging.Height != desc.Height || staging.Format != desc.Format)
+        {
+            ID3D11Texture2D_Release(pEnc->pStaging);
+            pEnc->pStaging = NULL;
+        }
+    }
+
     if (pEnc->pStaging == NULL)
     {
         D3D11_TEXTURE2D_DESC staging = desc;
@@ -561,7 +575,7 @@ static int DirectGate_Desktop_WinEnc_EncodeFrame(directgate_winenc_t *pEnc, xboo
     pEnc->nMailboxHeight = pEnc->nEncodeHeight;
     pEnc->bMailboxKeyframe = bKeyframe;
     pEnc->nMailboxPtsUs = nPtsUs;
-    pEnc->nMailboxCapturedUs = nCapturedUs;
+    pEnc->nMailboxCapturedUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
     pEnc->bMailboxHasFrame = XTRUE;
     ReleaseSRWLockExclusive(&pEnc->mailboxLock);
 
@@ -672,9 +686,12 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
 
     /* Do not use TIME_CRITICAL: the agent main loop must still inject input
      * and drain RTP. ABOVE_NORMAL gives capture/encode an edge over ordinary
-     * background work without starving those latency-critical consumers. */
-    if (pEnc->pDesktop->quality.ePreset == DIRECTGATE_DESKTOP_PRESET_LOW_LATENCY)
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+     * background work without starving those latency-critical consumers.
+     * Applied on every preset - the MMCSS registration above is
+     * unconditional too, and a balanced-preset session competing with a
+     * busy foreground application drops frames for exactly the same reason
+     * a low-latency one does. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
     pEnc->bInitOk = (DirectGate_Desktop_WinEnc_InitPipeline(pEnc) == XSTDOK) ? XTRUE : XFALSE;
     SetEvent(pEnc->hInitDone);
@@ -699,7 +716,12 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
 
         if (bBusy || DirectGate_Desktop_ShouldSkipForBackpressure(pEnc->pSession))
         {
-            DirectGate_Desktop_WinEnc_SleepUs(pEnc, 2000ULL);
+            /* Wait for the drain rather than a fixed sleep: at 60 fps a 2 ms
+             * poll interval is 12% of the frame budget added to every frame
+             * the main loop has not picked up yet. The timeout still bounds
+             * the backpressure case, which nothing signals. */
+            if (pEnc->hMailboxFree != NULL) WaitForSingleObject(pEnc->hMailboxFree, 2U);
+            else DirectGate_Desktop_WinEnc_SleepUs(pEnc, 2000ULL);
             continue;
         }
 
@@ -855,6 +877,12 @@ static void DirectGate_Desktop_WinEnc_Free(directgate_winenc_t *pEnc)
         pEnc->hInitDone = NULL;
     }
 
+    if (pEnc->hMailboxFree != NULL)
+    {
+        CloseHandle(pEnc->hMailboxFree);
+        pEnc->hMailboxFree = NULL;
+    }
+
     XByteBuffer_Clear(&pEnc->encoded);
     XByteBuffer_Clear(&pEnc->mailbox);
     XByteBuffer_Clear(&pEnc->drain);
@@ -910,6 +938,9 @@ int DirectGate_Desktop_WinEncoder_Start(directgate_session_t *pSession,
     XByteBuffer_Init(&pEnc->encoded, XSTDNON, XFALSE);
     XByteBuffer_Init(&pEnc->mailbox, XSTDNON, XFALSE);
     XByteBuffer_Init(&pEnc->drain, XSTDNON, XFALSE);
+
+    /* Auto-reset: one drain releases exactly one waiting capture pass. */
+    pEnc->hMailboxFree = CreateEventW(NULL, FALSE, FALSE, NULL);
 
     pEnc->hInitDone = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (pEnc->hInitDone == NULL)
@@ -1038,6 +1069,7 @@ int DirectGate_Desktop_WinEncoder_DrainMain(directgate_session_t *pSession)
     uint64_t nMaxAgeUs = nIntervalUs * 3U;
     uint64_t nDroppedAgeUs = 0U;
     xbool_t bDroppedStale = XFALSE;
+    xbool_t bDrained = XFALSE;
     if (nMaxAgeUs < 50000ULL) nMaxAgeUs = 50000ULL;
 
     AcquireSRWLockExclusive(&pEnc->mailboxLock);
@@ -1068,9 +1100,14 @@ int DirectGate_Desktop_WinEncoder_DrainMain(directgate_session_t *pSession)
         }
 
         pEnc->bMailboxHasFrame = XFALSE;
+        bDrained = XTRUE;
     }
 
     ReleaseSRWLockExclusive(&pEnc->mailboxLock);
+
+    /* Release the capture thread as soon as the slot is free (it parks on
+     * this event while the mailbox is occupied). */
+    if (bDrained && pEnc->hMailboxFree != NULL) SetEvent(pEnc->hMailboxFree);
 
     if (bDroppedStale)
     {

@@ -331,7 +331,10 @@ int DirectGate_Desktop_MacEncoder_DrainMain(directgate_session_t *pSession);
 
 #if defined(__linux__)
 /* X11 (XShm) capture + OpenH264 encoder pipeline. Implemented in
- * desktop_linux.c and only called by desktop.c on Linux. */
+ * desktop_linux.c and only called by desktop.c on Linux. Capture and encode
+ * run on a dedicated thread with its own Xlib connection; encoded frames
+ * land in a single-slot mailbox drained by
+ * DirectGate_Desktop_LinuxEncoder_DrainMain on the main loop. */
 int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
                                           int32_t nX, int32_t nY,
                                           uint32_t nWidth, uint32_t nHeight);
@@ -346,10 +349,11 @@ const char* DirectGate_Desktop_LinuxEncoder_LastError(const directgate_session_t
  * demotes the session to the raw RGBA pipeline. */
 xbool_t DirectGate_Desktop_LinuxEncoder_HasFailed(const directgate_session_t *pSession);
 
-/* Captures, encodes and sends one frame. Called from
- * DirectGate_Desktop_Process on every timer tick while an encoded
- * pipeline is active. */
-int DirectGate_Desktop_LinuxEncoder_ProcessTick(directgate_session_t *pSession);
+/* Drains the encoder mailbox on the main loop. Capture and encode run on
+ * the pipeline's own thread (like the Windows and macOS backends); this is
+ * called from DirectGate_Desktop_Process after a frame or the periodic tick
+ * wakes the loop. */
+int DirectGate_Desktop_LinuxEncoder_DrainMain(directgate_session_t *pSession);
 #endif
 
 #if defined(_WIN32)
