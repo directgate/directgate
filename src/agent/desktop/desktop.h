@@ -34,6 +34,7 @@ extern "C" {
 #define DIRECTGATE_DESKTOP_MONITOR_ID_LEN   32
 #define DIRECTGATE_DESKTOP_MONITOR_NAME_LEN 96
 #define DIRECTGATE_DESKTOP_MAX_MONITORS     16
+#define DIRECTGATE_DESKTOP_MAX_MODES        64
 #define DIRECTGATE_DESKTOP_CODEC_LEN        16
 #define DIRECTGATE_DESKTOP_RESOLUTION_LEN   16
 #define DIRECTGATE_DESKTOP_KEY_CODE_LEN     24
@@ -85,6 +86,11 @@ typedef struct directgate_desktop_quality_ {
 
 typedef struct directgate_session_ directgate_session_t;
 
+typedef struct directgate_desktop_mode_ {
+    uint32_t nWidth;
+    uint32_t nHeight;
+} directgate_desktop_mode_t;
+
 typedef struct directgate_desktop_monitor_ {
     char sId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
     char sName[DIRECTGATE_DESKTOP_MONITOR_NAME_LEN];
@@ -98,6 +104,8 @@ typedef struct directgate_desktop_monitor_ {
      * name, and macOS the CGDirectDisplayID. */
     char sDeviceId[DIRECTGATE_DESKTOP_DEVICE_ID_LEN];
     uint64_t nNativeId;
+    uint32_t nModeCount;
+    directgate_desktop_mode_t modes[DIRECTGATE_DESKTOP_MAX_MODES];
 } directgate_desktop_monitor_t;
 
 typedef struct directgate_desktop_held_key_ {
@@ -240,6 +248,8 @@ void DirectGate_Desktop_ReleaseHeldKeys(directgate_desktop_t *pDesktop);
 int DirectGate_Desktop_GetTimerFd(const directgate_desktop_t *pDesktop);
 xbool_t DirectGate_Desktop_IsRunning(const directgate_desktop_t *pDesktop);
 const char* DirectGate_Desktop_GetReason(const directgate_desktop_t *pDesktop);
+void DirectGate_Desktop_AddMonitorMode(directgate_desktop_monitor_t *pMonitor,
+                                       uint32_t nWidth, uint32_t nHeight);
 
 /* Cross-platform encoded-frame send. The encoded payload is split into
  * DIRECTGATE_DESKTOP_CHUNK_BYTES-sized chunks; each chunk goes through the

@@ -49,6 +49,14 @@ int main(void)
 {
     directgate_desktop_t desktop;
     DirectGate_Desktop_Init(&desktop);
+    directgate_desktop_monitor_t monitor;
+    memset(&monitor, 0, sizeof(monitor));
+    DirectGate_Desktop_AddMonitorMode(&monitor, 1920, 1080);
+    DirectGate_Desktop_AddMonitorMode(&monitor, 1920, 1080);
+    DirectGate_Desktop_AddMonitorMode(&monitor, 1600, 900);
+    CHECK(monitor.nModeCount == 2U,
+        "desktop monitor modes should be advertised once per resolution");
+
     desktop.nTargetWidth = 1280;
     desktop.nTargetHeight = 800;
     uint32_t nWidth = 0;

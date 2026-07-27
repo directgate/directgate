@@ -48,7 +48,12 @@ static void DirectGate_Desktop_EnumerateMonitors(directgate_desktop_t *pDesktop)
 
     int nMonitorCount = 0;
     XRRMonitorInfo *pMonitors = XRRGetMonitors(pDisplay, root, XTRUE, &nMonitorCount);
-    if (pMonitors == NULL || nMonitorCount <= 0) return;
+    XRRScreenResources *pResources = XRRGetScreenResourcesCurrent(pDisplay, root);
+    if (pMonitors == NULL || nMonitorCount <= 0)
+    {
+        if (pResources != NULL) XRRFreeScreenResources(pResources);
+        return;
+    }
 
     for (int i = 0; i < nMonitorCount && pDesktop->nMonitorCount < DIRECTGATE_DESKTOP_MAX_MONITORS; i++)
     {
@@ -69,13 +74,31 @@ static void DirectGate_Desktop_EnumerateMonitors(directgate_desktop_t *pDesktop)
             directgate_desktop_monitor_t *pAdded = &pDesktop->monitors[pDesktop->nMonitorCount - 1U];
             pAdded->nNativeId = (uint64_t)pInfo->outputs[0];
             snprintf(pAdded->sDeviceId, sizeof(pAdded->sDeviceId), "%lu", (unsigned long)pInfo->outputs[0]);
+
+            XRROutputInfo *pOutput = pResources != NULL ? XRRGetOutputInfo(pDisplay, pResources, pInfo->outputs[0]) : NULL;
+            if (pOutput != NULL)
+            {
+                for (int modeIndex = 0; modeIndex < pOutput->nmode; modeIndex++)
+                {
+                    for (int resourceIndex = 0; resourceIndex < pResources->nmode; resourceIndex++)
+                    {
+                        const XRRModeInfo *pMode = &pResources->modes[resourceIndex];
+                        if (pMode->id != pOutput->modes[modeIndex]) continue;
+
+                        DirectGate_Desktop_AddMonitorMode(pAdded, (uint32_t)pMode->width, (uint32_t)pMode->height);
+                        break;
+                    }
+                }
+
+                XRRFreeOutputInfo(pOutput);
+            }
         }
 
-        if (pAtomName != NULL)
-            XFree(pAtomName);
+        if (pAtomName != NULL) XFree(pAtomName);
     }
 
     XRRFreeMonitors(pMonitors);
+    if (pResources != NULL) XRRFreeScreenResources(pResources);
 }
 
 static void DirectGate_Desktop_RefreshLinuxMonitors(directgate_desktop_t *pDesktop)
@@ -369,6 +392,24 @@ static uint32_t DirectGate_Desktop_RectHeight(CGRect rect)
     return rect.size.height > 0 ? (uint32_t)ceil(rect.size.height) : 0;
 }
 
+static void DirectGate_Desktop_AddMacModes(directgate_desktop_monitor_t *pMonitor,
+                                           CGDirectDisplayID nDisplay)
+{
+    CFArrayRef pModes = CGDisplayCopyAllDisplayModes(nDisplay, NULL);
+    if (pModes == NULL) return;
+
+    CFIndex nCount = CFArrayGetCount(pModes);
+    for (CFIndex i = 0; i < nCount; i++)
+    {
+        CGDisplayModeRef pMode = (CGDisplayModeRef)CFArrayGetValueAtIndex(pModes, i);
+        DirectGate_Desktop_AddMonitorMode(pMonitor,
+            (uint32_t)CGDisplayModeGetWidth(pMode),
+            (uint32_t)CGDisplayModeGetHeight(pMode));
+    }
+
+    CFRelease(pModes);
+}
+
 int DirectGate_Desktop_OpenMacOS(directgate_session_t *pSession)
 {
     directgate_desktop_t *pDesktop = &pSession->desktop;
@@ -426,6 +467,7 @@ int DirectGate_Desktop_OpenMacOS(directgate_session_t *pSession)
         directgate_desktop_monitor_t *pAdded = &pDesktop->monitors[pDesktop->nMonitorCount - 1U];
         pAdded->nNativeId = (uint64_t)displays[i];
         snprintf(pAdded->sDeviceId, sizeof(pAdded->sDeviceId), "%u", displays[i]);
+        DirectGate_Desktop_AddMacModes(pAdded, displays[i]);
     }
 
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 101500
@@ -510,6 +552,7 @@ static void DirectGate_Desktop_RefreshMacMonitors(directgate_desktop_t *pDesktop
         directgate_desktop_monitor_t *pAdded = &pDesktop->monitors[pDesktop->nMonitorCount - 1U];
         pAdded->nNativeId = (uint64_t)displays[i];
         snprintf(pAdded->sDeviceId, sizeof(pAdded->sDeviceId), "%u", displays[i]);
+        DirectGate_Desktop_AddMacModes(pAdded, displays[i]);
     }
 }
 
@@ -603,6 +646,26 @@ void DirectGate_Desktop_RestoreDisplayMode(directgate_desktop_t *pDesktop)
 
 #elif defined(_WIN32)
 
+static void DirectGate_Desktop_AddWindowsModes(directgate_desktop_monitor_t *pMonitor)
+{
+    DEVMODEA current;
+    memset(&current, 0, sizeof(current));
+    current.dmSize = sizeof(current);
+    if (!EnumDisplaySettingsExA(pMonitor->sDeviceId, ENUM_CURRENT_SETTINGS, &current, 0)) return;
+
+    for (DWORD i = 0;; i++)
+    {
+        DEVMODEA candidate;
+        memset(&candidate, 0, sizeof(candidate));
+        candidate.dmSize = sizeof(candidate);
+
+        if (!EnumDisplaySettingsExA(pMonitor->sDeviceId, i, &candidate, 0)) break;
+        if (candidate.dmBitsPerPel != current.dmBitsPerPel) continue;
+
+        DirectGate_Desktop_AddMonitorMode(pMonitor, candidate.dmPelsWidth, candidate.dmPelsHeight);
+    }
+}
+
 static BOOL CALLBACK DirectGate_Desktop_MonitorEnumProc(HMONITOR hMonitor, HDC hDC,
                                                         LPRECT pRect, LPARAM lParam)
 {
@@ -630,6 +693,7 @@ static BOOL CALLBACK DirectGate_Desktop_MonitorEnumProc(HMONITOR hMonitor, HDC h
     directgate_desktop_monitor_t *pAdded = &pDesktop->monitors[pDesktop->nMonitorCount - 1U];
     xstrncpy(pAdded->sDeviceId, sizeof(pAdded->sDeviceId), info.szDevice);
     pAdded->nNativeId = (uint64_t)(uintptr_t)hMonitor;
+    DirectGate_Desktop_AddWindowsModes(pAdded);
 
     return (pDesktop->nMonitorCount < DIRECTGATE_DESKTOP_MAX_MONITORS) ? TRUE : FALSE;
 }

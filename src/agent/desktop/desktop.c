@@ -634,6 +634,23 @@ int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const char *pS
             XJSON_AddU32(pItem, "width", pMonitor->nWidth);
             XJSON_AddU32(pItem, "height", pMonitor->nHeight);
             XJSON_AddBool(pItem, "primary", pMonitor->bPrimary);
+
+            xjson_obj_t *pModes = XJSON_NewArray(NULL, "modes", XFALSE);
+            if (pModes != NULL)
+            {
+                for (uint32_t m = 0; m < pMonitor->nModeCount; m++)
+                {
+                    xjson_obj_t *pMode = XJSON_NewObject(NULL, NULL, XFALSE);
+                    if (pMode == NULL) continue;
+
+                    XJSON_AddU32(pMode, "width", pMonitor->modes[m].nWidth);
+                    XJSON_AddU32(pMode, "height", pMonitor->modes[m].nHeight);
+                    XJSON_AddObject(pModes, pMode);
+                }
+
+                XJSON_AddObject(pItem, pModes);
+            }
+
             XJSON_AddObject(pMonitors, pItem);
         }
 
@@ -775,6 +792,23 @@ void DirectGate_Desktop_AddMonitor(directgate_desktop_t *pDesktop,
     pMonitor->nWidth = nWidth;
     pMonitor->nHeight = nHeight;
     pMonitor->bPrimary = bPrimary;
+}
+
+void DirectGate_Desktop_AddMonitorMode(directgate_desktop_monitor_t *pMonitor,
+                                       uint32_t nWidth, uint32_t nHeight)
+{
+    XCHECK_VOID_NL((pMonitor != NULL && nWidth > 0U && nHeight > 0U));
+
+    for (uint32_t i = 0; i < pMonitor->nModeCount; i++)
+    {
+        if (pMonitor->modes[i].nWidth == nWidth &&
+            pMonitor->modes[i].nHeight == nHeight) return;
+    }
+
+    if (pMonitor->nModeCount >= DIRECTGATE_DESKTOP_MAX_MODES) return;
+    directgate_desktop_mode_t *pMode = &pMonitor->modes[pMonitor->nModeCount++];
+    pMode->nWidth = nWidth;
+    pMode->nHeight = nHeight;
 }
 
 const directgate_desktop_monitor_t* DirectGate_Desktop_FindMonitor(const directgate_desktop_t *pDesktop, const char *pMonitorId)
