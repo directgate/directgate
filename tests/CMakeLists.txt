@@ -117,6 +117,12 @@ if(UNIX AND NOT APPLE)
     directgate_smoke(desktop_input_smoke)
     target_include_directories(desktop_input_smoke PRIVATE ${X11_INCLUDE_DIR})
     target_link_libraries(desktop_input_smoke PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
+
+    # Same idea for the adaptive bitrate controller: compiles desktop.c and
+    # drives the policy with synthetic receiver reports, no encoder involved.
+    directgate_smoke(desktop_abr_smoke)
+    target_include_directories(desktop_abr_smoke PRIVATE ${X11_INCLUDE_DIR})
+    target_link_libraries(desktop_abr_smoke PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
 endif()
 directgate_smoke(enroll_prompt_smoke ${AGENT_DIR}/enroll.c)
 directgate_smoke(files_smoke         ${AGENT_DIR}/files.c)

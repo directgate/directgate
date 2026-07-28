@@ -201,6 +201,11 @@ typedef struct directgate_desktop_ {
     uint32_t nCurrentBitrateKbps;
     uint32_t nAbrCleanTicks;
     uint32_t nAbrHoldTicks;
+    /* Consecutive receiver reports that came back lossy. Congestion is only
+     * declared once this reaches DIRECTGATE_DESKTOP_ABR_LOSS_REPORTS; a
+     * single lossy report is not evidence of a link that cannot carry the
+     * rate, and treating it as such ratchets the session down for good. */
+    uint32_t nAbrLossReports;
     /* Platform encoder state (opaque to cross-platform code): the macOS
      * ScreenCaptureKit/VideoToolbox encoder, the Linux X11/OpenH264
      * pipeline or the Windows DXGI/MediaFoundation pipeline, owned by

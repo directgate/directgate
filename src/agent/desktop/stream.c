@@ -36,62 +36,23 @@
 
 #define DIRECTGATE_DESKTOP_CHUNK_SIZE        (128U * 1024U)
 
-/* Adaptive bitrate bounds: never throttle below this floor, and step back
- * up toward the preset target when the link stays clean. */
-#define DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS   1000U
-#define DIRECTGATE_DESKTOP_ABR_HOLD_TICKS     60U  /* ~2s at 30 fps */
-#define DIRECTGATE_DESKTOP_ABR_RAISE_TICKS    150U /* ~5s clean before raising */
-#define DIRECTGATE_DESKTOP_ABR_LOSS_THRESHOLD 8U   /* ~3% fraction lost */
-
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
 
-/* Adaptive bitrate: multiplicative decrease on congestion, slow stepwise
- * recovery toward the preset target on a clean link. RTCP receiver reports
- * (fraction lost) are the signal on the media track; on the data-channel
- * fallback the only available signal is transport backpressure. Runs once
- * per timer tick while an encoded pipeline is active. */
+/* Feeds this tick's congestion evidence to the shared controller and applies
+ * whatever rate it returns to the active platform encoder. */
 static void DirectGate_Desktop_AdaptBitrate(directgate_session_t *pSession)
 {
     directgate_desktop_t *pDesktop = &pSession->desktop;
-    uint32_t nTarget = pDesktop->quality.nBitrateKbps;
-    XCHECK_VOID_NL((nTarget > 0));
+    uint32_t nCurrent = pDesktop->nCurrentBitrateKbps ?
+                        pDesktop->nCurrentBitrateKbps : pDesktop->quality.nBitrateKbps;
 
-    uint32_t nCurrent = pDesktop->nCurrentBitrateKbps ? pDesktop->nCurrentBitrateKbps : nTarget;
-    xbool_t bCongested = XFALSE;
     uint8_t nFractionLost = 0;
+    xbool_t bHaveReport = DirectGate_WebRTC_TakeVideoLossReport(&pSession->webrtc, &nFractionLost);
+    xbool_t bBackpressure = (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC &&
+        DirectGate_Desktop_ShouldSkipForBackpressure(pSession)) ? XTRUE : XFALSE;
 
-    if (DirectGate_WebRTC_TakeVideoLossReport(&pSession->webrtc, &nFractionLost) &&
-        nFractionLost >= DIRECTGATE_DESKTOP_ABR_LOSS_THRESHOLD) bCongested = XTRUE;
-
-    if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC &&
-        DirectGate_Desktop_ShouldSkipForBackpressure(pSession)) bCongested = XTRUE;
-
-    if (pDesktop->nAbrHoldTicks > 0) pDesktop->nAbrHoldTicks--;
-    uint32_t nNext = nCurrent;
-
-    if (bCongested)
-    {
-        pDesktop->nAbrCleanTicks = 0;
-        if (!pDesktop->nAbrHoldTicks)
-        {
-            nNext = (nCurrent * 3U) / 4U;
-            if (nNext < DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS)
-                nNext = DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS;
-
-            /* Receiver reports lag the rate change; hold before the next
-             * step so one loss episode is not punished twice. */
-            pDesktop->nAbrHoldTicks = DIRECTGATE_DESKTOP_ABR_HOLD_TICKS;
-        }
-    }
-    else if (nCurrent < nTarget && ++pDesktop->nAbrCleanTicks >= DIRECTGATE_DESKTOP_ABR_RAISE_TICKS)
-    {
-        pDesktop->nAbrCleanTicks = 0;
-        nNext = nCurrent + nTarget / 10U + 1U;
-        if (nNext > nTarget) nNext = nTarget;
-    }
-
-    pDesktop->nCurrentBitrateKbps = nNext;
-    if (nNext == nCurrent) return;
+    uint32_t nNext = DirectGate_Desktop_AbrStep(pDesktop, bHaveReport, nFractionLost, bBackpressure);
+    if (!nNext || nNext == nCurrent) return;
 
 #if defined(__APPLE__)
     DirectGate_Desktop_MacEncoder_SetBitrate(pSession, nNext);
@@ -102,7 +63,8 @@ static void DirectGate_Desktop_AdaptBitrate(directgate_session_t *pSession)
 #endif
 
     xlogi("Desktop bitrate adapted: sid(%u), step(%s), rate(%u -> %u kbps), target(%u)",
-        pSession->nSessionId, nNext < nCurrent ? "down" : "up", nCurrent, nNext, nTarget);
+        pSession->nSessionId, nNext < nCurrent ? "down" : "up", nCurrent, nNext,
+        pDesktop->quality.nBitrateKbps);
 }
 
 static int DirectGate_Desktop_SendFrameChunks(directgate_session_t *pSession, const uint8_t *pFrame, size_t nFrameSize)

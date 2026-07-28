@@ -73,6 +73,13 @@ uint32_t DirectGate_Desktop_BitrateForSize(const directgate_desktop_t *pDesktop,
                                            uint32_t nWidth, uint32_t nHeight);
 void DirectGate_Desktop_ApplyBitrateForSize(directgate_desktop_t *pDesktop,
                                             uint32_t nWidth, uint32_t nHeight);
+
+/* One adaptive-bitrate decision. Pure over the desktop struct's nAbr* state
+ * so the policy is unit-testable; returns the rate the encoder should use. */
+uint32_t DirectGate_Desktop_AbrStep(directgate_desktop_t *pDesktop,
+                                    xbool_t bHaveReport,
+                                    uint8_t nFractionLost,
+                                    xbool_t bBackpressure);
 const directgate_desktop_monitor_t* DirectGate_Desktop_FindMonitor(const directgate_desktop_t *pDesktop, const char *pMonitorId);
 
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)

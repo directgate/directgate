@@ -38,6 +38,15 @@
  * without letting the fallback path accumulate a second of latency. */
 #define DIRECTGATE_DESKTOP_ENCODED_BUFFER_LIMIT (256U * 1024U)
 
+/* Adaptive bitrate bounds: never throttle below this floor, and step back up
+ * toward the preset target when the link stays clean. */
+#define DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS     1000U
+#define DIRECTGATE_DESKTOP_ABR_HOLD_TICKS       60U  /* ~2s at 30 fps */
+#define DIRECTGATE_DESKTOP_ABR_RAISE_TICKS      150U /* ~5s clean before raising */
+#define DIRECTGATE_DESKTOP_ABR_LOSS_THRESHOLD   8U   /* ~3% fraction lost */
+/* Consecutive lossy reports before the rate is cut. See DirectGate_Desktop_AbrStep. */
+#define DIRECTGATE_DESKTOP_ABR_LOSS_REPORTS     2U
+
 /* Hard ceiling on either encoded edge, whatever the resize mode asks for.
  * 8192 is the largest width or height any H.264 level defines, and it keeps
  * `width * height * 4` inside a 32-bit size_t on the i686 packages. */
@@ -136,6 +145,7 @@ void DirectGate_Desktop_ApplyPreset(directgate_desktop_t *pDesktop, directgate_d
     pDesktop->nCurrentBitrateKbps = pDesktop->quality.nBitrateKbps;
     pDesktop->nAbrCleanTicks = 0;
     pDesktop->nAbrHoldTicks = 0;
+    pDesktop->nAbrLossReports = 0;
     pDesktop->bRequestKeyframe = XTRUE;
 }
 
@@ -333,6 +343,60 @@ void DirectGate_Desktop_ComputeOutputSize(const directgate_desktop_t *pDesktop,
     if (!nHeight) nHeight = 1U;
     if (pWidth != NULL) *pWidth = nWidth;
     if (pHeight != NULL) *pHeight = nHeight;
+}
+
+uint32_t DirectGate_Desktop_AbrStep(directgate_desktop_t *pDesktop,
+                                    xbool_t bHaveReport,
+                                    uint8_t nFractionLost,
+                                    xbool_t bBackpressure)
+{
+    XCHECK_NL((pDesktop != NULL), 0);
+
+    uint32_t nTarget = pDesktop->quality.nBitrateKbps;
+    XCHECK_NL((nTarget > 0), 0);
+
+    uint32_t nCurrent = pDesktop->nCurrentBitrateKbps ? pDesktop->nCurrentBitrateKbps : nTarget;
+    uint32_t nFloor = DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS;
+    if (nFloor > nTarget) nFloor = nTarget;
+
+    /* A report is evidence either way; a tick without one says nothing, so it
+     * must not clear a streak that is still building. */
+    if (bHaveReport)
+    {
+        if (nFractionLost >= DIRECTGATE_DESKTOP_ABR_LOSS_THRESHOLD) pDesktop->nAbrLossReports++;
+        else pDesktop->nAbrLossReports = 0;
+    }
+
+    xbool_t bCongested = (pDesktop->nAbrLossReports >= DIRECTGATE_DESKTOP_ABR_LOSS_REPORTS ||
+                          bBackpressure) ? XTRUE : XFALSE;
+
+    if (pDesktop->nAbrHoldTicks > 0) pDesktop->nAbrHoldTicks--;
+    uint32_t nNext = nCurrent;
+
+    if (bCongested)
+    {
+        pDesktop->nAbrCleanTicks = 0;
+        if (!pDesktop->nAbrHoldTicks)
+        {
+            nNext = (nCurrent * 3U) / 4U;
+            if (nNext < nFloor) nNext = nFloor;
+
+            /* Receiver reports lag the rate change; hold before the next step
+             * so one loss episode is not punished twice, and start the streak
+             * over so the hold is not immediately re-armed by stale evidence. */
+            pDesktop->nAbrHoldTicks = DIRECTGATE_DESKTOP_ABR_HOLD_TICKS;
+            pDesktop->nAbrLossReports = 0;
+        }
+    }
+    else if (nCurrent < nTarget && ++pDesktop->nAbrCleanTicks >= DIRECTGATE_DESKTOP_ABR_RAISE_TICKS)
+    {
+        pDesktop->nAbrCleanTicks = 0;
+        nNext = nCurrent + nTarget / 10U + 1U;
+        if (nNext > nTarget) nNext = nTarget;
+    }
+
+    pDesktop->nCurrentBitrateKbps = nNext;
+    return nNext;
 }
 
 uint32_t DirectGate_Desktop_BitrateForSize(const directgate_desktop_t *pDesktop,
