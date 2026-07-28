@@ -85,6 +85,7 @@ int DirectGate_Desktop_SetDisplayResolution(directgate_desktop_t *pDesktop,
 #endif
 
 #if defined(__linux__)
+void DirectGate_Desktop_InstallX11ErrorHandlers(void);
 int DirectGate_Desktop_OpenX11(directgate_session_t *pSession);
 #elif defined(__APPLE__)
 int DirectGate_Desktop_OpenMacOS(directgate_session_t *pSession);

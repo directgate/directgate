@@ -38,6 +38,11 @@
  * without letting the fallback path accumulate a second of latency. */
 #define DIRECTGATE_DESKTOP_ENCODED_BUFFER_LIMIT (256U * 1024U)
 
+/* Hard ceiling on either encoded edge, whatever the resize mode asks for.
+ * 8192 is the largest width or height any H.264 level defines, and it keeps
+ * `width * height * 4` inside a 32-bit size_t on the i686 packages. */
+#define DIRECTGATE_DESKTOP_MAX_ENCODE_EDGE      8192U
+
 /* The encode size the preset bitrates are chosen for, and how far above it
  * the bitrate is allowed to scale (see DirectGate_Desktop_BitrateForSize). */
 #define DIRECTGATE_DESKTOP_BITRATE_REF_PIXELS   (1920U * 1080U)
@@ -304,6 +309,24 @@ void DirectGate_Desktop_ComputeOutputSize(const directgate_desktop_t *pDesktop,
             nWidth = (uint32_t)(((uint64_t)nWidth * nMaxEdge) / nHeight);
             nHeight = nMaxEdge;
         }
+    }
+
+    /* Absolute ceiling, applied after every other rule including display
+     * mode, which deliberately leaves nMaxEdge at zero. Two reasons: no
+     * H.264 level encodes beyond this, so a larger request only fails deeper
+     * in the encoder; and the frame buffers are sized `w * h * 4`, which on
+     * the 32-bit builds overflows size_t for a big enough video wall and
+     * would hand a short allocation to a full-size write. */
+    if (nWidth > DIRECTGATE_DESKTOP_MAX_ENCODE_EDGE)
+    {
+        nHeight = (uint32_t)(((uint64_t)nHeight * DIRECTGATE_DESKTOP_MAX_ENCODE_EDGE) / nWidth);
+        nWidth = DIRECTGATE_DESKTOP_MAX_ENCODE_EDGE;
+    }
+
+    if (nHeight > DIRECTGATE_DESKTOP_MAX_ENCODE_EDGE)
+    {
+        nWidth = (uint32_t)(((uint64_t)nWidth * DIRECTGATE_DESKTOP_MAX_ENCODE_EDGE) / nHeight);
+        nHeight = DIRECTGATE_DESKTOP_MAX_ENCODE_EDGE;
     }
 
     if (!nWidth) nWidth = 1U;

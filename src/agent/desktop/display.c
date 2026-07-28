@@ -37,6 +37,63 @@
 
 #if defined(__linux__)
 
+/* Xlib kills the process on an X error unless the application says otherwise:
+ * the default protocol-error handler prints and calls exit(), and so does the
+ * default I/O-error handler. That is fatal here in the most ordinary
+ * circumstances - unplugging a monitor, changing a resolution or switching
+ * users races the geometry this pipeline captured, and the next XGetImage /
+ * XShmGetImage against the now-invalid rectangle answers BadMatch. Losing the
+ * agent takes every other session with it: PTYs, file transfers, the lot.
+ *
+ * Protocol errors are recoverable - the call that raised one simply fails, and
+ * the capture path already handles a failed grab - so log and carry on. The
+ * handler is process-wide rather than per-connection, so installing it once
+ * covers the capture thread's private display too. */
+static uint32_t g_nX11ErrorCount;
+
+static int DirectGate_Desktop_X11ErrorHandler(Display *pDisplay, XErrorEvent *pEvent)
+{
+    /* Errors arrive in bursts while a monitor is being reconfigured, and this
+     * runs on the capture path - keep it to the first few and then one in a
+     * hundred so a persistent fault stays visible without flooding the log or
+     * costing frames. */
+    uint32_t nSeen = ++g_nX11ErrorCount;
+    if (nSeen <= 5U || (nSeen % 100U) == 0U)
+    {
+        char sText[128];
+        sText[0] = '\0';
+        if (pDisplay != NULL) XGetErrorText(pDisplay, pEvent->error_code, sText, (int)sizeof(sText));
+
+        xlogw("X11 protocol error ignored: code(%u), request(%u.%u), resource(0x%lx), total(%u), text(%s)",
+            (unsigned)pEvent->error_code, (unsigned)pEvent->request_code,
+            (unsigned)pEvent->minor_code, (unsigned long)pEvent->resourceid,
+            nSeen, sText[0] ? sText : "unknown");
+    }
+
+    return 0;
+}
+
+/* An I/O error means the connection itself is gone (server exit, user logout).
+ * Xlib gives no way to return from this - it exits once the handler does - so
+ * the only thing worth doing is making sure the reason reaches the log instead
+ * of the process dying silently. */
+static int DirectGate_Desktop_X11IOErrorHandler(Display *pDisplay)
+{
+    (void)pDisplay;
+    xloge("X11 connection lost; the display server went away");
+    return 0;
+}
+
+void DirectGate_Desktop_InstallX11ErrorHandlers(void)
+{
+    static xbool_t bInstalled = XFALSE;
+    if (bInstalled) return;
+
+    bInstalled = XTRUE;
+    XSetErrorHandler(DirectGate_Desktop_X11ErrorHandler);
+    XSetIOErrorHandler(DirectGate_Desktop_X11IOErrorHandler);
+}
+
 static void DirectGate_Desktop_EnumerateMonitors(directgate_desktop_t *pDesktop)
 {
     Display *pDisplay = (Display*)pDesktop->pDisplay;
@@ -66,10 +123,11 @@ static void DirectGate_Desktop_EnumerateMonitors(directgate_desktop_t *pDesktop)
         if (xstrused(pAtomName)) xstrncpy(sName, sizeof(sName), pAtomName);
         else snprintf(sName, sizeof(sName), "Monitor %d", i + 1);
 
+        uint32_t nBefore = pDesktop->nMonitorCount;
         DirectGate_Desktop_AddMonitor(pDesktop, sId, sName, pInfo->x, pInfo->y,
             (uint32_t)pInfo->width, (uint32_t)pInfo->height, pInfo->primary ? XTRUE : XFALSE);
 
-        if (pInfo->noutput > 0)
+        if (pInfo->noutput > 0 && pDesktop->nMonitorCount > nBefore)
         {
             directgate_desktop_monitor_t *pAdded = &pDesktop->monitors[pDesktop->nMonitorCount - 1U];
             pAdded->nNativeId = (uint64_t)pInfo->outputs[0];
@@ -343,6 +401,7 @@ int DirectGate_Desktop_OpenX11(directgate_session_t *pSession)
     }
 
     XInitThreads();
+    DirectGate_Desktop_InstallX11ErrorHandlers();
     DirectGate_Desktop_SetXAuthority(pSession);
 
     Display *pDisplay = XOpenDisplay(pDisplayName);
