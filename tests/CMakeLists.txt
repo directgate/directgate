@@ -43,6 +43,9 @@ function(directgate_smoke_desktop name)
             "-framework VideoToolbox"
             "-framework ScreenCaptureKit")
     elseif(UNIX)
+        # Deliberately built without DIRECTGATE_HAVE_HWENC/hwenc.c: this is the
+        # configuration a host without libavcodec headers gets, so the smoke
+        # tests keep the software-only fallback path compiling and passing.
         target_sources(${name} PRIVATE
             ${AGENT_DIR}/desktop/desktop_linux.c
             ${AGENT_DIR}/desktop/openh264.c

@@ -24,6 +24,7 @@
 #include "desktop.h"
 #include "session.h"
 #include "openh264.h"
+#include "hwenc.h"
 #include "priv.h"
 #include "yuv.h"
 
@@ -37,6 +38,13 @@
 /* Consecutive capture/encode failures before the pipeline reports itself
  * broken and desktop.c falls back to raw RGBA (~1s at 30 fps). */
 #define DIRECTGATE_X11ENC_MAX_FAILURES 30U
+
+/* Consecutive GPU encode failures before giving up on the GPU for this
+ * pipeline and continuing on the CPU. Deliberately generous: the software
+ * encoder is a visible quality drop that lasts until the pipeline is
+ * rebuilt, so it must answer a GPU that is genuinely broken, not one that
+ * stuttered for a couple of frames. */
+#define DIRECTGATE_X11ENC_MAX_HW_FAILURES 30U
 
 /* Poll interval while the mailbox is still occupied or the data channel is
  * backed up. Linux nanosleep honours this granularity, so it costs at most
@@ -57,10 +65,28 @@
 #define DIRECTGATE_X11ENC_SET(pFlag, nVal)  __atomic_store_n((pFlag), (nVal), __ATOMIC_RELEASE)
 #define DIRECTGATE_X11ENC_TAKE(pFlag)       __atomic_exchange_n((pFlag), 0, __ATOMIC_ACQ_REL)
 
+/* True while the GPU encoder is the active backend. Collapses to XFALSE on
+ * builds without libavcodec headers so the call sites stay #ifdef-free. */
+#ifdef DIRECTGATE_HAVE_HWENC
+#define DIRECTGATE_X11ENC_HAS_HW(pEnc)  ((pEnc)->pHwEncoder != NULL ? XTRUE : XFALSE)
+#else
+#define DIRECTGATE_X11ENC_HAS_HW(pEnc)  (XFALSE)
+#endif
+
 typedef struct directgate_x11enc_ {
     directgate_session_t *pSession;   /* backpressure checks only */
     directgate_desktop_t *pDesktop;
+
+    /* Exactly one of these is live. The GPU encoder is preferred and the
+     * software one is the guaranteed fallback: if no GPU encoder opens - or
+     * a live one starts failing - the session keeps streaming on the CPU
+     * rather than losing desktop mode. */
     directgate_openh264_t *pEncoder;
+#ifdef DIRECTGATE_HAVE_HWENC
+    directgate_hwenc_t *pHwEncoder;
+    xbool_t bHwDisabled;              /* GPU gave up for good; stay on the CPU */
+    uint32_t nHwFailures;             /* consecutive GPU encode failures */
+#endif
 
     /* Private X11 connection owned by the capture thread. */
     Display *pDisplay;
@@ -88,7 +114,10 @@ typedef struct directgate_x11enc_ {
     uint8_t *pCaptureBGRA;  /* capture-size BGRA; only allocated when scaling */
     uint8_t *pFrameBGRA;    /* encode-size BGRA fed into the converter */
     uint8_t *pPrevBGRA;     /* previous encode-size BGRA for change detection */
-    uint8_t *pI420;         /* encode-size planar YUV for the encoder */
+    /* OpenH264 takes planar I420, every GPU encoder takes NV12; only the
+     * plane buffer for the active encoder is allocated. */
+    uint8_t *pI420;
+    uint8_t *pNV12;
     xbool_t bHavePrev;
     uint64_t nStartUs;
     xbyte_buffer_t encoded; /* encoder output scratch (capture thread) */
@@ -360,6 +389,10 @@ static void DirectGate_Desktop_X11Enc_Free(directgate_x11enc_t *pEnc)
     DirectGate_Desktop_X11Enc_TeardownShm(pEnc);
     DirectGate_OpenH264_Destroy(pEnc->pEncoder);
 
+#ifdef DIRECTGATE_HAVE_HWENC
+    DirectGate_HWEnc_Destroy(pEnc->pHwEncoder);
+#endif
+
     if (pEnc->pDisplay != NULL)
     {
         XCloseDisplay(pEnc->pDisplay);
@@ -381,6 +414,7 @@ static void DirectGate_Desktop_X11Enc_Free(directgate_x11enc_t *pEnc)
     free(pEnc->pFrameBGRA);
     free(pEnc->pPrevBGRA);
     free(pEnc->pI420);
+    free(pEnc->pNV12);
     free(pEnc);
 }
 
@@ -444,11 +478,126 @@ static xbool_t DirectGate_Desktop_X11Enc_MailboxBusy(directgate_x11enc_t *pEnc)
  * so the bitrate controller only ever leaves a pending value behind. */
 static void DirectGate_Desktop_X11Enc_ApplyPendingControls(directgate_x11enc_t *pEnc)
 {
-    if (DIRECTGATE_X11ENC_TAKE(&pEnc->bApplyQuality))
-        DirectGate_OpenH264_ApplyQuality(pEnc->pEncoder, &pEnc->pDesktop->quality);
-
+    xbool_t bApplyQuality = DIRECTGATE_X11ENC_TAKE(&pEnc->bApplyQuality) ? XTRUE : XFALSE;
     uint32_t nBitrateKbps = DIRECTGATE_X11ENC_TAKE(&pEnc->nPendingBitrateKbps);
+
+#ifdef DIRECTGATE_HAVE_HWENC
+    if (pEnc->pHwEncoder != NULL)
+    {
+        if (bApplyQuality) DirectGate_HWEnc_ApplyQuality(pEnc->pHwEncoder, &pEnc->pDesktop->quality);
+        else if (nBitrateKbps) DirectGate_HWEnc_SetBitrate(pEnc->pHwEncoder, nBitrateKbps);
+        return;
+    }
+#endif
+
+    if (bApplyQuality) DirectGate_OpenH264_ApplyQuality(pEnc->pEncoder, &pEnc->pDesktop->quality);
     if (nBitrateKbps) DirectGate_OpenH264_SetBitrate(pEnc->pEncoder, nBitrateKbps);
+}
+
+/* Allocates the plane buffer the active encoder consumes. Called whenever
+ * the encoder backend changes, including the mid-session GPU -> CPU
+ * fallback. */
+static int DirectGate_Desktop_X11Enc_AllocPlanes(directgate_x11enc_t *pEnc)
+{
+    size_t nPlaneBytes = (size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight * 3U / 2U;
+
+#ifdef DIRECTGATE_HAVE_HWENC
+    if (pEnc->pHwEncoder != NULL)
+    {
+        if (pEnc->pNV12 == NULL) pEnc->pNV12 = (uint8_t*)malloc(nPlaneBytes);
+        return (pEnc->pNV12 != NULL) ? XSTDOK : XSTDERR;
+    }
+#endif
+
+    if (pEnc->pI420 == NULL) pEnc->pI420 = (uint8_t*)malloc(nPlaneBytes);
+    return (pEnc->pI420 != NULL) ? XSTDOK : XSTDERR;
+}
+
+#ifdef DIRECTGATE_HAVE_HWENC
+/* Drops the GPU encoder and continues on the CPU. The viewer keeps its
+ * session: a GPU that stops accepting frames (driver reset, suspend/resume,
+ * another process taking the encode engine) must degrade the picture, not
+ * end desktop mode. Latched so a broken GPU is not retried every frame. */
+static int DirectGate_Desktop_X11Enc_FallBackToSoftware(directgate_x11enc_t *pEnc)
+{
+    xlogw("GPU H.264 encoder failed, falling back to the software encoder: sid(%u), encoder(%s)",
+        pEnc->pDesktop->nSessionId, DirectGate_HWEnc_Describe(pEnc->pHwEncoder));
+
+    DirectGate_HWEnc_Destroy(pEnc->pHwEncoder);
+    pEnc->pHwEncoder = NULL;
+    pEnc->bHwDisabled = XTRUE;
+
+    char sError[DIRECTGATE_DESKTOP_REASON_LEN] = { 0 };
+    pEnc->pEncoder = DirectGate_OpenH264_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
+        &pEnc->pDesktop->quality, sError, sizeof(sError));
+
+    if (pEnc->pEncoder == NULL || DirectGate_Desktop_X11Enc_AllocPlanes(pEnc) != XSTDOK)
+    {
+        DirectGate_Desktop_X11Enc_SetError(pEnc, NULL,
+            sError[0] ? sError : "Software H.264 encoder unavailable after GPU failure.");
+
+        return XSTDERR;
+    }
+
+    /* New encoder, new reference chain. */
+    DIRECTGATE_X11ENC_SET(&pEnc->bForceKeyframe, 1U);
+    return XSTDOK;
+}
+#endif
+
+/* Converts the captured BGRA into whatever the active encoder wants and
+ * encodes it. Returns the encoder's XSTDOK/XSTDNON/XSTDERR verdict. */
+static int DirectGate_Desktop_X11Enc_Encode(directgate_x11enc_t *pEnc,
+                                            uint64_t nPtsUs,
+                                            xbool_t bForceKeyframe,
+                                            xbool_t *pKeyframe)
+{
+    uint32_t nWidth = pEnc->nEncodeWidth;
+    uint32_t nHeight = pEnc->nEncodeHeight;
+
+#ifdef DIRECTGATE_HAVE_HWENC
+    if (pEnc->pHwEncoder != NULL)
+    {
+        DirectGate_YUV_BGRAToNV12(pEnc->pNV12, pEnc->pNV12 + (size_t)nWidth * nHeight,
+            pEnc->pFrameBGRA, nWidth, nHeight);
+
+        int nStatus = DirectGate_HWEnc_Encode(pEnc->pHwEncoder, pEnc->pNV12,
+            nPtsUs, bForceKeyframe, &pEnc->encoded, pKeyframe);
+
+        if (nStatus != XSTDERR)
+        {
+            pEnc->nHwFailures = 0;
+            return nStatus;
+        }
+
+        /* A GPU encoder hiccups for reasons that pass: the surface pool is
+         * momentarily drained, the driver is busy, a compositor grabbed the
+         * encode engine. Abandoning the GPU on the first error would drop
+         * the whole session onto the software encoder - visibly worse, and
+         * latched until the pipeline is rebuilt - so only a sustained
+         * failure counts. Skipping the frame is safe: nothing reached the
+         * encoder, so its reference chain is intact. */
+        if (++pEnc->nHwFailures < DIRECTGATE_X11ENC_MAX_HW_FAILURES)
+        {
+            xlogd("GPU frame encode failed, retrying on the GPU: sid(%u), failures(%u)",
+                pEnc->pDesktop->nSessionId, pEnc->nHwFailures);
+
+            return XSTDNON;
+        }
+
+        /* Retry this frame on the CPU so the fallback costs no visible gap. */
+        if (DirectGate_Desktop_X11Enc_FallBackToSoftware(pEnc) != XSTDOK) return XSTDERR;
+        bForceKeyframe = XTRUE;
+    }
+#endif
+
+    DirectGate_YUV_BGRAToI420(pEnc->pI420,
+        pEnc->pI420 + (size_t)nWidth * nHeight,
+        pEnc->pI420 + (size_t)nWidth * nHeight * 5U / 4U,
+        pEnc->pFrameBGRA, nWidth, nHeight);
+
+    return DirectGate_OpenH264_Encode(pEnc->pEncoder, pEnc->pI420,
+        nPtsUs, bForceKeyframe, &pEnc->encoded, pKeyframe);
 }
 
 /* One capture -> convert -> encode -> publish pass. Runs on the worker. */
@@ -506,16 +655,10 @@ static void DirectGate_Desktop_X11Enc_CaptureFrame(directgate_x11enc_t *pEnc, ui
     if (!bForceKeyframe && pEnc->bHavePrev &&
         memcmp(pEnc->pFrameBGRA, pEnc->pPrevBGRA, nFrameBytes) == 0) return;
 
-    DirectGate_YUV_BGRAToI420(pEnc->pI420,
-        pEnc->pI420 + (size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight,
-        pEnc->pI420 + (size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight * 5U / 4U,
-        pEnc->pFrameBGRA, pEnc->nEncodeWidth, pEnc->nEncodeHeight);
-
     uint64_t nPtsUs = nCapturedUs - pEnc->nStartUs;
     xbool_t bKeyframe = XFALSE;
 
-    int nStatus = DirectGate_OpenH264_Encode(pEnc->pEncoder, pEnc->pI420,
-        nPtsUs, bForceKeyframe, &pEnc->encoded, &bKeyframe);
+    int nStatus = DirectGate_Desktop_X11Enc_Encode(pEnc, nPtsUs, bForceKeyframe, &bKeyframe);
 
     if (nStatus == XSTDERR)
     {
@@ -660,28 +803,45 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
 
     DirectGate_Desktop_X11Enc_PickSize(pDesktop, nWidth, nHeight, &pEnc->nEncodeWidth, &pEnc->nEncodeHeight);
 
+    /* GPU encoder first; the CPU encoder is the guaranteed fallback so a
+     * host with no usable GPU keeps full desktop functionality. */
     char sError[DIRECTGATE_DESKTOP_REASON_LEN] = {0};
-    pEnc->pEncoder = DirectGate_OpenH264_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
-                                                &pDesktop->quality, sError, sizeof(sError));
-    if (pEnc->pEncoder == NULL)
-    {
-        DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop,
-            sError[0] ? sError : "OpenH264 encoder initialization failed.");
 
-        DirectGate_Desktop_X11Enc_Free(pEnc);
-        return XSTDERR;
+#ifdef DIRECTGATE_HAVE_HWENC
+    char sHwError[DIRECTGATE_DESKTOP_REASON_LEN] = {0};
+    pEnc->pHwEncoder = DirectGate_HWEnc_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
+                                               &pDesktop->quality, sHwError, sizeof(sHwError));
+    if (pEnc->pHwEncoder == NULL)
+    {
+        xlogi("No GPU H.264 encoder available, using the software encoder: sid(%u), reason(%s)",
+            pSession->nSessionId, sHwError[0] ? sHwError : "unknown");
+    }
+#endif
+
+    if (DIRECTGATE_X11ENC_HAS_HW(pEnc) == XFALSE)
+    {
+        pEnc->pEncoder = DirectGate_OpenH264_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
+                                                    &pDesktop->quality, sError, sizeof(sError));
+        if (pEnc->pEncoder == NULL)
+        {
+            DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop,
+                sError[0] ? sError : "OpenH264 encoder initialization failed.");
+
+            DirectGate_Desktop_X11Enc_Free(pEnc);
+            return XSTDERR;
+        }
     }
 
     size_t nFrameBytes = (size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight * 4U;
     pEnc->pFrameBGRA = (uint8_t*)malloc(nFrameBytes);
     pEnc->pPrevBGRA = (uint8_t*)malloc(nFrameBytes);
-    pEnc->pI420 = (uint8_t*)malloc((size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight * 3U / 2U);
 
     xbool_t bScaling = (pEnc->nEncodeWidth != nWidth || pEnc->nEncodeHeight != nHeight) ? XTRUE : XFALSE;
     if (bScaling) pEnc->pCaptureBGRA = (uint8_t*)malloc((size_t)nWidth * nHeight * 4U);
 
     if (pEnc->pFrameBGRA == NULL || pEnc->pPrevBGRA == NULL ||
-        pEnc->pI420 == NULL || (bScaling && pEnc->pCaptureBGRA == NULL))
+        DirectGate_Desktop_X11Enc_AllocPlanes(pEnc) != XSTDOK ||
+        (bScaling && pEnc->pCaptureBGRA == NULL))
     {
         DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop, "Failed to allocate desktop frame buffers.");
         DirectGate_Desktop_X11Enc_Free(pEnc);
@@ -748,12 +908,26 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     pEnc->bThreadRunning = XTRUE;
     pDesktop->pEncoder = pEnc;
 
+    /* The encoder field is the first thing to look at when a session feels
+     * slow: "software (openh264 ...)" on a machine with a GPU means the
+     * probe found nothing usable and a full core is being spent encoding. */
+    const char *pEncoderName = DirectGate_OpenH264_Version();
+    const char *pEncoderKind = "software";
+
+#ifdef DIRECTGATE_HAVE_HWENC
+    if (pEnc->pHwEncoder != NULL)
+    {
+        pEncoderName = DirectGate_HWEnc_Describe(pEnc->pHwEncoder);
+        pEncoderKind = "hardware";
+    }
+#endif
+
     xlogi("X11 H.264 pipeline started: sid(%u), capture(%d,%d %ux%u), encode(%ux%u), "
-        "shm(%s), codec(%s), preset(%s)",
+        "shm(%s), encoder(%s: %s), preset(%s)",
         pSession->nSessionId, nX, nY, nWidth, nHeight,
         pEnc->nEncodeWidth, pEnc->nEncodeHeight,
         pEnc->bShmAttached ? "yes" : "no",
-        DirectGate_OpenH264_Version(),
+        pEncoderKind, pEncoderName,
         DirectGate_Desktop_PresetName(pDesktop->quality.ePreset));
 
     return XSTDOK;
@@ -797,7 +971,7 @@ void DirectGate_Desktop_LinuxEncoder_SetBitrate(directgate_session_t *pSession, 
 {
     XCHECK_VOID_NL((pSession != NULL));
     directgate_x11enc_t *pEnc = DirectGate_Desktop_X11Enc(&pSession->desktop);
-    XCHECK_VOID_NL((pEnc != NULL && pEnc->pEncoder != NULL && nBitrateKbps > 0));
+    XCHECK_VOID_NL((pEnc != NULL && nBitrateKbps > 0));
     DIRECTGATE_X11ENC_SET(&pEnc->nPendingBitrateKbps, nBitrateKbps);
 }
 
