@@ -38,6 +38,11 @@
  * without letting the fallback path accumulate a second of latency. */
 #define DIRECTGATE_DESKTOP_ENCODED_BUFFER_LIMIT (256U * 1024U)
 
+/* The encode size the preset bitrates are chosen for, and how far above it
+ * the bitrate is allowed to scale (see DirectGate_Desktop_BitrateForSize). */
+#define DIRECTGATE_DESKTOP_BITRATE_REF_PIXELS   (1920U * 1080U)
+#define DIRECTGATE_DESKTOP_BITRATE_MAX_SCALE    2U
+
 #if defined(__linux__)
 #include <dlfcn.h>
 #include <X11/Xlib.h>
@@ -121,6 +126,7 @@ void DirectGate_Desktop_ApplyPreset(directgate_desktop_t *pDesktop, directgate_d
             break;
     }
 
+    pDesktop->quality.nBaseBitrateKbps = pDesktop->quality.nBitrateKbps;
     pDesktop->nFps = pDesktop->quality.nFps;
     pDesktop->nCurrentBitrateKbps = pDesktop->quality.nBitrateKbps;
     pDesktop->nAbrCleanTicks = 0;
@@ -304,6 +310,46 @@ void DirectGate_Desktop_ComputeOutputSize(const directgate_desktop_t *pDesktop,
     if (!nHeight) nHeight = 1U;
     if (pWidth != NULL) *pWidth = nWidth;
     if (pHeight != NULL) *pHeight = nHeight;
+}
+
+uint32_t DirectGate_Desktop_BitrateForSize(const directgate_desktop_t *pDesktop,
+                                           uint32_t nWidth, uint32_t nHeight)
+{
+    XCHECK_NL((pDesktop != NULL), 0);
+
+    uint32_t nBase = pDesktop->quality.nBaseBitrateKbps ?
+                     pDesktop->quality.nBaseBitrateKbps :
+                     pDesktop->quality.nBitrateKbps;
+    XCHECK_NL((nBase > 0), 0);
+
+    uint64_t nPixels = (uint64_t)nWidth * nHeight;
+    if (nPixels <= DIRECTGATE_DESKTOP_BITRATE_REF_PIXELS) return nBase;
+
+    uint64_t nScaled = ((uint64_t)nBase * nPixels) / DIRECTGATE_DESKTOP_BITRATE_REF_PIXELS;
+    uint64_t nCeiling = (uint64_t)nBase * DIRECTGATE_DESKTOP_BITRATE_MAX_SCALE;
+
+    return (uint32_t)(nScaled > nCeiling ? nCeiling : nScaled);
+}
+
+/* Applies the above to the live quality settings so the encoder and the
+ * adaptive controller share one target. Idempotent: the scaling always
+ * starts from the preset's own figure, never from a previous result. */
+void DirectGate_Desktop_ApplyBitrateForSize(directgate_desktop_t *pDesktop,
+                                            uint32_t nWidth, uint32_t nHeight)
+{
+    XCHECK_VOID_NL((pDesktop != NULL));
+
+    uint32_t nBitrate = DirectGate_Desktop_BitrateForSize(pDesktop, nWidth, nHeight);
+    if (!nBitrate || nBitrate == pDesktop->quality.nBitrateKbps) return;
+
+    xlogi("Desktop bitrate scaled for encode size: sid(%u), encode(%ux%u), rate(%u -> %u kbps)",
+        pDesktop->nSessionId, nWidth, nHeight, pDesktop->quality.nBitrateKbps, nBitrate);
+
+    pDesktop->quality.nBitrateKbps = nBitrate;
+
+    /* Never leave the controller's idea of the live rate above the target. */
+    if (!pDesktop->nCurrentBitrateKbps || pDesktop->nCurrentBitrateKbps > nBitrate)
+        pDesktop->nCurrentBitrateKbps = nBitrate;
 }
 
 void DirectGate_Desktop_LimitFrameSize(const directgate_desktop_t *pDesktop,

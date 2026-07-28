@@ -51,6 +51,11 @@
  * half a millisecond of extra latency on a busy hand-off. */
 #define DIRECTGATE_X11ENC_BUSY_WAIT_US 500ULL
 
+/* How long a keyframe is allowed to keep settling on a screen that has gone
+ * still. Only reached after an actual keyframe, so an idle desktop costs
+ * nothing until one happens; see the reasoning where it is armed. */
+#define DIRECTGATE_X11ENC_REFINE_MS    1500U
+
 /* A frame that sat in the mailbox longer than this never goes on the wire
  * (see DrainMain). */
 #define DIRECTGATE_X11ENC_MIN_AGE_US   50000ULL
@@ -119,6 +124,7 @@ typedef struct directgate_x11enc_ {
     uint8_t *pI420;
     uint8_t *pNV12;
     xbool_t bHavePrev;
+    uint32_t nRefineLeft;   /* frames still owed to a settling keyframe */
     uint64_t nStartUs;
     xbyte_buffer_t encoded; /* encoder output scratch (capture thread) */
 
@@ -653,7 +659,13 @@ static void DirectGate_Desktop_X11Enc_CaptureFrame(directgate_x11enc_t *pEnc, ui
     xbool_t bForceKeyframe = DIRECTGATE_X11ENC_TAKE(&pEnc->bForceKeyframe) ? XTRUE : XFALSE;
 
     if (!bForceKeyframe && pEnc->bHavePrev &&
-        memcmp(pEnc->pFrameBGRA, pEnc->pPrevBGRA, nFrameBytes) == 0) return;
+        memcmp(pEnc->pFrameBGRA, pEnc->pPrevBGRA, nFrameBytes) == 0)
+    {
+        /* Nothing changed. Normally that ends the pass - but not while a
+         * keyframe is still settling (see nRefineLeft). */
+        if (pEnc->nRefineLeft == 0) return;
+        pEnc->nRefineLeft--;
+    }
 
     uint64_t nPtsUs = nCapturedUs - pEnc->nStartUs;
     xbool_t bKeyframe = XFALSE;
@@ -680,6 +692,14 @@ static void DirectGate_Desktop_X11Enc_CaptureFrame(directgate_x11enc_t *pEnc, ui
 
     /* Keep asking until the encoder actually emits an IDR. */
     if (bForceKeyframe && !bKeyframe) DIRECTGATE_X11ENC_SET(&pEnc->bForceKeyframe, 1U);
+
+    if (bKeyframe)
+    {
+        uint32_t nRefine = (nFps ? nFps : DIRECTGATE_DESKTOP_DEFAULT_FPS) *
+            DIRECTGATE_X11ENC_REFINE_MS / 1000U;
+
+        pEnc->nRefineLeft = nRefine ? nRefine : 1U;
+    }
 
     /* Remember what was sent for the next unchanged-frame check. */
     uint8_t *pSwap = pEnc->pPrevBGRA;
@@ -802,6 +822,10 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     Display *pDisplay = pEnc->pDisplay;
 
     DirectGate_Desktop_X11Enc_PickSize(pDesktop, nWidth, nHeight, &pEnc->nEncodeWidth, &pEnc->nEncodeHeight);
+
+    /* The preset's bitrate assumes a ~1080p encode; streaming a much larger
+     * monitor at its native size needs proportionally more to stay readable. */
+    DirectGate_Desktop_ApplyBitrateForSize(pDesktop, pEnc->nEncodeWidth, pEnc->nEncodeHeight);
 
     /* GPU encoder first; the CPU encoder is the guaranteed fallback so a
      * host with no usable GPU keeps full desktop functionality. */

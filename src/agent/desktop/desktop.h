@@ -80,6 +80,9 @@ typedef struct directgate_desktop_quality_ {
     uint32_t nMaxEdge;       /* longest edge of encoded output, e.g. 1920 */
     uint32_t nFps;           /* target capture/encode FPS */
     uint32_t nBitrateKbps;   /* hardware encoder bitrate target */
+    /* The preset's own figure, before it is scaled for the encode size.
+     * Kept so the scaling stays idempotent across pipeline rebuilds. */
+    uint32_t nBaseBitrateKbps;
     uint32_t nKeyframeFrames;/* GOP length, in frames */
     xbool_t bRealtime;       /* enables low-latency encoder hints */
 } directgate_desktop_quality_t;

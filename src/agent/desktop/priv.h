@@ -66,6 +66,13 @@ void DirectGate_Desktop_AddMonitor(directgate_desktop_t *pDesktop,
                                    xbool_t bPrimary);
 
 void DirectGate_Desktop_ComputeFrameSize(directgate_desktop_t *pDesktop);
+
+/* Restates the preset's bitrate for the size actually being encoded, so a
+ * monitor much larger than 1080p is not starved of bits per pixel. */
+uint32_t DirectGate_Desktop_BitrateForSize(const directgate_desktop_t *pDesktop,
+                                           uint32_t nWidth, uint32_t nHeight);
+void DirectGate_Desktop_ApplyBitrateForSize(directgate_desktop_t *pDesktop,
+                                            uint32_t nWidth, uint32_t nHeight);
 const directgate_desktop_monitor_t* DirectGate_Desktop_FindMonitor(const directgate_desktop_t *pDesktop, const char *pMonitorId);
 
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
