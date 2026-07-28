@@ -594,8 +594,11 @@ static int DirectGate_MFEnc_WaitCredit(directgate_mfenc_t *pEnc, const uint32_t 
 /* Runs one ProcessOutput round and appends the produced access unit to
  * pOut (keyframes are made self-contained first). Returns XSTDOK on a
  * produced frame, XSTDNON when the MFT needs more input, XSTDERR on
- * failure. */
-static int DirectGate_MFEnc_ProcessOutput(directgate_mfenc_t *pEnc, xbyte_buffer_t *pOut, xbool_t *pKeyframe)
+ * failure. pPtsUs, when given, receives the timestamp the frame was
+ * submitted with - the encoder carries it across, which is the only way a
+ * drained frame can be timestamped correctly. */
+static int DirectGate_MFEnc_ProcessOutput(directgate_mfenc_t *pEnc, xbyte_buffer_t *pOut,
+                                          xbool_t *pKeyframe, uint64_t *pPtsUs)
 {
     MFT_OUTPUT_DATA_BUFFER outputData;
     memset(&outputData, 0, sizeof(outputData));
@@ -655,6 +658,13 @@ static int DirectGate_MFEnc_ProcessOutput(directgate_mfenc_t *pEnc, xbyte_buffer
     UINT32 nCleanPoint = 0;
     IMFSample_GetUINT32(pProduced, &MFSampleExtension_CleanPoint, &nCleanPoint);
     if (pKeyframe != NULL) *pKeyframe = nCleanPoint ? XTRUE : XFALSE;
+
+    if (pPtsUs != NULL)
+    {
+        LONGLONG nSampleTime = 0;
+        if (SUCCEEDED(IMFSample_GetSampleTime(pProduced, &nSampleTime)) && nSampleTime > 0)
+            *pPtsUs = (uint64_t)nSampleTime / 10ULL; /* MF works in 100 ns units */
+    }
 
     int nResult = XSTDERR;
     IMFMediaBuffer *pContiguous = NULL;
@@ -770,10 +780,10 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
 
         if (DirectGate_MFEnc_WaitCredit(pEncoder, &pEncoder->nHaveOutput,
             DIRECTGATE_MFENC_OUTPUT_WAIT_MS) != XSTDOK)
-            return XSTDNON; /* warm-up buffering: the frame is not lost */
+            return XSTDNON; /* still buffered; DirectGate_MFEnc_Drain collects it */
 
         pEncoder->nHaveOutput--;
-        return DirectGate_MFEnc_ProcessOutput(pEncoder, pOut, pKeyframe);
+        return DirectGate_MFEnc_ProcessOutput(pEncoder, pOut, pKeyframe, NULL);
     }
 
     /* Synchronous (software) model: feed the frame, then drain until the
@@ -782,7 +792,7 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
     if (hr == MF_E_NOTACCEPTING)
     {
         xbool_t bPendingKeyframe = XFALSE;
-        int nPending = DirectGate_MFEnc_ProcessOutput(pEncoder, pOut, &bPendingKeyframe);
+        int nPending = DirectGate_MFEnc_ProcessOutput(pEncoder, pOut, &bPendingKeyframe, NULL);
 
         hr = IMFTransform_ProcessInput(pEncoder->pTransform, pEncoder->nInputStreamId, pSample, 0);
         IMFSample_Release(pSample);
@@ -810,7 +820,38 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
         return XSTDERR;
     }
 
-    int nStatus = DirectGate_MFEnc_ProcessOutput(pEncoder, pOut, pKeyframe);
+    int nStatus = DirectGate_MFEnc_ProcessOutput(pEncoder, pOut, pKeyframe, NULL);
+    if (nStatus == XSTDERR) return XSTDERR;
+    return (nStatus == XSTDOK && pOut->nUsed > 0) ? XSTDOK : XSTDNON;
+}
+
+int DirectGate_MFEnc_Drain(directgate_mfenc_t *pEncoder,
+                           xbyte_buffer_t *pOut,
+                           xbool_t *pKeyframe,
+                           uint64_t *pPtsUs)
+{
+    XCHECK((pEncoder != NULL && pEncoder->pTransform != NULL), XSTDERR);
+    XCHECK((pOut != NULL), XSTDERR);
+
+    if (pKeyframe != NULL) *pKeyframe = XFALSE;
+    pOut->nUsed = 0;
+
+    if (pEncoder->bAsync)
+    {
+        /* Non-blocking: consume whatever events are already queued, then take
+         * an output only against a credit. Asking an asynchronous MFT for
+         * output it has not announced is a protocol violation. */
+        while (pEncoder->nHaveOutput == 0)
+        {
+            int nEvent = DirectGate_MFEnc_PumpEvent(pEncoder);
+            if (nEvent == XSTDERR) return XSTDERR;
+            if (nEvent == XSTDNON) return XSTDNON;
+        }
+
+        pEncoder->nHaveOutput--;
+    }
+
+    int nStatus = DirectGate_MFEnc_ProcessOutput(pEncoder, pOut, pKeyframe, pPtsUs);
     if (nStatus == XSTDERR) return XSTDERR;
     return (nStatus == XSTDOK && pOut->nUsed > 0) ? XSTDOK : XSTDNON;
 }

@@ -108,6 +108,7 @@ typedef struct directgate_winenc_ {
     uint8_t *pNV12;
     xbool_t bHavePrev;
     xbool_t bHaveFrame;                 /* pFrameBGRA holds a valid image */
+    xbool_t bPublished;                 /* the viewer has had at least one frame */
     uint64_t nFrameCapturedUs;          /* absolute QPC time of freshest pixels */
 
     directgate_mfenc_t *pEncoder;
@@ -542,6 +543,27 @@ static void DirectGate_Desktop_WinEnc_WakeMainLoop(directgate_winenc_t *pEnc)
     send(nWriteFd, &cWake, sizeof(cWake), 0);
 }
 
+/* Publish: swap the encoded scratch into the mailbox slot (no copy) and
+ * wake the main loop through the timer socket pair. */
+static void DirectGate_Desktop_WinEnc_Publish(directgate_winenc_t *pEnc,
+                                              xbool_t bKeyframe, uint64_t nPtsUs)
+{
+    AcquireSRWLockExclusive(&pEnc->mailboxLock);
+    xbyte_buffer_t swap = pEnc->mailbox;
+    pEnc->mailbox = pEnc->encoded;
+    pEnc->encoded = swap;
+    pEnc->nMailboxWidth = pEnc->nEncodeWidth;
+    pEnc->nMailboxHeight = pEnc->nEncodeHeight;
+    pEnc->bMailboxKeyframe = bKeyframe;
+    pEnc->nMailboxPtsUs = nPtsUs;
+    pEnc->nMailboxCapturedUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
+    pEnc->bMailboxHasFrame = XTRUE;
+    ReleaseSRWLockExclusive(&pEnc->mailboxLock);
+
+    pEnc->bPublished = XTRUE;
+    DirectGate_Desktop_WinEnc_WakeMainLoop(pEnc);
+}
+
 static int DirectGate_Desktop_WinEnc_EncodeFrame(directgate_winenc_t *pEnc, xbool_t bForceKeyframe)
 {
     DirectGate_YUV_BGRAToNV12(pEnc->pNV12,
@@ -563,23 +585,27 @@ static int DirectGate_Desktop_WinEnc_EncodeFrame(directgate_winenc_t *pEnc, xboo
         return XSTDERR;
     }
 
-    if (nStatus == XSTDNON) return XSTDNON; /* encoder warm-up buffering */
+    if (nStatus == XSTDNON) return XSTDNON; /* encoder buffered it; drained later */
 
-    /* Publish: swap the encoded scratch into the mailbox slot (no copy)
-     * and wake the main loop through the timer socket pair. */
-    AcquireSRWLockExclusive(&pEnc->mailboxLock);
-    xbyte_buffer_t swap = pEnc->mailbox;
-    pEnc->mailbox = pEnc->encoded;
-    pEnc->encoded = swap;
-    pEnc->nMailboxWidth = pEnc->nEncodeWidth;
-    pEnc->nMailboxHeight = pEnc->nEncodeHeight;
-    pEnc->bMailboxKeyframe = bKeyframe;
-    pEnc->nMailboxPtsUs = nPtsUs;
-    pEnc->nMailboxCapturedUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
-    pEnc->bMailboxHasFrame = XTRUE;
-    ReleaseSRWLockExclusive(&pEnc->mailboxLock);
+    DirectGate_Desktop_WinEnc_Publish(pEnc, bKeyframe, nPtsUs);
+    return XSTDOK;
+}
 
-    DirectGate_Desktop_WinEnc_WakeMainLoop(pEnc);
+/* Collects an access unit the encoder is still holding and publishes it.
+ * Media Foundation hands output back only when asked, so without this the
+ * frame that ends a burst of activity - the one showing where the pointer
+ * came to rest, or what a click opened - stays inside the encoder until the
+ * screen changes again, which on an otherwise idle desktop can be a minute
+ * later. Cheap enough to run on every capture that produced nothing. */
+static int DirectGate_Desktop_WinEnc_DrainEncoder(directgate_winenc_t *pEnc)
+{
+    xbool_t bKeyframe = XFALSE;
+    uint64_t nPtsUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc) - pEnc->nStartUs;
+
+    int nStatus = DirectGate_MFEnc_Drain(pEnc->pEncoder, &pEnc->encoded, &bKeyframe, &nPtsUs);
+    if (nStatus != XSTDOK) return nStatus;
+
+    DirectGate_Desktop_WinEnc_Publish(pEnc, bKeyframe, nPtsUs);
     return XSTDOK;
 }
 
@@ -785,15 +811,30 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
             continue;
         }
 
-        /* No new pixels: still honour a pending keyframe request (new
-         * viewer / PLI recovery) by re-encoding the last frame as an IDR. */
-        if (nCapture == XSTDNON && (!bForceKeyframe || !pEnc->bHaveFrame))
+        /* Nothing new on screen. Two things still have to happen: a pending
+         * keyframe request (new viewer / PLI recovery) re-encodes the last
+         * frame as an IDR, and until the viewer has had its first frame the
+         * last captured image keeps being fed so the encoder's start-up
+         * buffering completes. A hardware MFT holds the first frames until
+         * more input arrives, so on a desktop nobody is touching the very
+         * first picture would otherwise wait for whatever repaints next -
+         * the taskbar clock, a minute away. Anything the encoder is merely
+         * holding is collected without new input. */
+        xbool_t bWarmUp = (!pEnc->bPublished && pEnc->bHaveFrame) ? XTRUE : XFALSE;
+
+        if (nCapture == XSTDNON && !bWarmUp && (!bForceKeyframe || !pEnc->bHaveFrame))
         {
             if (bForceKeyframe) InterlockedExchange(&pEnc->bForceKeyframe, 1);
+            if (DirectGate_Desktop_WinEnc_DrainEncoder(pEnc) == XSTDERR)
+                InterlockedIncrement(&pEnc->nFailures);
+
             continue;
         }
 
-        int nEncode = DirectGate_Desktop_WinEnc_EncodeFrame(pEnc, bForceKeyframe);
+        /* Every warm-up frame is forced intra so whatever the encoder hands
+         * back first is decodable on its own - the viewer is waiting on
+         * exactly that frame, and the cost stops with the first publish. */
+        int nEncode = DirectGate_Desktop_WinEnc_EncodeFrame(pEnc, (bForceKeyframe || bWarmUp) ? XTRUE : XFALSE);
         if (nEncode == XSTDERR)
         {
             InterlockedIncrement(&pEnc->nFailures);

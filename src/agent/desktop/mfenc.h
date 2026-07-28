@@ -78,10 +78,23 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
                         xbyte_buffer_t *pOut,
                         xbool_t *pKeyframe);
 
+/* Collects an access unit the encoder is still holding, without feeding it a
+ * new frame. Media Foundation encoders hand output back only when asked, and
+ * a hardware MFT buffers the first frames of a stream, so without this the
+ * last thing that happened on screen stays inside the encoder until the
+ * screen changes again - on an idle desktop that can be the taskbar clock a
+ * minute later. Returns XSTDOK when pOut holds a frame (*pPtsUs is then the
+ * timestamp that frame was submitted with), XSTDNON when the encoder has
+ * nothing pending, XSTDERR on encoder failure. */
+int DirectGate_MFEnc_Drain(directgate_mfenc_t *pEncoder,
+                           xbyte_buffer_t *pOut,
+                           xbool_t *pKeyframe,
+                           uint64_t *pPtsUs);
+
 /* Applies bitrate/GOP updates that do not change the encode dimensions.
  * A dimension change requires Destroy + Create by the caller. */
 int DirectGate_MFEnc_ApplyQuality(directgate_mfenc_t *pEncoder,
-                              const directgate_desktop_quality_t *pQuality);
+                                  const directgate_desktop_quality_t *pQuality);
 
 /* Live bitrate step without forcing a keyframe; used by the adaptive
  * bitrate controller. Silently ignored when the MFT rejects dynamic
