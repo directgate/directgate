@@ -55,9 +55,6 @@ extern "C" {
  * messages on the data channel. */
 #define DIRECTGATE_DESKTOP_CHUNK_BYTES      (64U * 1024U)
 
-/* Enable thread priority so we will get CPU slice even on high load */
-//#define DIRECTGATE_HAVE_AVRT_THREAD_PRIORITY 1
-
 typedef enum {
     DIRECTGATE_DESKTOP_PIPELINE_RAW = 0,    /* legacy raw RGBA fallback/debug */
     DIRECTGATE_DESKTOP_PIPELINE_H264_DC,    /* H.264 chunks over encrypted DataChannel */
