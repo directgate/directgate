@@ -42,7 +42,8 @@
  * toward the preset target when the link stays clean. */
 #define DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS     1000U
 #define DIRECTGATE_DESKTOP_ABR_HOLD_TICKS       60U  /* ~2s at 30 fps */
-#define DIRECTGATE_DESKTOP_ABR_RAISE_TICKS      150U /* ~5s clean before raising */
+#define DIRECTGATE_DESKTOP_ABR_RAISE_TICKS      150U /* ~5s without DC backpressure */
+#define DIRECTGATE_DESKTOP_ABR_RAISE_REPORTS    5U   /* ~5 clean RTCP reports */
 #define DIRECTGATE_DESKTOP_ABR_LOSS_THRESHOLD   8U   /* ~3% fraction lost */
 /* Consecutive lossy reports before the rate is cut. See DirectGate_Desktop_AbrStep. */
 #define DIRECTGATE_DESKTOP_ABR_LOSS_REPORTS     2U
@@ -143,7 +144,7 @@ void DirectGate_Desktop_ApplyPreset(directgate_desktop_t *pDesktop, directgate_d
     pDesktop->quality.nBaseBitrateKbps = pDesktop->quality.nBitrateKbps;
     pDesktop->nFps = pDesktop->quality.nFps;
     pDesktop->nCurrentBitrateKbps = pDesktop->quality.nBitrateKbps;
-    pDesktop->nAbrCleanTicks = 0;
+    pDesktop->nAbrCleanEvidence = 0;
     pDesktop->nAbrHoldTicks = 0;
     pDesktop->nAbrLossReports = 0;
     pDesktop->bRequestKeyframe = XTRUE;
@@ -351,9 +352,10 @@ uint32_t DirectGate_Desktop_AbrStep(directgate_desktop_t *pDesktop,
                                     xbool_t bBackpressure)
 {
     XCHECK_NL((pDesktop != NULL), 0);
+    XCHECK_NL((pDesktop->quality.nBitrateKbps > 0), 0);
 
     uint32_t nTarget = pDesktop->quality.nBitrateKbps;
-    XCHECK_NL((nTarget > 0), 0);
+    if (pDesktop->nAbrCeilingKbps && pDesktop->nAbrCeilingKbps < nTarget) nTarget = pDesktop->nAbrCeilingKbps;
 
     uint32_t nCurrent = pDesktop->nCurrentBitrateKbps ? pDesktop->nCurrentBitrateKbps : nTarget;
     uint32_t nFloor = DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS;
@@ -373,9 +375,19 @@ uint32_t DirectGate_Desktop_AbrStep(directgate_desktop_t *pDesktop,
     if (pDesktop->nAbrHoldTicks > 0) pDesktop->nAbrHoldTicks--;
     uint32_t nNext = nCurrent;
 
-    if (bCongested)
+    if (nCurrent > nTarget)
     {
-        pDesktop->nAbrCleanTicks = 0;
+        /* Route changes can lower the transport ceiling without a packet-loss
+         * report. Apply that cap immediately so a TURN queue cannot build
+         * enough latency to delay input on the same ICE transport. */
+        nNext = nTarget;
+        pDesktop->nAbrCleanEvidence = 0;
+        pDesktop->nAbrHoldTicks = 0;
+        pDesktop->nAbrLossReports = 0;
+    }
+    else if (bCongested)
+    {
+        pDesktop->nAbrCleanEvidence = 0;
         if (!pDesktop->nAbrHoldTicks)
         {
             nNext = (nCurrent * 3U) / 4U;
@@ -388,11 +400,28 @@ uint32_t DirectGate_Desktop_AbrStep(directgate_desktop_t *pDesktop,
             pDesktop->nAbrLossReports = 0;
         }
     }
-    else if (nCurrent < nTarget && ++pDesktop->nAbrCleanTicks >= DIRECTGATE_DESKTOP_ABR_RAISE_TICKS)
+    else if (nCurrent < nTarget && !pDesktop->nAbrHoldTicks)
     {
-        pDesktop->nAbrCleanTicks = 0;
-        nNext = nCurrent + nTarget / 10U + 1U;
-        if (nNext > nTarget) nNext = nTarget;
+        /* RTP video may recover only from positive receiver feedback. No
+         * report is not a clean report: a congested or half-open connection
+         * can stop delivering RTCP altogether. The DataChannel fallback has
+         * no RTCP, so its equivalent evidence is a run of ticks without
+         * buffered-amount backpressure. */
+        uint32_t nRaiseEvidence = DIRECTGATE_DESKTOP_ABR_RAISE_REPORTS;
+        xbool_t bCleanEvidence = (bHaveReport && nFractionLost < DIRECTGATE_DESKTOP_ABR_LOSS_THRESHOLD) ? XTRUE : XFALSE;
+
+        if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
+        {
+            nRaiseEvidence = DIRECTGATE_DESKTOP_ABR_RAISE_TICKS;
+            bCleanEvidence = (!bBackpressure) ? XTRUE : XFALSE;
+        }
+
+        if (bCleanEvidence && ++pDesktop->nAbrCleanEvidence >= nRaiseEvidence)
+        {
+            pDesktop->nAbrCleanEvidence = 0;
+            nNext = nCurrent + nTarget / 10U + 1U;
+            if (nNext > nTarget) nNext = nTarget;
+        }
     }
 
     pDesktop->nCurrentBitrateKbps = nNext;
@@ -427,16 +456,20 @@ void DirectGate_Desktop_ApplyBitrateForSize(directgate_desktop_t *pDesktop,
     XCHECK_VOID_NL((pDesktop != NULL));
 
     uint32_t nBitrate = DirectGate_Desktop_BitrateForSize(pDesktop, nWidth, nHeight);
-    if (!nBitrate || nBitrate == pDesktop->quality.nBitrateKbps) return;
+    if (!nBitrate) return;
 
-    xlogi("Desktop bitrate scaled for encode size: sid(%u), encode(%ux%u), rate(%u -> %u kbps)",
-        pDesktop->nSessionId, nWidth, nHeight, pDesktop->quality.nBitrateKbps, nBitrate);
+    if (nBitrate != pDesktop->quality.nBitrateKbps)
+    {
+        xlogi("Desktop bitrate scaled for encode size: sid(%u), encode(%ux%u), rate(%u -> %u kbps)",
+            pDesktop->nSessionId, nWidth, nHeight, pDesktop->quality.nBitrateKbps, nBitrate);
 
-    pDesktop->quality.nBitrateKbps = nBitrate;
+        pDesktop->quality.nBitrateKbps = nBitrate;
+    }
 
-    /* Never leave the controller's idea of the live rate above the target. */
-    if (!pDesktop->nCurrentBitrateKbps || pDesktop->nCurrentBitrateKbps > nBitrate)
-        pDesktop->nCurrentBitrateKbps = nBitrate;
+    pDesktop->nCurrentBitrateKbps = nBitrate;
+    pDesktop->nAbrCleanEvidence = 0;
+    pDesktop->nAbrHoldTicks = 0;
+    pDesktop->nAbrLossReports = 0;
 }
 
 void DirectGate_Desktop_LimitFrameSize(const directgate_desktop_t *pDesktop,

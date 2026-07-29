@@ -17,7 +17,7 @@
     } while (0)
 
 /* Builds an RR with one report block; returns the packet size. */
-static size_t build_rr(uint8_t *pOut, uint8_t nFractionLost)
+static size_t build_rr(uint8_t *pOut, uint32_t nMediaSsrc, uint8_t nFractionLost)
 {
     memset(pOut, 0, 32);
     pOut[0] = 0x81; /* V=2, RC=1 */
@@ -25,6 +25,10 @@ static size_t build_rr(uint8_t *pOut, uint8_t nFractionLost)
     pOut[2] = 0;
     pOut[3] = 7;    /* length: 8 words - 1 */
     /* reporter SSRC: bytes 4..7, block source SSRC: bytes 8..11 */
+    pOut[8] = (uint8_t)(nMediaSsrc >> 24U);
+    pOut[9] = (uint8_t)(nMediaSsrc >> 16U);
+    pOut[10] = (uint8_t)(nMediaSsrc >> 8U);
+    pOut[11] = (uint8_t)nMediaSsrc;
     pOut[12] = nFractionLost;
     return 32;
 }
@@ -47,22 +51,22 @@ int main(void)
     int nFraction = 0;
 
     /* Plain RR without loss: no keyframe request, fraction 0. */
-    size_t nSize = build_rr(buffer, 0);
-    DirectGate_WebRTC_ParseRtcp(buffer, nSize, &bKeyframe, &nFraction);
+    size_t nSize = build_rr(buffer, 0x11223344U, 0);
+    DirectGate_WebRTC_ParseRtcp(buffer, nSize, 0, &bKeyframe, &nFraction);
     CHECK(!bKeyframe, "plain RR must not request a keyframe");
     CHECK(nFraction == 0, "plain RR must report zero fraction lost");
 
     /* Compound RR(loss) + PLI: both signals must be seen. */
-    nSize = build_rr(buffer, 64); /* 25% loss */
+    nSize = build_rr(buffer, 0x11223344U, 64); /* 25% loss */
     nSize += build_pli(buffer + nSize);
-    DirectGate_WebRTC_ParseRtcp(buffer, nSize, &bKeyframe, &nFraction);
+    DirectGate_WebRTC_ParseRtcp(buffer, nSize, 0, &bKeyframe, &nFraction);
     CHECK(bKeyframe, "PLI behind an RR must be detected");
     CHECK(nFraction == 64, "fraction lost must come from the RR block");
 
     /* FIR as PSFB FMT=4. */
     nSize = build_pli(buffer);
     buffer[0] = 0x84; /* FMT=4 */
-    DirectGate_WebRTC_ParseRtcp(buffer, nSize, &bKeyframe, &nFraction);
+    DirectGate_WebRTC_ParseRtcp(buffer, nSize, 0, &bKeyframe, &nFraction);
     CHECK(bKeyframe, "FIR (PSFB FMT=4) must be detected");
     CHECK(nFraction == -1, "no report block means fraction -1");
 
@@ -73,20 +77,30 @@ int main(void)
     buffer[2] = 0;
     buffer[3] = 12;   /* length: 13 words - 1 = 4+4+20+24 bytes */
     buffer[32] = 128; /* fraction lost of block 0 (offset 28 + 4) */
-    DirectGate_WebRTC_ParseRtcp(buffer, 52, &bKeyframe, &nFraction);
+    DirectGate_WebRTC_ParseRtcp(buffer, 52, 0, &bKeyframe, &nFraction);
     CHECK(!bKeyframe, "SR must not request a keyframe");
     CHECK(nFraction == 128, "SR report block fraction lost must be parsed");
 
+    /* A compound report may contain blocks for audio and video. Only the
+     * requested media SSRC may influence the video bitrate controller. */
+    nSize = build_rr(buffer, 0xAABBCCDDU, 192);
+    nSize += build_rr(buffer + nSize, 0x11223344U, 3);
+    DirectGate_WebRTC_ParseRtcp(buffer, nSize, 0x11223344U, &bKeyframe, &nFraction);
+    CHECK(nFraction == 3, "loss from another media SSRC leaked into video");
+
+    DirectGate_WebRTC_ParseRtcp(buffer, nSize, 0x55667788U, &bKeyframe, &nFraction);
+    CHECK(nFraction == -1, "an absent media SSRC produced a loss report");
+
     /* Truncated / hostile input must not report anything. */
-    nSize = build_rr(buffer, 200);
-    DirectGate_WebRTC_ParseRtcp(buffer, 10, &bKeyframe, &nFraction);
+    nSize = build_rr(buffer, 0x11223344U, 200);
+    DirectGate_WebRTC_ParseRtcp(buffer, 10, 0, &bKeyframe, &nFraction);
     CHECK(!bKeyframe && nFraction == -1, "truncated RR must be ignored");
 
     buffer[0] = 0x41; /* wrong RTCP version */
-    DirectGate_WebRTC_ParseRtcp(buffer, 32, &bKeyframe, &nFraction);
+    DirectGate_WebRTC_ParseRtcp(buffer, 32, 0, &bKeyframe, &nFraction);
     CHECK(!bKeyframe && nFraction == -1, "non-RTCP data must be ignored");
 
-    DirectGate_WebRTC_ParseRtcp(NULL, 0, &bKeyframe, &nFraction);
+    DirectGate_WebRTC_ParseRtcp(NULL, 0, 0, &bKeyframe, &nFraction);
     CHECK(!bKeyframe && nFraction == -1, "NULL input must be ignored");
 
     printf("webrtc_rtcp_smoke: OK\n");

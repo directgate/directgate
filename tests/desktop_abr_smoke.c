@@ -161,6 +161,28 @@ static int DirectGate_AbrTest_CleanLinkRecovers(void)
     return 0;
 }
 
+/* Missing RTCP feedback is not proof that an RTP link is healthy. Before
+ * this regression fix, 150 frame ticks with no report raised the bitrate,
+ * so a feedback-starved/congested session repeatedly climbed and fell. */
+static int DirectGate_AbrTest_NoFeedbackDoesNotRecover(void)
+{
+    directgate_desktop_t desktop;
+    DirectGate_AbrTest_Init(&desktop);
+    desktop.ePipeline = DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO;
+    desktop.nCurrentBitrateKbps = DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS;
+
+    for (uint32_t nTick = 0; nTick < ABR_TICKS_PER_SEC * 60U; nTick++)
+        DirectGate_Desktop_AbrStep(&desktop, XFALSE, 0, XFALSE);
+
+    CHECK(desktop.nCurrentBitrateKbps == DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS,
+        "missing RTCP feedback was treated as a clean link");
+
+    uint32_t nRate = DirectGate_AbrTest_Run(&desktop, 6, 0, 1);
+    CHECK(nRate > DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS,
+        "clean receiver reports did not restart recovery");
+    return 0;
+}
+
 /* Data-channel backpressure is the fallback pipeline's only congestion
  * signal and has no report behind it, so it must act immediately. */
 static int DirectGate_AbrTest_Backpressure(void)
@@ -204,14 +226,67 @@ static int DirectGate_AbrTest_Bounds(void)
     return 0;
 }
 
+/* A fresh encoder opens at the size-adjusted target. Its ABR bookkeeping
+ * must be reset to that same rate instead of carrying a throttled value from
+ * the old encoder across a resolution change/rebuild. */
+static int DirectGate_AbrTest_EncoderRebuildSynchronizesRate(void)
+{
+    directgate_desktop_t desktop;
+    DirectGate_AbrTest_Init(&desktop);
+    desktop.nCurrentBitrateKbps = DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS;
+    desktop.nAbrCleanEvidence = 4;
+    desktop.nAbrHoldTicks = 20;
+    desktop.nAbrLossReports = 1;
+
+    DirectGate_Desktop_ApplyBitrateForSize(&desktop, 3840U, 1080U);
+    CHECK(desktop.quality.nBitrateKbps == ABR_TARGET_KBPS * 2U,
+        "large encode size did not scale its target");
+    CHECK(desktop.nCurrentBitrateKbps == desktop.quality.nBitrateKbps,
+        "fresh encoder rate and ABR state disagree");
+    CHECK(!desktop.nAbrCleanEvidence && !desktop.nAbrHoldTicks && !desktop.nAbrLossReports,
+        "fresh encoder retained stale congestion history");
+
+    /* The equal-target path used to return early and retain the stale rate. */
+    desktop.quality.nBitrateKbps = ABR_TARGET_KBPS;
+    desktop.nCurrentBitrateKbps = DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS;
+    DirectGate_Desktop_ApplyBitrateForSize(&desktop, 1920U, 1080U);
+    CHECK(desktop.nCurrentBitrateKbps == ABR_TARGET_KBPS,
+        "equal target did not synchronize a rebuilt encoder");
+    return 0;
+}
+
+/* A relay route needs a latency ceiling even before loss is visible: TURN
+ * can queue packets instead of dropping them, delaying video and input
+ * together. Removing the cap must return to normal evidence-based recovery. */
+static int DirectGate_AbrTest_TransportCeiling(void)
+{
+    directgate_desktop_t desktop;
+    DirectGate_AbrTest_Init(&desktop);
+    desktop.ePipeline = DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO;
+    desktop.nAbrCeilingKbps = DIRECTGATE_DESKTOP_TURN_BITRATE_KBPS;
+
+    uint32_t nRate = DirectGate_Desktop_AbrStep(&desktop, XFALSE, 0, XFALSE);
+    CHECK(nRate == DIRECTGATE_DESKTOP_TURN_BITRATE_KBPS,
+        "TURN ceiling did not apply without packet loss");
+
+    desktop.nAbrCeilingKbps = 0;
+    nRate = DirectGate_AbrTest_Run(&desktop, 6, 0, 1);
+    CHECK(nRate > DIRECTGATE_DESKTOP_TURN_BITRATE_KBPS,
+        "P2P promotion did not restore bitrate recovery");
+    return 0;
+}
+
 int main(void)
 {
     if (DirectGate_AbrTest_SustainedLoss()) return 1;
     if (DirectGate_AbrTest_IsolatedLossIgnored()) return 1;
     if (DirectGate_AbrTest_IntermittentLossRecovers()) return 1;
     if (DirectGate_AbrTest_CleanLinkRecovers()) return 1;
+    if (DirectGate_AbrTest_NoFeedbackDoesNotRecover()) return 1;
     if (DirectGate_AbrTest_Backpressure()) return 1;
     if (DirectGate_AbrTest_Bounds()) return 1;
+    if (DirectGate_AbrTest_EncoderRebuildSynchronizesRate()) return 1;
+    if (DirectGate_AbrTest_TransportCeiling()) return 1;
 
     printf("desktop_abr_smoke: ok\n");
     return 0;

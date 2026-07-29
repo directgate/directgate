@@ -28,21 +28,22 @@
 extern "C" {
 #endif
 
-#define DIRECTGATE_DESKTOP_BACKEND_LEN      16
-#define DIRECTGATE_DESKTOP_REASON_LEN       160
-#define DIRECTGATE_DESKTOP_DISPLAY_LEN      128
-#define DIRECTGATE_DESKTOP_MONITOR_ID_LEN   32
-#define DIRECTGATE_DESKTOP_MONITOR_NAME_LEN 96
-#define DIRECTGATE_DESKTOP_MAX_MONITORS     16
-#define DIRECTGATE_DESKTOP_MAX_MODES        64
-#define DIRECTGATE_DESKTOP_CODEC_LEN        16
-#define DIRECTGATE_DESKTOP_RESOLUTION_LEN   16
-#define DIRECTGATE_DESKTOP_KEY_CODE_LEN     24
-#define DIRECTGATE_DESKTOP_MAX_HELD_KEYS    32
-#define DIRECTGATE_DESKTOP_PRESET_LEN       16
-#define DIRECTGATE_DESKTOP_PIPELINE_LEN     24
-#define DIRECTGATE_DESKTOP_TRANSPORT_LEN    32
-#define DIRECTGATE_DESKTOP_DEVICE_ID_LEN    128
+#define DIRECTGATE_DESKTOP_BACKEND_LEN       16
+#define DIRECTGATE_DESKTOP_REASON_LEN        160
+#define DIRECTGATE_DESKTOP_DISPLAY_LEN       128
+#define DIRECTGATE_DESKTOP_MONITOR_ID_LEN    32
+#define DIRECTGATE_DESKTOP_MONITOR_NAME_LEN  96
+#define DIRECTGATE_DESKTOP_MAX_MONITORS      16
+#define DIRECTGATE_DESKTOP_MAX_MODES         64
+#define DIRECTGATE_DESKTOP_CODEC_LEN         16
+#define DIRECTGATE_DESKTOP_RESOLUTION_LEN    16
+#define DIRECTGATE_DESKTOP_KEY_CODE_LEN      24
+#define DIRECTGATE_DESKTOP_MAX_HELD_KEYS     32
+#define DIRECTGATE_DESKTOP_PRESET_LEN        16
+#define DIRECTGATE_DESKTOP_PIPELINE_LEN      24
+#define DIRECTGATE_DESKTOP_TRANSPORT_LEN     32
+#define DIRECTGATE_DESKTOP_DEVICE_ID_LEN     128
+#define DIRECTGATE_DESKTOP_TURN_BITRATE_KBPS 4000U
 
 /* Encoded desktop frame transport (cross-platform).
  * Chunk size matches the raw-RGBA path so the relay/WebRTC fragments stay
@@ -193,10 +194,12 @@ typedef struct directgate_desktop_ {
     xbool_t bWebRTCVideoFailed; /* suppress retry until track/ICE recovery */
     xbool_t bPreferDataChannel; /* browser could not decode RTP; avoid pipeline flapping */
     /* Adaptive bitrate controller state: current encoder rate (<= preset
-     * target), ticks since the last congestion signal, and the cooldown
-     * ticks left before the next downward step is allowed. */
+     * target), clean recovery evidence (RTCP reports for RTP, ticks for the
+     * DataChannel fallback), and the cooldown ticks left before the next
+     * downward step is allowed. */
     uint32_t nCurrentBitrateKbps;
-    uint32_t nAbrCleanTicks;
+    uint32_t nAbrCeilingKbps; /* temporary route-specific cap; zero = preset target */
+    uint32_t nAbrCleanEvidence;
     uint32_t nAbrHoldTicks;
     /* Consecutive receiver reports that came back lossy. Congestion is only
      * declared once this reaches DIRECTGATE_DESKTOP_ABR_LOSS_REPORTS; a

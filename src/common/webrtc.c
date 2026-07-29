@@ -684,6 +684,7 @@ void DirectGate_WebRTC_Init(directgate_webrtc_t *pRTC)
     pRTC->bVideoEnabled = XFALSE;
     pRTC->bVideoTrackOpen = XFALSE;
     pRTC->bVideoKeyframeRequested = XFALSE;
+    pRTC->bActiveRelay = XFALSE;
     pRTC->nSignalGeneration = 0;
     pRTC->nPendingSignalGeneration = 0;
     pRTC->bPendingDataOpen = XFALSE;
@@ -930,6 +931,7 @@ static void DirectGate_WebRTC_PromotePending(directgate_webrtc_t *pRTC)
     pRTC->bConnected = XTRUE;
     pRTC->bVideoTrackOpen = pRTC->bPendingVideoOpen;
     pRTC->bVideoKeyframeRequested = pRTC->bVideoEnabled ? XTRUE : XFALSE;
+    pRTC->bActiveRelay = XFALSE;
     pRTC->bVideoLossUpdated = XFALSE;
     pRTC->nVideoFractionLost = -1;
 
@@ -1087,6 +1089,7 @@ static void DirectGate_WebRTC_NotifyTransport(directgate_webrtc_t *pRTC, int nPC
 
     xbool_t bRelay = DirectGate_WebRTC_IsRelayCandidate(sLocal) || DirectGate_WebRTC_IsRelayCandidate(sRemote);
     xlogn("Selected WebRTC transport: pc(%d), route(%s)", nPC, bRelay ? "turn" : "p2p");
+    pRTC->bActiveRelay = bRelay;
 
     xjson_obj_t *pHeader = XJSON_NewObject(NULL, NULL, XSTDNON);
     XCHECK_VOID((pHeader != NULL));
@@ -1493,7 +1496,9 @@ static void DirectGate_WebRTC_OnDataChannel(int nPC, int nDC, void *pPtr)
     rtcSetMessageCallback(nDC, DirectGate_WebRTC_OnDataChannelMessage);
 }
 
-void DirectGate_WebRTC_ParseRtcp(const uint8_t *pData, size_t nSize, xbool_t *pKeyframeRequest, int *pFractionLost)
+void DirectGate_WebRTC_ParseRtcp(const uint8_t *pData, size_t nSize,
+                                 uint32_t nMediaSsrc,
+                                 xbool_t *pKeyframeRequest, int *pFractionLost)
 {
     if (pKeyframeRequest != NULL) *pKeyframeRequest = XFALSE;
     if (pFractionLost != NULL) *pFractionLost = -1;
@@ -1536,9 +1541,14 @@ void DirectGate_WebRTC_ParseRtcp(const uint8_t *pData, size_t nSize, xbool_t *pK
                 size_t nBlock = nBlockBase + (size_t)i * 24U;
                 if (nBlock + 24U > nLength) break;
 
+                uint32_t nReportedSsrc = ((uint32_t)p[nBlock] << 24U) |
+                                         ((uint32_t)p[nBlock + 1U] << 16U) |
+                                         ((uint32_t)p[nBlock + 2U] << 8U) |
+                                         (uint32_t)p[nBlock + 3U];
+                if (nMediaSsrc && nReportedSsrc != nMediaSsrc) continue;
+
                 int nFraction = p[nBlock + 4U];
-                if (pFractionLost != NULL && nFraction > *pFractionLost)
-                    *pFractionLost = nFraction;
+                if (pFractionLost != NULL && nFraction > *pFractionLost) *pFractionLost = nFraction;
             }
         }
 
@@ -1659,9 +1669,10 @@ static void DirectGate_WebRTC_OnVideoTrackMessage(int nTrack, const char *pMessa
         return;
     }
 
-    xbool_t bKeyframeRequest = XFALSE;
     int nFractionLost = -1;
-    DirectGate_WebRTC_ParseRtcp((const uint8_t*)pMessage, (size_t)nSize, &bKeyframeRequest, &nFractionLost);
+    xbool_t bKeyframeRequest = XFALSE;
+    uint32_t nVideoSsrc = (pRTC->nVideoTrackID == nTrack) ? pRTC->nVideoSsrc : pRTC->nPendingVideoSsrc;
+    DirectGate_WebRTC_ParseRtcp((const uint8_t*)pMessage, (size_t)nSize, nVideoSsrc, &bKeyframeRequest, &nFractionLost);
 
     if (bKeyframeRequest && pRTC->nVideoTrackID == nTrack)
     {
@@ -2192,6 +2203,12 @@ xbool_t DirectGate_WebRTC_IsConnected(const directgate_webrtc_t *pRTC)
 {
     XCHECK_NL((pRTC != NULL), XFALSE);
     return pRTC->bConnected && pRTC->nDataChannelID >= 0;
+}
+
+xbool_t DirectGate_WebRTC_IsRelay(const directgate_webrtc_t *pRTC)
+{
+    XCHECK_NL((pRTC != NULL), XFALSE);
+    return pRTC->bActiveRelay ? XTRUE : XFALSE;
 }
 
 int DirectGate_WebRTC_GetBufferedAmount(const directgate_webrtc_t *pRTC)

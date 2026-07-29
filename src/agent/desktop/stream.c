@@ -43,6 +43,26 @@
 static void DirectGate_Desktop_AdaptBitrate(directgate_session_t *pSession)
 {
     directgate_desktop_t *pDesktop = &pSession->desktop;
+
+#if defined(__linux__)
+    /* Media and input share one ICE transport. A TURN path adds a remote
+     * relay and can accumulate substantial queueing delay without dropping
+     * packets, which fraction-lost ABR cannot detect. Keep that path below a
+     * latency-safe ceiling; a later direct-P2P promotion removes the cap and
+     * normal clean-report recovery restores the preset rate. */
+    uint32_t nCeiling = DirectGate_WebRTC_IsRelay(&pSession->webrtc) ?
+                        DIRECTGATE_DESKTOP_TURN_BITRATE_KBPS : 0U;
+    if (pDesktop->nAbrCeilingKbps != nCeiling)
+    {
+        pDesktop->nAbrCeilingKbps = nCeiling;
+        pDesktop->nAbrCleanEvidence = 0;
+        pDesktop->nAbrLossReports = 0;
+
+        xlogi("Desktop transport bitrate ceiling changed: sid(%u), route(%s), ceiling(%u kbps)",
+            pSession->nSessionId, nCeiling ? "turn" : "p2p", nCeiling ? nCeiling : pDesktop->quality.nBitrateKbps);
+    }
+#endif
+
     uint32_t nCurrent = pDesktop->nCurrentBitrateKbps ?
                         pDesktop->nCurrentBitrateKbps : pDesktop->quality.nBitrateKbps;
 
@@ -62,9 +82,11 @@ static void DirectGate_Desktop_AdaptBitrate(directgate_session_t *pSession)
     DirectGate_Desktop_LinuxEncoder_SetBitrate(pSession, nNext);
 #endif
 
+    uint32_t nTarget = pDesktop->quality.nBitrateKbps;
+    if (pDesktop->nAbrCeilingKbps && pDesktop->nAbrCeilingKbps < nTarget) nTarget = pDesktop->nAbrCeilingKbps;
+
     xlogi("Desktop bitrate adapted: sid(%u), step(%s), rate(%u -> %u kbps), target(%u)",
-        pSession->nSessionId, nNext < nCurrent ? "down" : "up", nCurrent, nNext,
-        pDesktop->quality.nBitrateKbps);
+        pSession->nSessionId, nNext < nCurrent ? "down" : "up", nCurrent, nNext, nTarget);
 }
 
 static int DirectGate_Desktop_SendFrameChunks(directgate_session_t *pSession, const uint8_t *pFrame, size_t nFrameSize)

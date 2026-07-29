@@ -32,10 +32,10 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
 
-/* Rebuild policy for adaptive bitrate. libavcodec cannot retarget a GPU
- * encoder mid-stream, so a step is applied by re-opening the encoder, which
- * costs one IDR. Both guards below exist to keep that rare: a congested link
- * must not be answered with a keyframe burst every couple of frames. */
+/* Reconfiguration policy for adaptive bitrate. NVENC can apply AVCodecContext
+ * rate-control changes to its live session; the other hardware backends need
+ * a context rebuild. Both paths force an IDR, so coalesce small changes and
+ * rate-limit the rest to avoid answering congestion with keyframe bursts. */
 #define DIRECTGATE_HWENC_RECONFIG_MIN_PCT   20U
 #define DIRECTGATE_HWENC_RECONFIG_MIN_US    3000000ULL
 
@@ -182,7 +182,7 @@ struct directgate_hwenc_ {
     uint32_t nHeight;
     uint32_t nFps;
     uint32_t nGopFrames;
-    uint32_t nBitrateKbps;           /* rate the open encoder was built with */
+    uint32_t nBitrateKbps;           /* rate currently applied to the encoder */
     uint32_t nTargetKbps;            /* the preset's full rate (recovery goal) */
     uint32_t nPendingBitrateKbps;    /* requested by the adaptive controller */
     uint64_t nLastReconfigUs;
@@ -714,10 +714,7 @@ const char* DirectGate_HWEnc_Describe(const directgate_hwenc_t *pEncoder)
     return pEncoder->sName;
 }
 
-/* Re-opens the context so a new bitrate takes effect. libavcodec offers no
- * live retarget for GPU encoders, so this is the only way the adaptive
- * controller can act on congestion at all - the coalescing in
- * MaybeReconfigure is what keeps the cost (one IDR) acceptable. */
+/* Re-opens hardware encoders which do not expose a reliable live bitrate update through libavcodec. */
 static int DirectGate_HWEnc_Reconfigure(directgate_hwenc_t *pEnc, uint32_t nBitrateKbps)
 {
     char sError[DIRECTGATE_DESKTOP_REASON_LEN] = { 0 };
@@ -734,6 +731,25 @@ static int DirectGate_HWEnc_Reconfigure(directgate_hwenc_t *pEnc, uint32_t nBitr
         return XSTDERR;
     }
 
+    pEnc->nLastReconfigUs = DirectGate_HWEnc_MonotonicUs();
+    return XSTDOK;
+}
+
+/* FFmpeg's NVENC wrapper notices changes to these public AVCodecContext
+ * fields in avcodec_send_frame and calls nvEncReconfigureEncoder on the
+ * existing NVIDIA session. This avoids destroying the encoder, its surfaces
+ * and rate-control history for every ABR step. NVENC still forces one IDR,
+ * hence the coalescing/rate limit in MaybeReconfigure remains useful. */
+static int DirectGate_HWEnc_ReconfigureNvenc(directgate_hwenc_t *pEnc,
+                                             uint32_t nBitrateKbps)
+{
+    XCHECK((pEnc != NULL && pEnc->pCtx != NULL), XSTDERR);
+
+    int64_t nBitrate = (int64_t)nBitrateKbps * 1000;
+    pEnc->pCtx->bit_rate = nBitrate;
+    pEnc->pCtx->rc_max_rate = nBitrate;
+    pEnc->pCtx->rc_buffer_size = (int)(nBitrate / 4);
+    pEnc->nBitrateKbps = nBitrateKbps;
     pEnc->nLastReconfigUs = DirectGate_HWEnc_MonotonicUs();
     return XSTDOK;
 }
@@ -760,6 +776,9 @@ static int DirectGate_HWEnc_MaybeReconfigure(directgate_hwenc_t *pEnc)
         nNowUs - pEnc->nLastReconfigUs < DIRECTGATE_HWENC_RECONFIG_MIN_US) return XSTDOK;
 
     pEnc->nPendingBitrateKbps = 0;
+    if (xstrcmp(pEnc->pCodec->name, "h264_nvenc"))
+        return DirectGate_HWEnc_ReconfigureNvenc(pEnc, nWanted);
+
     return DirectGate_HWEnc_Reconfigure(pEnc, nWanted);
 }
 
