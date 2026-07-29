@@ -59,12 +59,18 @@
 /* DuplicateOutput re-init duration before flipping to GDI. */
 #define DIRECTGATE_WINENC_REINIT_SECONDS   3U
 
-/* How often the capture thread asks whether the input desktop is still the
- * ordinary one. Four OpenInputDesktop calls a second is nothing next to a
- * 60 fps capture loop, and it is what lets a UAC prompt be picked up from the
- * GDI path too - there duplication never fails, it just keeps returning the
- * same frozen picture. The DXGI path does not wait for this: a lost
- * duplication probes immediately. */
+/* How often the capture thread may ask whether the input desktop is still the
+ * ordinary one - and, just as importantly, when it is allowed to ask at all.
+ *
+ * A live DXGI capture never needs this: a desktop switch invalidates the
+ * duplication and the ACCESS_LOST branch probes on the spot. So while frames
+ * are flowing the probe is skipped entirely and the streaming path issues no
+ * extra syscalls whatsoever - which is the whole point, because that path is
+ * the one carrying a game.
+ *
+ * It is only reached when the picture has gone quiet for this long, or on the
+ * GDI fallback, where duplication cannot report anything and a UAC prompt
+ * looks exactly like a screen that stopped changing. */
 #define DIRECTGATE_WINENC_DESKTOP_PROBE_US 250000ULL
 
 /* How long DirectGate_Desktop_WinEncoder_Start waits for the capture thread
@@ -111,6 +117,7 @@ typedef struct directgate_winenc_ {
     xbool_t bElevAttached;
     xbool_t bBridged;
     uint64_t nDesktopProbeUs;
+    uint64_t nLastFrameUs;              /* last capture that actually produced pixels */
 
     /* GDI BitBlt fallback capture. */
     HDC hScreenDC;
@@ -366,6 +373,13 @@ static int DirectGate_Desktop_WinEnc_CaptureDxgi(directgate_winenc_t *pEnc, uint
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
     IDXGIResource *pResource = NULL;
     memset(&frameInfo, 0, sizeof(frameInfo));
+
+    /* Re-duplication can fail without reaching the GDI threshold - another
+     * duplication client still holding the output for a frame or two is the
+     * usual reason - and the loop then comes straight back here with a NULL
+     * interface. Reporting it as a lost frame puts it back on the same retry
+     * path instead of dereferencing NULL through the COBJMACROS vtable. */
+    if (pEnc->pDuplication == NULL) return XSTDERR;
 
     HRESULT hr = IDXGIOutputDuplication_AcquireNextFrame(pEnc->pDuplication, nTimeoutMs, &frameInfo, &pResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) return XSTDNON;
@@ -833,7 +847,18 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
         uint64_t nNowUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
         int nCapture;
 
-        if (pEnc->bElevAttached && (pEnc->bBridged || nNowUs - pEnc->nDesktopProbeUs >= DIRECTGATE_WINENC_DESKTOP_PROBE_US))
+        /* While bridged, every pass, so the bridge is dropped the instant the
+         * prompt is dismissed. Otherwise only once the screen has gone quiet
+         * (or on the GDI path); a DXGI capture that is still delivering frames
+         * cannot be looking at a secure desktop, so it probes nothing at all. */
+        xbool_t bProbeDesktop = pEnc->bBridged;
+
+        if (!bProbeDesktop && pEnc->bElevAttached &&
+            nNowUs - pEnc->nDesktopProbeUs >= DIRECTGATE_WINENC_DESKTOP_PROBE_US &&
+            (pEnc->bUseGdi || nNowUs - pEnc->nLastFrameUs >= DIRECTGATE_WINENC_DESKTOP_PROBE_US))
+            bProbeDesktop = XTRUE;
+
+        if (bProbeDesktop)
         {
             pEnc->nDesktopProbeUs = nNowUs;
 
@@ -935,6 +960,10 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
             if (bForceKeyframe) InterlockedExchange(&pEnc->bForceKeyframe, 1);
             continue;
         }
+
+        /* Evidence that the desktop is alive and ours, which is what lets the
+         * probe above stay switched off while a game is streaming. */
+        if (nCapture == XSTDOK) pEnc->nLastFrameUs = nNowUs;
 
         /* Nothing new on screen. Two things still have to happen: a pending
          * keyframe request (new viewer / PLI recovery) re-encodes the last

@@ -37,13 +37,16 @@
     file manager) run AS shell.user, never as SYSTEM, mirroring the POSIX setuid
     model. No Windows password is ever stored or prompted for.
 
-    Start=auto: the service starts at boot so it survives reboots with no manual
-    intervention. The launcher tolerates "not paired / not logged on yet" - it
-    waits in a poll loop for shell.user to log on, then spawns the agent (and
-    respawns it on each later logon). The only no-op case is the very first boot
-    after install, before pairing: with no shell.user in the config the launcher
-    exits and the service simply stays stopped until the first pairing. It only
-    serves sessions while shell.user is logged on.
+    The service is started by the installer itself (ServiceControl Start=install,
+    below) at the end of install, repair and upgrade, and registered Start=auto
+    so it also survives reboots with no manual intervention.
+
+    The launcher tolerates every "not ready yet" state by waiting rather than
+    exiting: no agent.json at all, no shell.user in it, or shell.user not logged
+    on. It polls, then spawns the agent as soon as the state is usable and
+    respawns it on each later logon. So a fresh install can be paired afterwards
+    with no service start and no reboot, and it only serves sessions while
+    shell.user is logged on.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:firewall="http://wixtoolset.org/schemas/v4/wxs/firewall"
@@ -121,9 +124,25 @@
                         Arguments=" --win-service --win-launcher -c &quot;C:\ProgramData\directgate\agent.json&quot;"
                         Vital="no" />
 
+                    <!--
+                        Start="install" is what makes an unattended remote
+                        upgrade survivable. Windows Installer has to stop the
+                        service to replace the binary, and start=auto alone
+                        would only bring it back at the next boot - so a
+                        machine upgraded from another city would go dark until
+                        somebody walked up to it. StartServices runs at the end
+                        of install, repair and major upgrade, after the new
+                        files and the re-registered service are in place.
+
+                        Safe to Wait on: the launcher reports SERVICE_RUNNING
+                        before it does anything, and on a machine that has not
+                        been paired yet it waits for a configuration instead of
+                        exiting, so a fresh install cannot fail here either.
+                    -->
                     <ServiceControl
                         Id="AgentSvcCtl"
                         Name="directgate-agent"
+                        Start="install"
                         Stop="both"
                         Remove="uninstall"
                         Wait="yes" />

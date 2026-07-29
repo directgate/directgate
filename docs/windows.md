@@ -108,7 +108,8 @@ Installing `directgate-<version>-x64.msi` (double-click, or `msiexec /i directga
 - creates `C:\ProgramData\directgate\`, the machine-wide config home;
 - registers one Windows service, `directgate-agent`, running as **LocalSystem**
   and configured to start automatically at boot with the command line
-  `directgate.exe --win-service --win-launcher -c "C:\ProgramData\directgate\agent.json"`.
+  `directgate.exe --win-service --win-launcher -c "C:\ProgramData\directgate\agent.json"`;
+- **starts that service before the installer finishes** - on every install, repair and upgrade, not only at the next boot.
 
 An interactive install shows the normal Windows UAC prompt. A silent `/qn` install cannot display UAC, so it must be launched from an already elevated process or deployment service.
 
@@ -123,11 +124,31 @@ Finish setup after installing:
    ```
 
 2. Set `shell.user` in that config to the account whose sessions the agent should own (the logged-on user).
-3. Start it: `sc.exe start directgate-agent` (or `Start-Service directgate-agent`).
+
+There is no third step: the service is already running and picks the configuration up on its own within a couple of seconds. It does not need to be started by hand and the machine does not need a reboot. Until a config with a `shell.user` exists the launcher simply waits, which is also why a fresh install never reports a failed service start.
 
 The launcher serves sessions only while `shell.user` is logged on (console/RDP); when they are not it waits and starts the agent on the next logon. There is no headless mode - that is the deliberate cost of never storing a password.
 
 Uninstalling stops and removes the service, deletes the files, and removes the `PATH` entry.
+
+### Upgrading a machine you can only reach remotely
+
+Replacing `directgate.exe` means stopping the service, which drops your own session. That is unavoidable. What must not happen is the service staying down afterwards, so the installer starts it again itself and the agent reconnects on its own - no console access needed at the far end.
+
+One thing still to get right: **do not launch the installer from a DirectGate terminal session.** That console belongs to the agent, and when the installer stops the service the agent - and everything running under its pseudo-console, including `msiexec` - goes with it. Windows Installer would then roll the transaction back mid-upgrade, which is exactly the state you cannot recover from remotely.
+
+Safe ways to start it:
+
+- From the **remote desktop** session, by double-clicking the MSI or running it from an ordinary `cmd`/PowerShell window opened inside that desktop. Those belong to Explorer, not to the agent, and survive the restart.
+- Detached from the session entirely, which is the option to prefer for a scripted or unattended upgrade:
+
+  ```bat
+  schtasks /create /tn DirectGateUpgrade /ru SYSTEM /sc once /st 00:00 /f ^
+      /tr "msiexec /i C:\path\directgate-<version>-x64.msi /qn /norestart"
+  schtasks /run /tn DirectGateUpgrade
+  ```
+
+  `msiexec` then runs under the Task Scheduler and is unaffected by the agent restarting underneath it. Delete the task afterwards with `schtasks /delete /tn DirectGateUpgrade /f`.
 
 ### Config path: console vs service
 
@@ -182,7 +203,7 @@ sc.exe start directgate-agent
 
 Notes:
 
-- **No password.** The service is LocalSystem; only the launcher (which holds   `SeTcbPrivilege`) can mint `shell.user`'s token. `shell.user` must be set in the config and **logged on** for sessions to run: the launcher refuses to start when `shell.user` is unset, and waits for a logon when it is set but not present.
+- **No password.** The service is LocalSystem; only the launcher (which holds   `SeTcbPrivilege`) can mint `shell.user`'s token. `shell.user` must be set in the config and **logged on** for sessions to run - the launcher waits for both rather than exiting, so it can be installed and started before the machine has ever been paired. The identity is still pinned once: the first configuration carrying a `shell.user` is the one it commits to, and nothing re-reads it afterwards.
 - The launcher pins the spawn identity to the configured `shell.user` and never takes it from anything else, so terminal and file-manager sessions can never run under an unexpected identity - the Windows counterpart of the POSIX privilege-drop policy.
 - A service stop (`sc.exe stop directgate-agent`) stops the launcher, which terminates the supervised agent.
 - Logs go to the file configured under `log` in `agent.json`; there is no Windows Event Log integration.
@@ -224,6 +245,24 @@ This is a fallback, never the normal path. The agent keeps its own duplication a
 - **Capture:** a lost duplication that `OpenInputDesktop` confirms is the secure desktop hands capture to the helper, which delivers BGRA at the pipeline's own encode size through a shared section. The same encoder, the same stream - only a keyframe is forced on each transition, which the screen change warrants anyway.
 
 The agent log names which path took over, once per transition: `Elevated window has focus, routing input through the elevated helper` or `Secure desktop is up, routing input through the elevated helper`. Neither line appearing while privileged UI is unresponsive means the helper never started - check the `directgate-launcher` and `directgate-helper` logs in the same directory.
+
+#### Lifetime, and what it costs when nothing privileged is on screen
+
+The helper **process** exists for exactly as long as a desktop session does: the launcher spawns it when the pipeline starts and it exits when the agent releases it or the agent itself goes away. In between it is blocked on a pipe read - no capture, no injection, no GPU objects, normal priority, and the frame section it shares is committed but untouched, so only its first page is ever resident.
+
+The helper **path** is entered and left independently of that, and separately for the two halves:
+
+| | engaged when | back to the agent's own path when |
+|---|---|---|
+| Capture | duplication is lost *and* `OpenInputDesktop` confirms the secure desktop | the next pass sees the desktop is `Default` again - checked every pass while bridged, so within one frame |
+| Input | the foreground window's process outranks the agent's integrity level, or a direct `SendInput` was refused | the next event, as soon as the foreground window is an ordinary one again |
+
+Both are edge-triggered off state the loop already has, so an ordinary session pays essentially nothing for the feature being present:
+
+- **Capture.** While DXGI duplication is delivering frames the desktop probe is skipped outright - a duplication that is still producing pixels cannot be looking at a secure desktop. It only runs after the picture has been unchanged for 250 ms, or on the GDI fallback where duplication cannot report anything. A game at 60 fps therefore issues **zero** extra calls.
+- **Input.** One `GetForegroundWindow` per injected event while the helper is attached (sub-microsecond); the token lookup behind it is cached against that window, so a fullscreen game recomputes nothing after the first event.
+
+Leaving the bridge restores the original pipeline exactly: the same Media Foundation encoder instance is used throughout - it is never destroyed or reconfigured - and the only visible effect is one forced keyframe, which the wholesale screen change warrants anyway. Bitrate, ABR state and the hardware encoder selection all carry across untouched.
 
 `Ctrl+Alt+Del` is a separate case: the secure attention sequence cannot be synthesized at all, by design. The viewer's request reaches the launcher, which calls `SendSAS` - permitted only to a LocalSystem service, which is exactly what it is.
 

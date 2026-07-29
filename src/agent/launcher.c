@@ -797,40 +797,81 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
         return XSTDERR;
     }
 
-    /* Read the trusted identity once. Every agent process is spawned as this
-       account; it is never derived from anything but config. */
-    directgate_cfg_t cfg;
-    DirectGate_InitConfig(&cfg);
-
-    if (!DirectGate_LoadConfig(&cfg, pCfgPath))
-    {
-        xloge("launcher: failed to load agent config: path(%s)", pCfgPath);
-        return XSTDERR;
-    }
-
-    if (!xstrused(cfg.sShellUser))
-    {
-        xloge("launcher: shell.user is not configured, refusing to start: cfg(%s)", pCfgPath);
-        return XSTDERR;
-    }
-
-    char sShellUser[XSTR_MID];
-    xstrncpy(sShellUser, sizeof(sShellUser), cfg.sShellUser);
-
-    /* Elevated-UI policy is read here, not taken from the agent: the launcher
-       is the process that would act on it, so it must own the decision. */
-    g_bElevEnabled = cfg.desktop.bElevatedInput;
-    g_bElevLockScreen = cfg.desktop.bLockScreen;
+    SetConsoleCtrlHandler(DirectGate_WinLauncher_CtrlHandler, TRUE);
     xstrncpy(g_sElevCfgPath, sizeof(g_sElevCfgPath), pCfgPath);
 
-    /* Under the SCM there is no console, so without this every launcher and
-       helper diagnostic is lost - including the ones that explain why
-       privileged UI is not reachable. A separate ident keeps the file apart
-       from the agent's own log. */
+    /*
+       Wait for a usable configuration rather than exiting without one.
+
+       The installer starts this service, and on a fresh machine that happens
+       before anything has been paired - there is no agent.json yet, and no
+       shell.user in it when there is. Exiting there would make the MSI's
+       StartServices look like a failed start, and would mean pairing had to be
+       followed by a manual service start or a reboot. Waiting costs a 2 s poll
+       loop and makes pairing alone enough to bring the agent up.
+
+       The identity is still read once and pinned: the loop ends the moment a
+       valid shell.user appears and nothing re-reads it afterwards, so an agent
+       can never be spawned under an account the launcher did not commit to at
+       start-up.
+    */
+    directgate_cfg_t cfg;
+    char sShellUser[XSTR_MID] = { 0 };
+    xbool_t bWaitingForConfig = XFALSE;
+
+    /* Logging before anything else, from whatever can be read right now - on an
+       unpaired machine that is the built-in default. Without it every launcher
+       and helper diagnostic is lost, because the SCM gives a service no
+       console. A separate ident keeps the file apart from the agent's own. */
+    DirectGate_InitConfig(&cfg);
+    if (XPath_Exists(pCfgPath)) (void)DirectGate_LoadConfig(&cfg, pCfgPath);
     xstrncpy(cfg.log.sIdent, sizeof(cfg.log.sIdent), "directgate-launcher");
     DirectGate_LogApply(&cfg.log);
 
-    SetConsoleCtrlHandler(DirectGate_WinLauncher_CtrlHandler, TRUE);
+    while (!DirectGate_WinLauncher_Stopping())
+    {
+        DirectGate_InitConfig(&cfg);
+
+        /* DirectGate_InitConfig seeds shell.user with the account the process
+           is running under, which for a LocalSystem service is SYSTEM. Clearing
+           it is what makes "the identity comes only from the file" true rather
+           than merely intended - and it is also what lets the wait below tell
+           an unpaired config apart from a paired one. */
+        cfg.sShellUser[0] = '\0';
+
+        /* Existence first: a machine that is installed but not yet paired must
+           not log a failed load on every poll for as long as it stays that way. */
+        if (XPath_Exists(pCfgPath) && DirectGate_LoadConfig(&cfg, pCfgPath) &&
+            xstrused(cfg.sShellUser))
+        {
+            xstrncpy(sShellUser, sizeof(sShellUser), cfg.sShellUser);
+
+            /* Elevated-UI policy is read here, not taken from the agent: the
+               launcher is the process that would act on it, so it must own
+               the decision. */
+            g_bElevEnabled = cfg.desktop.bElevatedInput;
+            g_bElevLockScreen = cfg.desktop.bLockScreen;
+
+            xstrncpy(cfg.log.sIdent, sizeof(cfg.log.sIdent), "directgate-launcher");
+            DirectGate_LogApply(&cfg.log);
+            break;
+        }
+
+        if (!bWaitingForConfig)
+        {
+            bWaitingForConfig = XTRUE;
+            xlogn("launcher: no paired configuration with shell.user yet, waiting for one: cfg(%s)", pCfgPath);
+        }
+
+        Sleep(DIRECTGATE_WIN_LAUNCHER_POLL_MS);
+    }
+
+    if (!xstrused(sShellUser))
+    {
+        xlogn("launcher: stopped before a configuration became available");
+        return XSTDOK;
+    }
+
     xlogn("launcher: supervising agent for shell.user(%s), elevatedInput(%s), lockScreen(%s)",
         sShellUser, g_bElevEnabled ? "on" : "off", g_bElevLockScreen ? "on" : "off");
 
