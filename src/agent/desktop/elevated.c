@@ -138,6 +138,44 @@ static xbool_t DirectGate_Elev_RecvTimed(HANDLE hPipe, uint16_t *pType, void *pP
     return DirectGate_Elevated_RecvRecord(hPipe, pType, pPayload, pLength);
 }
 
+/* Integrity level of a process, as the RID of its token's integrity SID
+   (SECURITY_MANDATORY_MEDIUM_RID and friends). Zero when it cannot be read. */
+static DWORD DirectGate_Elev_ProcessIntegrity(DWORD nPid)
+{
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, nPid);
+    if (hProcess == NULL) return 0;
+
+    HANDLE hToken = NULL;
+    DWORD nLevel = 0;
+
+    if (OpenProcessToken(hProcess, TOKEN_QUERY, &hToken))
+    {
+        DWORD nSize = 0;
+        GetTokenInformation(hToken, TokenIntegrityLevel, NULL, 0, &nSize);
+
+        if (nSize > 0)
+        {
+            TOKEN_MANDATORY_LABEL *pLabel = (TOKEN_MANDATORY_LABEL*)malloc(nSize);
+            if (pLabel != NULL)
+            {
+                if (GetTokenInformation(hToken, TokenIntegrityLevel, pLabel, nSize, &nSize))
+                {
+                    UCHAR *pCount = GetSidSubAuthorityCount(pLabel->Label.Sid);
+                    if (pCount != NULL && *pCount > 0)
+                        nLevel = *GetSidSubAuthority(pLabel->Label.Sid, (DWORD)(*pCount - 1));
+                }
+
+                free(pLabel);
+            }
+        }
+
+        CloseHandle(hToken);
+    }
+
+    CloseHandle(hProcess);
+    return nLevel;
+}
+
 /* Name of the desktop currently receiving input. Empty when the caller is not
  * allowed to open it, which for a medium-integrity process is itself the
  * secure-desktop signal. */
@@ -253,6 +291,56 @@ xbool_t DirectGate_Elevated_SecureDesktopActive(void)
         return bDenied;
 
     return xstrcmp(sName, "Default") ? XFALSE : XTRUE;
+}
+
+/*
+ * The two refusals are not alike, and this is the one that has to be seen
+ * coming. The secure desktop reports itself: SendInput returns zero because
+ * the calling thread's desktop is not the one receiving input. UIPI does not -
+ * MSDN says outright that SendInput "fails when it is blocked by UIPI" and
+ * that "neither GetLastError nor the return value will indicate the failure",
+ * so a higher-integrity foreground window is silently swallowed and there is
+ * nothing after the call to notice. It has to be decided beforehand.
+ *
+ * GetForegroundWindow is cheap enough to run per event; the token lookup
+ * behind it is not, so the verdict is cached against the window it was taken
+ * for and only recomputed when focus actually moves. During a game that is one
+ * fast user32 call per input event and nothing else.
+ */
+xbool_t DirectGate_Elevated_ForegroundOutranksAgent(void)
+{
+    static HWND hCachedWindow = NULL;
+    static xbool_t bCachedVerdict = XFALSE;
+    static DWORD nAgentIntegrity = 0;
+
+    HWND hForeground = GetForegroundWindow();
+    if (hForeground == NULL) return XFALSE;
+    if (hForeground == hCachedWindow) return bCachedVerdict;
+
+    if (nAgentIntegrity == 0)
+    {
+        nAgentIntegrity = DirectGate_Elev_ProcessIntegrity(GetCurrentProcessId());
+        if (nAgentIntegrity == 0) nAgentIntegrity = SECURITY_MANDATORY_MEDIUM_RID;
+    }
+
+    DWORD nPid = 0;
+    GetWindowThreadProcessId(hForeground, &nPid);
+
+    xbool_t bOutranks = XFALSE;
+    if (nPid != 0 && nPid != GetCurrentProcessId())
+    {
+        DWORD nIntegrity = DirectGate_Elev_ProcessIntegrity(nPid);
+
+        /* A refused query counts as outranking. PROCESS_QUERY_LIMITED_INFORMATION
+         * exists so a process can look at one above it, and within our own
+         * session everything at or below our level answers, so being turned
+         * away is itself the answer. */
+        bOutranks = (nIntegrity == 0 || nIntegrity > nAgentIntegrity) ? XTRUE : XFALSE;
+    }
+
+    hCachedWindow = hForeground;
+    bCachedVerdict = bOutranks;
+    return bOutranks;
 }
 
 static void DirectGate_Elev_CloseHelper(void)
@@ -547,8 +635,14 @@ int DirectGate_Elevated_ReadFrame(uint8_t *pDstBGRA, uint32_t nWidth, uint32_t n
     uint32_t nSrcStride = pShm->nStride;
     int nStatus = XSTDOK;
 
-    if (nSrcWidth == 0 || nSrcHeight == 0 || (size_t)nSrcStride * nSrcHeight > pShm->nSlotBytes) nStatus = XSTDNON;
-    else if (nSrcWidth == nWidth && nSrcHeight == nHeight && nSrcStride == nWidth * 4U) memcpy(pDstBGRA, pSlot, (size_t)nWidth * nHeight * 4U);
+    if (nSrcWidth == 0 || nSrcHeight == 0 || (size_t)nSrcStride * nSrcHeight > pShm->nSlotBytes)
+    {
+        nStatus = XSTDNON;
+    }
+    else if (nSrcWidth == nWidth && nSrcHeight == nHeight && nSrcStride == nWidth * 4U)
+    {
+        memcpy(pDstBGRA, pSlot, (size_t)nWidth * nHeight * 4U);
+    }
     else
     {
         /* The helper caps its slot at DIRECTGATE_ELEV_MAX_*, so a capture
@@ -584,43 +678,6 @@ typedef struct directgate_elev_helper_ {
 } directgate_elev_helper_t;
 
 static directgate_elev_helper_t g_helper = { 0 };
-
-/* Integrity level of a process, as the RID of its token's integrity SID
-   (SECURITY_MANDATORY_MEDIUM_RID and friends). Zero when it cannot be read. */
-static DWORD DirectGate_Elev_ProcessIntegrity(DWORD nPid)
-{
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, nPid);
-    if (hProcess == NULL) return 0;
-
-    HANDLE hToken = NULL;
-    DWORD nLevel = 0;
-
-    if (OpenProcessToken(hProcess, TOKEN_QUERY, &hToken))
-    {
-        DWORD nSize = 0;
-        GetTokenInformation(hToken, TokenIntegrityLevel, NULL, 0, &nSize);
-
-        if (nSize > 0)
-        {
-            TOKEN_MANDATORY_LABEL *pLabel = (TOKEN_MANDATORY_LABEL*)malloc(nSize);
-            if (pLabel != NULL)
-            {
-                if (GetTokenInformation(hToken, TokenIntegrityLevel, pLabel, nSize, &nSize))
-                {
-                    UCHAR *pCount = GetSidSubAuthorityCount(pLabel->Label.Sid);
-                    if (pCount != NULL && *pCount > 0) nLevel = *GetSidSubAuthority(pLabel->Label.Sid, (DWORD)(*pCount - 1));
-                }
-
-                free(pLabel);
-            }
-        }
-
-        CloseHandle(hToken);
-    }
-
-    CloseHandle(hProcess);
-    return nLevel;
-}
 
 /* True while the interactive session is showing the lock screen. Treated as
    unlocked when the query fails: a UAC prompt must never be blocked because
@@ -871,8 +928,7 @@ static xbool_t DirectGate_Elev_CapInitDxgi(directgate_elev_capsrc_t *pSrc,
     }
 
     pSrc->pOutput = pFoundOutput;
-    if (FAILED(IDXGIOutput1_DuplicateOutput(pSrc->pOutput, (IUnknown*)pSrc->pDevice, &pSrc->pDuplication)) ||
-        pSrc->pDuplication == NULL)
+    if (FAILED(IDXGIOutput1_DuplicateOutput(pSrc->pOutput, (IUnknown*)pSrc->pDevice, &pSrc->pDuplication)) || pSrc->pDuplication == NULL)
     {
         pSrc->pDuplication = NULL;
         DirectGate_Elev_CapReleaseDxgi(pSrc);

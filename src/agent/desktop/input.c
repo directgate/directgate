@@ -1087,16 +1087,24 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
 
 /*
  * Windows refuses synthesized input from this process in two situations the
- * operator hits constantly: UIPI drops the whole batch while a higher-
- * integrity window (Task Manager, an elevated app) is foreground, and nothing
- * reaches the secure desktop at all while a UAC prompt or the lock screen is
- * up. Both used to fail silently - none of these calls looked at the return
- * value - which is exactly what "the screen froze" was.
+ * operator hits constantly, and the two refusals do not behave alike - which
+ * is the whole reason this is not a one-liner.
  *
- * The refusal is also the cheapest possible detector, so the direct call stays
- * first and unchanged: on the normal desktop this adds nothing but a
- * comparison against a value SendInput already returned. Only what Windows
- * actually rejected is re-sent through the SYSTEM helper.
+ *   - The secure desktop (a UAC prompt, the lock screen). SendInput returns
+ *     zero, because the calling thread's desktop is not the one receiving
+ *     input. The return value is a usable signal, so the direct call goes
+ *     first and only what it rejected is re-sent through the helper.
+ *
+ *   - A higher-integrity foreground window (Task Manager, an elevated app) on
+ *     the ordinary desktop. UIPI drops the event and says nothing: MSDN is
+ *     explicit that SendInput "fails when it is blocked by UIPI" and that
+ *     "neither GetLastError nor the return value will indicate the failure".
+ *     Nothing after the call can detect it, so it has to be decided before,
+ *     and the direct SendInput is then skipped entirely - issuing it as well
+ *     would double every event on any window that does accept input.
+ *
+ * Both used to fail silently, because none of these calls looked at the return
+ * value at all; that is what "the screen froze" was.
  */
 static void DirectGate_Desktop_WinSendInput(INPUT *pInputs, UINT nCount)
 {
@@ -1104,6 +1112,20 @@ static void DirectGate_Desktop_WinSendInput(INPUT *pInputs, UINT nCount)
      * clears again as soon as input flows, which makes each transition into
      * and out of privileged UI visible in the log exactly once. */
     static xbool_t bRefused = XFALSE;
+
+    if (DirectGate_Elevated_Ready() && DirectGate_Elevated_ForegroundOutranksAgent())
+    {
+        if (!bRefused)
+        {
+            bRefused = XTRUE;
+            xlogi("Elevated window has focus, routing input through the elevated helper");
+        }
+
+        for (UINT i = 0; i < nCount; i++)
+            (void)DirectGate_Elevated_SendInput(&pInputs[i]);
+
+        return;
+    }
 
     UINT nSent = SendInput(nCount, pInputs, sizeof(INPUT));
     if (nSent == nCount)
@@ -1130,7 +1152,7 @@ static void DirectGate_Desktop_WinSendInput(INPUT *pInputs, UINT nCount)
     if (!bRefused)
     {
         bRefused = XTRUE;
-        xlogi("Privileged UI has focus, routing input through the elevated helper: err(%lu)", (unsigned long)nError);
+        xlogi("Secure desktop is up, routing input through the elevated helper: err(%lu)", (unsigned long)nError);
     }
 
     for (UINT i = nSent; i < nCount; i++)
@@ -1460,9 +1482,16 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
 
             if (bHavePos)
             {
-                if (DirectGate_Desktop_ClampCursorToCapture(pDesktop, &nCursorX, &nCursorY) &&
-                    !SetCursorPos(nCursorX, nCursorY))
-                    (void)DirectGate_Elevated_SetCursorPos(nCursorX, nCursorY);
+                if (DirectGate_Desktop_ClampCursorToCapture(pDesktop, &nCursorX, &nCursorY))
+                {
+                    /* Same split as DirectGate_Desktop_WinSendInput: an
+                       elevated foreground window has to be decided before the
+                       call, the secure desktop reports itself after it. */
+                    if (DirectGate_Elevated_Ready() && DirectGate_Elevated_ForegroundOutranksAgent())
+                        (void)DirectGate_Elevated_SetCursorPos(nCursorX, nCursorY);
+                    else if (!SetCursorPos(nCursorX, nCursorY))
+                        (void)DirectGate_Elevated_SetCursorPos(nCursorX, nCursorY);
+                }
 
                 DirectGate_Desktop_SendCursorPosition(pSession, nCursorX, nCursorY, nSequence);
             }

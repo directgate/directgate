@@ -217,10 +217,13 @@ Windows walls a medium-integrity process off from privileged UI in two different
 
 Neither can be lifted from inside the agent. Instead the LocalSystem launcher spawns a small **desktop helper** - the same `directgate.exe` under `--win-desktop-helper` - as SYSTEM inside the interactive session. SYSTEM is not subject to UIPI and may attach to the Winlogon desktop, so one mechanism covers all of it. The helper is started with the desktop session and exits with it.
 
-This is a fallback, never the normal path. The agent keeps its own duplication and its own `SendInput`, and the helper is engaged only after Windows has actually refused something:
+This is a fallback, never the normal path. The agent keeps its own duplication and its own `SendInput`, and the helper is engaged only for the events Windows will not take. The two refusals are detected differently, and the difference matters:
 
-- **Input:** the direct `SendInput` runs first exactly as before; only what it rejects is re-sent through the helper. On the ordinary desktop this costs nothing but reading a return value the call already produced.
+- **Secure desktop.** `SendInput` returns zero, because the calling thread's desktop is not the one receiving input. The direct call therefore goes first exactly as before and only what it rejected is re-sent through the helper - which costs nothing but reading a return value the call already produced.
+- **Elevated window.** UIPI drops the event and reports nothing: MSDN states plainly that `SendInput` "fails when it is blocked by UIPI" and that "neither `GetLastError` nor the return value will indicate the failure". This one has to be decided *before* the call, so the agent checks whether the foreground window outranks its own integrity level and, if so, skips the direct `SendInput` entirely - sending both would double every event on windows that do accept input. The check is one `GetForegroundWindow` per event; the token lookup behind it is cached against that window and only redone when focus moves.
 - **Capture:** a lost duplication that `OpenInputDesktop` confirms is the secure desktop hands capture to the helper, which delivers BGRA at the pipeline's own encode size through a shared section. The same encoder, the same stream - only a keyframe is forced on each transition, which the screen change warrants anyway.
+
+The agent log names which path took over, once per transition: `Elevated window has focus, routing input through the elevated helper` or `Secure desktop is up, routing input through the elevated helper`. Neither line appearing while privileged UI is unresponsive means the helper never started - check the `directgate-launcher` and `directgate-helper` logs in the same directory.
 
 `Ctrl+Alt+Del` is a separate case: the secure attention sequence cannot be synthesized at all, by design. The viewer's request reaches the launcher, which calls `SendSAS` - permitted only to a LocalSystem service, which is exactly what it is.
 

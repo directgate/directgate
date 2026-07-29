@@ -201,8 +201,6 @@ typedef struct directgate_elev_shm_ {
     volatile LONG nHeartbeatMs;    /* GetTickCount() of the helper's last loop pass */
 } directgate_elev_shm_t;
 
-/* ---- framed record I/O ------------------------------------------------- */
-
 /* Shared by all three processes so the framing has exactly one implementation.
  * pPayload must have room for DIRECTGATE_ELEV_MAX_PAYLOAD bytes; a bad magic or
  * an over-long record is reported as a dead channel rather than skipped. */
@@ -212,8 +210,6 @@ xbool_t DirectGate_Elevated_SendRecord(HANDLE hPipe, uint16_t nType,
                                        const void *pPayload, uint16_t nLength);
 xbool_t DirectGate_Elevated_RecvRecord(HANDLE hPipe, uint16_t *pType,
                                        void *pPayload, uint16_t *pLength);
-
-/* ---- agent side -------------------------------------------------------- */
 
 /* Installed once at start-up from the handles the launcher inherited into the
  * agent. Without them the bridge stays unavailable and every entry point below
@@ -256,7 +252,11 @@ int  DirectGate_Elevated_ReadFrame(uint8_t *pDstBGRA, uint32_t nWidth, uint32_t 
  * itself, because OpenInputDesktop being refused is the signal. */
 xbool_t DirectGate_Elevated_SecureDesktopActive(void);
 
-/* ---- helper side ------------------------------------------------------- */
+/* True when the foreground window belongs to a process of higher integrity
+ * than the agent, i.e. one UIPI will silently refuse injected input to. Must
+ * be consulted before SendInput, not after: unlike the secure desktop, UIPI
+ * reports nothing through the return value. Cached per foreground window. */
+xbool_t DirectGate_Elevated_ForegroundOutranksAgent(void);
 
 /* Entry point for --win-desktop-helper. Runs as SYSTEM inside the agent's
  * session and never returns until the agent exits or the channel breaks. */
