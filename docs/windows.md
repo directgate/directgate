@@ -202,11 +202,33 @@ extra to install:
 
 - **Capture:** [DXGI Desktop Duplication](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/desktop-dup-api) on a dedicated thread. Duplication delivers a frame only when pixels actually changed, so an idle desktop costs no CPU. When duplication is unavailable - the "All displays" capture spanning several monitors, rotated outputs, or another application already duplicating the screen - the pipeline falls back to paced GDI `BitBlt` capture with the same encoder behind it.
 - **Encoding:** the H.264 encoder is picked through Media Foundation, hardware first (Quick Sync / NVENC / AMF - whichever MFT the GPU driver registered), with the Microsoft software encoder as the fallback. Low-latency mode, CBR and zero B-frames are requested for interactive latency; bitrate adapts live from RTCP receiver reports like on the other platforms.
-- **Input:** pointer and keyboard injection via `SendInput` over the virtual desktop, so multi-monitor setups and negative coordinates work.
+- **Input:** pointer and keyboard injection via `SendInput` over the virtual desktop, so multi-monitor setups and negative coordinates work. Privileged UI is handled separately - see [Elevated UI and the secure desktop](#elevated-ui-and-the-secure-desktop).
 
 `mfplat.dll` is loaded at runtime rather than linked, so the agent still starts on **Windows N editions** that ship without Media Foundation - desktop sessions there run the raw-RGBA fallback pipeline and report the reason in the desktop status, or you can install the [Media Feature Pack](https://support.microsoft.com/en-us/topic/media-feature-pack-for-windows-10-n-may-2020-ebbdf559-b84c-0fc2-bd51-e23c9f6a4439) to get H.264 back. The agent marks itself per-monitor-DPI-aware at desktop session start so capture geometry and input coordinates always work in physical pixels on scaled displays.
 
-Desktop streaming requires the interactive session the launcher starts the agent in (see [As a Windows service](#as-a-windows-service)); a UAC secure-desktop prompt pauses duplication until it is dismissed, and the lock screen cannot be captured by design.
+Desktop streaming requires the interactive session the launcher starts the agent in (see [As a Windows service](#as-a-windows-service)).
+
+### Elevated UI and the secure desktop
+
+Windows walls a medium-integrity process off from privileged UI in two different ways, and both used to end a remote session in a frozen picture that nobody could click out of:
+
+- **The secure desktop.** A UAC consent prompt, the lock screen and the Ctrl+Alt+Del security screen all run on `winsta0\Winlogon`. Duplication dies with `DXGI_ERROR_ACCESS_LOST`, `OpenInputDesktop` is refused, and no injected input arrives.
+- **Elevated windows on the normal desktop.** Task Manager and any elevated application stay on `winsta0\Default`, so the picture keeps updating, but UIPI silently drops every `SendInput` from the agent while one of them has focus - which reads as a frozen screen even though it is not.
+
+Neither can be lifted from inside the agent. Instead the LocalSystem launcher spawns a small **desktop helper** - the same `directgate.exe` under `--win-desktop-helper` - as SYSTEM inside the interactive session. SYSTEM is not subject to UIPI and may attach to the Winlogon desktop, so one mechanism covers all of it. The helper is started with the desktop session and exits with it.
+
+This is a fallback, never the normal path. The agent keeps its own duplication and its own `SendInput`, and the helper is engaged only after Windows has actually refused something:
+
+- **Input:** the direct `SendInput` runs first exactly as before; only what it rejects is re-sent through the helper. On the ordinary desktop this costs nothing but reading a return value the call already produced.
+- **Capture:** a lost duplication that `OpenInputDesktop` confirms is the secure desktop hands capture to the helper, which delivers BGRA at the pipeline's own encode size through a shared section. The same encoder, the same stream - only a keyframe is forced on each transition, which the screen change warrants anyway.
+
+`Ctrl+Alt+Del` is a separate case: the secure attention sequence cannot be synthesized at all, by design. The viewer's request reaches the launcher, which calls `SendSAS` - permitted only to a LocalSystem service, which is exactly what it is.
+
+`desktop-status` reports `elevatedInput` (the helper is available), `secureDesktop` (frames are coming from it right now), `secureAttention` (Ctrl+Alt+Del can be delivered) and `elevatedReason` when it is unavailable, so the viewer can say why a prompt cannot be answered instead of just appearing to hang.
+
+**This is a real privilege boundary, and it is on by default.** An operator who can approve a UAC prompt on your machine is, in practice, an administrator on it; one who can drive the lock screen can log in. That is the inherent price of the feature, not an implementation flaw. See [What a desktop session can do](security.md#what-a-desktop-session-can-do) for what the design does and does not bound, and set `"desktop": { "elevatedInput": false }` to keep the previous behaviour - privileged UI visible but frozen. `"lockScreen": false` keeps UAC prompts working while refusing the lock screen.
+
+The helper is unavailable when the agent runs from a console rather than the service (there is no launcher to mint it). Everything degrades to the previous behaviour and the reason is reported in `desktop-status`.
 
 **System audio** (opt-in) is captured with WASAPI loopback on the default render endpoint. The encode worker drains the endpoint directly (no separate capture thread or ring buffer, so audio stays tight to video), resamples the shared mix to 48 kHz stereo, and pads silent stretches on a high-resolution wall clock (loopback delivers nothing during silence). libopus is linked **statically** into the exe (see [Opus for Windows](#opus-for-windows-one-time)), so no runtime DLL is needed and audio always works when an output device is present. See [Desktop audio track](webrtc.md#desktop-audio-track).
 
@@ -215,6 +237,7 @@ Desktop streaming requires the interactive session the launcher starts the agent
 ## Security notes specific to Windows
 
 - Private files (config, enrollment keys) are written with a **protected DACL** restricted to `SYSTEM`,  `Administrators`, and the file owner - the ACL equivalent of `0600`, with no inheritance from the parent directory.
+- The **desktop helper** ([above](#elevated-ui-and-the-secure-desktop)) is the only SYSTEM code besides the launcher. Every channel it uses - the command pipe, the frame section and the two hand-off events - is an **unnamed** kernel object minted by the launcher and duplicated straight into the two intended processes, so there is no object-namespace entry to squat and no DACL to get wrong. It accepts only fixed-size binary records whose length is checked against the exact size for their type: the untrusted protocol parser stays in the agent, never in a SYSTEM process. It injects only when the input desktop is not `Default` or the foreground window outranks the agent's integrity level, so on the ordinary desktop it grants nothing `shell.user` did not already have. It is spawned only by the launcher, waits on the agent's process handle and exits with it.
 - Internal IPC (the ConPTY terminal bridge, search and WebRTC notification channels) uses **AF_UNIX socket pairs** (Windows 10 1803+), which are not addressable from the network stack at all; the accepted endpoint is verified by **peer PID** before use. On systems without AF_UNIX support the implementation falls back to a loopback TCP pair hardened against connect-race hijacking.
 - Atomic config updates use `MoveFileEx(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`; targets that are reparse points (symlinks / junctions) are refused, mirroring the `O_NOFOLLOW` checks on POSIX.
 - Binaries are linked with DEP (`--nxcompat`), ASLR (`--dynamicbase`) and high-entropy 64-bit ASLR (`--high-entropy-va`).

@@ -25,6 +25,7 @@
 
 #include "desktop.h"
 #include "session.h"
+#include "elevated.h"
 #include "mfenc.h"
 #include "yuv.h"
 
@@ -57,6 +58,14 @@
 
 /* DuplicateOutput re-init duration before flipping to GDI. */
 #define DIRECTGATE_WINENC_REINIT_SECONDS   3U
+
+/* How often the capture thread asks whether the input desktop is still the
+ * ordinary one. Four OpenInputDesktop calls a second is nothing next to a
+ * 60 fps capture loop, and it is what lets a UAC prompt be picked up from the
+ * GDI path too - there duplication never fails, it just keeps returning the
+ * same frozen picture. The DXGI path does not wait for this: a lost
+ * duplication probes immediately. */
+#define DIRECTGATE_WINENC_DESKTOP_PROBE_US 250000ULL
 
 /* How long DirectGate_Desktop_WinEncoder_Start waits for the capture thread
  * to bring the pipeline up. First-ever MFT activation can spin up GPU
@@ -94,6 +103,14 @@ typedef struct directgate_winenc_ {
     ID3D11Texture2D *pStaging;
     uint32_t nDxgiReinitFails;
     xbool_t bUseGdi;
+
+    /* Elevated-UI bridge. bElevAttached is the exact counterpart of a
+     * successful DirectGate_Elevated_Attach; bBridged is true only while the
+     * secure desktop is actually up and frames come from the helper instead
+     * of this thread's own capture. */
+    xbool_t bElevAttached;
+    xbool_t bBridged;
+    uint64_t nDesktopProbeUs;
 
     /* GDI BitBlt fallback capture. */
     HDC hScreenDC;
@@ -534,6 +551,70 @@ static int DirectGate_Desktop_WinEnc_CaptureGdi(directgate_winenc_t *pEnc, xbool
     return XSTDOK;
 }
 
+/*
+ * Secure-desktop hand-over.
+ *
+ * A UAC prompt, the lock screen and the security screen all live on
+ * winsta0\Winlogon, which this process may neither duplicate nor attach to.
+ * The SYSTEM helper can, so while one of them is up the frames come from it
+ * instead. Everything downstream is untouched: the helper delivers BGRA at
+ * exactly this pipeline's encode size, so it feeds the same NV12 conversion,
+ * the same Media Foundation encoder and the same mailbox. One encoder, one
+ * stream, no discontinuity for the viewer beyond the keyframe forced on each
+ * transition - which is warranted anyway, because the whole screen changed.
+ */
+static xbool_t DirectGate_Desktop_WinEnc_EnterBridge(directgate_winenc_t *pEnc)
+{
+    if (pEnc->bBridged) return XTRUE;
+    if (!pEnc->bElevAttached) return XFALSE;
+
+    if (DirectGate_Elevated_StartCapture(pEnc->nCaptureX, pEnc->nCaptureY,
+        pEnc->nCaptureWidth, pEnc->nCaptureHeight,
+        pEnc->nEncodeWidth, pEnc->nEncodeHeight, pEnc->nFps) != XSTDOK) return XFALSE;
+
+    /* Drop our own duplication rather than let it fail once per frame; the
+     * GDI objects are kept because they cost nothing to hold. */
+    DirectGate_Desktop_WinEnc_ReleaseDuplication(pEnc);
+    InterlockedExchange(&pEnc->bForceKeyframe, 1);
+
+    pEnc->bBridged = XTRUE;
+    return XTRUE;
+}
+
+static void DirectGate_Desktop_WinEnc_LeaveBridge(directgate_winenc_t *pEnc)
+{
+    if (!pEnc->bBridged) return;
+
+    DirectGate_Elevated_StopCapture();
+    pEnc->bBridged = XFALSE;
+    pEnc->bHavePrev = XFALSE;
+    InterlockedExchange(&pEnc->bForceKeyframe, 1);
+
+    DirectGate_Desktop_WinEnc_AttachInputDesktop();
+    if (!pEnc->bUseGdi && DirectGate_Desktop_WinEnc_Duplicate(pEnc) == XSTDOK)
+        pEnc->nDxgiReinitFails = 0;
+}
+
+static int DirectGate_Desktop_WinEnc_CaptureBridged(directgate_winenc_t *pEnc)
+{
+    uint64_t nCapturedUs = 0;
+    int nStatus = DirectGate_Elevated_ReadFrame(pEnc->pFrameBGRA,
+        pEnc->nEncodeWidth, pEnc->nEncodeHeight,
+        DIRECTGATE_ELEV_FRAME_WAIT_MS, &nCapturedUs);
+
+    if (nStatus != XSTDOK) return nStatus;
+
+    /* The helper stamps frames off the same QPC, so the timestamp carries
+     * straight into the pipeline's own timeline. Guard the subtraction
+     * anyway - a bogus stamp must not wrap the PTS. */
+    uint64_t nNowUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
+    if (nCapturedUs < pEnc->nStartUs || nCapturedUs > nNowUs) nCapturedUs = nNowUs;
+
+    pEnc->bHaveFrame = XTRUE;
+    pEnc->nFrameCapturedUs = nCapturedUs;
+    return XSTDOK;
+}
+
 static void DirectGate_Desktop_WinEnc_WakeMainLoop(directgate_winenc_t *pEnc)
 {
     XSOCKET nWriteFd = pEnc->pDesktop->nTimerWriteFd;
@@ -752,7 +833,33 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
         uint64_t nNowUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
         int nCapture;
 
-        if (!pEnc->bUseGdi)
+        if (pEnc->bElevAttached && (pEnc->bBridged || nNowUs - pEnc->nDesktopProbeUs >= DIRECTGATE_WINENC_DESKTOP_PROBE_US))
+        {
+            pEnc->nDesktopProbeUs = nNowUs;
+
+            if (DirectGate_Elevated_SecureDesktopActive()) DirectGate_Desktop_WinEnc_EnterBridge(pEnc);
+            else DirectGate_Desktop_WinEnc_LeaveBridge(pEnc);
+        }
+
+        if (pEnc->bBridged)
+        {
+            /* The helper paces itself and only publishes real changes, so this
+             * blocks on its hand-off event rather than on the frame timer. */
+            nCapture = DirectGate_Desktop_WinEnc_CaptureBridged(pEnc);
+
+            if (nCapture == XSTDERR)
+            {
+                /* Helper gone: back to our own capture and let the normal
+                 * recovery paths deal with whatever they find. */
+                xlogw("Elevated helper stopped delivering frames, resuming local capture: sid(%u)",
+                    pEnc->pDesktop->nSessionId);
+
+                DirectGate_Desktop_WinEnc_LeaveBridge(pEnc);
+                if (bForceKeyframe) InterlockedExchange(&pEnc->bForceKeyframe, 1);
+                continue;
+            }
+        }
+        else if (!pEnc->bUseGdi)
         {
             /* AcquireNextFrame wakes on every host present. Merely passing a
              * deadline as its timeout does NOT cap FPS: a 144/240 Hz game
@@ -778,16 +885,37 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
                 if (DirectGate_Desktop_WinEnc_Duplicate(pEnc) == XSTDOK)
                 {
                     pEnc->nDxgiReinitFails = 0;
+                    DirectGate_Desktop_WinEnc_SleepUs(pEnc, nIntervalUs);
+                    continue;
                 }
-                else if (++pEnc->nDxgiReinitFails >= (pEnc->nFps ? pEnc->nFps : 30U) * DIRECTGATE_WINENC_REINIT_SECONDS)
+
+                if (++pEnc->nDxgiReinitFails >= (pEnc->nFps ? pEnc->nFps : 30U) * DIRECTGATE_WINENC_REINIT_SECONDS)
                 {
                     xlogw("Desktop Duplication lost for good, switching to GDI capture: sid(%u)", pEnc->pDesktop->nSessionId);
                     DirectGate_Desktop_WinEnc_ReleaseDxgi(pEnc);
                     pEnc->bUseGdi = XTRUE;
                 }
 
-                DirectGate_Desktop_WinEnc_SleepUs(pEnc, nIntervalUs);
-                continue;
+                /* A desktop switch is the usual reason duplication dies, so
+                 * ask straight away rather than waiting out the probe
+                 * interval - the operator is looking at a prompt right now. */
+                pEnc->nDesktopProbeUs = DirectGate_Desktop_WinEnc_MonotonicUs(pEnc);
+
+                if (pEnc->bElevAttached && DirectGate_Elevated_SecureDesktopActive() && DirectGate_Desktop_WinEnc_EnterBridge(pEnc))
+                {
+                    if (bForceKeyframe) InterlockedExchange(&pEnc->bForceKeyframe, 1);
+                    continue;
+                }
+
+                /* Otherwise keep a picture flowing instead of going silent for
+                 * DIRECTGATE_WINENC_REINIT_SECONDS: GDI still has the last
+                 * composed desktop, which beats a stalled viewer. */
+                nCapture = DirectGate_Desktop_WinEnc_CaptureGdi(pEnc, bForceKeyframe);
+                if (nCapture == XSTDERR)
+                {
+                    DirectGate_Desktop_WinEnc_SleepUs(pEnc, nIntervalUs);
+                    continue;
+                }
             }
         }
         else
@@ -897,6 +1025,20 @@ static void DirectGate_Desktop_WinEnc_Free(directgate_winenc_t *pEnc)
         pEnc->hThread = NULL;
     }
 
+    /* After the join, so the capture thread can no longer be
+     * inside the bridge when its channels go away. */
+    if (pEnc->bBridged)
+    {
+        DirectGate_Elevated_StopCapture();
+        pEnc->bBridged = XFALSE;
+    }
+
+    if (pEnc->bElevAttached)
+    {
+        DirectGate_Elevated_Detach();
+        pEnc->bElevAttached = XFALSE;
+    }
+
     if (pEnc->hInitDone != NULL)
     {
         CloseHandle(pEnc->hInitDone);
@@ -936,6 +1078,13 @@ int DirectGate_Desktop_WinEncoder_Start(directgate_session_t *pSession,
     XCHECK((pSession != NULL), XSTDERR);
     directgate_desktop_t *pDesktop = &pSession->desktop;
 
+    /* Attached before the old pipeline is torn down, so the reference count
+     * never reaches zero across a preset or monitor rebuild and the helper is
+     * not released and respawned for every quality change. Costs ~100 ms the
+     * first time, which is why it is not deferred to the moment a UAC prompt
+     * is already on screen. Never fatal. */
+    xbool_t bElevAttached = (DirectGate_Elevated_Attach() == XSTDOK) ? XTRUE : XFALSE;
+
     DirectGate_Desktop_WinEncoder_StopDesktop(pDesktop);
 
     if (nWidth == 0 || nHeight == 0)
@@ -947,10 +1096,12 @@ int DirectGate_Desktop_WinEncoder_Start(directgate_session_t *pSession,
     directgate_winenc_t *pEnc = (directgate_winenc_t*)calloc(1, sizeof(*pEnc));
     if (pEnc == NULL)
     {
+        if (bElevAttached) DirectGate_Elevated_Detach();
         xstrncpy(pDesktop->sReason, sizeof(pDesktop->sReason), "Failed to allocate Windows encoder pipeline.");
         return XSTDERR;
     }
 
+    pEnc->bElevAttached = bElevAttached;
     pEnc->pSession = pSession;
     pEnc->pDesktop = pDesktop;
     pEnc->nCaptureX = nX;

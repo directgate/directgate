@@ -39,6 +39,26 @@ After authentication, the client and agent automatically negotiate a WebRTC peer
 
 Once the WebRTC data channel is established, the relay no longer carries terminal data or file transfers. It continues to handle signaling and session management but is completely removed from the data path.
 
+## Process model on Windows
+
+Windows is the one platform where the agent is not a single process. POSIX drops privileges with `setuid`; Windows has no equivalent, so the split is made with processes instead:
+
+```
+[ directgate-agent service ]  LocalSystem, session 0
+        |
+        |  launcher: acquires shell.user's logon token (passwordless, WTSQueryUserToken)
+        |
+        +--> [ agent ]         shell.user, medium integrity, session N, winsta0\Default
+        |       protocol parsing, PTY, file manager, capture, input - everything untrusted
+        |
+        +--> [ desktop helper ] SYSTEM, session N, follows the input desktop
+                on demand, only while a desktop session is live: reaches the UAC
+                secure desktop and higher-integrity windows, which a medium-integrity
+                process cannot. Parses nothing but fixed-size records from the agent.
+```
+
+The launcher and the agent talk over two anonymous pipes the agent inherits at spawn; the agent and the helper over unnamed objects the launcher mints and duplicates into both. Nothing is registered in the object namespace, so no other process can address any of it. See [Elevated UI and the secure desktop](windows.md#elevated-ui-and-the-secure-desktop) for what the helper is for and [Security model](security.md#privileged-ui-on-windows) for what it costs.
+
 ## Multiplexed PTY sessions
 
 DirectGate supports multiple concurrent PTY sessions over a single WebSocket or WebRTC connection. During authentication, the signaling server assigns each client a unique `sessionId`. All protocol messages carry this identifier, allowing the agent to route encrypted traffic to the correct PTY instance without opening additional transport connections. This provides:

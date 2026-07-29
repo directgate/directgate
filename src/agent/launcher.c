@@ -20,6 +20,7 @@
 #include "includes.h"
 #include "config.h"
 #include "launcher.h"
+#include "elevated.h"
 
 #include <windows.h>   /* HANDLE, DWORD, etc. */
 #include <wtsapi32.h>  /* WTSEnumerateSessionsA / WTSQueryUserToken */
@@ -27,6 +28,13 @@
 
 #define DIRECTGATE_WIN_LAUNCHER_POLL_MS    2000  /* supervisor tick */
 #define DIRECTGATE_WIN_LAUNCHER_RESPAWN_MS 2000  /* min gap between spawn attempts */
+
+/* Page-aligned so the pixel slot that follows starts on a page boundary. */
+#define DIRECTGATE_WIN_ELEV_HEADER_BYTES   4096U
+
+/* Sanity bound on the capture rectangle an agent may ask a section for; the
+   per-axis caps in elevated.h already keep the slot itself in check. */
+#define DIRECTGATE_WIN_ELEV_MAX_EDGE       16384U
 
 /*
     Windows Service Control Manager integration: the systemd/launchd
@@ -201,6 +209,432 @@ static XSTATUS DirectGate_WinLauncher_AcquireTokenForUser(const char *pShellUser
     return nStatus;
 }
 
+/*
+    Elevated-UI bridge, launcher half (see desktop/elevated.h for the model).
+
+    The launcher is the only process here that can do three things: mint kernel
+    objects nobody else can name, put a SYSTEM process into the interactive
+    session, and generate the secure attention sequence. It does all three on
+    request from the one agent it supervises, and nothing else - the request
+    channel is an anonymous pipe inherited by that agent at spawn, so there is
+    no endpoint another process could ever reach.
+*/
+
+typedef struct directgate_win_elev_ctx_ {
+    HANDLE hAgent;
+    DWORD nAgentPid;
+} directgate_win_elev_ctx_t;
+
+static HANDLE g_hElevRequest = NULL;   /* read end:  agent -> launcher */
+static HANDLE g_hElevReply = NULL;     /* write end: launcher -> agent */
+static HANDLE g_hElevThread = NULL;
+static HANDLE g_hElevHelper = NULL;
+static xbool_t g_bElevEnabled = XTRUE;
+static xbool_t g_bElevLockScreen = XTRUE;
+static char g_sElevCfgPath[XPATH_MAX] = { 0 };
+
+/* Builds a single-entry PROC_THREAD_ATTRIBUTE_HANDLE_LIST so a child inherits exactly the
+   handles named here and nothing else that happens to be inheritable in this process. */
+static LPPROC_THREAD_ATTRIBUTE_LIST DirectGate_WinLauncher_HandleList(HANDLE *pHandles, DWORD nCount)
+{
+    SIZE_T nSize = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &nSize);
+    if (nSize == 0) return NULL;
+
+    LPPROC_THREAD_ATTRIBUTE_LIST pList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(nSize);
+    if (pList == NULL) return NULL;
+
+    if (!InitializeProcThreadAttributeList(pList, 1, 0, &nSize))
+    {
+        free(pList);
+        return NULL;
+    }
+
+    if (!UpdateProcThreadAttribute(pList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        pHandles, (SIZE_T)nCount * sizeof(HANDLE), NULL, NULL))
+    {
+        DeleteProcThreadAttributeList(pList);
+        free(pList);
+        return NULL;
+    }
+
+    return pList;
+}
+
+static void DirectGate_WinLauncher_FreeHandleList(LPPROC_THREAD_ATTRIBUTE_LIST pList)
+{
+    if (pList == NULL) return;
+    DeleteProcThreadAttributeList(pList);
+    free(pList);
+}
+
+static void DirectGate_WinLauncher_CloseHandle(HANDLE *phHandle)
+{
+    if (phHandle == NULL || *phHandle == NULL) return;
+    CloseHandle(*phHandle);
+    *phHandle = NULL;
+}
+
+static void DirectGate_WinLauncher_StopHelper(void)
+{
+    if (g_hElevHelper == NULL) return;
+
+    /* The agent closes its write end of the command pipe before releasing, so
+       by the time this runs the helper is normally already on its way out.
+       The short wait is only there to reap it cleanly; anything longer would
+       just stall the control thread on a helper that is being replaced. */
+    if (WaitForSingleObject(g_hElevHelper, 1500) != WAIT_OBJECT_0)
+    {
+        xlogw("launcher: elevated helper did not exit, terminating it");
+        TerminateProcess(g_hElevHelper, 0);
+        WaitForSingleObject(g_hElevHelper, 2000);
+    }
+
+    CloseHandle(g_hElevHelper);
+    g_hElevHelper = NULL;
+}
+
+/* Spawns the in-session SYSTEM helper and hands the agent its end of every
+   channel. On success pReady carries handle values already valid inside the
+   agent's own handle table. */
+static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid,
+                                                  uint32_t nCaptureWidth, uint32_t nCaptureHeight,
+                                                  directgate_elev_helper_ready_t *pReady)
+{
+    memset(pReady, 0, sizeof(*pReady));
+    pReady->nStatus = XSTDERR;
+
+    if (nCaptureWidth == 0 || nCaptureHeight == 0 ||
+        nCaptureWidth > DIRECTGATE_WIN_ELEV_MAX_EDGE ||
+        nCaptureHeight > DIRECTGATE_WIN_ELEV_MAX_EDGE)
+    {
+        xloge("launcher: refusing an implausible helper capture rectangle: %ux%u",
+            nCaptureWidth, nCaptureHeight);
+        return XSTDERR;
+    }
+
+    DWORD nSessionId = 0;
+    if (!ProcessIdToSessionId(nAgentPid, &nSessionId))
+    {
+        xloge("launcher: failed to resolve the agent session: pid(%lu), error(%lu)",
+            (unsigned long)nAgentPid, GetLastError());
+        return XSTDERR;
+    }
+
+    uint32_t nSlotWidth = (nCaptureWidth < DIRECTGATE_ELEV_MAX_WIDTH) ? nCaptureWidth : DIRECTGATE_ELEV_MAX_WIDTH;
+    uint32_t nSlotHeight = (nCaptureHeight < DIRECTGATE_ELEV_MAX_HEIGHT) ? nCaptureHeight : DIRECTGATE_ELEV_MAX_HEIGHT;
+    uint64_t nSlotBytes = (uint64_t)nSlotWidth * nSlotHeight * 4ULL;
+    uint64_t nTotalBytes = DIRECTGATE_WIN_ELEV_HEADER_BYTES + nSlotBytes;
+
+    SECURITY_ATTRIBUTES sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;   /* default DACL: SYSTEM + Administrators only */
+
+    HANDLE hCmdRead = NULL, hCmdWrite = NULL, hSection = NULL;
+    HANDLE hReady = NULL, hTaken = NULL, hAgentInherit = NULL;
+    LPPROC_THREAD_ATTRIBUTE_LIST pAttrs = NULL;
+    HANDLE hToken = NULL, hSelfToken = NULL;
+    XSTATUS nStatus = XSTDERR;
+
+    /* Single-pass block: every failure below breaks out to the one teardown
+       after it, so no step has to know what the previous ones allocated. */
+    do
+    {
+        if (!CreatePipe(&hCmdRead, &hCmdWrite, &sa, 64U * 1024U))
+        {
+            xloge("launcher: failed to create the helper command pipe: error(%lu)", GetLastError());
+            break;
+        }
+
+        hSection = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE,
+            (DWORD)(nTotalBytes >> 32), (DWORD)(nTotalBytes & 0xFFFFFFFFULL), NULL);
+
+        if (hSection == NULL)
+        {
+            xloge("launcher: failed to create the %llu byte frame section: error(%lu)",
+                (unsigned long long)nTotalBytes, GetLastError());
+            break;
+        }
+
+        directgate_elev_shm_t *pShm = (directgate_elev_shm_t*)MapViewOfFile(hSection,
+            FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, (SIZE_T)nTotalBytes);
+
+        if (pShm == NULL)
+        {
+            xloge("launcher: failed to map the frame section: error(%lu)", GetLastError());
+            break;
+        }
+
+        memset(pShm, 0, sizeof(*pShm));
+        pShm->nMagic = DIRECTGATE_ELEV_SHM_MAGIC;
+        pShm->nHeaderBytes = DIRECTGATE_WIN_ELEV_HEADER_BYTES;
+        pShm->nSlotBytes = (uint32_t)nSlotBytes;
+        pShm->nMaxWidth = nSlotWidth;
+        pShm->nMaxHeight = nSlotHeight;
+        UnmapViewOfFile(pShm);
+
+        hReady = CreateEventW(&sa, FALSE, FALSE, NULL);
+        hTaken = CreateEventW(&sa, FALSE, FALSE, NULL);
+
+        if (hReady == NULL || hTaken == NULL)
+        {
+            xloge("launcher: failed to create the frame hand-off events: error(%lu)", GetLastError());
+            break;
+        }
+
+        /* SYNCHRONIZE only: the helper waits on the agent to know when to exit
+           and must not be able to do anything else to it. */
+        if (!DuplicateHandle(GetCurrentProcess(), hAgent, GetCurrentProcess(),
+            &hAgentInherit, SYNCHRONIZE, TRUE, 0))
+        {
+            xloge("launcher: failed to duplicate the agent handle for the helper: error(%lu)", GetLastError());
+            break;
+        }
+
+        char sSelf[XPATH_MAX];
+        DWORD nSelfLen = GetModuleFileNameA(NULL, sSelf, (DWORD)sizeof(sSelf));
+        if (nSelfLen == 0 || nSelfLen >= sizeof(sSelf))
+        {
+            xloge("launcher: failed to resolve own executable path: error(%lu)", GetLastError());
+            break;
+        }
+
+        /* Inherited handles keep their numeric value in the child, so passing them
+           on the command line is enough; the values mean nothing anywhere else. */
+        char sCmd[XPATH_MAX * 2 + 512];
+        xstrncpyf(sCmd, sizeof(sCmd),
+            "\"%s\" %s --cmd %llu --shm %llu --shm-bytes %llu --ready %llu --taken %llu "
+            "--agent %llu --agent-pid %lu --allow-lock %d -c \"%s\"",
+            sSelf, DIRECTGATE_ELEV_HELPER_FLAG,
+            (unsigned long long)(uintptr_t)hCmdRead,
+            (unsigned long long)(uintptr_t)hSection,
+            (unsigned long long)nTotalBytes,
+            (unsigned long long)(uintptr_t)hReady,
+            (unsigned long long)(uintptr_t)hTaken,
+            (unsigned long long)(uintptr_t)hAgentInherit,
+            (unsigned long)nAgentPid,
+            g_bElevLockScreen ? 1 : 0,
+            g_sElevCfgPath);
+
+        HANDLE sHandles[5] = { hCmdRead, hSection, hReady, hTaken, hAgentInherit };
+        pAttrs = DirectGate_WinLauncher_HandleList(sHandles, 5);
+        if (pAttrs == NULL)
+        {
+            xloge("launcher: failed to build the helper handle list: error(%lu)", GetLastError());
+            break;
+        }
+
+        /* A copy of this process's own LocalSystem token, retargeted at the
+           interactive session. Setting TokenSessionId needs SeTcbPrivilege,
+           which is exactly why this cannot be done from the agent. */
+        if (!OpenProcessToken(GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &hSelfToken) ||
+            !DuplicateTokenEx(hSelfToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &hToken))
+        {
+            xloge("launcher: failed to duplicate the system token for the helper: error(%lu)", GetLastError());
+            break;
+        }
+
+        if (!SetTokenInformation(hToken, TokenSessionId, &nSessionId, (DWORD)sizeof(nSessionId)))
+        {
+            xloge("launcher: failed to move the helper token into session %lu: error(%lu)",
+                (unsigned long)nSessionId, GetLastError());
+            break;
+        }
+
+        STARTUPINFOEXA si;
+        memset(&si, 0, sizeof(si));
+        si.StartupInfo.cb = sizeof(si);
+        si.StartupInfo.lpDesktop = (LPSTR)"winsta0\\default";
+        si.lpAttributeList = pAttrs;
+
+        PROCESS_INFORMATION pi;
+        memset(&pi, 0, sizeof(pi));
+
+        if (!CreateProcessAsUserA(hToken, NULL, sCmd, NULL, NULL, TRUE,
+            CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, NULL, NULL, &si.StartupInfo, &pi))
+        {
+            xloge("launcher: failed to start the elevated desktop helper: error(%lu)", GetLastError());
+            break;
+        }
+
+        CloseHandle(pi.hThread);
+        g_hElevHelper = pi.hProcess;
+
+        /* Hand the agent its ends. DUPLICATE_SAME_ACCESS from these full-access
+           handles is what grants the agent use of objects whose DACL would
+           otherwise keep it out - the handle, not the DACL, is the grant. */
+        HANDLE hAgentCmd = NULL, hAgentSection = NULL, hAgentReady = NULL, hAgentTaken = NULL;
+
+        if (!DuplicateHandle(GetCurrentProcess(), hCmdWrite, hAgent, &hAgentCmd, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
+            !DuplicateHandle(GetCurrentProcess(), hSection, hAgent, &hAgentSection, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
+            !DuplicateHandle(GetCurrentProcess(), hReady, hAgent, &hAgentReady, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
+            !DuplicateHandle(GetCurrentProcess(), hTaken, hAgent, &hAgentTaken, 0, FALSE, DUPLICATE_SAME_ACCESS))
+        {
+            xloge("launcher: failed to hand the helper channels to the agent: error(%lu)", GetLastError());
+
+            /* Nothing else holds a write end, so dropping ours is what tells
+               the helper to leave; without it StopHelper would sit out its wait. */
+            DirectGate_WinLauncher_CloseHandle(&hCmdWrite);
+            DirectGate_WinLauncher_StopHelper();
+            break;
+        }
+
+        pReady->nStatus = XSTDOK;
+        pReady->nSectionBytes = (uint32_t)nTotalBytes;
+        pReady->hCommand = (uint64_t)(uintptr_t)hAgentCmd;
+        pReady->hSection = (uint64_t)(uintptr_t)hAgentSection;
+        pReady->hFrameReady = (uint64_t)(uintptr_t)hAgentReady;
+        pReady->hFrameTaken = (uint64_t)(uintptr_t)hAgentTaken;
+        nStatus = XSTDOK;
+
+        xlogn("launcher: elevated desktop helper started: pid(%lu), session(%lu), slot(%ux%u)",
+            (unsigned long)pi.dwProcessId, (unsigned long)nSessionId, nSlotWidth, nSlotHeight);
+    } while (0);
+
+    DirectGate_WinLauncher_FreeHandleList(pAttrs);
+    DirectGate_WinLauncher_CloseHandle(&hToken);
+    DirectGate_WinLauncher_CloseHandle(&hSelfToken);
+    DirectGate_WinLauncher_CloseHandle(&hAgentInherit);
+    DirectGate_WinLauncher_CloseHandle(&hCmdRead);
+    DirectGate_WinLauncher_CloseHandle(&hCmdWrite);
+    DirectGate_WinLauncher_CloseHandle(&hSection);
+    DirectGate_WinLauncher_CloseHandle(&hReady);
+    DirectGate_WinLauncher_CloseHandle(&hTaken);
+
+    return nStatus;
+}
+
+/* Ctrl+Alt+Del. SendSAS only obeys a process running as LocalSystem under the
+   SCM, so the in-session helper cannot do this and the launcher must. */
+static void DirectGate_WinLauncher_SendSAS(void)
+{
+    typedef VOID (WINAPI *directgate_send_sas_fn)(BOOL);
+    static directgate_send_sas_fn pSendSAS = NULL;
+    static xbool_t bResolved = XFALSE;
+
+    if (!bResolved)
+    {
+        HMODULE hSas = LoadLibraryW(L"sas.dll");
+        if (hSas != NULL) pSendSAS = (directgate_send_sas_fn)(void*)GetProcAddress(hSas, "SendSAS");
+        bResolved = XTRUE;
+    }
+
+    if (pSendSAS == NULL)
+    {
+        xlogw("launcher: SendSAS is unavailable; Ctrl+Alt+Del cannot be injected");
+        return;
+    }
+
+    pSendSAS(FALSE);
+    xlogn("launcher: injected the secure attention sequence");
+}
+
+/* Serves one agent for as long as it lives. Ends when the agent closes its
+   write end (exit or shutdown), which is also the only way the loop stops. */
+static DWORD WINAPI DirectGate_WinLauncher_ElevThread(LPVOID pArg)
+{
+    directgate_win_elev_ctx_t ctx = *(directgate_win_elev_ctx_t*)pArg;
+    free(pArg);
+
+    uint8_t sPayload[DIRECTGATE_ELEV_MAX_PAYLOAD];
+    uint16_t nType = 0, nLength = 0;
+
+    while (DirectGate_Elevated_RecvRecord(g_hElevRequest, &nType, sPayload, &nLength))
+    {
+        if (!g_bElevEnabled)
+        {
+            xlogw("launcher: ignoring an elevated-UI request while the feature is disabled");
+            if (nType == DIRECTGATE_ELEV_MSG_HELPER_REQUEST)
+            {
+                directgate_elev_helper_ready_t ready;
+                memset(&ready, 0, sizeof(ready));
+                ready.nStatus = XSTDERR;
+
+                (void)DirectGate_Elevated_SendRecord(g_hElevReply, DIRECTGATE_ELEV_MSG_HELPER_READY,
+                    &ready, (uint16_t)sizeof(ready));
+            }
+
+            continue;
+        }
+
+        switch (nType)
+        {
+            case DIRECTGATE_ELEV_MSG_HELPER_REQUEST:
+            {
+                directgate_elev_helper_ready_t ready;
+                memset(&ready, 0, sizeof(ready));
+                ready.nStatus = XSTDERR;
+
+                if (nLength == (uint16_t)sizeof(directgate_elev_helper_req_t))
+                {
+                    directgate_elev_helper_req_t request;
+                    memcpy(&request, sPayload, sizeof(request));
+
+                    DirectGate_WinLauncher_StopHelper();
+                    (void)DirectGate_WinLauncher_SpawnHelper(ctx.hAgent, ctx.nAgentPid, request.nCaptureWidth, request.nCaptureHeight, &ready);
+                }
+
+                if (!DirectGate_Elevated_SendRecord(g_hElevReply, DIRECTGATE_ELEV_MSG_HELPER_READY, &ready, (uint16_t)sizeof(ready)))
+                {
+                    xlogw("launcher: failed to answer a helper request; agent channel is gone");
+                    DirectGate_WinLauncher_StopHelper();
+                    return 0;
+                }
+
+                break;
+            }
+
+            case DIRECTGATE_ELEV_MSG_HELPER_RELEASE:
+                DirectGate_WinLauncher_StopHelper();
+                break;
+
+            case DIRECTGATE_ELEV_MSG_SAS_REQUEST:
+                DirectGate_WinLauncher_SendSAS();
+                break;
+
+            default:
+                xlogd("launcher: ignoring unknown control record: type(%u), length(%u)", nType, nLength);
+                break;
+        }
+    }
+
+    DirectGate_WinLauncher_StopHelper();
+    return 0;
+}
+
+/* Called only once the agent process is gone. That is what unblocks the
+   servicing thread: the agent held the sole write end of the request pipe, so
+   its exit turns the thread's blocking read into a clean end-of-file. Joining
+   before closing matters - closing a handle a thread is parked in ReadFile on
+   is not something Windows defines. */
+static void DirectGate_WinLauncher_StopElevChannel(void)
+{
+    if (g_hElevThread != NULL)
+    {
+        if (WaitForSingleObject(g_hElevThread, 5000) != WAIT_OBJECT_0)
+        {
+            xlogw("launcher: control channel thread did not stop; leaking its handles");
+        }
+        else
+        {
+            DirectGate_WinLauncher_CloseHandle(&g_hElevRequest);
+            DirectGate_WinLauncher_CloseHandle(&g_hElevReply);
+        }
+
+        CloseHandle(g_hElevThread);
+        g_hElevThread = NULL;
+    }
+    else
+    {
+        DirectGate_WinLauncher_CloseHandle(&g_hElevRequest);
+        DirectGate_WinLauncher_CloseHandle(&g_hElevReply);
+    }
+
+    DirectGate_WinLauncher_StopHelper();
+}
+
 static BOOL WINAPI DirectGate_WinLauncher_CtrlHandler(DWORD nType)
 {
     switch (nType)
@@ -244,36 +678,107 @@ static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfg
         return XSTDERR;
     }
 
-    char sCmd[XPATH_MAX + 256];
-    xstrncpyf(sCmd, sizeof(sCmd), "\"%s\" -c \"%s\"", sSelf, pCfgPath);
+    /* Control channel for the elevated-UI bridge: two anonymous pipes the
+       agent inherits at spawn. Nothing about them is named, so the only
+       process that can ever reach the launcher through them is this child. */
+    HANDLE hReqRead = NULL, hReqWrite = NULL, hRspRead = NULL, hRspWrite = NULL;
+    LPPROC_THREAD_ATTRIBUTE_LIST pAttrs = NULL;
+
+    SECURITY_ATTRIBUTES sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    if (g_bElevEnabled)
+    {
+        if (!CreatePipe(&hReqRead, &hReqWrite, &sa, 0) ||
+            !CreatePipe(&hRspRead, &hRspWrite, &sa, 0))
+        {
+            xlogw("launcher: failed to create the agent control channel, elevated UI "
+                  "will be unavailable: error(%lu)", GetLastError());
+
+            DirectGate_WinLauncher_CloseHandle(&hReqRead);
+            DirectGate_WinLauncher_CloseHandle(&hReqWrite);
+            DirectGate_WinLauncher_CloseHandle(&hRspRead);
+            DirectGate_WinLauncher_CloseHandle(&hRspWrite);
+        }
+        else
+        {
+            HANDLE sHandles[2] = { hReqWrite, hRspRead };
+            pAttrs = DirectGate_WinLauncher_HandleList(sHandles, 2);
+        }
+    }
+
+    char sCmd[XPATH_MAX * 2 + 256];
+
+    if (pAttrs != NULL)
+    {
+        xstrncpyf(sCmd, sizeof(sCmd), "\"%s\" -c \"%s\" --win-ctl-write %llu --win-ctl-read %llu",
+            sSelf, pCfgPath, (unsigned long long)(uintptr_t)hReqWrite,
+            (unsigned long long)(uintptr_t)hRspRead);
+    }
+    else xstrncpyf(sCmd, sizeof(sCmd), "\"%s\" -c \"%s\"", sSelf, pCfgPath);
 
     /* Run with the user's environment so HOME/USERPROFILE/APPDATA
        resolve to shell.user, not the launcher's SYSTEM profile. */
     LPVOID pEnv = NULL;
     CreateEnvironmentBlock(&pEnv, hToken, FALSE);
 
-    STARTUPINFOA si;
+    STARTUPINFOEXA si;
     memset(&si, 0, sizeof(si));
-    si.cb = sizeof(si);
-    si.lpDesktop = (LPSTR)"winsta0\\default";
+    si.StartupInfo.cb = (pAttrs != NULL) ? (DWORD)sizeof(si) : (DWORD)sizeof(si.StartupInfo);
+    si.StartupInfo.lpDesktop = (LPSTR)"winsta0\\default";
+    si.lpAttributeList = pAttrs;
+
+    DWORD nFlags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+    if (pAttrs != NULL) nFlags |= EXTENDED_STARTUPINFO_PRESENT;
 
     PROCESS_INFORMATION pi;
     memset(&pi, 0, sizeof(pi));
 
-    BOOL bOk = CreateProcessAsUserA(hToken, NULL, sCmd, NULL, NULL, FALSE,
-        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, pEnv, NULL, &si, &pi);
+    BOOL bOk = CreateProcessAsUserA(hToken, NULL, sCmd, NULL, NULL,
+        (pAttrs != NULL) ? TRUE : FALSE, nFlags, pEnv, NULL, &si.StartupInfo, &pi);
 
-    if (pEnv != NULL)
-        DestroyEnvironmentBlock(pEnv);
+    if (pEnv != NULL) DestroyEnvironmentBlock(pEnv);
+    DirectGate_WinLauncher_FreeHandleList(pAttrs);
+
+    /* The child owns its ends now; keeping copies here would hide its exit
+       from the servicing thread's blocking read. */
+    DirectGate_WinLauncher_CloseHandle(&hReqWrite);
+    DirectGate_WinLauncher_CloseHandle(&hRspRead);
 
     if (!bOk)
     {
         xloge("launcher: failed to spawn agent as shell.user: error(%lu)", GetLastError());
+        DirectGate_WinLauncher_CloseHandle(&hReqRead);
+        DirectGate_WinLauncher_CloseHandle(&hRspWrite);
         return XSTDERR;
     }
 
     CloseHandle(pi.hThread);
     *phProcess = pi.hProcess;
+
+    if (hReqRead != NULL && hRspWrite != NULL)
+    {
+        directgate_win_elev_ctx_t *pCtx = (directgate_win_elev_ctx_t*)calloc(1, sizeof(*pCtx));
+        g_hElevRequest = hReqRead;
+        g_hElevReply = hRspWrite;
+
+        if (pCtx != NULL)
+        {
+            pCtx->hAgent = pi.hProcess;
+            pCtx->nAgentPid = pi.dwProcessId;
+            g_hElevThread = CreateThread(NULL, 0, DirectGate_WinLauncher_ElevThread, pCtx, 0, NULL);
+        }
+
+        if (g_hElevThread == NULL)
+        {
+            xlogw("launcher: failed to start the control channel thread: error(%lu)", GetLastError());
+            free(pCtx);
+            DirectGate_WinLauncher_CloseHandle(&g_hElevRequest);
+            DirectGate_WinLauncher_CloseHandle(&g_hElevReply);
+        }
+    }
 
     xlogn("launcher: started agent in shell.user session: pid(%lu)", pi.dwProcessId);
     return XSTDOK;
@@ -312,8 +817,22 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
     char sShellUser[XSTR_MID];
     xstrncpy(sShellUser, sizeof(sShellUser), cfg.sShellUser);
 
+    /* Elevated-UI policy is read here, not taken from the agent: the launcher
+       is the process that would act on it, so it must own the decision. */
+    g_bElevEnabled = cfg.desktop.bElevatedInput;
+    g_bElevLockScreen = cfg.desktop.bLockScreen;
+    xstrncpy(g_sElevCfgPath, sizeof(g_sElevCfgPath), pCfgPath);
+
+    /* Under the SCM there is no console, so without this every launcher and
+       helper diagnostic is lost - including the ones that explain why
+       privileged UI is not reachable. A separate ident keeps the file apart
+       from the agent's own log. */
+    xstrncpy(cfg.log.sIdent, sizeof(cfg.log.sIdent), "directgate-launcher");
+    DirectGate_LogApply(&cfg.log);
+
     SetConsoleCtrlHandler(DirectGate_WinLauncher_CtrlHandler, TRUE);
-    xlogn("launcher: supervising agent for shell.user(%s)", sShellUser);
+    xlogn("launcher: supervising agent for shell.user(%s), elevatedInput(%s), lockScreen(%s)",
+        sShellUser, g_bElevEnabled ? "on" : "off", g_bElevLockScreen ? "on" : "off");
 
     HANDLE hAgent = NULL;
     uint64_t nLastSpawnMs = 0;
@@ -363,8 +882,12 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
         DWORD nWait = WaitForSingleObject(hAgent, DIRECTGATE_WIN_LAUNCHER_POLL_MS);
         if (nWait == WAIT_OBJECT_0)
         {
+            /* Tear the bridge down before the handle goes: no agent means no
+               reason for a SYSTEM process to be injecting input. */
+            DirectGate_WinLauncher_StopElevChannel();
             CloseHandle(hAgent);
             hAgent = NULL;
+
             xlogn("launcher: agent exited; will restart when shell.user is logged on");
         }
     }
@@ -375,6 +898,9 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
            sessions already tolerate an abrupt agent exit like a logoff. */
         TerminateProcess(hAgent, 0);
         WaitForSingleObject(hAgent, 5000);
+
+        /* After the agent is gone, so the servicing thread's read has ended. */
+        DirectGate_WinLauncher_StopElevChannel();
         CloseHandle(hAgent);
     }
 
@@ -442,17 +968,47 @@ XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[])
     xbool_t bWinLauncher = XFALSE;
     xbool_t bWinService = XFALSE;
     const char *pWinCfg = NULL;
+    HANDLE hCtlRead = NULL, hCtlWrite = NULL;
     int i, nFiltered = XSTDNON;
+
+    /* The in-session SYSTEM desktop helper shares this executable but none of
+       the agent: it reads only the log section of the config, never opens a
+       socket and never parses a protocol message. Dispatch before anything
+       else so none of the agent's start-up runs in a SYSTEM process. */
+    for (i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], DIRECTGATE_ELEV_HELPER_FLAG) == 0)
+            return DirectGate_Elevated_HelperMain(argc, argv);
+    }
 
     for (i = 0; i < argc && nFiltered < (int)XARR_SIZE(pFilteredArgv) - 1; i++)
     {
         if (strcmp(argv[i], DIRECTGATE_WIN_LAUNCHER_FLAG) == 0) { bWinLauncher = XTRUE; continue; }
         if (strcmp(argv[i], DIRECTGATE_WIN_SERVICE_FLAG) == 0) { bWinService = XTRUE; continue; }
+
+        /* Control-channel handles the launcher inherited into this process.
+           Stripped here so no other option parser has to know about them. */
+        if (strcmp(argv[i], "--win-ctl-read") == 0 && i + 1 < argc)
+        {
+            hCtlRead = (HANDLE)(uintptr_t)strtoull(argv[++i], NULL, 0);
+            continue;
+        }
+
+        if (strcmp(argv[i], "--win-ctl-write") == 0 && i + 1 < argc)
+        {
+            hCtlWrite = (HANDLE)(uintptr_t)strtoull(argv[++i], NULL, 0);
+            continue;
+        }
+
         if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) pWinCfg = argv[i + 1];
         pFilteredArgv[nFiltered++] = argv[i];
     }
 
     pFilteredArgv[nFiltered] = NULL;
+
+    /* Called even when there are no handles: this is also what initialises the
+       bridge's own state and records why it is unavailable. */
+    DirectGate_Elevated_SetControlChannel(hCtlRead, hCtlWrite);
 
     if (bWinService)
     {
@@ -484,4 +1040,5 @@ XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[])
 
     return DirectGate_RunAgent(nFiltered, pFilteredArgv);
 }
+
 #endif /* _WIN32 */

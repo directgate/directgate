@@ -374,8 +374,14 @@ if(WIN32)
     # user32/gdi32: monitors, SendInput, BitBlt. d3d11/dxgi: duplication.
     # ole32/oleaut32: COM apartment + VARIANT for ICodecAPI.
     # uuid/mfuuid/strmiids/dxguid: interface and media type GUIDs.
+    # desktop/elevated.c carries both halves of the elevated-UI bridge: the
+    # agent-side client and the SYSTEM helper the launcher spawns into the
+    # interactive session (--win-desktop-helper), which is what makes UAC
+    # prompts, elevated windows and the lock screen reachable remotely.
+    # wtsapi32: session lock state for the injection gate.
     target_sources(directgate PRIVATE
         ${AGENT_DIR}/desktop/desktop_win.c
+        ${AGENT_DIR}/desktop/elevated.c
         ${AGENT_DIR}/desktop/mfenc.c
         ${AGENT_DIR}/yuv.c)
     # System-audio streaming: Opus encoder (opus.c) + the cross-platform
