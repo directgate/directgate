@@ -24,30 +24,77 @@
 #include "desktop.h"
 #include "session.h"
 #include "openh264.h"
+#include "hwenc.h"
+#include "priv.h"
 #include "yuv.h"
 
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/timerfd.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XShm.h>
-
-/* Counterpart of desktop_mac.m: desktop.c drives this pipeline from the
- * main loop. Unlike ScreenCaptureKit there is no push-style capture on
- * Linux, so everything runs synchronously per timer tick:
- *
- *   timerfd tick -> XShmGetImage -> normalize/scale BGRA -> unchanged-frame
- *   check -> BGRA->I420 -> OpenH264 -> DirectGate_Desktop_SendEncodedFrame
- *
- * Keeping the pipeline on the main loop means no locking, and the existing
- * WebRTC backpressure guard naturally turns into an adaptive frame rate. */
 
 /* Consecutive capture/encode failures before the pipeline reports itself
  * broken and desktop.c falls back to raw RGBA (~1s at 30 fps). */
 #define DIRECTGATE_X11ENC_MAX_FAILURES 30U
 
+/* Consecutive GPU encode failures before giving up on the GPU for this
+ * pipeline and continuing on the CPU. Deliberately generous: the software
+ * encoder is a visible quality drop that lasts until the pipeline is
+ * rebuilt, so it must answer a GPU that is genuinely broken, not one that
+ * stuttered for a couple of frames. */
+#define DIRECTGATE_X11ENC_MAX_HW_FAILURES 30U
+
+/* Poll interval while the mailbox is still occupied or the data channel is
+ * backed up. Linux nanosleep honours this granularity, so it costs at most
+ * half a millisecond of extra latency on a busy hand-off. */
+#define DIRECTGATE_X11ENC_BUSY_WAIT_US 500ULL
+
+/* How long a keyframe is allowed to keep settling on a screen that has gone
+ * still. Only reached after an actual keyframe, so an idle desktop costs
+ * nothing until one happens; see the reasoning where it is armed. */
+#define DIRECTGATE_X11ENC_REFINE_MS    1500U
+
+/* A frame that sat in the mailbox longer than this never goes on the wire
+ * (see DrainMain). */
+#define DIRECTGATE_X11ENC_MIN_AGE_US   50000ULL
+
+/* Cross-thread control flags. Taking a request is a read-modify-write on
+ * both sides, so plain volatile is not enough: the worker's "handled" store
+ * could clobber a request the main loop raised while the encoder was still
+ * running, and a lost keyframe request means the viewer stares at a broken
+ * picture until the next PLI. desktop_win.c uses InterlockedExchange for
+ * exactly this; these builtins are the gcc/clang equivalent. */
+#define DIRECTGATE_X11ENC_LOAD(pFlag)       __atomic_load_n((pFlag), __ATOMIC_ACQUIRE)
+#define DIRECTGATE_X11ENC_SET(pFlag, nVal)  __atomic_store_n((pFlag), (nVal), __ATOMIC_RELEASE)
+#define DIRECTGATE_X11ENC_TAKE(pFlag)       __atomic_exchange_n((pFlag), 0, __ATOMIC_ACQ_REL)
+
+/* True while the GPU encoder is the active backend. Collapses to XFALSE on
+ * builds without libavcodec headers so the call sites stay #ifdef-free. */
+#ifdef DIRECTGATE_HAVE_HWENC
+#define DIRECTGATE_X11ENC_HAS_HW(pEnc)  ((pEnc)->pHwEncoder != NULL ? XTRUE : XFALSE)
+#else
+#define DIRECTGATE_X11ENC_HAS_HW(pEnc)  (XFALSE)
+#endif
+
 typedef struct directgate_x11enc_ {
+    directgate_session_t *pSession;   /* backpressure checks only */
+    directgate_desktop_t *pDesktop;
+
+    /* Exactly one of these is live. The GPU encoder is preferred and the
+     * software one is the guaranteed fallback: if no GPU encoder opens - or
+     * a live one starts failing - the session keeps streaming on the CPU
+     * rather than losing desktop mode. */
     directgate_openh264_t *pEncoder;
+#ifdef DIRECTGATE_HAVE_HWENC
+    directgate_hwenc_t *pHwEncoder;
+    xbool_t bHwDisabled;              /* GPU gave up for good; stay on the CPU */
+    uint32_t nHwFailures;             /* consecutive GPU encode failures */
+#endif
+
+    /* Private X11 connection owned by the capture thread. */
+    Display *pDisplay;
 
     /* XShm-backed capture image; NULL when the slow XGetImage path is used
      * (e.g. remote DISPLAY where MIT-SHM is not usable). */
@@ -72,12 +119,45 @@ typedef struct directgate_x11enc_ {
     uint8_t *pCaptureBGRA;  /* capture-size BGRA; only allocated when scaling */
     uint8_t *pFrameBGRA;    /* encode-size BGRA fed into the converter */
     uint8_t *pPrevBGRA;     /* previous encode-size BGRA for change detection */
-    uint8_t *pI420;         /* encode-size planar YUV for the encoder */
+    /* OpenH264 takes planar I420, every GPU encoder takes NV12; only the
+     * plane buffer for the active encoder is allocated. */
+    uint8_t *pI420;
+    uint8_t *pNV12;
     xbool_t bHavePrev;
-    xbool_t bForceKeyframe;
-    uint32_t nFailures;
+    uint32_t nRefineLeft;   /* frames still owed to a settling keyframe */
     uint64_t nStartUs;
-    xbyte_buffer_t encoded;
+    xbyte_buffer_t encoded; /* encoder output scratch (capture thread) */
+
+    /* Thread control. The main loop only touches the flags below, the
+     * mailbox, and nFailures; everything else belongs to the worker. All of
+     * these are accessed through the atomic helpers above. */
+    xthread_t thread;
+    xbool_t bThreadRunning;
+    uint32_t bStop;
+    uint32_t bForceKeyframe;
+    uint32_t bApplyQuality;       /* preset knobs waiting for the worker */
+    uint32_t nPendingBitrateKbps; /* 0 = no pending step */
+    uint32_t nFailures;
+
+    /* Duplicate of the session's desktop timerfd. dup(2) shares the timer
+     * itself, so re-arming this descriptor wakes the event loop exactly
+     * like the periodic tick does - and because the worker owns the
+     * descriptor, the event loop closing its own copy can never turn this
+     * into a write to a recycled fd. */
+    int nWakeFd;
+
+    /* Single-slot mailbox: capture thread (producer) -> main loop
+     * (consumer). Buffers are swapped under the lock, never copied. */
+    xsync_mutex_t lock;
+    xbyte_buffer_t mailbox;
+    xbyte_buffer_t drain;
+    uint32_t nMailboxWidth;
+    uint32_t nMailboxHeight;
+    xbool_t bMailboxKeyframe;
+    uint64_t nMailboxPtsUs;
+    uint64_t nMailboxCapturedUs;
+    xbool_t bMailboxHasFrame;
+
     char sLastError[DIRECTGATE_DESKTOP_REASON_LEN];
 } directgate_x11enc_t;
 
@@ -227,8 +307,10 @@ static void DirectGate_Desktop_X11Enc_Normalize(const directgate_x11enc_t *pEnc,
     }
 }
 
-static void DirectGate_Desktop_X11Enc_TeardownShm(directgate_x11enc_t *pEnc, Display *pDisplay)
+static void DirectGate_Desktop_X11Enc_TeardownShm(directgate_x11enc_t *pEnc)
 {
+    Display *pDisplay = pEnc->pDisplay;
+
     if (pEnc->bShmAttached)
     {
         if (pDisplay != NULL)
@@ -299,18 +381,46 @@ static int DirectGate_Desktop_X11Enc_SetupShm(directgate_x11enc_t *pEnc, Display
     return XSTDOK;
 }
 
-static void DirectGate_Desktop_X11Enc_Free(directgate_x11enc_t *pEnc, Display *pDisplay)
+static void DirectGate_Desktop_X11Enc_Free(directgate_x11enc_t *pEnc)
 {
     XCHECK_VOID_NL((pEnc != NULL));
 
-    DirectGate_Desktop_X11Enc_TeardownShm(pEnc, pDisplay);
+    if (pEnc->bThreadRunning)
+    {
+        DIRECTGATE_X11ENC_SET(&pEnc->bStop, 1U);
+        XThread_Join(&pEnc->thread);
+        pEnc->bThreadRunning = XFALSE;
+    }
+
+    DirectGate_Desktop_X11Enc_TeardownShm(pEnc);
     DirectGate_OpenH264_Destroy(pEnc->pEncoder);
+
+#ifdef DIRECTGATE_HAVE_HWENC
+    DirectGate_HWEnc_Destroy(pEnc->pHwEncoder);
+#endif
+
+    if (pEnc->pDisplay != NULL)
+    {
+        XCloseDisplay(pEnc->pDisplay);
+        pEnc->pDisplay = NULL;
+    }
+
+    if (pEnc->nWakeFd >= 0)
+    {
+        close(pEnc->nWakeFd);
+        pEnc->nWakeFd = -1;
+    }
+
+    XSync_Destroy(&pEnc->lock);
     XByteBuffer_Clear(&pEnc->encoded);
+    XByteBuffer_Clear(&pEnc->mailbox);
+    XByteBuffer_Clear(&pEnc->drain);
 
     free(pEnc->pCaptureBGRA);
     free(pEnc->pFrameBGRA);
     free(pEnc->pPrevBGRA);
     free(pEnc->pI420);
+    free(pEnc->pNV12);
     free(pEnc);
 }
 
@@ -320,8 +430,10 @@ void DirectGate_Desktop_LinuxEncoder_StopDesktop(directgate_desktop_t *pDesktop)
     directgate_x11enc_t *pEnc = DirectGate_Desktop_X11Enc(pDesktop);
     if (pEnc == NULL) return;
 
+    /* Detach first: the join below runs on the main loop, and nothing must
+     * be able to reach a half-freed pipeline in the meantime. */
     pDesktop->pEncoder = NULL;
-    DirectGate_Desktop_X11Enc_Free(pEnc, (Display*)pDesktop->pDisplay);
+    DirectGate_Desktop_X11Enc_Free(pEnc);
 }
 
 void DirectGate_Desktop_LinuxEncoder_Stop(directgate_session_t *pSession)
@@ -330,16 +442,346 @@ void DirectGate_Desktop_LinuxEncoder_Stop(directgate_session_t *pSession)
     DirectGate_Desktop_LinuxEncoder_StopDesktop(&pSession->desktop);
 }
 
+static void DirectGate_Desktop_X11Enc_SleepUs(uint64_t nUs)
+{
+    struct timespec delay;
+    delay.tv_sec = (time_t)(nUs / 1000000ULL);
+    delay.tv_nsec = (long)((nUs % 1000000ULL) * 1000ULL);
+    nanosleep(&delay, NULL);
+}
+
+/* Wakes the agent event loop so it drains the mailbox now instead of at the
+ * next periodic tick. Re-arming the timerfd is the only cross-thread signal
+ * available here (a timerfd cannot be written to), and it is exactly what
+ * the loop already waits on. it_interval is restated so the periodic
+ * heartbeat survives, re-anchored to this frame - which is the behaviour we
+ * want anyway: "wake on a frame, or after one frame period of silence". */
+static void DirectGate_Desktop_X11Enc_WakeMainLoop(const directgate_x11enc_t *pEnc, uint32_t nFps)
+{
+    if (pEnc->nWakeFd < 0) return;
+    uint64_t nNs = 1000000000ULL / (nFps ? nFps : DIRECTGATE_DESKTOP_DEFAULT_FPS);
+
+    struct itimerspec spec;
+    memset(&spec, 0, sizeof(spec));
+    spec.it_interval.tv_sec = (time_t)(nNs / 1000000000ULL);
+    spec.it_interval.tv_nsec = (long)(nNs % 1000000000ULL);
+    spec.it_value.tv_sec = 0;
+    spec.it_value.tv_nsec = 1; /* fire immediately */
+
+    (void)timerfd_settime(pEnc->nWakeFd, 0, &spec, NULL);
+}
+
+static xbool_t DirectGate_Desktop_X11Enc_MailboxBusy(directgate_x11enc_t *pEnc)
+{
+    XSync_Lock(&pEnc->lock);
+    xbool_t bBusy = pEnc->bMailboxHasFrame;
+    XSync_Unlock(&pEnc->lock);
+    return bBusy;
+}
+
+/* Applies the control steps the main loop marshalled to this thread.
+ * OpenH264's SetOption is not safe to call concurrently with EncodeFrame,
+ * so the bitrate controller only ever leaves a pending value behind. */
+static void DirectGate_Desktop_X11Enc_ApplyPendingControls(directgate_x11enc_t *pEnc)
+{
+    xbool_t bApplyQuality = DIRECTGATE_X11ENC_TAKE(&pEnc->bApplyQuality) ? XTRUE : XFALSE;
+    uint32_t nBitrateKbps = DIRECTGATE_X11ENC_TAKE(&pEnc->nPendingBitrateKbps);
+
+#ifdef DIRECTGATE_HAVE_HWENC
+    if (pEnc->pHwEncoder != NULL)
+    {
+        if (bApplyQuality) DirectGate_HWEnc_ApplyQuality(pEnc->pHwEncoder, &pEnc->pDesktop->quality);
+        else if (nBitrateKbps) DirectGate_HWEnc_SetBitrate(pEnc->pHwEncoder, nBitrateKbps);
+        return;
+    }
+#endif
+
+    if (bApplyQuality) DirectGate_OpenH264_ApplyQuality(pEnc->pEncoder, &pEnc->pDesktop->quality);
+    if (nBitrateKbps) DirectGate_OpenH264_SetBitrate(pEnc->pEncoder, nBitrateKbps);
+}
+
+/* Allocates the plane buffer the active encoder consumes. Called whenever
+ * the encoder backend changes, including the mid-session GPU -> CPU
+ * fallback. */
+static int DirectGate_Desktop_X11Enc_AllocPlanes(directgate_x11enc_t *pEnc)
+{
+    size_t nPlaneBytes = (size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight * 3U / 2U;
+
+#ifdef DIRECTGATE_HAVE_HWENC
+    if (pEnc->pHwEncoder != NULL)
+    {
+        if (pEnc->pNV12 == NULL) pEnc->pNV12 = (uint8_t*)malloc(nPlaneBytes);
+        return (pEnc->pNV12 != NULL) ? XSTDOK : XSTDERR;
+    }
+#endif
+
+    if (pEnc->pI420 == NULL) pEnc->pI420 = (uint8_t*)malloc(nPlaneBytes);
+    return (pEnc->pI420 != NULL) ? XSTDOK : XSTDERR;
+}
+
+#ifdef DIRECTGATE_HAVE_HWENC
+/* Drops the GPU encoder and continues on the CPU. The viewer keeps its
+ * session: a GPU that stops accepting frames (driver reset, suspend/resume,
+ * another process taking the encode engine) must degrade the picture, not
+ * end desktop mode. Latched so a broken GPU is not retried every frame. */
+static int DirectGate_Desktop_X11Enc_FallBackToSoftware(directgate_x11enc_t *pEnc)
+{
+    xlogw("GPU H.264 encoder failed, falling back to the software encoder: sid(%u), encoder(%s)",
+        pEnc->pDesktop->nSessionId, DirectGate_HWEnc_Describe(pEnc->pHwEncoder));
+
+    DirectGate_HWEnc_Destroy(pEnc->pHwEncoder);
+    pEnc->pHwEncoder = NULL;
+    pEnc->bHwDisabled = XTRUE;
+
+    char sError[DIRECTGATE_DESKTOP_REASON_LEN] = { 0 };
+    pEnc->pEncoder = DirectGate_OpenH264_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
+        &pEnc->pDesktop->quality, sError, sizeof(sError));
+
+    if (pEnc->pEncoder == NULL || DirectGate_Desktop_X11Enc_AllocPlanes(pEnc) != XSTDOK)
+    {
+        DirectGate_Desktop_X11Enc_SetError(pEnc, NULL,
+            sError[0] ? sError : "Software H.264 encoder unavailable after GPU failure.");
+
+        return XSTDERR;
+    }
+
+    /* New encoder, new reference chain. */
+    DIRECTGATE_X11ENC_SET(&pEnc->bForceKeyframe, 1U);
+    return XSTDOK;
+}
+#endif
+
+/* Converts the captured BGRA into whatever the active encoder wants and
+ * encodes it. Returns the encoder's XSTDOK/XSTDNON/XSTDERR verdict. */
+static int DirectGate_Desktop_X11Enc_Encode(directgate_x11enc_t *pEnc,
+                                            uint64_t nPtsUs,
+                                            xbool_t bForceKeyframe,
+                                            xbool_t *pKeyframe)
+{
+    uint32_t nWidth = pEnc->nEncodeWidth;
+    uint32_t nHeight = pEnc->nEncodeHeight;
+
+#ifdef DIRECTGATE_HAVE_HWENC
+    if (pEnc->pHwEncoder != NULL)
+    {
+        DirectGate_YUV_BGRAToNV12(pEnc->pNV12, pEnc->pNV12 + (size_t)nWidth * nHeight,
+            pEnc->pFrameBGRA, nWidth, nHeight);
+
+        int nStatus = DirectGate_HWEnc_Encode(pEnc->pHwEncoder, pEnc->pNV12,
+            nPtsUs, bForceKeyframe, &pEnc->encoded, pKeyframe);
+
+        if (nStatus != XSTDERR)
+        {
+            pEnc->nHwFailures = 0;
+            return nStatus;
+        }
+
+        /* A GPU encoder hiccups for reasons that pass: the surface pool is
+         * momentarily drained, the driver is busy, a compositor grabbed the
+         * encode engine. Abandoning the GPU on the first error would drop
+         * the whole session onto the software encoder - visibly worse, and
+         * latched until the pipeline is rebuilt - so only a sustained
+         * failure counts. Skipping the frame is safe: nothing reached the
+         * encoder, so its reference chain is intact. */
+        if (++pEnc->nHwFailures < DIRECTGATE_X11ENC_MAX_HW_FAILURES)
+        {
+            xlogd("GPU frame encode failed, retrying on the GPU: sid(%u), failures(%u)",
+                pEnc->pDesktop->nSessionId, pEnc->nHwFailures);
+
+            return XSTDNON;
+        }
+
+        /* Retry this frame on the CPU so the fallback costs no visible gap. */
+        if (DirectGate_Desktop_X11Enc_FallBackToSoftware(pEnc) != XSTDOK) return XSTDERR;
+        bForceKeyframe = XTRUE;
+    }
+#endif
+
+    DirectGate_YUV_BGRAToI420(pEnc->pI420,
+        pEnc->pI420 + (size_t)nWidth * nHeight,
+        pEnc->pI420 + (size_t)nWidth * nHeight * 5U / 4U,
+        pEnc->pFrameBGRA, nWidth, nHeight);
+
+    return DirectGate_OpenH264_Encode(pEnc->pEncoder, pEnc->pI420,
+        nPtsUs, bForceKeyframe, &pEnc->encoded, pKeyframe);
+}
+
+/* One capture -> convert -> encode -> publish pass. Runs on the worker. */
+static void DirectGate_Desktop_X11Enc_CaptureFrame(directgate_x11enc_t *pEnc, uint32_t nFps)
+{
+    Display *pDisplay = pEnc->pDisplay;
+    XImage *pImage = NULL;
+
+    if (pEnc->pShmImage != NULL)
+    {
+        if (XShmGetImage(pDisplay, DefaultRootWindow(pDisplay), pEnc->pShmImage,
+            pEnc->nCaptureX, pEnc->nCaptureY, AllPlanes)) pImage = pEnc->pShmImage;
+    }
+    else
+    {
+        pImage = XGetImage(pDisplay, DefaultRootWindow(pDisplay),
+            pEnc->nCaptureX, pEnc->nCaptureY,
+            pEnc->nCaptureWidth, pEnc->nCaptureHeight, AllPlanes, ZPixmap);
+    }
+
+    if (pImage == NULL)
+    {
+        uint32_t nFailures = __atomic_add_fetch(&pEnc->nFailures, 1U, __ATOMIC_ACQ_REL);
+        xlogw("Failed to capture X11 frame: sid(%u), failures(%u)", pEnc->pDesktop->nSessionId, nFailures);
+
+        return;
+    }
+
+    uint64_t nCapturedUs = DirectGate_Desktop_X11Enc_MonotonicUs();
+
+    /* Normalize into BGRA, scaling to the encode size when needed. */
+    if (pEnc->pCaptureBGRA != NULL)
+    {
+        DirectGate_Desktop_X11Enc_Normalize(pEnc, pImage, pEnc->pCaptureBGRA);
+        DirectGate_YUV_ScaleBGRA(pEnc->pFrameBGRA, pEnc->nEncodeWidth, pEnc->nEncodeHeight,
+            pEnc->pCaptureBGRA, pEnc->nCaptureWidth, pEnc->nCaptureHeight,
+            (size_t)pEnc->nCaptureWidth * 4U);
+    }
+    else
+    {
+        DirectGate_Desktop_X11Enc_Normalize(pEnc, pImage, pEnc->pFrameBGRA);
+    }
+
+    if (pImage != pEnc->pShmImage) XDestroyImage(pImage);
+
+    /* Idle desktops are the common case for a remote-admin agent: skip the
+     * whole convert+encode+send pass when nothing changed on screen. A
+     * pending keyframe request always goes through (new viewer / PLI). */
+    size_t nFrameBytes = (size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight * 4U;
+
+    /* Claim the pending request now: any request raised from here on is a
+     * new one and stays pending for the next pass. */
+    xbool_t bForceKeyframe = DIRECTGATE_X11ENC_TAKE(&pEnc->bForceKeyframe) ? XTRUE : XFALSE;
+
+    if (!bForceKeyframe && pEnc->bHavePrev &&
+        memcmp(pEnc->pFrameBGRA, pEnc->pPrevBGRA, nFrameBytes) == 0)
+    {
+        /* Nothing changed. Normally that ends the pass - but not while a
+         * keyframe is still settling (see nRefineLeft). */
+        if (pEnc->nRefineLeft == 0) return;
+        pEnc->nRefineLeft--;
+    }
+
+    uint64_t nPtsUs = nCapturedUs - pEnc->nStartUs;
+    xbool_t bKeyframe = XFALSE;
+
+    int nStatus = DirectGate_Desktop_X11Enc_Encode(pEnc, nPtsUs, bForceKeyframe, &bKeyframe);
+
+    if (nStatus == XSTDERR)
+    {
+        __atomic_add_fetch(&pEnc->nFailures, 1U, __ATOMIC_ACQ_REL);
+        DirectGate_Desktop_X11Enc_SetError(pEnc, NULL, "OpenH264 frame encoding failed.");
+
+        if (bForceKeyframe) DIRECTGATE_X11ENC_SET(&pEnc->bForceKeyframe, 1U);
+        return;
+    }
+
+    DIRECTGATE_X11ENC_SET(&pEnc->nFailures, 0U);
+
+    if (nStatus == XSTDNON)
+    {
+        /* Rate controller skipped the frame: the request was not answered. */
+        if (bForceKeyframe) DIRECTGATE_X11ENC_SET(&pEnc->bForceKeyframe, 1U);
+        return;
+    }
+
+    /* Keep asking until the encoder actually emits an IDR. */
+    if (bForceKeyframe && !bKeyframe) DIRECTGATE_X11ENC_SET(&pEnc->bForceKeyframe, 1U);
+
+    if (bKeyframe)
+    {
+        uint32_t nRefine = (nFps ? nFps : DIRECTGATE_DESKTOP_DEFAULT_FPS) *
+            DIRECTGATE_X11ENC_REFINE_MS / 1000U;
+
+        pEnc->nRefineLeft = nRefine ? nRefine : 1U;
+    }
+
+    /* Remember what was sent for the next unchanged-frame check. */
+    uint8_t *pSwap = pEnc->pPrevBGRA;
+    pEnc->pPrevBGRA = pEnc->pFrameBGRA;
+    pEnc->pFrameBGRA = pSwap;
+    pEnc->bHavePrev = XTRUE;
+
+    /* Publish: swap the encoded scratch into the mailbox slot (no copy). */
+    XSync_Lock(&pEnc->lock);
+    xbyte_buffer_t swap = pEnc->mailbox;
+    pEnc->mailbox = pEnc->encoded;
+    pEnc->encoded = swap;
+    pEnc->encoded.nUsed = 0;
+    pEnc->nMailboxWidth = pEnc->nEncodeWidth;
+    pEnc->nMailboxHeight = pEnc->nEncodeHeight;
+    pEnc->bMailboxKeyframe = bKeyframe;
+    pEnc->nMailboxPtsUs = nPtsUs;
+    pEnc->nMailboxCapturedUs = DirectGate_Desktop_X11Enc_MonotonicUs();
+    pEnc->bMailboxHasFrame = XTRUE;
+    XSync_Unlock(&pEnc->lock);
+
+    DirectGate_Desktop_X11Enc_WakeMainLoop(pEnc, nFps);
+}
+
+static void* DirectGate_Desktop_X11Enc_Worker(void *pArg)
+{
+    directgate_x11enc_t *pEnc = (directgate_x11enc_t*)pArg;
+    XCHECK((pEnc != NULL), NULL);
+
+    uint64_t nNextDueUs = DirectGate_Desktop_X11Enc_MonotonicUs();
+
+    while (!DIRECTGATE_X11ENC_LOAD(&pEnc->bStop))
+    {
+        /* Read the rate live: a set-preset control message changes fps
+         * without rebuilding the encoder. */
+        uint32_t nFps = pEnc->pDesktop->quality.nFps;
+        if (!nFps) nFps = DIRECTGATE_DESKTOP_DEFAULT_FPS;
+        uint64_t nIntervalUs = 1000000ULL / nFps;
+
+        DirectGate_Desktop_X11Enc_ApplyPendingControls(pEnc);
+
+        /* Mailbox still occupied or transport backed up: skip the capture
+         * entirely. Nothing entered the encoder, so its reference chain is
+         * untouched and no keyframe is needed on resume. */
+        if (DirectGate_Desktop_X11Enc_MailboxBusy(pEnc) ||
+            DirectGate_Desktop_ShouldSkipForBackpressure(pEnc->pSession))
+        {
+            DirectGate_Desktop_X11Enc_SleepUs(DIRECTGATE_X11ENC_BUSY_WAIT_US);
+            continue;
+        }
+
+        uint64_t nNowUs = DirectGate_Desktop_X11Enc_MonotonicUs();
+        if (nNextDueUs > nNowUs)
+        {
+            /* Bound the sleep by one frame period so a stop request is
+             * observed promptly even on the slowest preset. */
+            uint64_t nWaitUs = nNextDueUs - nNowUs;
+            if (nWaitUs > nIntervalUs) nWaitUs = nIntervalUs;
+
+            DirectGate_Desktop_X11Enc_SleepUs(nWaitUs);
+            if (DIRECTGATE_X11ENC_LOAD(&pEnc->bStop)) break;
+            nNowUs = DirectGate_Desktop_X11Enc_MonotonicUs();
+        }
+
+        nNextDueUs = (nNextDueUs + nIntervalUs > nNowUs) ?
+            nNextDueUs + nIntervalUs : nNowUs + nIntervalUs;
+
+        DirectGate_Desktop_X11Enc_CaptureFrame(pEnc, nFps);
+    }
+
+    return NULL;
+}
+
 int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
                                           int32_t nX, int32_t nY,
                                           uint32_t nWidth, uint32_t nHeight)
 {
     XCHECK((pSession != NULL), XSTDERR);
     directgate_desktop_t *pDesktop = &pSession->desktop;
-    Display *pDisplay = (Display*)pDesktop->pDisplay;
     DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
 
-    if (pDisplay == NULL || nWidth == 0 || nHeight == 0)
+    if (pDesktop->pDisplay == NULL || nWidth == 0 || nHeight == 0)
     {
         DirectGate_Desktop_X11Enc_SetError(NULL, pDesktop, "Empty X11 capture rectangle.");
         return XSTDERR;
@@ -353,38 +795,80 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     }
 
     XByteBuffer_Init(&pEnc->encoded, XSTDNON, XFALSE);
+    XByteBuffer_Init(&pEnc->mailbox, XSTDNON, XFALSE);
+    XByteBuffer_Init(&pEnc->drain, XSTDNON, XFALSE);
+    XSync_Init(&pEnc->lock);
+
+    pEnc->pSession = pSession;
+    pEnc->pDesktop = pDesktop;
+    pEnc->nWakeFd = -1;
     pEnc->nCaptureX = nX;
     pEnc->nCaptureY = nY;
     pEnc->nCaptureWidth = nWidth;
     pEnc->nCaptureHeight = nHeight;
 
-    DirectGate_Desktop_X11Enc_PickSize(pDesktop, nWidth, nHeight, &pEnc->nEncodeWidth, &pEnc->nEncodeHeight);
-
-    char sError[DIRECTGATE_DESKTOP_REASON_LEN] = {0};
-    pEnc->pEncoder = DirectGate_OpenH264_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
-                                                &pDesktop->quality, sError, sizeof(sError));
-    if (pEnc->pEncoder == NULL)
+    /* The worker must not share the main loop's Xlib connection: input
+     * injection runs on that one from the event loop. */
+    pEnc->pDisplay = XOpenDisplay(xstrused(pDesktop->sDisplay) ? pDesktop->sDisplay : NULL);
+    if (pEnc->pDisplay == NULL)
     {
         DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop,
-            sError[0] ? sError : "OpenH264 encoder initialization failed.");
+            "Failed to open a second X11 connection for the capture thread.");
 
-        DirectGate_Desktop_X11Enc_Free(pEnc, pDisplay);
+        DirectGate_Desktop_X11Enc_Free(pEnc);
         return XSTDERR;
+    }
+
+    Display *pDisplay = pEnc->pDisplay;
+
+    DirectGate_Desktop_X11Enc_PickSize(pDesktop, nWidth, nHeight, &pEnc->nEncodeWidth, &pEnc->nEncodeHeight);
+
+    /* The preset's bitrate assumes a ~1080p encode; streaming a much larger
+     * monitor at its native size needs proportionally more to stay readable. */
+    DirectGate_Desktop_ApplyBitrateForSize(pDesktop, pEnc->nEncodeWidth, pEnc->nEncodeHeight);
+
+    /* GPU encoder first; the CPU encoder is the guaranteed fallback so a
+     * host with no usable GPU keeps full desktop functionality. */
+    char sError[DIRECTGATE_DESKTOP_REASON_LEN] = {0};
+
+#ifdef DIRECTGATE_HAVE_HWENC
+    char sHwError[DIRECTGATE_DESKTOP_REASON_LEN] = {0};
+    pEnc->pHwEncoder = DirectGate_HWEnc_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
+                                               &pDesktop->quality, sHwError, sizeof(sHwError));
+    if (pEnc->pHwEncoder == NULL)
+    {
+        xlogi("No GPU H.264 encoder available, using the software encoder: sid(%u), reason(%s)",
+            pSession->nSessionId, sHwError[0] ? sHwError : "unknown");
+    }
+#endif
+
+    if (DIRECTGATE_X11ENC_HAS_HW(pEnc) == XFALSE)
+    {
+        pEnc->pEncoder = DirectGate_OpenH264_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
+                                                    &pDesktop->quality, sError, sizeof(sError));
+        if (pEnc->pEncoder == NULL)
+        {
+            DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop,
+                sError[0] ? sError : "OpenH264 encoder initialization failed.");
+
+            DirectGate_Desktop_X11Enc_Free(pEnc);
+            return XSTDERR;
+        }
     }
 
     size_t nFrameBytes = (size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight * 4U;
     pEnc->pFrameBGRA = (uint8_t*)malloc(nFrameBytes);
     pEnc->pPrevBGRA = (uint8_t*)malloc(nFrameBytes);
-    pEnc->pI420 = (uint8_t*)malloc((size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight * 3U / 2U);
 
     xbool_t bScaling = (pEnc->nEncodeWidth != nWidth || pEnc->nEncodeHeight != nHeight) ? XTRUE : XFALSE;
     if (bScaling) pEnc->pCaptureBGRA = (uint8_t*)malloc((size_t)nWidth * nHeight * 4U);
 
     if (pEnc->pFrameBGRA == NULL || pEnc->pPrevBGRA == NULL ||
-        pEnc->pI420 == NULL || (bScaling && pEnc->pCaptureBGRA == NULL))
+        DirectGate_Desktop_X11Enc_AllocPlanes(pEnc) != XSTDOK ||
+        (bScaling && pEnc->pCaptureBGRA == NULL))
     {
         DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop, "Failed to allocate desktop frame buffers.");
-        DirectGate_Desktop_X11Enc_Free(pEnc, pDisplay);
+        DirectGate_Desktop_X11Enc_Free(pEnc);
         return XSTDERR;
     }
 
@@ -409,7 +893,7 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     if (pProbe == NULL)
     {
         DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop, "X11 screen capture probe failed.");
-        DirectGate_Desktop_X11Enc_Free(pEnc, pDisplay);
+        DirectGate_Desktop_X11Enc_Free(pEnc);
         return XSTDERR;
     }
 
@@ -417,20 +901,57 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     if (pProbe != pEnc->pShmImage) XDestroyImage(pProbe);
     if (nFormat != XSTDOK)
     {
-        DirectGate_Desktop_X11Enc_Free(pEnc, pDisplay);
+        DirectGate_Desktop_X11Enc_Free(pEnc);
         return XSTDERR;
     }
 
-    pEnc->bForceKeyframe = XTRUE;
+    DIRECTGATE_X11ENC_SET(&pEnc->bForceKeyframe, 1U);
     pEnc->nStartUs = DirectGate_Desktop_X11Enc_MonotonicUs();
+
+    /* Own copy of the event loop's wake-up descriptor (see nWakeFd). The
+     * pipeline still works without it - the periodic tick would just drain
+     * the mailbox a fraction of a frame later - so this is not fatal. */
+    int nTimerFd = DirectGate_Desktop_GetTimerFd(pDesktop);
+    if (nTimerFd >= 0)
+    {
+        pEnc->nWakeFd = fcntl(nTimerFd, F_DUPFD_CLOEXEC, 0);
+        if (pEnc->nWakeFd < 0)
+        {
+            xlogw("Failed to duplicate desktop timer fd, frames will wait for the periodic tick: sid(%u)",
+                pSession->nSessionId);
+        }
+    }
+
+    if (XThread_Create(&pEnc->thread, DirectGate_Desktop_X11Enc_Worker, pEnc, 0) != XSTDOK)
+    {
+        DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop, "Failed to start desktop capture thread.");
+        DirectGate_Desktop_X11Enc_Free(pEnc);
+        return XSTDERR;
+    }
+
+    pEnc->bThreadRunning = XTRUE;
     pDesktop->pEncoder = pEnc;
 
+    /* The encoder field is the first thing to look at when a session feels
+     * slow: "software (openh264 ...)" on a machine with a GPU means the
+     * probe found nothing usable and a full core is being spent encoding. */
+    const char *pEncoderName = DirectGate_OpenH264_Version();
+    const char *pEncoderKind = "software";
+
+#ifdef DIRECTGATE_HAVE_HWENC
+    if (pEnc->pHwEncoder != NULL)
+    {
+        pEncoderName = DirectGate_HWEnc_Describe(pEnc->pHwEncoder);
+        pEncoderKind = "hardware";
+    }
+#endif
+
     xlogi("X11 H.264 pipeline started: sid(%u), capture(%d,%d %ux%u), encode(%ux%u), "
-        "shm(%s), codec(%s), preset(%s)",
+        "shm(%s), encoder(%s: %s), preset(%s)",
         pSession->nSessionId, nX, nY, nWidth, nHeight,
         pEnc->nEncodeWidth, pEnc->nEncodeHeight,
         pEnc->bShmAttached ? "yes" : "no",
-        DirectGate_OpenH264_Version(),
+        pEncoderKind, pEncoderName,
         DirectGate_Desktop_PresetName(pDesktop->quality.ePreset));
 
     return XSTDOK;
@@ -465,20 +986,17 @@ void DirectGate_Desktop_LinuxEncoder_ApplyQuality(directgate_session_t *pSession
         return;
     }
 
-    DirectGate_OpenH264_ApplyQuality(pEnc->pEncoder, &pDesktop->quality);
-    pEnc->bForceKeyframe = XTRUE;
+    /* Marshalled like the bitrate step: the worker owns the encoder. */
+    DIRECTGATE_X11ENC_SET(&pEnc->bApplyQuality, 1U);
+    DIRECTGATE_X11ENC_SET(&pEnc->bForceKeyframe, 1U);
 }
 
 void DirectGate_Desktop_LinuxEncoder_SetBitrate(directgate_session_t *pSession, uint32_t nBitrateKbps)
 {
     XCHECK_VOID_NL((pSession != NULL));
     directgate_x11enc_t *pEnc = DirectGate_Desktop_X11Enc(&pSession->desktop);
-    XCHECK_VOID_NL((pEnc != NULL && pEnc->pEncoder != NULL));
-
-    /* Deliberately no keyframe request: the encoder keeps its reference
-     * chain and converges to the new rate, so a congested link is not hit
-     * with an IDR burst on top of the loss that triggered the step. */
-    DirectGate_OpenH264_SetBitrate(pEnc->pEncoder, nBitrateKbps);
+    XCHECK_VOID_NL((pEnc != NULL && nBitrateKbps > 0));
+    DIRECTGATE_X11ENC_SET(&pEnc->nPendingBitrateKbps, nBitrateKbps);
 }
 
 void DirectGate_Desktop_LinuxEncoder_RequestKeyframe(directgate_session_t *pSession)
@@ -486,7 +1004,7 @@ void DirectGate_Desktop_LinuxEncoder_RequestKeyframe(directgate_session_t *pSess
     XCHECK_VOID_NL((pSession != NULL));
     directgate_x11enc_t *pEnc = DirectGate_Desktop_X11Enc(&pSession->desktop);
     XCHECK_VOID_NL((pEnc != NULL));
-    pEnc->bForceKeyframe = XTRUE;
+    DIRECTGATE_X11ENC_SET(&pEnc->bForceKeyframe, 1U);
 }
 
 const char* DirectGate_Desktop_LinuxEncoder_LastError(const directgate_session_t *pSession)
@@ -503,102 +1021,73 @@ xbool_t DirectGate_Desktop_LinuxEncoder_HasFailed(const directgate_session_t *pS
     XCHECK_NL((pSession != NULL), XFALSE);
     const directgate_x11enc_t *pEnc = DirectGate_Desktop_X11Enc(&pSession->desktop);
     if (pEnc == NULL) return XTRUE;
-    return (pEnc->nFailures >= DIRECTGATE_X11ENC_MAX_FAILURES) ? XTRUE : XFALSE;
+    return (DIRECTGATE_X11ENC_LOAD(&pEnc->nFailures) >= DIRECTGATE_X11ENC_MAX_FAILURES) ? XTRUE : XFALSE;
 }
 
-int DirectGate_Desktop_LinuxEncoder_ProcessTick(directgate_session_t *pSession)
+int DirectGate_Desktop_LinuxEncoder_DrainMain(directgate_session_t *pSession)
 {
     XCHECK((pSession != NULL), XAPI_DISCONNECT);
     directgate_desktop_t *pDesktop = &pSession->desktop;
     directgate_x11enc_t *pEnc = DirectGate_Desktop_X11Enc(pDesktop);
-    Display *pDisplay = (Display*)pDesktop->pDisplay;
-    XCHECK_NL((pEnc != NULL && pDisplay != NULL), XAPI_CONTINUE);
+    XCHECK_NL((pEnc != NULL), XAPI_CONTINUE);
 
-    /* Transport backpressure: skipping the whole capture keeps the encoder
-     * reference chain untouched, so no keyframe is needed on resume (same
-     * reasoning as the macOS SCK callback). */
-    if (DirectGate_Desktop_ShouldSkipForBackpressure(pSession)) return XAPI_CONTINUE;
-
-    XImage *pImage = NULL;
-    if (pEnc->pShmImage != NULL)
+    /* A preset change asks for a fresh keyframe through the desktop struct;
+     * hand it to the capture thread and clear it here on the main loop. */
+    if (pDesktop->bRequestKeyframe)
     {
-        if (XShmGetImage(pDisplay, DefaultRootWindow(pDisplay), pEnc->pShmImage,
-            pEnc->nCaptureX, pEnc->nCaptureY, AllPlanes))
-            pImage = pEnc->pShmImage;
-    }
-    else
-    {
-        pImage = XGetImage(pDisplay, DefaultRootWindow(pDisplay),
-            pEnc->nCaptureX, pEnc->nCaptureY,
-            pEnc->nCaptureWidth, pEnc->nCaptureHeight, AllPlanes, ZPixmap);
+        pDesktop->bRequestKeyframe = XFALSE;
+        DIRECTGATE_X11ENC_SET(&pEnc->bForceKeyframe, 1U);
     }
 
-    if (pImage == NULL)
-    {
-        xlogw("Failed to capture X11 frame: sid(%u), failures(%u)",
-            pSession->nSessionId, ++pEnc->nFailures);
+    uint32_t nFps = pDesktop->quality.nFps ? pDesktop->quality.nFps : DIRECTGATE_DESKTOP_DEFAULT_FPS;
+    uint64_t nNowUs = DirectGate_Desktop_X11Enc_MonotonicUs();
+    uint64_t nMaxAgeUs = (1000000ULL / nFps) * 3ULL;
+    if (nMaxAgeUs < DIRECTGATE_X11ENC_MIN_AGE_US) nMaxAgeUs = DIRECTGATE_X11ENC_MIN_AGE_US;
 
-        return XAPI_CONTINUE;
+    uint32_t nWidth = 0, nHeight = 0;
+    xbool_t bKeyframe = XFALSE, bHasFrame = XFALSE, bDroppedStale = XFALSE;
+    uint64_t nPtsUs = 0, nDroppedAgeUs = 0;
+
+    XSync_Lock(&pEnc->lock);
+    if (pEnc->bMailboxHasFrame)
+    {
+        uint64_t nAgeUs = (nNowUs >= pEnc->nMailboxCapturedUs) ? nNowUs - pEnc->nMailboxCapturedUs : 0U;
+        if (pEnc->nMailboxCapturedUs && nAgeUs > nMaxAgeUs)
+        {
+            pEnc->mailbox.nUsed = 0;
+            DIRECTGATE_X11ENC_SET(&pEnc->bForceKeyframe, 1U);
+            nDroppedAgeUs = nAgeUs;
+            bDroppedStale = XTRUE;
+        }
+        else
+        {
+            xbyte_buffer_t swap = pEnc->drain;
+            pEnc->drain = pEnc->mailbox;
+            pEnc->mailbox = swap;
+            pEnc->mailbox.nUsed = 0;
+            nWidth = pEnc->nMailboxWidth;
+            nHeight = pEnc->nMailboxHeight;
+            bKeyframe = pEnc->bMailboxKeyframe;
+            nPtsUs = pEnc->nMailboxPtsUs;
+            bHasFrame = XTRUE;
+        }
+
+        pEnc->bMailboxHasFrame = XFALSE;
     }
 
-    /* Normalize into BGRA, scaling to the encode size when needed. */
-    if (pEnc->pCaptureBGRA != NULL)
+    XSync_Unlock(&pEnc->lock);
+
+    if (bDroppedStale)
     {
-        DirectGate_Desktop_X11Enc_Normalize(pEnc, pImage, pEnc->pCaptureBGRA);
-        DirectGate_YUV_ScaleBGRA(pEnc->pFrameBGRA, pEnc->nEncodeWidth, pEnc->nEncodeHeight,
-            pEnc->pCaptureBGRA, pEnc->nCaptureWidth, pEnc->nCaptureHeight,
-            (size_t)pEnc->nCaptureWidth * 4U);
-    }
-    else
-    {
-        DirectGate_Desktop_X11Enc_Normalize(pEnc, pImage, pEnc->pFrameBGRA);
+        xlogd("Dropping stale X11 desktop frame: sid(%u), ageUs(%llu), maxUs(%llu)",
+            pSession->nSessionId, (unsigned long long)nDroppedAgeUs,
+            (unsigned long long)nMaxAgeUs);
     }
 
-    if (pImage != pEnc->pShmImage) XDestroyImage(pImage);
+    if (!bHasFrame || !pEnc->drain.nUsed) return XAPI_CONTINUE;
 
-    /* Idle desktops are the common case for a remote-admin agent: skip the
-     * whole convert+encode+send pass when nothing changed on screen. A
-     * pending keyframe request always goes through (new viewer / PLI). */
-    size_t nFrameBytes = (size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight * 4U;
-    xbool_t bForceKeyframe = (pEnc->bForceKeyframe || pDesktop->bRequestKeyframe) ? XTRUE : XFALSE;
-
-    if (!bForceKeyframe && pEnc->bHavePrev &&
-        memcmp(pEnc->pFrameBGRA, pEnc->pPrevBGRA, nFrameBytes) == 0)
-        return XAPI_CONTINUE;
-
-    DirectGate_YUV_BGRAToI420(pEnc->pI420,
-        pEnc->pI420 + (size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight,
-        pEnc->pI420 + (size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight * 5U / 4U,
-        pEnc->pFrameBGRA, pEnc->nEncodeWidth, pEnc->nEncodeHeight);
-
-    uint64_t nPtsUs = DirectGate_Desktop_X11Enc_MonotonicUs() - pEnc->nStartUs;
-    xbool_t bKeyframe = XFALSE;
-
-    int nStatus = DirectGate_OpenH264_Encode(pEnc->pEncoder, pEnc->pI420,
-        nPtsUs, bForceKeyframe, &pEnc->encoded, &bKeyframe);
-
-    if (nStatus == XSTDERR)
-    {
-        pEnc->nFailures++;
-        DirectGate_Desktop_X11Enc_SetError(pEnc, NULL, "OpenH264 frame encoding failed.");
-        return XAPI_CONTINUE;
-    }
-
-    pEnc->nFailures = 0;
-    if (nStatus == XSTDNON) return XAPI_CONTINUE; /* rate controller skip */
-
-    pEnc->bForceKeyframe = XFALSE;
-    pDesktop->bRequestKeyframe = XFALSE;
-
-    /* Remember what was sent for the next unchanged-frame check. */
-    uint8_t *pSwap = pEnc->pPrevBGRA;
-    pEnc->pPrevBGRA = pEnc->pFrameBGRA;
-    pEnc->pFrameBGRA = pSwap;
-    pEnc->bHavePrev = XTRUE;
-
-    return DirectGate_Desktop_SendEncodedFrame(pSession, pEnc->encoded.pData,
-        pEnc->encoded.nUsed, pEnc->nEncodeWidth, pEnc->nEncodeHeight,
-        bKeyframe, nPtsUs);
+    return DirectGate_Desktop_SendEncodedFrame(pSession, pEnc->drain.pData,
+        pEnc->drain.nUsed, nWidth, nHeight, bKeyframe, nPtsUs);
 }
 
 #endif /* __linux__ */

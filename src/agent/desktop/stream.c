@@ -36,62 +36,43 @@
 
 #define DIRECTGATE_DESKTOP_CHUNK_SIZE        (128U * 1024U)
 
-/* Adaptive bitrate bounds: never throttle below this floor, and step back
- * up toward the preset target when the link stays clean. */
-#define DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS   1000U
-#define DIRECTGATE_DESKTOP_ABR_HOLD_TICKS     60U  /* ~2s at 30 fps */
-#define DIRECTGATE_DESKTOP_ABR_RAISE_TICKS    150U /* ~5s clean before raising */
-#define DIRECTGATE_DESKTOP_ABR_LOSS_THRESHOLD 8U   /* ~3% fraction lost */
-
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
 
-/* Adaptive bitrate: multiplicative decrease on congestion, slow stepwise
- * recovery toward the preset target on a clean link. RTCP receiver reports
- * (fraction lost) are the signal on the media track; on the data-channel
- * fallback the only available signal is transport backpressure. Runs once
- * per timer tick while an encoded pipeline is active. */
+/* Feeds this tick's congestion evidence to the shared controller and applies
+ * whatever rate it returns to the active platform encoder. */
 static void DirectGate_Desktop_AdaptBitrate(directgate_session_t *pSession)
 {
     directgate_desktop_t *pDesktop = &pSession->desktop;
-    uint32_t nTarget = pDesktop->quality.nBitrateKbps;
-    XCHECK_VOID_NL((nTarget > 0));
 
-    uint32_t nCurrent = pDesktop->nCurrentBitrateKbps ? pDesktop->nCurrentBitrateKbps : nTarget;
-    xbool_t bCongested = XFALSE;
+#if defined(__linux__)
+    /* Media and input share one ICE transport. A TURN path adds a remote
+     * relay and can accumulate substantial queueing delay without dropping
+     * packets, which fraction-lost ABR cannot detect. Keep that path below a
+     * latency-safe ceiling; a later direct-P2P promotion removes the cap and
+     * normal clean-report recovery restores the preset rate. */
+    uint32_t nCeiling = DirectGate_WebRTC_IsRelay(&pSession->webrtc) ?
+                        DIRECTGATE_DESKTOP_TURN_BITRATE_KBPS : 0U;
+    if (pDesktop->nAbrCeilingKbps != nCeiling)
+    {
+        pDesktop->nAbrCeilingKbps = nCeiling;
+        pDesktop->nAbrCleanEvidence = 0;
+        pDesktop->nAbrLossReports = 0;
+
+        xlogi("Desktop transport bitrate ceiling changed: sid(%u), route(%s), ceiling(%u kbps)",
+            pSession->nSessionId, nCeiling ? "turn" : "p2p", nCeiling ? nCeiling : pDesktop->quality.nBitrateKbps);
+    }
+#endif
+
+    uint32_t nCurrent = pDesktop->nCurrentBitrateKbps ?
+                        pDesktop->nCurrentBitrateKbps : pDesktop->quality.nBitrateKbps;
+
     uint8_t nFractionLost = 0;
+    xbool_t bHaveReport = DirectGate_WebRTC_TakeVideoLossReport(&pSession->webrtc, &nFractionLost);
+    xbool_t bBackpressure = (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC &&
+        DirectGate_Desktop_ShouldSkipForBackpressure(pSession)) ? XTRUE : XFALSE;
 
-    if (DirectGate_WebRTC_TakeVideoLossReport(&pSession->webrtc, &nFractionLost) &&
-        nFractionLost >= DIRECTGATE_DESKTOP_ABR_LOSS_THRESHOLD) bCongested = XTRUE;
-
-    if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC &&
-        DirectGate_Desktop_ShouldSkipForBackpressure(pSession)) bCongested = XTRUE;
-
-    if (pDesktop->nAbrHoldTicks > 0) pDesktop->nAbrHoldTicks--;
-    uint32_t nNext = nCurrent;
-
-    if (bCongested)
-    {
-        pDesktop->nAbrCleanTicks = 0;
-        if (!pDesktop->nAbrHoldTicks)
-        {
-            nNext = (nCurrent * 3U) / 4U;
-            if (nNext < DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS)
-                nNext = DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS;
-
-            /* Receiver reports lag the rate change; hold before the next
-             * step so one loss episode is not punished twice. */
-            pDesktop->nAbrHoldTicks = DIRECTGATE_DESKTOP_ABR_HOLD_TICKS;
-        }
-    }
-    else if (nCurrent < nTarget && ++pDesktop->nAbrCleanTicks >= DIRECTGATE_DESKTOP_ABR_RAISE_TICKS)
-    {
-        pDesktop->nAbrCleanTicks = 0;
-        nNext = nCurrent + nTarget / 10U + 1U;
-        if (nNext > nTarget) nNext = nTarget;
-    }
-
-    pDesktop->nCurrentBitrateKbps = nNext;
-    if (nNext == nCurrent) return;
+    uint32_t nNext = DirectGate_Desktop_AbrStep(pDesktop, bHaveReport, nFractionLost, bBackpressure);
+    if (!nNext || nNext == nCurrent) return;
 
 #if defined(__APPLE__)
     DirectGate_Desktop_MacEncoder_SetBitrate(pSession, nNext);
@@ -100,6 +81,9 @@ static void DirectGate_Desktop_AdaptBitrate(directgate_session_t *pSession)
 #else
     DirectGate_Desktop_LinuxEncoder_SetBitrate(pSession, nNext);
 #endif
+
+    uint32_t nTarget = pDesktop->quality.nBitrateKbps;
+    if (pDesktop->nAbrCeilingKbps && pDesktop->nAbrCeilingKbps < nTarget) nTarget = pDesktop->nAbrCeilingKbps;
 
     xlogi("Desktop bitrate adapted: sid(%u), step(%s), rate(%u -> %u kbps), target(%u)",
         pSession->nSessionId, nNext < nCurrent ? "down" : "up", nCurrent, nNext, nTarget);
@@ -397,13 +381,14 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
 
 #ifdef DIRECTGATE_DESKTOP_HAS_AUDIO
     /* Ship any encoded Opus frames the capture thread queued. Runs before the
-     * video encode so audio is never delayed by this tick's frame, and is a
+     * video drain so audio is never delayed by this tick's frame, and is a
      * no-op unless the audio track is open. */
     DirectGate_Desktop_AudioDrainMain(pSession);
 #endif
 
-    /* The H.264 pipeline captures + encodes synchronously on each tick;
-     * the raw path keeps the legacy pull-per-tick behavior. */
+    /* The H.264 pipeline pushes frames from its capture thread; the wake-up
+     * is just a signal to drain the encoder mailbox. The raw path still
+     * pulls per tick. */
     if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||
         pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
     {
@@ -423,7 +408,7 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
             return XAPI_CONTINUE;
         }
 
-        return DirectGate_Desktop_LinuxEncoder_ProcessTick(pSession);
+        return DirectGate_Desktop_LinuxEncoder_DrainMain(pSession);
     }
 
     return DirectGate_Desktop_CaptureFrame(pSession);
@@ -647,16 +632,22 @@ static int DirectGate_Desktop_SetFdNonBlocking(int nFd)
 static void* DirectGate_Desktop_TimerThread(void *pArg)
 {
     directgate_desktop_t *pDesktop = (directgate_desktop_t*)pArg;
-    uint32_t nFps = pDesktop->nFps ? pDesktop->nFps : DIRECTGATE_DESKTOP_DEFAULT_FPS;
-    uint64_t nNs = 1000000000ULL / nFps;
-
-    struct timespec delay;
-    memset(&delay, 0, sizeof(delay));
-    delay.tv_sec = (time_t)(nNs / 1000000000ULL);
-    delay.tv_nsec = (long)(nNs % 1000000000ULL);
 
     while (pDesktop->bTimerThreadRunning)
     {
+        /* Re-read the rate every iteration: a set-preset control message
+         * changes nFps live, and a tick period frozen at the rate the
+         * session started with would leave the bitrate controller, the
+         * audio drain and the raw fallback running at the wrong cadence
+         * (the Linux path re-arms its timerfd for the same reason). */
+        uint32_t nFps = pDesktop->nFps ? pDesktop->nFps : DIRECTGATE_DESKTOP_DEFAULT_FPS;
+        uint64_t nNs = 1000000000ULL / nFps;
+
+        struct timespec delay;
+        memset(&delay, 0, sizeof(delay));
+        delay.tv_sec = (time_t)(nNs / 1000000000ULL);
+        delay.tv_nsec = (long)(nNs % 1000000000ULL);
+
         nanosleep(&delay, NULL);
         if (!pDesktop->bTimerThreadRunning) break;
         if (pDesktop->nTimerWriteFd != XSOCK_INVALID)
@@ -1091,9 +1082,6 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
 static DWORD WINAPI DirectGate_Desktop_TimerThread(LPVOID pArg)
 {
     directgate_desktop_t *pDesktop = (directgate_desktop_t*)pArg;
-    uint32_t nFps = pDesktop->nFps ? pDesktop->nFps : DIRECTGATE_DESKTOP_DEFAULT_FPS;
-    DWORD nDelayMs = 1000U / nFps;
-    if (!nDelayMs) nDelayMs = 1U;
 
     /* Sleep granularity (~16 ms) is fine here: on the H.264 pipeline these
      * ticks only drive the bitrate controller and drain fallback (frames
@@ -1101,6 +1089,12 @@ static DWORD WINAPI DirectGate_Desktop_TimerThread(LPVOID pArg)
      * a fallback anyway. */
     while (pDesktop->bTimerThreadRunning)
     {
+        /* Re-read the rate every iteration - a set-preset control message
+         * changes nFps live and the period must follow it. */
+        uint32_t nFps = pDesktop->nFps ? pDesktop->nFps : DIRECTGATE_DESKTOP_DEFAULT_FPS;
+        DWORD nDelayMs = 1000U / nFps;
+        if (!nDelayMs) nDelayMs = 1U;
+
         Sleep(nDelayMs);
         if (!pDesktop->bTimerThreadRunning) break;
         if (pDesktop->nTimerWriteFd != XSOCK_INVALID)

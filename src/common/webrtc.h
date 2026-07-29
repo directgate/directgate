@@ -79,6 +79,7 @@ typedef struct directgate_webrtc_ {
     xbool_t bVideoEnabled;      /* Offer answers may include a desktop video track */
     xbool_t bVideoTrackOpen;    /* Outbound media track is open */
     xbool_t bVideoKeyframeRequested; /* new track or RTCP PLI/FIR needs an IDR */
+    volatile xbool_t bActiveRelay; /* selected active ICE pair uses TURN */
     uint32_t nSignalGeneration; /* Browser negotiation generation; rejects stale SDP/ICE */
 
     /* Background P2P candidate. The active TURN peer remains untouched until
@@ -207,6 +208,7 @@ XSTATUS DirectGate_WebRTC_Send(directgate_webrtc_t *pRTC, const uint8_t *pData, 
 
 /* Check if the data channel is connected */
 xbool_t DirectGate_WebRTC_IsConnected(const directgate_webrtc_t *pRTC);
+xbool_t DirectGate_WebRTC_IsRelay(const directgate_webrtc_t *pRTC);
 int DirectGate_WebRTC_GetBufferedAmount(const directgate_webrtc_t *pRTC);
 
 /* Enable a send-only H.264 video track when answering a browser offer. */
@@ -228,9 +230,11 @@ xbool_t DirectGate_WebRTC_IsAudioOpen(const directgate_webrtc_t *pRTC);
 xbool_t DirectGate_WebRTC_TakeVideoLossReport(directgate_webrtc_t *pRTC, uint8_t *pFractionLost);
 
 /* Walks a compound RTCP datagram: reports whether it contains a keyframe
- * request (PLI/FIR) and the highest fraction-lost across RR/SR report
- * blocks (-1 when no report block is present). Exposed for tests. */
+ * request (PLI/FIR) and the highest fraction-lost across RR/SR report blocks
+ * for nMediaSsrc (-1 when no matching block is present). A zero SSRC matches
+ * every block and is useful for parser-only tests. */
 void DirectGate_WebRTC_ParseRtcp(const uint8_t *pData, size_t nSize,
+                                 uint32_t nMediaSsrc,
                                  xbool_t *pKeyframeRequest, int *pFractionLost);
 
 /* Locates the browser offer's recv-only Opus audio m-line and reports its

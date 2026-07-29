@@ -66,6 +66,11 @@ static int DirectGate_Desktop_FrameToScreenY(const directgate_desktop_t *pDeskto
 }
 
 #if defined(__linux__) || defined(_WIN32)
+/* Largest pixel delta a single wheel event may contribute. A real notch is
+ * ~100px and a trackpad sample is a handful, so this only ever clips input
+ * that was never going to be a scroll. */
+#define DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA 100000
+
 /* Browsers report wheel motion in pixels: a discrete mouse notch is ~100px
  * while trackpads emit a stream of 1-10px samples. Platforms that inject
  * discrete wheel clicks (X11 buttons 4-7, Windows WHEEL_DELTA) accumulate
@@ -73,6 +78,13 @@ static int DirectGate_Desktop_FrameToScreenY(const directgate_desktop_t *pDeskto
  * every sample into a full click. (macOS scrolls in pixel units natively.) */
 static int DirectGate_Desktop_WheelNotches(int32_t *pAccum, int nDelta)
 {
+    /* The delta arrives straight off the wire, so it cannot be trusted to be
+     * a plausible scroll: accumulating an arbitrary int overflows the counter,
+     * which is undefined behaviour and traps on a hardened build. A single
+     * event is never worth more than a few hundred notches. */
+    if (nDelta > DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA) nDelta = DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA;
+    else if (nDelta < -DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA) nDelta = -DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA;
+
     /* A direction flip discards the leftover from the previous direction
      * so scrolling reverses immediately instead of eating the first input. */
     if ((nDelta > 0 && *pAccum < 0) || (nDelta < 0 && *pAccum > 0)) *pAccum = 0;

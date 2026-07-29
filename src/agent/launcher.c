@@ -58,18 +58,15 @@ extern xbool_t g_bFinish;
 /* Real agent entrypoint from directgate.c */
 int DirectGate_RunAgent(int argc, char* argv[]);
 
-/* Windows Game Mode (and the modern power manager) push background services
- * into EcoQoS - a reduced-frequency, low-scheduling-priority class - and hand
- * the CPU/GPU scheduler to the foreground game. The desktop capture -> encode
- * -> send pipeline is exactly the kind of background work that gets starved,
- * so the remote FPS collapses whenever Game Mode is on. Opt the whole agent
- * process out of that: raise the base priority class and clear the
- * execution-speed power throttle so Windows keeps the process at full
- * performance (HighQoS), regardless of Game Mode.
+/* Windows Game Mode and the modern power manager favour the foreground game.
+ * The desktop capture -> encode -> send pipeline is exactly the kind of
+ * background work that otherwise loses scheduling time, so raise the process
+ * base priority and explicitly opt out of execution-speed power throttling.
  *
  * HIGH_PRIORITY_CLASS (not REALTIME) is deliberate: realtime outranks kernel
  * input, paging and disk threads and can freeze the machine. High is the
- * highest class that is safe for a long-running, user-facing service. */
+ * strongest non-realtime class. Worker threads use ABOVE_NORMAL within this
+ * class instead of MMCSS, whose CPU quota can demote sustained encode work. */
 void DirectGate_WinLauncher_BoostPriority(void)
 {
     HANDLE hProcess = GetCurrentProcess();
@@ -77,7 +74,15 @@ void DirectGate_WinLauncher_BoostPriority(void)
     if (SetPriorityClass(hProcess, HIGH_PRIORITY_CLASS))
         xlogi("Agent process priority raised to HIGH_PRIORITY_CLASS");
     else
-        xlogw("Failed to raise agent process priority class: err(%lu)", (unsigned long)GetLastError());
+    {
+        DWORD nHighError = GetLastError();
+        if (SetPriorityClass(hProcess, ABOVE_NORMAL_PRIORITY_CLASS))
+            xlogw("HIGH_PRIORITY_CLASS unavailable; using ABOVE_NORMAL_PRIORITY_CLASS: err(%lu)",
+                (unsigned long)nHighError);
+        else
+            xlogw("Failed to raise agent process priority class: high_err(%lu), fallback_err(%lu)",
+                (unsigned long)nHighError, (unsigned long)GetLastError());
+    }
 
     /* SetProcessInformation(ProcessPowerThrottling, ...) is Windows 10 1709+.
      * Resolve it at runtime and describe the state struct locally so the build
@@ -112,7 +117,7 @@ void DirectGate_WinLauncher_BoostPriority(void)
     state.StateMask = 0;
 
     if (pSetProcessInformation(hProcess, DIRECTGATE_PROCESS_POWER_THROTTLING, &state, (DWORD)sizeof(state)))
-        xlogi("Agent power throttling disabled (HighQoS): immune to Game Mode background throttling");
+        xlogi("Agent execution-speed power throttling disabled");
     else
         xlogw("Failed to disable agent power throttling: err(%lu)", (unsigned long)GetLastError());
 }

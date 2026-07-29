@@ -87,8 +87,6 @@ typedef struct directgate_wasapi_ {
     xbool_t bWorkerInit;
     xbool_t bWorkerCom;
     HANDLE hTimer;                 /* high-resolution poll timer */
-    HMODULE hAvrt;                 /* MMCSS lib (freed at close) */
-    HANDLE hMmcss;
 
     /* Real-time frame pacing. Unlike a PulseAudio monitor (which streams silence
      * as real samples at the sink rate), WASAPI loopback delivers nothing during
@@ -271,30 +269,45 @@ static int DirectGate_WASAPI_Open(directgate_wasapi_t *pCtx, char *pErr, size_t 
 static void DirectGate_WASAPI_WorkerInit(directgate_wasapi_t *pCtx)
 {
     pCtx->bWorkerInit = XTRUE;
+    HANDLE hThread = GetCurrentThread();
 
     /* Join the process MTA so the worker can call the capture client that the
      * main thread created. No CoUninitialize: balanced by the thread exit. */
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     pCtx->bWorkerCom = (hr == S_OK || hr == S_FALSE) ? XTRUE : XFALSE;
 
-#ifdef DIRECTGATE_HAVE_AVRT_THREAD_PRIORITY
-    /* MMCSS so a CPU-bound foreground game cannot starve audio (dropouts are
-     * more noticeable than a late video frame). "Pro Audio" is the real-time
-     * audio band; avrt.dll is loaded at runtime and fails soft. */
-    pCtx->hAvrt = LoadLibraryW(L"avrt.dll");
-    if (pCtx->hAvrt != NULL)
+#if defined(THREAD_POWER_THROTTLING_CURRENT_VERSION) && defined(THREAD_POWER_THROTTLING_EXECUTION_SPEED)
+    THREAD_POWER_THROTTLING_STATE PowerThrottling;
+    ZeroMemory(&PowerThrottling, sizeof(PowerThrottling));
+
+    PowerThrottling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    PowerThrottling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    PowerThrottling.StateMask = 0;
+
+    if (!SetThreadInformation(hThread, ThreadPowerThrottling, &PowerThrottling, sizeof(PowerThrottling)))
     {
-        typedef HANDLE (WINAPI *directgate_av_set_fn)(LPCWSTR, LPDWORD);
-        typedef BOOL (WINAPI *directgate_av_prio_fn)(HANDLE, int);
-
-        directgate_av_set_fn pAvSet = (directgate_av_set_fn)(void*)GetProcAddress(pCtx->hAvrt, "AvSetMmThreadCharacteristicsW");
-        directgate_av_prio_fn pAvPrio = (directgate_av_prio_fn)(void*)GetProcAddress(pCtx->hAvrt, "AvSetMmThreadPriority");
-        DWORD nMmTaskIndex = 0;
-
-        if (pAvSet != NULL) pCtx->hMmcss = pAvSet(L"Pro Audio", &nMmTaskIndex);
-        if (pCtx->hMmcss != NULL && pAvPrio != NULL) pAvPrio(pCtx->hMmcss, 1); /* AVRT_PRIORITY_HIGH */
+        xlogw("Failed to configure audio capture thread as HighQoS: err(%lu)",
+            (unsigned long)GetLastError());
     }
 #endif
+
+    /* Prevent Windows from applying execution-speed power throttling
+     * to the latency-sensitive desktop capture thread. */
+    DWORD nPriorityClass = GetPriorityClass(GetCurrentProcess());
+    int nThreadPriority = THREAD_PRIORITY_ABOVE_NORMAL;
+
+    if (nPriorityClass == NORMAL_PRIORITY_CLASS)
+    {
+        /* HIGHEST is base priority 10 in NORMAL_PRIORITY_CLASS, but can become
+         * excessively aggressive if the process priority class is raised. */
+        nThreadPriority = THREAD_PRIORITY_HIGHEST;
+    }
+
+    if (!SetThreadPriority(hThread, nThreadPriority))
+    {
+        xlogw("Failed to configure audio capture thread priority: class(%lu), priority(%d), err(%lu)",
+            (unsigned long)nPriorityClass, nThreadPriority, (unsigned long)GetLastError());
+    }
 
     /* High-resolution timer so the poll wait is ~2 ms, not the ~15 ms a plain
      * Sleep rounds to. Falls back to a normal timer on pre-1803 Windows. */
@@ -458,13 +471,9 @@ void DirectGate_Audio_BackendClose(void *pBackend)
     if (pCtx->pClient != NULL) pCtx->pClient->lpVtbl->Stop(pCtx->pClient);
     if (pCtx->pCapture != NULL) pCtx->pCapture->lpVtbl->Release(pCtx->pCapture);
     if (pCtx->pClient != NULL) pCtx->pClient->lpVtbl->Release(pCtx->pClient);
-
     if (pCtx->hTimer != NULL) CloseHandle(pCtx->hTimer);
-#ifdef DIRECTGATE_HAVE_AVRT_THREAD_PRIORITY
-    if (pCtx->hAvrt != NULL) FreeLibrary(pCtx->hAvrt);
-#endif
-
     if (pCtx->bMainCom) CoUninitialize();
+
     free(pCtx->pCarry);
     free(pCtx);
 }

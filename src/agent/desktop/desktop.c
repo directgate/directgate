@@ -38,6 +38,26 @@
  * without letting the fallback path accumulate a second of latency. */
 #define DIRECTGATE_DESKTOP_ENCODED_BUFFER_LIMIT (256U * 1024U)
 
+/* Adaptive bitrate bounds: never throttle below this floor, and step back up
+ * toward the preset target when the link stays clean. */
+#define DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS     1000U
+#define DIRECTGATE_DESKTOP_ABR_HOLD_TICKS       60U  /* ~2s at 30 fps */
+#define DIRECTGATE_DESKTOP_ABR_RAISE_TICKS      150U /* ~5s without DC backpressure */
+#define DIRECTGATE_DESKTOP_ABR_RAISE_REPORTS    5U   /* ~5 clean RTCP reports */
+#define DIRECTGATE_DESKTOP_ABR_LOSS_THRESHOLD   8U   /* ~3% fraction lost */
+/* Consecutive lossy reports before the rate is cut. See DirectGate_Desktop_AbrStep. */
+#define DIRECTGATE_DESKTOP_ABR_LOSS_REPORTS     2U
+
+/* Hard ceiling on either encoded edge, whatever the resize mode asks for.
+ * 8192 is the largest width or height any H.264 level defines, and it keeps
+ * `width * height * 4` inside a 32-bit size_t on the i686 packages. */
+#define DIRECTGATE_DESKTOP_MAX_ENCODE_EDGE      8192U
+
+/* The encode size the preset bitrates are chosen for, and how far above it
+ * the bitrate is allowed to scale (see DirectGate_Desktop_BitrateForSize). */
+#define DIRECTGATE_DESKTOP_BITRATE_REF_PIXELS   (1920U * 1080U)
+#define DIRECTGATE_DESKTOP_BITRATE_MAX_SCALE    2U
+
 #if defined(__linux__)
 #include <dlfcn.h>
 #include <X11/Xlib.h>
@@ -121,10 +141,12 @@ void DirectGate_Desktop_ApplyPreset(directgate_desktop_t *pDesktop, directgate_d
             break;
     }
 
+    pDesktop->quality.nBaseBitrateKbps = pDesktop->quality.nBitrateKbps;
     pDesktop->nFps = pDesktop->quality.nFps;
     pDesktop->nCurrentBitrateKbps = pDesktop->quality.nBitrateKbps;
-    pDesktop->nAbrCleanTicks = 0;
+    pDesktop->nAbrCleanEvidence = 0;
     pDesktop->nAbrHoldTicks = 0;
+    pDesktop->nAbrLossReports = 0;
     pDesktop->bRequestKeyframe = XTRUE;
 }
 
@@ -300,10 +322,158 @@ void DirectGate_Desktop_ComputeOutputSize(const directgate_desktop_t *pDesktop,
         }
     }
 
+    /* Absolute ceiling, applied after every other rule including display
+     * mode, which deliberately leaves nMaxEdge at zero. Two reasons: no
+     * H.264 level encodes beyond this, so a larger request only fails deeper
+     * in the encoder; and the frame buffers are sized `w * h * 4`, which on
+     * the 32-bit builds overflows size_t for a big enough video wall and
+     * would hand a short allocation to a full-size write. */
+    if (nWidth > DIRECTGATE_DESKTOP_MAX_ENCODE_EDGE)
+    {
+        nHeight = (uint32_t)(((uint64_t)nHeight * DIRECTGATE_DESKTOP_MAX_ENCODE_EDGE) / nWidth);
+        nWidth = DIRECTGATE_DESKTOP_MAX_ENCODE_EDGE;
+    }
+
+    if (nHeight > DIRECTGATE_DESKTOP_MAX_ENCODE_EDGE)
+    {
+        nWidth = (uint32_t)(((uint64_t)nWidth * DIRECTGATE_DESKTOP_MAX_ENCODE_EDGE) / nHeight);
+        nHeight = DIRECTGATE_DESKTOP_MAX_ENCODE_EDGE;
+    }
+
     if (!nWidth) nWidth = 1U;
     if (!nHeight) nHeight = 1U;
     if (pWidth != NULL) *pWidth = nWidth;
     if (pHeight != NULL) *pHeight = nHeight;
+}
+
+uint32_t DirectGate_Desktop_AbrStep(directgate_desktop_t *pDesktop,
+                                    xbool_t bHaveReport,
+                                    uint8_t nFractionLost,
+                                    xbool_t bBackpressure)
+{
+    XCHECK_NL((pDesktop != NULL), 0);
+    XCHECK_NL((pDesktop->quality.nBitrateKbps > 0), 0);
+
+    uint32_t nTarget = pDesktop->quality.nBitrateKbps;
+    if (pDesktop->nAbrCeilingKbps && pDesktop->nAbrCeilingKbps < nTarget) nTarget = pDesktop->nAbrCeilingKbps;
+
+    uint32_t nCurrent = pDesktop->nCurrentBitrateKbps ? pDesktop->nCurrentBitrateKbps : nTarget;
+    uint32_t nFloor = DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS;
+    if (nFloor > nTarget) nFloor = nTarget;
+
+    if (pDesktop->nAbrHoldTicks > 0)
+    {
+        /* A report is evidence either way; a tick without one says nothing,
+         * so it must not clear a streak that is still building. */
+        pDesktop->nAbrLossReports = 0;
+    }
+    else if (bHaveReport)
+    {
+        if (nFractionLost >= DIRECTGATE_DESKTOP_ABR_LOSS_THRESHOLD) pDesktop->nAbrLossReports++;
+        else pDesktop->nAbrLossReports = 0;
+    }
+
+    xbool_t bCongested = (pDesktop->nAbrLossReports >= DIRECTGATE_DESKTOP_ABR_LOSS_REPORTS ||
+                          bBackpressure) ? XTRUE : XFALSE;
+
+    if (pDesktop->nAbrHoldTicks > 0) pDesktop->nAbrHoldTicks--;
+    uint32_t nNext = nCurrent;
+
+    if (nCurrent > nTarget)
+    {
+        /* Route changes can lower the transport ceiling without a packet-loss
+         * report. Apply that cap immediately so a TURN queue cannot build
+         * enough latency to delay input on the same ICE transport. */
+        nNext = nTarget;
+        pDesktop->nAbrCleanEvidence = 0;
+        pDesktop->nAbrHoldTicks = 0;
+        pDesktop->nAbrLossReports = 0;
+    }
+    else if (bCongested)
+    {
+        pDesktop->nAbrCleanEvidence = 0;
+        if (!pDesktop->nAbrHoldTicks)
+        {
+            nNext = (nCurrent * 3U) / 4U;
+            if (nNext < nFloor) nNext = nFloor;
+
+            /* Receiver reports lag the rate change; hold before the next step
+             * so one loss episode is not punished twice, and start the streak
+             * over so the hold is not immediately re-armed by stale evidence. */
+            pDesktop->nAbrHoldTicks = DIRECTGATE_DESKTOP_ABR_HOLD_TICKS;
+            pDesktop->nAbrLossReports = 0;
+        }
+    }
+    else if (nCurrent < nTarget && !pDesktop->nAbrHoldTicks)
+    {
+        /* RTP video may recover only from positive receiver feedback. No
+         * report is not a clean report: a congested or half-open connection
+         * can stop delivering RTCP altogether. The DataChannel fallback has
+         * no RTCP, so its equivalent evidence is a run of ticks without
+         * buffered-amount backpressure. */
+        uint32_t nRaiseEvidence = DIRECTGATE_DESKTOP_ABR_RAISE_REPORTS;
+        xbool_t bCleanEvidence = (bHaveReport && nFractionLost < DIRECTGATE_DESKTOP_ABR_LOSS_THRESHOLD) ? XTRUE : XFALSE;
+
+        if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
+        {
+            nRaiseEvidence = DIRECTGATE_DESKTOP_ABR_RAISE_TICKS;
+            bCleanEvidence = (!bBackpressure) ? XTRUE : XFALSE;
+        }
+
+        if (bCleanEvidence && ++pDesktop->nAbrCleanEvidence >= nRaiseEvidence)
+        {
+            pDesktop->nAbrCleanEvidence = 0;
+            nNext = nCurrent + nTarget / 10U + 1U;
+            if (nNext > nTarget) nNext = nTarget;
+        }
+    }
+
+    pDesktop->nCurrentBitrateKbps = nNext;
+    return nNext;
+}
+
+uint32_t DirectGate_Desktop_BitrateForSize(const directgate_desktop_t *pDesktop,
+                                           uint32_t nWidth, uint32_t nHeight)
+{
+    XCHECK_NL((pDesktop != NULL), 0);
+
+    uint32_t nBase = pDesktop->quality.nBaseBitrateKbps ?
+                     pDesktop->quality.nBaseBitrateKbps :
+                     pDesktop->quality.nBitrateKbps;
+    XCHECK_NL((nBase > 0), 0);
+
+    uint64_t nPixels = (uint64_t)nWidth * nHeight;
+    if (nPixels <= DIRECTGATE_DESKTOP_BITRATE_REF_PIXELS) return nBase;
+
+    uint64_t nScaled = ((uint64_t)nBase * nPixels) / DIRECTGATE_DESKTOP_BITRATE_REF_PIXELS;
+    uint64_t nCeiling = (uint64_t)nBase * DIRECTGATE_DESKTOP_BITRATE_MAX_SCALE;
+
+    return (uint32_t)(nScaled > nCeiling ? nCeiling : nScaled);
+}
+
+/* Applies the above to the live quality settings so the encoder and the
+ * adaptive controller share one target. Idempotent: the scaling always
+ * starts from the preset's own figure, never from a previous result. */
+void DirectGate_Desktop_ApplyBitrateForSize(directgate_desktop_t *pDesktop,
+                                            uint32_t nWidth, uint32_t nHeight)
+{
+    XCHECK_VOID_NL((pDesktop != NULL));
+
+    uint32_t nBitrate = DirectGate_Desktop_BitrateForSize(pDesktop, nWidth, nHeight);
+    if (!nBitrate) return;
+
+    if (nBitrate != pDesktop->quality.nBitrateKbps)
+    {
+        xlogi("Desktop bitrate scaled for encode size: sid(%u), encode(%ux%u), rate(%u -> %u kbps)",
+            pDesktop->nSessionId, nWidth, nHeight, pDesktop->quality.nBitrateKbps, nBitrate);
+
+        pDesktop->quality.nBitrateKbps = nBitrate;
+    }
+
+    pDesktop->nCurrentBitrateKbps = nBitrate;
+    pDesktop->nAbrCleanEvidence = 0;
+    pDesktop->nAbrHoldTicks = 0;
+    pDesktop->nAbrLossReports = 0;
 }
 
 void DirectGate_Desktop_LimitFrameSize(const directgate_desktop_t *pDesktop,
@@ -407,6 +577,13 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     }
 #endif
 
+#if defined(__linux__)
+    /* Stop the capture thread before the timer descriptor goes away: it
+     * holds its own dup of that timerfd to wake the loop, and it detaches
+     * the XShm segment on its private display. */
+    if (pDesktop->pEncoder != NULL) DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
+#endif
+
 #if defined(__linux__) || defined(__APPLE__)
     if (pDesktop->nTimerFd != XSOCK_INVALID)
     {
@@ -424,9 +601,6 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
 #endif
 
 #if defined(__linux__)
-    /* Detaches the XShm segment, so it must run before the display closes. */
-    if (pDesktop->pEncoder != NULL) DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
-
     DirectGate_Desktop_RestoreDisplayMode(pDesktop);
     DirectGate_Desktop_ReleaseHeldKeys(pDesktop);
 

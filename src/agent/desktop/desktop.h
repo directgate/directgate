@@ -28,21 +28,22 @@
 extern "C" {
 #endif
 
-#define DIRECTGATE_DESKTOP_BACKEND_LEN      16
-#define DIRECTGATE_DESKTOP_REASON_LEN       160
-#define DIRECTGATE_DESKTOP_DISPLAY_LEN      128
-#define DIRECTGATE_DESKTOP_MONITOR_ID_LEN   32
-#define DIRECTGATE_DESKTOP_MONITOR_NAME_LEN 96
-#define DIRECTGATE_DESKTOP_MAX_MONITORS     16
-#define DIRECTGATE_DESKTOP_MAX_MODES        64
-#define DIRECTGATE_DESKTOP_CODEC_LEN        16
-#define DIRECTGATE_DESKTOP_RESOLUTION_LEN   16
-#define DIRECTGATE_DESKTOP_KEY_CODE_LEN     24
-#define DIRECTGATE_DESKTOP_MAX_HELD_KEYS    32
-#define DIRECTGATE_DESKTOP_PRESET_LEN       16
-#define DIRECTGATE_DESKTOP_PIPELINE_LEN     24
-#define DIRECTGATE_DESKTOP_TRANSPORT_LEN    32
-#define DIRECTGATE_DESKTOP_DEVICE_ID_LEN    128
+#define DIRECTGATE_DESKTOP_BACKEND_LEN       16
+#define DIRECTGATE_DESKTOP_REASON_LEN        160
+#define DIRECTGATE_DESKTOP_DISPLAY_LEN       128
+#define DIRECTGATE_DESKTOP_MONITOR_ID_LEN    32
+#define DIRECTGATE_DESKTOP_MONITOR_NAME_LEN  96
+#define DIRECTGATE_DESKTOP_MAX_MONITORS      16
+#define DIRECTGATE_DESKTOP_MAX_MODES         64
+#define DIRECTGATE_DESKTOP_CODEC_LEN         16
+#define DIRECTGATE_DESKTOP_RESOLUTION_LEN    16
+#define DIRECTGATE_DESKTOP_KEY_CODE_LEN      24
+#define DIRECTGATE_DESKTOP_MAX_HELD_KEYS     32
+#define DIRECTGATE_DESKTOP_PRESET_LEN        16
+#define DIRECTGATE_DESKTOP_PIPELINE_LEN      24
+#define DIRECTGATE_DESKTOP_TRANSPORT_LEN     32
+#define DIRECTGATE_DESKTOP_DEVICE_ID_LEN     128
+#define DIRECTGATE_DESKTOP_TURN_BITRATE_KBPS 4000U
 
 /* Encoded desktop frame transport (cross-platform).
  * Chunk size matches the raw-RGBA path so the relay/WebRTC fragments stay
@@ -54,9 +55,6 @@ extern "C" {
  * frames; going above ~128 KB starts head-of-line-blocking smaller
  * messages on the data channel. */
 #define DIRECTGATE_DESKTOP_CHUNK_BYTES      (64U * 1024U)
-
-/* Enable thread priority so we will get CPU slice even on high load */
-#define DIRECTGATE_HAVE_AVRT_THREAD_PRIORITY 1
 
 typedef enum {
     DIRECTGATE_DESKTOP_PIPELINE_RAW = 0,    /* legacy raw RGBA fallback/debug */
@@ -80,6 +78,9 @@ typedef struct directgate_desktop_quality_ {
     uint32_t nMaxEdge;       /* longest edge of encoded output, e.g. 1920 */
     uint32_t nFps;           /* target capture/encode FPS */
     uint32_t nBitrateKbps;   /* hardware encoder bitrate target */
+    /* The preset's own figure, before it is scaled for the encode size.
+     * Kept so the scaling stays idempotent across pipeline rebuilds. */
+    uint32_t nBaseBitrateKbps;
     uint32_t nKeyframeFrames;/* GOP length, in frames */
     xbool_t bRealtime;       /* enables low-latency encoder hints */
 } directgate_desktop_quality_t;
@@ -193,11 +194,18 @@ typedef struct directgate_desktop_ {
     xbool_t bWebRTCVideoFailed; /* suppress retry until track/ICE recovery */
     xbool_t bPreferDataChannel; /* browser could not decode RTP; avoid pipeline flapping */
     /* Adaptive bitrate controller state: current encoder rate (<= preset
-     * target), ticks since the last congestion signal, and the cooldown
-     * ticks left before the next downward step is allowed. */
+     * target), clean recovery evidence (RTCP reports for RTP, ticks for the
+     * DataChannel fallback), and the cooldown ticks left before the next
+     * downward step is allowed. */
     uint32_t nCurrentBitrateKbps;
-    uint32_t nAbrCleanTicks;
+    uint32_t nAbrCeilingKbps; /* temporary route-specific cap; zero = preset target */
+    uint32_t nAbrCleanEvidence;
     uint32_t nAbrHoldTicks;
+    /* Consecutive receiver reports that came back lossy. Congestion is only
+     * declared once this reaches DIRECTGATE_DESKTOP_ABR_LOSS_REPORTS; a
+     * single lossy report is not evidence of a link that cannot carry the
+     * rate, and treating it as such ratchets the session down for good. */
+    uint32_t nAbrLossReports;
     /* Platform encoder state (opaque to cross-platform code): the macOS
      * ScreenCaptureKit/VideoToolbox encoder, the Linux X11/OpenH264
      * pipeline or the Windows DXGI/MediaFoundation pipeline, owned by
@@ -331,7 +339,10 @@ int DirectGate_Desktop_MacEncoder_DrainMain(directgate_session_t *pSession);
 
 #if defined(__linux__)
 /* X11 (XShm) capture + OpenH264 encoder pipeline. Implemented in
- * desktop_linux.c and only called by desktop.c on Linux. */
+ * desktop_linux.c and only called by desktop.c on Linux. Capture and encode
+ * run on a dedicated thread with its own Xlib connection; encoded frames
+ * land in a single-slot mailbox drained by
+ * DirectGate_Desktop_LinuxEncoder_DrainMain on the main loop. */
 int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
                                           int32_t nX, int32_t nY,
                                           uint32_t nWidth, uint32_t nHeight);
@@ -346,10 +357,11 @@ const char* DirectGate_Desktop_LinuxEncoder_LastError(const directgate_session_t
  * demotes the session to the raw RGBA pipeline. */
 xbool_t DirectGate_Desktop_LinuxEncoder_HasFailed(const directgate_session_t *pSession);
 
-/* Captures, encodes and sends one frame. Called from
- * DirectGate_Desktop_Process on every timer tick while an encoded
- * pipeline is active. */
-int DirectGate_Desktop_LinuxEncoder_ProcessTick(directgate_session_t *pSession);
+/* Drains the encoder mailbox on the main loop. Capture and encode run on
+ * the pipeline's own thread (like the Windows and macOS backends); this is
+ * called from DirectGate_Desktop_Process after a frame or the periodic tick
+ * wakes the loop. */
+int DirectGate_Desktop_LinuxEncoder_DrainMain(directgate_session_t *pSession);
 #endif
 
 #if defined(_WIN32)

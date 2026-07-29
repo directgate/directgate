@@ -43,6 +43,9 @@ function(directgate_smoke_desktop name)
             "-framework VideoToolbox"
             "-framework ScreenCaptureKit")
     elseif(UNIX)
+        # Deliberately built without DIRECTGATE_HAVE_HWENC/hwenc.c: this is the
+        # configuration a host without libavcodec headers gets, so the smoke
+        # tests keep the software-only fallback path compiling and passing.
         target_sources(${name} PRIVATE
             ${AGENT_DIR}/desktop/desktop_linux.c
             ${AGENT_DIR}/desktop/openh264.c
@@ -114,6 +117,12 @@ if(UNIX AND NOT APPLE)
     directgate_smoke(desktop_input_smoke)
     target_include_directories(desktop_input_smoke PRIVATE ${X11_INCLUDE_DIR})
     target_link_libraries(desktop_input_smoke PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
+
+    # Same idea for the adaptive bitrate controller: compiles desktop.c and
+    # drives the policy with synthetic receiver reports, no encoder involved.
+    directgate_smoke(desktop_abr_smoke)
+    target_include_directories(desktop_abr_smoke PRIVATE ${X11_INCLUDE_DIR})
+    target_link_libraries(desktop_abr_smoke PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
 endif()
 directgate_smoke(enroll_prompt_smoke ${AGENT_DIR}/enroll.c)
 directgate_smoke(files_smoke         ${AGENT_DIR}/files.c)
