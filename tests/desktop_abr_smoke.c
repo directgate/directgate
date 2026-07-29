@@ -276,9 +276,35 @@ static int DirectGate_AbrTest_TransportCeiling(void)
     return 0;
 }
 
+/* A rate step is not free: the GPU encoders answer a bitrate change with a
+ * forced IDR several times the size of a normal frame, and that burst shows
+ * up as loss in the reports covering the next second or two. Those reports
+ * describe the step, not the link. Counting them let one congestion episode
+ * take a second step the instant the hold expired - and on NVENC that second
+ * step forced another keyframe, whose burst justified a third, all the way to
+ * the floor on a link that was never the problem. */
+static int DirectGate_AbrTest_StepFalloutIsNotCongestion(void)
+{
+    directgate_desktop_t desktop;
+    DirectGate_AbrTest_Init(&desktop);
+
+    /* Two lossy seconds of real congestion, then two more carrying only the
+     * fallout of the step those triggered, then a link that is simply fine. */
+    for (uint32_t nSecond = 0; nSecond < 4; nSecond++)
+        DirectGate_AbrTest_Run(&desktop, 1, 40, 0);
+
+    CHECK(desktop.nCurrentBitrateKbps == (ABR_TARGET_KBPS * 3U) / 4U,
+        "the fallout of a rate step was counted as a second congestion episode");
+
+    uint32_t nRate = DirectGate_AbrTest_Run(&desktop, 300, 0, 1);
+    CHECK(nRate == ABR_TARGET_KBPS, "the link recovered clean but the rate did not");
+    return 0;
+}
+
 int main(void)
 {
     if (DirectGate_AbrTest_SustainedLoss()) return 1;
+    if (DirectGate_AbrTest_StepFalloutIsNotCongestion()) return 1;
     if (DirectGate_AbrTest_IsolatedLossIgnored()) return 1;
     if (DirectGate_AbrTest_IntermittentLossRecovers()) return 1;
     if (DirectGate_AbrTest_CleanLinkRecovers()) return 1;

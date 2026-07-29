@@ -409,6 +409,7 @@ static void DirectGate_HWEnc_ApplyLatencyOptions(directgate_hwenc_t *pEnc, const
         g_hwenc.av_opt_set(pCtx, "zerolatency", "1", nFlags);
         g_hwenc.av_opt_set(pCtx, "delay", "0", nFlags);
         g_hwenc.av_opt_set(pCtx, "b_ref_mode", "disabled", nFlags);
+        g_hwenc.av_opt_set(pCtx, "forced-idr", "1", nFlags);
     }
     else if (xstrcmp(pEncoderName, "h264_vaapi"))
     {

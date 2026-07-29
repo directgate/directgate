@@ -361,9 +361,13 @@ uint32_t DirectGate_Desktop_AbrStep(directgate_desktop_t *pDesktop,
     uint32_t nFloor = DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS;
     if (nFloor > nTarget) nFloor = nTarget;
 
-    /* A report is evidence either way; a tick without one says nothing, so it
-     * must not clear a streak that is still building. */
-    if (bHaveReport)
+    if (pDesktop->nAbrHoldTicks > 0)
+    {
+        /* A report is evidence either way; a tick without one says nothing,
+         * so it must not clear a streak that is still building. */
+        pDesktop->nAbrLossReports = 0;
+    }
+    else if (bHaveReport)
     {
         if (nFractionLost >= DIRECTGATE_DESKTOP_ABR_LOSS_THRESHOLD) pDesktop->nAbrLossReports++;
         else pDesktop->nAbrLossReports = 0;
