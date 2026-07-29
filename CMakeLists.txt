@@ -314,6 +314,15 @@ elseif(UNIX)
     # Without the headers the feature vanishes and the software encoder is
     # the only path; nothing about the package dependencies changes either
     # way, because the library is never linked.
+    #
+    # That silent fallback is fine for a source build on a machine that simply
+    # has no FFmpeg development package, but it is not acceptable for a
+    # release artifact: the decision is baked in at compile time, so a package
+    # built without the headers can never do GPU encoding on any host, no
+    # matter what the user installs afterwards. The package builds turn this
+    # on so a build image that has lost its FFmpeg headers fails here instead
+    # of shipping a permanently software-only agent.
+    option(DIRECTGATE_REQUIRE_HWENC "Fail the build if GPU desktop encoding cannot be compiled in" OFF)
     find_package(PkgConfig QUIET)
     if(PKG_CONFIG_FOUND)
         pkg_check_modules(LIBAV libavcodec libavutil)
@@ -323,6 +332,13 @@ elseif(UNIX)
         target_sources(directgate PRIVATE ${AGENT_DIR}/desktop/hwenc.c)
         target_compile_definitions(directgate PRIVATE DIRECTGATE_HAVE_HWENC=1)
         target_include_directories(directgate PRIVATE ${LIBAV_INCLUDE_DIRS})
+    elseif(DIRECTGATE_REQUIRE_HWENC)
+        message(FATAL_ERROR
+            "GPU desktop encoding was required but the libavcodec/libavutil headers "
+            "were not found. Install the FFmpeg development package for this build "
+            "image (libavcodec-dev + libavutil-dev on Debian, ffmpeg-devel on RHEL) "
+            "or configure with -DDIRECTGATE_REQUIRE_HWENC=OFF to accept a "
+            "software-only agent.")
     else()
         message(STATUS "GPU desktop encoding: disabled (libavcodec headers not found)")
     endif()

@@ -422,6 +422,7 @@ static void DirectGate_HWEnc_ApplyLatencyOptions(directgate_hwenc_t *pEnc, const
         g_hwenc.av_opt_set(pCtx, "preset", "faster", nFlags);
         g_hwenc.av_opt_set(pCtx, "async_depth", "1", nFlags);
         g_hwenc.av_opt_set(pCtx, "low_delay_brc", "1", nFlags);
+        g_hwenc.av_opt_set(pCtx, "forced_idr", "1", nFlags);
     }
     else if (xstrcmp(pEncoderName, "h264_amf"))
     {

@@ -269,15 +269,45 @@ static int DirectGate_WASAPI_Open(directgate_wasapi_t *pCtx, char *pErr, size_t 
 static void DirectGate_WASAPI_WorkerInit(directgate_wasapi_t *pCtx)
 {
     pCtx->bWorkerInit = XTRUE;
+    HANDLE hThread = GetCurrentThread();
 
     /* Join the process MTA so the worker can call the capture client that the
      * main thread created. No CoUninitialize: balanced by the thread exit. */
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     pCtx->bWorkerCom = (hr == S_OK || hr == S_FALSE) ? XTRUE : XFALSE;
 
-    if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST))
-        xlogw("Failed to raise desktop audio thread priority: err(%lu)",
+#if defined(THREAD_POWER_THROTTLING_CURRENT_VERSION) && defined(THREAD_POWER_THROTTLING_EXECUTION_SPEED)
+    THREAD_POWER_THROTTLING_STATE PowerThrottling;
+    ZeroMemory(&PowerThrottling, sizeof(PowerThrottling));
+
+    PowerThrottling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    PowerThrottling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    PowerThrottling.StateMask = 0;
+
+    if (!SetThreadInformation(hThread, ThreadPowerThrottling, &PowerThrottling, sizeof(PowerThrottling)))
+    {
+        xlogw("Failed to configure audio capture thread as HighQoS: err(%lu)",
             (unsigned long)GetLastError());
+    }
+#endif
+
+    /* Prevent Windows from applying execution-speed power throttling
+     * to the latency-sensitive desktop capture thread. */
+    DWORD nPriorityClass = GetPriorityClass(GetCurrentProcess());
+    int nThreadPriority = THREAD_PRIORITY_ABOVE_NORMAL;
+
+    if (nPriorityClass == NORMAL_PRIORITY_CLASS)
+    {
+        /* HIGHEST is base priority 10 in NORMAL_PRIORITY_CLASS, but can become
+         * excessively aggressive if the process priority class is raised. */
+        nThreadPriority = THREAD_PRIORITY_HIGHEST;
+    }
+
+    if (!SetThreadPriority(hThread, nThreadPriority))
+    {
+        xlogw("Failed to configure audio capture thread priority: class(%lu), priority(%d), err(%lu)",
+            (unsigned long)nPriorityClass, nThreadPriority, (unsigned long)GetLastError());
+    }
 
     /* High-resolution timer so the poll wait is ~2 ms, not the ~15 ms a plain
      * Sleep rounds to. Falls back to a normal timer on pre-1803 Windows. */
