@@ -11,7 +11,13 @@ BUILD="${BUILD_DIR:-$ROOT/build}"
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 
 # Configure (idempotent) with the smoke tests enabled.
-cmake -S "$ROOT" -B "$BUILD" -DDIRECTGATE_BUILD_TESTS=ON
+# Release builds compile the GPU encoder once per libavcodec major; set
+# DIRECTGATE_HWENC_HEADERS to exercise that here too (see docs/building.md).
+set -- -S "$ROOT" -B "$BUILD" -DDIRECTGATE_BUILD_TESTS=ON
+if [ -n "${DIRECTGATE_HWENC_HEADERS:-}" ]; then
+    set -- "$@" "-DDIRECTGATE_HWENC_HEADERS=$DIRECTGATE_HWENC_HEADERS"
+fi
+cmake "$@"
 
 # Build the library, binaries and test executables.
 cmake --build "$BUILD" -j "$JOBS"

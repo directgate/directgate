@@ -325,8 +325,8 @@ elseif(UNIX)
     #
     # One set of headers gets one major, and that is only ever right for the
     # hosts running the same one. DIRECTGATE_HWENC_HEADERS points at a
-    # directory of per-major header trees (see docs/building.md for the
-    # layout); hwenc.c is then compiled once per tree and
+    # directory of per-major header trees (misc/ffmpeg-headers.sh builds
+    # one); hwenc.c is then compiled once per tree and
     # desktop/hwenc_abi.c picks the variant whose library the host actually
     # has. A plain source build passes nothing and keeps the single
     # pkg-config variant below, compiled against whatever FFmpeg is installed.
@@ -349,8 +349,8 @@ elseif(UNIX)
         if(NOT DIRECTGATE_HWENC_ABIS)
             message(FATAL_ERROR
                 "DIRECTGATE_HWENC_HEADERS is set to '${DIRECTGATE_HWENC_HEADERS}' but holds no "
-                "usable <major>/libavcodec + <major>/libavutil header tree. See "
-                "docs/building.md for the expected layout.")
+                "usable <major>/libavcodec + <major>/libavutil header tree. Run "
+                "misc/ffmpeg-headers.sh to populate it.")
         endif()
     endif()
 
@@ -391,7 +391,7 @@ elseif(UNIX)
         message(FATAL_ERROR
             "GPU desktop encoding was required but no libavcodec/libavutil headers "
             "were found. Point DIRECTGATE_HWENC_HEADERS at per-major header trees "
-            "(see docs/building.md), install the FFmpeg development package for this "
+            "(misc/ffmpeg-headers.sh), install the FFmpeg development package for this "
             "build image (libavcodec-dev + libavutil-dev on Debian, ffmpeg-devel on "
             "RHEL), or configure with -DDIRECTGATE_REQUIRE_HWENC=OFF to accept a "
             "software-only agent.")

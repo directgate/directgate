@@ -21,7 +21,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake build-essential clang pkg-config \
-            libssl-dev libx11-dev libxrandr-dev libxext-dev libopus-dev
+            libssl-dev libx11-dev libxrandr-dev libxext-dev libopus-dev \
+            libavcodec-dev libavutil-dev
 
       - name: Build and run ASan/UBSan smoke tests
         run: sh ./tests/run-sanitizers.sh

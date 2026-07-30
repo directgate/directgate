@@ -23,11 +23,11 @@ Linux desktop sessions prefer the **GPU** encoder when one is usable (NVENC, VAA
 
 The struct layouts come from the build-time headers, so one compiled encoder only accepts a runtime libavcodec with the *same major soname* - a mismatch is treated like "not installed" and falls back to software, silently. A single build would therefore reach the GPU only on hosts running the same FFmpeg generation as the machine that built it.
 
-A binary meant to run on machines other than the one that built it can carry several instead. Point `DIRECTGATE_HWENC_HEADERS` at a directory holding one FFmpeg public-header tree per major:
+A binary meant to run on machines other than the one that built it can carry several instead. [`misc/ffmpeg-headers.sh`](../misc/ffmpeg-headers.sh) populates a directory with one FFmpeg public-header tree per major, and `DIRECTGATE_HWENC_HEADERS` points CMake at it:
 
 ```
 <dir>/58/libavcodec/*.h   <dir>/58/libavutil/*.h
-<dir>/59/...              <dir>/60/...   <dir>/61/...
+<dir>/59/...              <dir>/60/...   <dir>/61/...   <dir>/62/...
 ```
 
 `desktop/hwenc.c` is then compiled once against each tree and `desktop/hwenc_abi.c` selects the variant matching whatever the host has, newest first. Nothing is linked or redistributed - the host's own FFmpeg is still what gets loaded, so VAAPI and QSV keep using the drivers that distribution configured, and the binary grows by a few tens of kilobytes per major.
@@ -38,12 +38,18 @@ A binary meant to run on machines other than the one that built it can carry sev
 | 59         | 57        | 5.1    | Debian 12, EL9                       |
 | 60         | 58        | 6.1    | Ubuntu 24.04                         |
 | 61         | 59        | 7.1    | Debian 13, current Fedora            |
+| 62         | 60        | 8.0    | rolling releases moving to FFmpeg 8  |
 
-The trees are ordinary `libavcodec/` and `libavutil/` directories from an FFmpeg release tarball, plus a `libavutil/avconfig.h` (two macros, which FFmpeg's `configure` normally generates). CMake takes whatever majors it finds, so adding one as distributions move on means dropping in another tree and adding the matching pair of `#if` blocks in `hwenc_abi.c`.
+```sh
+./misc/ffmpeg-headers.sh /tmp/ffmpeg-headers
+cmake -B build -DDIRECTGATE_HWENC_HEADERS=/tmp/ffmpeg-headers
+```
+
+The trees are ordinary `libavcodec/` and `libavutil/` directories from an FFmpeg release tarball, plus a `libavutil/avconfig.h` (two macros, which FFmpeg's `configure` normally generates) - so a distribution's own `-dev` package works just as well if you symlink it in. CMake takes whatever majors it finds, so adding one as distributions move on means another release line in that script plus the matching pair of `#if` blocks in `hwenc_abi.c`.
 
 A plain `cmake -B build` passes no header trees and keeps the single-variant behaviour, compiled against whatever FFmpeg is installed - which is what you want on a machine that only has to run its own build.
 
-Two switches guard this for release builds. `-DDIRECTGATE_REQUIRE_HWENC=ON` fails at configure time when no FFmpeg headers are found at all, instead of quietly producing a permanently software-only binary - the decision is baked in at compile time and no user can repair it afterwards. And the `hwenc_abi_smoke` test loads the build machine's own libavcodec through the dispatcher, so a variant that compiles but cannot be selected fails too.
+Two switches guard this for release builds, and the `hwenc-abi` CI job exercises both on every push. `-DDIRECTGATE_REQUIRE_HWENC=ON` fails at configure time when no FFmpeg headers are found at all, instead of quietly producing a permanently software-only binary - the decision is baked in at compile time and no user can repair it afterwards. And the `hwenc_abi_smoke` test loads the build machine's own libavcodec through the dispatcher, so a variant that compiles but cannot be selected fails too.
 
 On macOS and Windows desktop streaming uses only OS components (ScreenCaptureKit + VideoToolbox, and DXGI Desktop Duplication + Media Foundation respectively) - nothing extra to install; see [Building for Windows](windows.md#desktop-streaming) for the Windows specifics.
 

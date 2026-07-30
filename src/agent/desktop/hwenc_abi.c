@@ -84,7 +84,7 @@ typedef struct directgate_hwenc_abi_ {
 
 /* CMake defines DIRECTGATE_HWENC_HAS_<major> for each variant it built, so the
  * set follows whatever header trees the build image provided. Adding a major
- * is another header tree plus a pair of blocks here; see docs/building.md. */
+ * is a line in misc/ffmpeg-headers.sh plus a pair of blocks here. */
 #if defined(DIRECTGATE_HWENC_HAS_62)
 DIRECTGATE_HWENC_DECLARE(62);
 #endif
