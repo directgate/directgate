@@ -19,6 +19,32 @@ For H.264 desktop streaming on Linux the agent loads `libopenh264.so` at runtime
 
 Linux desktop sessions prefer the **GPU** encoder when one is usable (NVENC, VAAPI, QSV, AMF or V4L2 M2M), reached through libavcodec. If the `libavcodec`/`libavutil` development headers are present at configure time - `ffmpeg-devel` on Fedora, `libavcodec-dev libavutil-dev` on Debian/Ubuntu - CMake reports `GPU desktop encoding: enabled` and compiles the support in; the libraries themselves are dlopen'd at runtime and never linked, so they stay optional and add no package dependency. Building without those headers, or running on a host with no libavcodec, no GPU or no usable encoder, simply keeps the OpenH264 software path. Set `DIRECTGATE_HWENC=0` to force software encoding, or `DIRECTGATE_HWENC_ENCODER=h264_vaapi` to pin one.
 
+### Talking to more than one libavcodec
+
+The struct layouts come from the build-time headers, so one compiled encoder only accepts a runtime libavcodec with the *same major soname* - a mismatch is treated like "not installed" and falls back to software, silently. A single build would therefore reach the GPU only on hosts running the same FFmpeg generation as the machine that built it.
+
+A binary meant to run on machines other than the one that built it can carry several instead. Point `DIRECTGATE_HWENC_HEADERS` at a directory holding one FFmpeg public-header tree per major:
+
+```
+<dir>/58/libavcodec/*.h   <dir>/58/libavutil/*.h
+<dir>/59/...              <dir>/60/...   <dir>/61/...
+```
+
+`desktop/hwenc.c` is then compiled once against each tree and `desktop/hwenc_abi.c` selects the variant matching whatever the host has, newest first. Nothing is linked or redistributed - the host's own FFmpeg is still what gets loaded, so VAAPI and QSV keep using the drivers that distribution configured, and the binary grows by a few tens of kilobytes per major.
+
+| libavcodec | libavutil | FFmpeg | Covers                               |
+|------------|-----------|--------|--------------------------------------|
+| 58         | 56        | 4.4    | Debian 11, Ubuntu 20.04 / 22.04, EL8 |
+| 59         | 57        | 5.1    | Debian 12, EL9                       |
+| 60         | 58        | 6.1    | Ubuntu 24.04                         |
+| 61         | 59        | 7.1    | Debian 13, current Fedora            |
+
+The trees are ordinary `libavcodec/` and `libavutil/` directories from an FFmpeg release tarball, plus a `libavutil/avconfig.h` (two macros, which FFmpeg's `configure` normally generates). CMake takes whatever majors it finds, so adding one as distributions move on means dropping in another tree and adding the matching pair of `#if` blocks in `hwenc_abi.c`.
+
+A plain `cmake -B build` passes no header trees and keeps the single-variant behaviour, compiled against whatever FFmpeg is installed - which is what you want on a machine that only has to run its own build.
+
+Two switches guard this for release builds. `-DDIRECTGATE_REQUIRE_HWENC=ON` fails at configure time when no FFmpeg headers are found at all, instead of quietly producing a permanently software-only binary - the decision is baked in at compile time and no user can repair it afterwards. And the `hwenc_abi_smoke` test loads the build machine's own libavcodec through the dispatcher, so a variant that compiles but cannot be selected fails too.
+
 On macOS and Windows desktop streaming uses only OS components (ScreenCaptureKit + VideoToolbox, and DXGI Desktop Duplication + Media Foundation respectively) - nothing extra to install; see [Building for Windows](windows.md#desktop-streaming) for the Windows specifics.
 
 Desktop **system-audio** streaming encodes with `libopus`. On Linux and macOS it is loaded at runtime (`DIRECTGATE_OPUS_LIB` overrides the search; `libopus.so`/`libopus.dylib`) and is optional - a missing library just reports audio `unavailable`. On Windows there is no package manager, so libopus is **linked statically** into the exe (see [Building for Windows](windows.md#opus-for-windows-one-time)) and is always present. Capture uses the OS output loopback: `libpulse` for the PulseAudio / PipeWire default-sink monitor on Linux (`DIRECTGATE_AUDIO_SOURCE` overrides the source), WASAPI on Windows, and ScreenCaptureKit on macOS (13+, sharing the screen-recording permission the video path already needs) - nothing extra to install for the Windows or macOS capture side. When the capture source is missing the session still streams video and audio just reports `unavailable`. On a headless Linux host install your distribution's `libopus` and `pulseaudio-libs` / `libpulse` packages to enable it.
