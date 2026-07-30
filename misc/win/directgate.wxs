@@ -72,6 +72,42 @@
             AllowSameVersionUpgrades="yes"
             DowngradeErrorMessage="A newer version of DirectGate Agent is already installed." />
 
+        <!--
+            No install, upgrade or removal of this package ever needs a reboot.
+            It replaces two executables and re-registers one service, and it
+            stops that service itself before touching the files.
+
+            Windows Installer decides otherwise on its own, and the reason is a
+            sequencing detail: InstallValidate looks for files in use *before*
+            StopServices runs, so it always finds directgate.exe held open -
+            by the service, by the agent the launcher spawned into the user's
+            session, and by the elevated desktop helper. The service is a
+            process Restart Manager knows how to stop and start again, but the
+            other two are plain windowless processes it cannot shut down
+            gracefully, so it falls back to declaring a reboot necessary. By
+            the time InstallFiles actually runs, StopServices has taken all
+            three down and the files are free - the warning was already stale.
+
+            CloseApplication closes that gap by ending them before validation,
+            so nothing is in use and the question never arises. They are killed
+            rather than asked to quit: none has a window or a Restart Manager
+            registration, and the launcher brings the agent back the moment the
+            service starts again at the end of the install.
+
+            REBOOT stays as the backstop for anything else the sequence might
+            flag, which for a package of this shape would equally be spurious.
+        -->
+        <util:CloseApplication
+            Id="CloseDirectGateProcesses"
+            Target="directgate.exe"
+            Description="DirectGate is running and will be stopped so its files can be replaced. It starts again on its own when the installer finishes."
+            CloseMessage="no"
+            TerminateProcess="0"
+            RebootPrompt="no"
+            Timeout="10" />
+
+        <Property Id="REBOOT" Value="ReallySuppress" />
+
         <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
 
         <Feature Id="Main" Title="DirectGate Agent" Level="1">
