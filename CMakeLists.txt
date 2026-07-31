@@ -125,6 +125,12 @@ if(APPLE)
         set(OPENSSL_ROOT_DIR "${BREW_OPENSSL_PREFIX}")
     endif()
 endif()
+# FindOpenSSL adds ZLIB::ZLIB to OpenSSL::Crypto's link interface whenever
+# OPENSSL_USE_STATIC_LIBS is on, because a static libcrypto may have been built
+# with zlib support and nothing else can resolve it. The target has to exist by
+# then or the link fails with "cannot find -lZLIB::ZLIB". Harmless for the
+# normal dynamic build, which never references it.
+find_package(ZLIB QUIET)
 find_package(OpenSSL REQUIRED)
 
 # libutil provides forkpty()/openpty() used by the agent PTY layer.
