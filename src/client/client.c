@@ -23,6 +23,7 @@
 #include "version.h"
 #include "protocol.h"
 #include "transfer.h"
+#include "common.h"
 #include "config.h"
 #include "relay.h"
 #include "webrtc.h"
@@ -1428,6 +1429,9 @@ int main(int argc, char* argv[])
     int nSignals[4] = { SIGTERM, SIGINT, SIGPIPE, SIGWINCH };
     XSig_Register(nSignals, 4, DirectGate_Client_SignalCallback);
 #endif
+
+    /* Before the first relay or API connection; see common.c. */
+    DirectGate_InitTrustStore();
 
     directgate_ctx_t client;
     memset(&client, 0, sizeof(client));

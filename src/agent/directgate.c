@@ -2933,6 +2933,9 @@ int DirectGate_RunAgent(int argc, char* argv[])
     DirectGate_Elevated_SetEnabled(args.desktop.bElevatedInput, args.desktop.bLockScreen);
 #endif
 
+    /* Before the first relay or API connection. */
+    DirectGate_InitTrustStore();
+
     xlogn("Starting directgate agent: v%s", DirectGate_GetVersionLong());
     xlogi("libxutils version: %s", XUtils_Version());
     xlogi("WebRTC library: v%s", RTC_VERSION);
