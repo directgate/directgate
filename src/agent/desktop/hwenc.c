@@ -282,18 +282,35 @@ int DirectGate_HWEnc_Load(char *pErrBuf, size_t nErrSize)
     snprintf(sCodecName, sizeof(sCodecName), "libavcodec.so.%d", LIBAVCODEC_VERSION_MAJOR);
     snprintf(sUtilName, sizeof(sUtilName), "libavutil.so.%d", LIBAVUTIL_VERSION_MAJOR);
 
+    char sCodecError[160] = { 0 };
+    char sUtilError[160] = { 0 };
     const char *pEnvCodec = getenv("DIRECTGATE_HWENC_LIB");
+
+    dlerror();
     void *pCodec = dlopen(xstrused(pEnvCodec) ? pEnvCodec : sCodecName, RTLD_NOW | RTLD_LOCAL);
+    if (pCodec == NULL)
+    {
+        const char *pError = dlerror();
+        if (pError != NULL) xstrncpy(sCodecError, sizeof(sCodecError), pError);
+    }
+
     void *pUtil = dlopen(sUtilName, RTLD_NOW | RTLD_LOCAL);
+    if (pUtil == NULL)
+    {
+        const char *pError = dlerror();
+        if (pError != NULL) xstrncpy(sUtilError, sizeof(sUtilError), pError);
+    }
 
     if (pCodec == NULL || pUtil == NULL)
     {
         if (pCodec != NULL) dlclose(pCodec);
         if (pUtil != NULL) dlclose(pUtil);
 
-        DirectGate_HWEnc_SetError(pErrBuf, nErrSize,
-            "libavcodec/libavutil (%s, %s) are not installed; using the software H.264 encoder.",
-            sCodecName, sUtilName);
+        const char *pFailed = (pCodec == NULL) ? sCodecName : sUtilName;
+        const char *pReason = (pCodec == NULL) ? sCodecError : sUtilError;
+
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "%s could not be loaded: %s",
+            pFailed, xstrused(pReason) ? pReason : "no reason reported");
 
         return XSTDERR;
     }

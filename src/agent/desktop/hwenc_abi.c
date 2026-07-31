@@ -127,6 +127,13 @@ int DirectGate_HWEnc_Load(char *pErrBuf, size_t nErrSize)
 {
     if (g_pHwencAbi != NULL) return XSTDOK;
 
+    /* Only the summary reaches the desktop status, and it has no room for five
+     * loader errors - but exactly one of them is usually the real story, and
+     * which one depends on the host. So each attempt is logged once per
+     * process. Without this the operator sees "no libavcodec this build
+     * understands" and has no way to tell a host that has none from a host
+     * whose libavcodec was found and then refused. */
+    static xbool_t bLogged = XFALSE;
     char sTried[128] = { 0 };
     size_t nTried = 0;
 
@@ -142,16 +149,24 @@ int DirectGate_HWEnc_Load(char *pErrBuf, size_t nErrSize)
             return XSTDOK;
         }
 
+        if (!bLogged)
+        {
+            xlogi("GPU encoder: libavcodec %d unusable: %s", g_hwencAbis[i].nMajor,
+                xstrused(sError) ? sError : "no reason reported");
+        }
+
         nTried += (size_t)snprintf(sTried + nTried, sizeof(sTried) - nTried,
             "%s%d", nTried ? "/" : "", g_hwencAbis[i].nMajor);
 
         if (nTried >= sizeof(sTried)) break;
     }
 
+    bLogged = XTRUE;
+
     if (pErrBuf != NULL && nErrSize > 0)
     {
         snprintf(pErrBuf, nErrSize,
-            "no libavcodec this build understands (%s) is installed; "
+            "no libavcodec this build supports (%s) could be loaded; "
             "using the software H.264 encoder.", sTried);
     }
 
