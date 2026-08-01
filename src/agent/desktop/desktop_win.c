@@ -795,20 +795,10 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
 
     /* Prevent Windows from applying execution-speed power throttling
      * to the latency-sensitive desktop capture thread. */
-    DWORD nPriorityClass = GetPriorityClass(GetCurrentProcess());
-    int nThreadPriority = THREAD_PRIORITY_ABOVE_NORMAL;
-
-    if (nPriorityClass == NORMAL_PRIORITY_CLASS)
+    if (!SetThreadPriority(hThread, THREAD_PRIORITY_HIGHEST))
     {
-        /* HIGHEST is base priority 10 in NORMAL_PRIORITY_CLASS, but can become
-         * excessively aggressive if the process priority class is raised. */
-        nThreadPriority = THREAD_PRIORITY_HIGHEST;
-    }
-
-    if (!SetThreadPriority(hThread, nThreadPriority))
-    {
-        xlogw("Failed to configure desktop capture thread priority: class(%lu), priority(%d), err(%lu)",
-            (unsigned long)nPriorityClass, nThreadPriority, (unsigned long)GetLastError());
+        xlogw("Failed to configure desktop capture thread priority: err(%lu)",
+            (unsigned long)GetLastError());
     }
 
     pEnc->bInitOk = (DirectGate_Desktop_WinEnc_InitPipeline(pEnc) == XSTDOK) ? XTRUE : XFALSE;
