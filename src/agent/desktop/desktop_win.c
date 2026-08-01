@@ -778,21 +778,6 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
     HRESULT hrCom = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     HANDLE hThread = GetCurrentThread();
 
-#if defined(THREAD_POWER_THROTTLING_CURRENT_VERSION) && defined(THREAD_POWER_THROTTLING_EXECUTION_SPEED)
-    THREAD_POWER_THROTTLING_STATE PowerThrottling;
-    ZeroMemory(&PowerThrottling, sizeof(PowerThrottling));
-
-    PowerThrottling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
-    PowerThrottling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
-    PowerThrottling.StateMask = 0;
-
-    if (!SetThreadInformation(hThread, ThreadPowerThrottling, &PowerThrottling, sizeof(PowerThrottling)))
-    {
-        xlogw("Failed to configure desktop capture thread as HighQoS: err(%lu)",
-            (unsigned long)GetLastError());
-    }
-#endif
-
     /* Prevent Windows from applying execution-speed power throttling
      * to the latency-sensitive desktop capture thread. */
     if (!SetThreadPriority(hThread, THREAD_PRIORITY_HIGHEST))

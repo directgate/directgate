@@ -276,21 +276,6 @@ static void DirectGate_WASAPI_WorkerInit(directgate_wasapi_t *pCtx)
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     pCtx->bWorkerCom = (hr == S_OK || hr == S_FALSE) ? XTRUE : XFALSE;
 
-#if defined(THREAD_POWER_THROTTLING_CURRENT_VERSION) && defined(THREAD_POWER_THROTTLING_EXECUTION_SPEED)
-    THREAD_POWER_THROTTLING_STATE PowerThrottling;
-    ZeroMemory(&PowerThrottling, sizeof(PowerThrottling));
-
-    PowerThrottling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
-    PowerThrottling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
-    PowerThrottling.StateMask = 0;
-
-    if (!SetThreadInformation(hThread, ThreadPowerThrottling, &PowerThrottling, sizeof(PowerThrottling)))
-    {
-        xlogw("Failed to configure audio capture thread as HighQoS: err(%lu)",
-            (unsigned long)GetLastError());
-    }
-#endif
-
     /* Prevent Windows from applying execution-speed power throttling
      * to the latency-sensitive desktop capture thread. */
     if (!SetThreadPriority(hThread, THREAD_PRIORITY_HIGHEST))
