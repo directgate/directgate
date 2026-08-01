@@ -67,6 +67,38 @@ int main(void)
         "duplicate signaling packet rejected");
     DirectGate_E2E_Clear(&ccState);
 
+    /* A session that migrates between the relay socket and a data channel
+       delivers packets out of order; being overtaken is not a replay. */
+    DirectGate_E2E_Init(&ccState);
+    CHECK(check_scoped_cc(&ccState, "session", 1, 5, 5),
+        "newest packet of a burst accepted first");
+    CHECK(check_scoped_cc(&ccState, "session", 1, 3, 3),
+        "packet overtaken on the slower transport still accepted");
+    CHECK(check_scoped_cc(&ccState, "session", 1, 4, 4),
+        "gap between reordered packets still accepted");
+    CHECK(!check_scoped_cc(&ccState, "session", 1, 4, 4),
+        "replay inside the window rejected");
+    CHECK(!check_scoped_cc(&ccState, "session", 1, 5, 5),
+        "replay of the window head rejected");
+    CHECK(check_scoped_cc(&ccState, "session", 1, 5 + XE2E_CC_WINDOW_SIZE, 6),
+        "packet far ahead advances the window");
+    CHECK(!check_scoped_cc(&ccState, "session", 1, 4, 7),
+        "packet older than the window rejected");
+    DirectGate_E2E_Clear(&ccState);
+
+    /* The window is per scope: unordered input must not consume the budget of
+       the reliable session stream, or vice versa. */
+    DirectGate_E2E_Init(&ccState);
+    CHECK(check_scoped_cc(&ccState, "input", 1, 9, 1),
+        "input scope tracks its own window");
+    CHECK(check_scoped_cc(&ccState, "session", 1, 1, 2),
+        "session scope unaffected by the input window");
+    CHECK(check_scoped_cc(&ccState, "input", 1, 8, 3),
+        "reordered input packet accepted");
+    CHECK(!check_scoped_cc(&ccState, "input", 1, 8, 4),
+        "duplicate input packet still rejected");
+    DirectGate_E2E_Clear(&ccState);
+
     xbyte_buffer_t packet;
     XByteBuffer_Init(&packet, XSTDNON, XFALSE);
 

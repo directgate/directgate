@@ -62,6 +62,7 @@
 #define DIRECTGATE_TRANSFER_WS_BUFFER_MAX   (8U * 1024U * 1024U)
 #define DIRECTGATE_TRANSFER_RTC_BUFFER_MAX  (8U * 1024U * 1024U)
 #define DIRECTGATE_RELAY_KA_TIMEOUT_MS      60000ULL
+#define DIRECTGATE_RELAY_KA_PROBE_MS        20000ULL
 
 #define DIRECTGATE_NO_ANSWER                "N/A"
 
@@ -818,7 +819,7 @@ int DirectGate_HandshakeResponse(xapi_ctx_t *pCtx, xapi_session_t *pApiSession)
     return XAPI_CONTINUE;
 }
 
-int DirectGate_SendPong(xapi_session_t *pApiSession)
+static int DirectGate_SendControlFrame(xapi_session_t *pApiSession, xws_frame_type_t eType)
 {
     XCHECK((pApiSession != NULL), XAPI_DISCONNECT);
     directgate_conn_t *pConn = (directgate_conn_t*)pApiSession->pSessionData;
@@ -826,10 +827,11 @@ int DirectGate_SendPong(xapi_session_t *pApiSession)
     xws_status_t status;
     xws_frame_t frame;
 
-    status = XWebFrame_Create(&frame, NULL, 0, XWS_PONG, XTRUE, XTRUE);
+    status = XWebFrame_Create(&frame, NULL, 0, eType, XTRUE, XTRUE);
     if (status != XWS_ERR_NONE)
     {
-        xloge("Failed to create PONG frame: id(%u), fd(%d), status(%s)",
+        xloge("Failed to create %s frame: id(%u), fd(%d), status(%s)",
+            XWS_FrameTypeStr(eType),
             DirectGate_Conn_GetID(pConn, pApiSession),
             DirectGate_Conn_GetFD(pConn, pApiSession),
             XWebSock_GetStatusStr(status));
@@ -837,7 +839,8 @@ int DirectGate_SendPong(xapi_session_t *pApiSession)
         return XAPI_DISCONNECT;
     }
 
-    xlogd("Sending WS PONG: id(%u), fd(%d), bytes(%zu)",
+    xlogt("Sending WS %s: id(%u), fd(%d), bytes(%zu)",
+        XWS_FrameTypeStr(eType),
         DirectGate_Conn_GetID(pConn, pApiSession),
         DirectGate_Conn_GetFD(pConn, pApiSession),
         frame.buffer.nUsed);
@@ -846,6 +849,16 @@ int DirectGate_SendPong(xapi_session_t *pApiSession)
     XWebFrame_Clear(&frame);
 
     return XAPI_EnableEvent(pApiSession, XPOLLOUT);
+}
+
+static int DirectGate_SendPong(xapi_session_t *pApiSession)
+{
+    return DirectGate_SendControlFrame(pApiSession, XWS_PONG);
+}
+
+static int DirectGate_SendPing(xapi_session_t *pApiSession)
+{
+    return DirectGate_SendControlFrame(pApiSession, XWS_PING);
 }
 
 static int DirectGate_HandleError(xapi_session_t *pApiSession, directgate_pkg_t *pPkg)
@@ -892,6 +905,7 @@ static int DirectGate_InitConnection(xapi_ctx_t *pCtx, xapi_session_t *pApiSessi
 
     pConn->pWsSession = pApiSession;
     pConn->nLastRelayRecvMs = XTime_GetMs();
+    pConn->nLastRelayProbeMs = 0;
     pConn->nNextReconnectMs = 0;
     pConn->sDisconnectReason[0] = XSTR_NUL;
     pConn->bStartupRelayRefreshDone = XFALSE;
@@ -2196,7 +2210,9 @@ static int DirectGate_HandleEncryptedMsg(xapi_session_t *pApiSession, directgate
 
     if (!DirectGate_Proto_DecryptPackage(&inner, pPkg, &pSession->e2e))
     {
-        xloge("Failed to decrypt %s message: sid(%u), wsfd(%d)",
+        /* Dropping a single packet is recoverable (replay window, stale
+           transport), so this must not read like a session-fatal error. */
+        xlogw("Dropped undecryptable %s message: sid(%u), wsfd(%d)",
             xstrused(pTransport) ? pTransport : "transport",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
 
@@ -2359,7 +2375,7 @@ int DirectGate_HandleFrame(xapi_ctx_t *pCtx, xapi_session_t *pApiSession)
     XCHECK((pFrame != NULL), xthrowr(XAPI_DISCONNECT, "Invalid frame"));
     pConn->nLastRelayRecvMs = XTime_GetMs();
 
-    xlogd("Received WS frame: id(%u), fd(%d), type(%s), fin(%s), hdr(%zu), pl(%zu), bytes(%zu)",
+    xlogt("Received WS frame: id(%u), fd(%d), type(%s), fin(%s), hdr(%zu), pl(%zu), bytes(%zu)",
         DirectGate_Conn_GetID(pConn, pApiSession), DirectGate_Conn_GetFD(pConn, pApiSession),
         XWS_FrameTypeStr(pFrame->eType), pFrame->bFin ? "true" : "false",
         pFrame->nHeaderSize, pFrame->nPayloadLength, pFrame->buffer.nUsed);
@@ -2574,7 +2590,21 @@ static void DirectGate_CheckRelayKeepalive(directgate_conn_t *pConn)
 
     uint64_t nNowMs = XTime_GetMs();
     uint64_t nSinceRecv = nNowMs - pConn->nLastRelayRecvMs;
-    if (nSinceRecv < DIRECTGATE_RELAY_KA_TIMEOUT_MS) return;
+
+    if (nSinceRecv < DIRECTGATE_RELAY_KA_TIMEOUT_MS)
+    {
+        if (nSinceRecv < DIRECTGATE_RELAY_KA_PROBE_MS ||
+            pConn->nLastRelayProbeMs >= pConn->nLastRelayRecvMs) return;
+
+        pConn->nLastRelayProbeMs = nNowMs;
+
+        xlogd("Probing idle relay link: id(%u), fd(%d), idleMs(%" PRIu64 ")",
+            DirectGate_Conn_GetID(pConn, pConn->pWsSession),
+            DirectGate_Conn_GetFD(pConn, pConn->pWsSession), nSinceRecv);
+
+        DirectGate_SendPing(pConn->pWsSession);
+        return;
+    }
 
     xlogw("Relay keepalive timeout, no data received for %" PRIu64 "ms: id(%u), fd(%d)", nSinceRecv,
         DirectGate_Conn_GetID(pConn, pConn->pWsSession), DirectGate_Conn_GetFD(pConn, pConn->pWsSession));

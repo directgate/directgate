@@ -51,6 +51,10 @@ typedef struct directgate_conn_ {
     uint32_t nReconnectAttempt;
     uint64_t nNextReconnectMs;
     uint64_t nLastRelayRecvMs;
+    /* Timestamp of the last liveness PING we sent to the relay. Compared
+     * against nLastRelayRecvMs so exactly one probe goes out per silent
+     * stretch instead of one per event loop tick. */
+    uint64_t nLastRelayProbeMs;
     /* Force one API refresh before the first connect of this process so relay
      * assignment is re-evaluated on agent startup instead of blindly reusing
      * the relayUrl persisted in the config. */

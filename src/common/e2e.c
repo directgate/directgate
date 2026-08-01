@@ -31,6 +31,45 @@ void DirectGate_E2E_Init(directgate_e2e_t *pE2E)
     pE2E->bInitialized = XFALSE;
 }
 
+void DirectGate_E2E_ResetCCWindow(directgate_ccwin_t *pWindow)
+{
+    XCHECK_VOID_NL((pWindow != NULL));
+    pWindow->nHighest = 0;
+    pWindow->nBitmap = 0;
+}
+
+xbool_t DirectGate_E2E_AcceptCC(directgate_ccwin_t *pWindow, uint32_t nCC)
+{
+    XCHECK_NL((pWindow != NULL), XFALSE);
+    XCHECK_NL((nCC > 0), XFALSE);
+
+    if (pWindow->nHighest == 0)
+    {
+        pWindow->nHighest = nCC;
+        pWindow->nBitmap = 1ULL;
+        return XTRUE;
+    }
+
+    if (nCC > pWindow->nHighest)
+    {
+        uint32_t nShift = nCC - pWindow->nHighest;
+        pWindow->nBitmap = (nShift >= XE2E_CC_WINDOW_SIZE) ?
+            1ULL : ((pWindow->nBitmap << nShift) | 1ULL);
+
+        pWindow->nHighest = nCC;
+        return XTRUE;
+    }
+
+    uint32_t nBehind = pWindow->nHighest - nCC;
+    if (nBehind >= XE2E_CC_WINDOW_SIZE) return XFALSE;
+
+    uint64_t nMask = 1ULL << nBehind;
+    if (pWindow->nBitmap & nMask) return XFALSE;
+
+    pWindow->nBitmap |= nMask;
+    return XTRUE;
+}
+
 void DirectGate_E2E_Clear(directgate_e2e_t *pE2E)
 {
     XCHECK_VOID((pE2E != NULL));

@@ -608,11 +608,23 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     DirectGate_Desktop_RestoreDisplayMode(pDesktop);
     DirectGate_Desktop_ReleaseHeldKeys(pDesktop);
 
-    if (pDesktop->pDisplay != NULL && pDesktop->nScratchKeycode != 0U)
+    if (pDesktop->pDisplay != NULL && pDesktop->nScratchCount > 0U)
     {
         KeySym clearSyms[2] = { NoSymbol, NoSymbol };
-        XChangeKeyboardMapping((Display*)pDesktop->pDisplay, (int)pDesktop->nScratchKeycode, 2, clearSyms, 1);
-        XSync((Display*)pDesktop->pDisplay, XFALSE);
+        xbool_t bRestored = XFALSE;
+
+        for (uint32_t i = 0; i < pDesktop->nScratchCount; i++)
+        {
+            if (pDesktop->scratchKeys[i].nKeysym == NoSymbol) continue;
+
+            XChangeKeyboardMapping((Display*)pDesktop->pDisplay,
+                (int)pDesktop->scratchKeys[i].nKeycode, 2, clearSyms, 1);
+
+            pDesktop->scratchKeys[i].nKeysym = NoSymbol;
+            bRestored = XTRUE;
+        }
+
+        if (bRestored) XSync((Display*)pDesktop->pDisplay, XFALSE);
     }
 
     if (pDesktop->pDisplay != NULL)
@@ -668,6 +680,7 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     pDesktop->bRequestKeyframe = XFALSE;
     pDesktop->bWebRTCVideoFailed = XFALSE;
     pDesktop->bPreferDataChannel = XFALSE;
+    pDesktop->bScratchProbed = XFALSE;
     pDesktop->pOriginalDisplayMode = NULL;
     pDesktop->pFakeRelativeMotion = NULL;
     pDesktop->pFakeMotion = NULL;
@@ -695,15 +708,16 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     pDesktop->nClickCount = 0;
     pDesktop->nLastClickButton = 0;
     pDesktop->nInputRecheckMs = 0;
-    pDesktop->nScratchKeycode = 0;
-    pDesktop->nScratchKeysym = 0;
+    pDesktop->nScratchCount = 0;
+    pDesktop->nScratchSeq = 0;
     pDesktop->nMonitorCount = 0;
     pDesktop->sSelectedMonitor[0] = '\0';
     pDesktop->sInputReason[0] = '\0';
     pDesktop->sFallbackReason[0] = '\0';
-    xstrncpy(pDesktop->sResolution, sizeof(pDesktop->sResolution), "original");
+    memset(pDesktop->scratchKeys, 0, sizeof(pDesktop->scratchKeys));
     memset(pDesktop->monitors, 0, sizeof(pDesktop->monitors));
     xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "raw-rgba");
+    xstrncpy(pDesktop->sResolution, sizeof(pDesktop->sResolution), "original");
 }
 
 void DirectGate_Desktop_DetachEvent(directgate_desktop_t *pDesktop)

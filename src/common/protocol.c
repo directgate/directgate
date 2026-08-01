@@ -826,10 +826,10 @@ xbool_t DirectGate_Proto_CheckCC(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E)
                 XCHECK_CALL((nScopedCC > 0), XJSON_Destroy, &json,
                     xthrowr(XFALSE, "Missing scoped CC for scope(%s)", pScope));
 
-                uint32_t *pLast;
+                directgate_ccwin_t *pWindow;
                 if (bSignal)
                 {
-                    pLast = &pE2E->nRxSignalPacketId;
+                    pWindow = &pE2E->rxSignalWindow;
                 }
                 else
                 {
@@ -840,27 +840,33 @@ xbool_t DirectGate_Proto_CheckCC(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E)
                     if (nEpoch > pE2E->nRxSessionEpoch)
                     {
                         pE2E->nRxSessionEpoch = nEpoch;
-                        pE2E->nRxSessionPacketId = 0;
-                        pE2E->nRxInputPacketId = 0;
+                        DirectGate_E2E_ResetCCWindow(&pE2E->rxSessionWindow);
+                        DirectGate_E2E_ResetCCWindow(&pE2E->rxInputWindow);
                     }
 
-                    pLast = bInput ?
-                        &pE2E->nRxInputPacketId :
-                        &pE2E->nRxSessionPacketId;
+                    pWindow = bInput ?
+                        &pE2E->rxInputWindow :
+                        &pE2E->rxSessionWindow;
                 }
 
-                XCHECK_CALL((nScopedCC > *pLast), XJSON_Destroy, &json,
-                    xthrowr(XFALSE, "SC(%u) <= last(%u), scope(%s)",
-                    nScopedCC, *pLast, bSignal ? "signal" : (bInput ? "input" : "session")));
+                if (!DirectGate_E2E_AcceptCC(pWindow, nScopedCC))
+                {
+                    xlogw("Dropping replayed or stale packet: sc(%u), window(%u), scope(%s)",
+                        nScopedCC, pWindow->nHighest, bSignal ? "signal" : (bInput ? "input" : "session"));
 
-                *pLast = nScopedCC;
-                if (nCC > pE2E->nRxPacketId) pE2E->nRxPacketId = nCC;
+                    XJSON_Destroy(&json);
+                    return XFALSE;
+                }
+
+                DirectGate_E2E_AcceptCC(&pE2E->rxWindow, nCC);
             }
-            else
+            else if (!DirectGate_E2E_AcceptCC(&pE2E->rxWindow, nCC))
             {
-                XCHECK_CALL((nCC > pE2E->nRxPacketId), XJSON_Destroy, &json,
-                    xthrowr(XFALSE, "CC(%u) <= last(%u)", nCC, pE2E->nRxPacketId));
-                pE2E->nRxPacketId = nCC;
+                xlogw("Dropping replayed or stale packet: cc(%u), window(%u)",
+                    nCC, pE2E->rxWindow.nHighest);
+
+                XJSON_Destroy(&json);
+                return XFALSE;
             }
 
             XJSON_Destroy(&json);
@@ -915,8 +921,11 @@ xbool_t DirectGate_Proto_DecryptPackage(xbyte_buffer_t *pOut, const directgate_p
     free(pDecrypted);
     XCHECK(bOk, XFALSE);
 
-    XCHECK_CALL((DirectGate_Proto_CheckCC(pOut, pE2E) == XTRUE), XByteBuffer_Reset, pOut,
-        xthrowr(XFALSE, "Failed to validate packet counter after decryption"));
+    if (!DirectGate_Proto_CheckCC(pOut, pE2E))
+    {
+        XByteBuffer_Reset(pOut);
+        return XFALSE;
+    }
 
     return XTRUE;
 }

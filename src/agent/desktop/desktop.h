@@ -39,6 +39,7 @@ extern "C" {
 #define DIRECTGATE_DESKTOP_RESOLUTION_LEN    16
 #define DIRECTGATE_DESKTOP_KEY_CODE_LEN      24
 #define DIRECTGATE_DESKTOP_MAX_HELD_KEYS     32
+#define DIRECTGATE_DESKTOP_MAX_SCRATCH_KEYS  48
 #define DIRECTGATE_DESKTOP_PRESET_LEN        16
 #define DIRECTGATE_DESKTOP_PIPELINE_LEN      24
 #define DIRECTGATE_DESKTOP_TRANSPORT_LEN     32
@@ -114,6 +115,14 @@ typedef struct directgate_desktop_held_key_ {
     uint32_t nKeycode;
 } directgate_desktop_held_key_t;
 
+/* One spare X11 keycode and the keysym currently bound to it. */
+typedef struct directgate_desktop_scratch_key_ {
+    uint32_t nKeycode;
+    uint64_t nKeysym;   /* NoSymbol while the slot is unused */
+    uint64_t nUsedSeq;  /* Monotonic use counter, drives LRU reclaim */
+    xbool_t bHeld;      /* Injected press outstanding, must not be rebound */
+} directgate_desktop_scratch_key_t;
+
 typedef struct directgate_desktop_ {
     xbool_t bRunning;
     xbool_t bInputReady;
@@ -159,10 +168,14 @@ typedef struct directgate_desktop_ {
     uint32_t nLastClickButton;
     /* macOS: last accessibility-permission recheck while input is disabled. */
     uint64_t nInputRecheckMs;
-    /* X11: spare keycode temporarily bound to keysyms missing from the
-     * active layout (e.g. non-Latin text typed from the browser). */
-    uint32_t nScratchKeycode;
-    uint64_t nScratchKeysym;
+    /* X11: spare keycodes temporarily bound to keysyms missing from the
+     * active layout (e.g. non-Latin text typed from the browser). Bindings
+     * persist so a repeated character reuses its slot instead of rewriting
+     * the keymap, which applications observe asynchronously. */
+    uint32_t nScratchCount;
+    uint64_t nScratchSeq;
+    xbool_t bScratchProbed;
+    directgate_desktop_scratch_key_t scratchKeys[DIRECTGATE_DESKTOP_MAX_SCRATCH_KEYS];
     uint32_t nHeldKeyCount;
     uint64_t nFrameId;
     uint32_t nMonitorCount;

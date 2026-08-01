@@ -778,9 +778,9 @@ static int DirectGate_Client_HandleEncryptedMsg(directgate_ctx_t *pCli, directga
 
     if (!DirectGate_Proto_DecryptPackage(&inner, pMsg, &pCli->e2e))
     {
-        xloge("%s: Failed to decrypt message", xstrused(pTransport) ? pTransport : "transport");
+        xlogw("%s: Dropped undecryptable message", xstrused(pTransport) ? pTransport : "transport");
         XByteBuffer_Clear(&inner);
-        return XAPI_DISCONNECT;
+        return XAPI_CONTINUE;
     }
 
     directgate_pkg_t innerMsg;

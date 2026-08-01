@@ -36,6 +36,26 @@ extern "C" {
 #define XE2E_IV_SIZE                16
 #define XE2E_CHALLENGE_SIZE         32
 
+/* Sliding replay window for one counter scope.
+ *
+ * A strictly increasing "must be greater than the last one" check only holds
+ * when every packet of a scope travels the same wire. It does not: a session
+ * migrates between the relay WebSocket, the reliable data channel and (after
+ * a P2P upgrade) a second peer connection, and the unordered input channel
+ * reorders by design. A packet that was merely overtaken is not a replay, so
+ * rejecting it drops live user input and logs a bogus counter violation.
+ *
+ * The window keeps the highest accepted counter plus a bitmap of the previous
+ * XE2E_CC_WINDOW_SIZE counters, exactly like the IPsec/DTLS anti-replay
+ * window: anything newer advances it, anything inside it is accepted once,
+ * anything older or already seen is still refused. */
+#define XE2E_CC_WINDOW_SIZE 64
+
+typedef struct directgate_ccwin_ {
+    uint32_t nHighest; /* Highest counter accepted so far (0 = nothing yet) */
+    uint64_t nBitmap;  /* Bit i marks counter (nHighest - i) as already seen */
+} directgate_ccwin_t;
+
 typedef struct directgate_e2e_ {
     /* Direction-bound keys: a session encrypts with its TX pair and decrypts
        with its RX pair. The two pairs are distinct, so a packet reflected
@@ -45,17 +65,25 @@ typedef struct directgate_e2e_ {
     uint8_t rxCmacKey[XE2E_KEY_SIZE];
     uint8_t rxCtrKey[XE2E_KEY_SIZE];
     uint32_t nTxPacketId;
-    uint32_t nRxPacketId;
     uint32_t nTxSessionPacketId;
-    uint32_t nRxSessionPacketId;
     uint32_t nTxInputPacketId;
-    uint32_t nRxInputPacketId;
     uint32_t nTxSessionEpoch;
-    uint32_t nRxSessionEpoch;
     uint32_t nTxSignalPacketId;
-    uint32_t nRxSignalPacketId;
+    uint32_t nRxSessionEpoch;
+    directgate_ccwin_t rxWindow;        /* Legacy unscoped counter */
+    directgate_ccwin_t rxSessionWindow;
+    directgate_ccwin_t rxInputWindow;
+    directgate_ccwin_t rxSignalWindow;
     xbool_t bInitialized;
 } directgate_e2e_t;
+
+/*!
+ * @brief Validate @p nCC against the replay window and record it.
+ * @return XTRUE when the counter is fresh (window advanced or gap filled),
+ *         XFALSE when it is a duplicate or older than the window.
+ */
+xbool_t DirectGate_E2E_AcceptCC(directgate_ccwin_t *pWindow, uint32_t nCC);
+void DirectGate_E2E_ResetCCWindow(directgate_ccwin_t *pWindow);
 
 void DirectGate_E2E_Init(directgate_e2e_t *pE2E);
 void DirectGate_E2E_Clear(directgate_e2e_t *pE2E);

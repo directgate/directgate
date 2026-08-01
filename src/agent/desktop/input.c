@@ -267,55 +267,137 @@ static KeySym DirectGate_Desktop_KeySymFromJson(xjson_obj_t *pRoot)
     return NoSymbol;
 }
 
-/* Finds (or creates) a spare keycode and binds the requested keysym to it.
- * Used for keysyms missing from the active host layout, e.g. typing Georgian
- * text into a host that only has a US keymap. The binding is cached until a
- * different keysym needs the slot and restored in DirectGate_Desktop_Clear. */
+/* Collects the unassigned keycodes of the host keymap into the scratch pool.
+ * Runs once per session; a keymap with no free slot leaves the pool empty and
+ * out-of-layout keysyms are then simply unreachable, as before. */
+static void DirectGate_Desktop_X11ProbeScratch(directgate_desktop_t *pDesktop)
+{
+    Display *pDisplay = (Display*)pDesktop->pDisplay;
+    pDesktop->bScratchProbed = XTRUE;
+
+    int nMinCode = 0, nMaxCode = 0, nSymsPerCode = 0;
+    XDisplayKeycodes(pDisplay, &nMinCode, &nMaxCode);
+    if (nMaxCode < nMinCode) return;
+
+    KeySym *pMap = XGetKeyboardMapping(pDisplay, (KeyCode)nMinCode,
+        nMaxCode - nMinCode + 1, &nSymsPerCode);
+    if (pMap == NULL || nSymsPerCode <= 0)
+    {
+        if (pMap != NULL) XFree(pMap);
+        return;
+    }
+
+    /* Walk down from the top: the high keycodes are the ones layouts leave
+     * empty, so the pool stays clear of anything the host actually uses. */
+    for (int i = nMaxCode; i >= nMinCode &&
+         pDesktop->nScratchCount < DIRECTGATE_DESKTOP_MAX_SCRATCH_KEYS; i--)
+    {
+        xbool_t bFree = XTRUE;
+        for (int j = 0; j < nSymsPerCode; j++)
+        {
+            if (pMap[(i - nMinCode) * nSymsPerCode + j] != NoSymbol)
+            {
+                bFree = XFALSE;
+                break;
+            }
+        }
+
+        if (!bFree) continue;
+
+        directgate_desktop_scratch_key_t *pSlot =
+            &pDesktop->scratchKeys[pDesktop->nScratchCount++];
+
+        pSlot->nKeycode = (uint32_t)i;
+        pSlot->nKeysym = NoSymbol;
+        pSlot->nUsedSeq = 0;
+        pSlot->bHeld = XFALSE;
+    }
+
+    XFree(pMap);
+}
+
+/* Returns the keycode a previous call already bound to this keysym, or 0.
+ * Refreshes the slot's recency so a character in active use is never picked
+ * as the one to recycle. */
+static KeyCode DirectGate_Desktop_X11FindScratch(directgate_desktop_t *pDesktop, KeySym sym)
+{
+    /* Deliberately does not probe. An empty pool simply finds nothing, so a
+       session that only ever types characters its host layout already has
+       never pays for the keymap round trip. */
+    for (uint32_t i = 0; i < pDesktop->nScratchCount; i++)
+    {
+        directgate_desktop_scratch_key_t *pSlot = &pDesktop->scratchKeys[i];
+        if (pSlot->nKeysym != (uint64_t)sym) continue;
+
+        pSlot->nUsedSeq = ++pDesktop->nScratchSeq;
+        return (KeyCode)pSlot->nKeycode;
+    }
+
+    return 0;
+}
+
+/* Binds a keysym missing from the host layout to a spare keycode.
+ *
+ * Rebinding one shared keycode per keystroke is what made fast typing lose
+ * characters: XChangeKeyboardMapping is asynchronous from the receiving
+ * application's point of view. Toolkits reload their keymap when the server
+ * announces the change, and a synthetic press that lands inside that reload
+ * resolves against a keymap in flux - the keystroke arrives, resolves to
+ * nothing, and is dropped. Typing a non-Latin script through a single slot
+ * triggers that race on every single letter.
+ *
+ * Each distinct keysym therefore keeps its own slot, and the caller looks the
+ * pool up before coming here. An alphabet is bound once during warm-up and
+ * reused from then on, so the steady state issues no keymap changes at all,
+ * and the rare rebind lands on the least recently used slot - many keystrokes
+ * away from anything an application is still processing. Slots with an
+ * outstanding injected press are never reused, so a key can never change
+ * meaning while it is down. */
 static KeyCode DirectGate_Desktop_X11BindScratch(directgate_desktop_t *pDesktop, KeySym sym)
 {
     Display *pDisplay = (Display*)pDesktop->pDisplay;
+    directgate_desktop_scratch_key_t *pVictim = NULL;
 
-    if (pDesktop->nScratchKeycode == 0U)
+    /* First keysym the host layout cannot reach pays for the pool, once. */
+    if (!pDesktop->bScratchProbed) DirectGate_Desktop_X11ProbeScratch(pDesktop);
+
+    for (uint32_t i = 0; i < pDesktop->nScratchCount; i++)
     {
-        int nMinCode = 0, nMaxCode = 0, nSymsPerCode = 0;
-        XDisplayKeycodes(pDisplay, &nMinCode, &nMaxCode);
+        directgate_desktop_scratch_key_t *pSlot = &pDesktop->scratchKeys[i];
+        if (pSlot->bHeld) continue;
 
-        KeySym *pMap = XGetKeyboardMapping(pDisplay, (KeyCode)nMinCode,
-            nMaxCode - nMinCode + 1, &nSymsPerCode);
-        if (pMap == NULL || nSymsPerCode <= 0)
-        {
-            if (pMap != NULL) XFree(pMap);
-            return 0;
-        }
-
-        for (int i = nMaxCode; i >= nMinCode && pDesktop->nScratchKeycode == 0U; i--)
-        {
-            xbool_t bFree = XTRUE;
-            for (int j = 0; j < nSymsPerCode; j++)
-            {
-                if (pMap[(i - nMinCode) * nSymsPerCode + j] != NoSymbol)
-                {
-                    bFree = XFALSE;
-                    break;
-                }
-            }
-
-            if (bFree) pDesktop->nScratchKeycode = (uint32_t)i;
-        }
-
-        XFree(pMap);
-        if (pDesktop->nScratchKeycode == 0U) return 0;
+        /* Prefer a never-used slot, then the coldest one. Used slots always
+           carry a non-zero sequence, so the recency test alone never picks a
+           used slot over a free one. */
+        if (pVictim == NULL) pVictim = pSlot;
+        else if (pSlot->nKeysym == NoSymbol && pVictim->nKeysym != NoSymbol) pVictim = pSlot;
+        else if (pSlot->nUsedSeq < pVictim->nUsedSeq) pVictim = pSlot;
     }
 
-    if (pDesktop->nScratchKeysym != (uint64_t)sym)
-    {
-        KeySym syms[2] = { sym, sym };
-        XChangeKeyboardMapping(pDisplay, (int)pDesktop->nScratchKeycode, 2, syms, 1);
-        XSync(pDisplay, XFALSE);
-        pDesktop->nScratchKeysym = (uint64_t)sym;
-    }
+    /* No pool at all, or every slot is holding a physically-down key.
+     * Refusing is correct: any rebind here would silently change what that
+     * held key produces. */
+    if (pVictim == NULL) return 0;
 
-    return (KeyCode)pDesktop->nScratchKeycode;
+    KeySym syms[2] = { sym, sym };
+    XChangeKeyboardMapping(pDisplay, (int)pVictim->nKeycode, 2, syms, 1);
+    XSync(pDisplay, XFALSE);
+
+    pVictim->nKeysym = (uint64_t)sym;
+    pVictim->nUsedSeq = ++pDesktop->nScratchSeq;
+
+    return (KeyCode)pVictim->nKeycode;
+}
+
+static void DirectGate_Desktop_X11MarkScratchHeld(directgate_desktop_t *pDesktop,
+                                                  KeyCode code, xbool_t bHeld)
+{
+    for (uint32_t i = 0; i < pDesktop->nScratchCount; i++)
+    {
+        if (pDesktop->scratchKeys[i].nKeycode != (uint32_t)code) continue;
+        pDesktop->scratchKeys[i].bHeld = bHeld;
+        return;
+    }
 }
 
 /* Resolves a keysym to a keycode reachable in the ACTIVE layout group.
@@ -326,10 +408,18 @@ static KeyCode DirectGate_Desktop_X11BindScratch(directgate_desktop_t *pDesktop,
  * shifted level (e.g. "!" on the "1" key), *pNeedShift is set so the
  * caller can synthesize Shift when the client is not physically holding it. */
 static KeyCode DirectGate_Desktop_X11ResolveKeysym(directgate_desktop_t *pDesktop,
-                                                   KeySym sym, xbool_t *pNeedShift)
+                                                   KeySym sym, xbool_t *pNeedShift,
+                                                   xbool_t bAllowBind)
 {
     Display *pDisplay = (Display*)pDesktop->pDisplay;
     *pNeedShift = XFALSE;
+
+    /* A keysym the pool already holds resolves straight from there: that
+     * binding is what the injected keycode will be interpreted with anyway,
+     * and short-circuiting keeps the per-keystroke cost flat instead of
+     * rescanning the whole keymap for every non-Latin character. */
+    KeyCode bound = DirectGate_Desktop_X11FindScratch(pDesktop, sym);
+    if (bound != 0) return bound;
 
     int nGroup = 0;
     XkbStateRec state;
@@ -357,6 +447,11 @@ static KeyCode DirectGate_Desktop_X11ResolveKeysym(directgate_desktop_t *pDeskto
         *pNeedShift = XTRUE;
         return shiftedMatch;
     }
+
+    /* Releases never allocate: the pool lookup above already returned if this
+     * keysym owns a slot, so there is nothing left to release. Binding one
+     * here would rewrite the keymap for a key that was never pressed. */
+    if (!bAllowBind) return 0;
 
     return DirectGate_Desktop_X11BindScratch(pDesktop, sym);
 }
@@ -423,7 +518,7 @@ static KeyCode DirectGate_Desktop_X11SendKeysym(directgate_desktop_t *pDesktop,
     Display *pDisplay = (Display*)pDesktop->pDisplay;
     xbool_t bNeedShift = XFALSE;
 
-    KeyCode code = DirectGate_Desktop_X11ResolveKeysym(pDesktop, sym, &bNeedShift);
+    KeyCode code = DirectGate_Desktop_X11ResolveKeysym(pDesktop, sym, &bNeedShift, bDown);
     if (code == 0) return 0;
 
     directgate_xtest_key_fn pKeyFn = (directgate_xtest_key_fn)pDesktop->pFakeKey;
@@ -433,6 +528,10 @@ static KeyCode DirectGate_Desktop_X11SendKeysym(directgate_desktop_t *pDesktop,
      * physically held client Shift already arrives as its own key event. */
     xbool_t bWrapShift = bDown && bNeedShift && shiftCode != 0 &&
         !DirectGate_Desktop_X11ShiftDown(pDisplay);
+
+    /* Pin the slot for as long as the injected key is down, so a keysym typed
+     * meanwhile cannot take this keycode over and change what is being held. */
+    DirectGate_Desktop_X11MarkScratchHeld(pDesktop, code, bDown);
 
     if (bWrapShift) pKeyFn(pDisplay, shiftCode, XTRUE, CurrentTime);
     pKeyFn(pDisplay, code, bDown ? XTRUE : XFALSE, CurrentTime);
@@ -452,6 +551,7 @@ static void DirectGate_Desktop_X11HandleKey(directgate_desktop_t *pDesktop,
         KeyCode tracked = DirectGate_Desktop_X11ForgetKey(pDesktop, pCode);
         if (tracked != 0)
         {
+            DirectGate_Desktop_X11MarkScratchHeld(pDesktop, tracked, XFALSE);
             ((directgate_xtest_key_fn)pDesktop->pFakeKey)(
                 (Display*)pDesktop->pDisplay, tracked, XFALSE, CurrentTime);
             return;
@@ -477,6 +577,9 @@ void DirectGate_Desktop_ReleaseHeldKeys(directgate_desktop_t *pDesktop)
         pKeyFn(pDisplay, (KeyCode)pDesktop->heldKeys[i].nKeycode, XFALSE, CurrentTime);
 
     pDesktop->nHeldKeyCount = 0;
+    for (uint32_t i = 0; i < pDesktop->nScratchCount; i++)
+        pDesktop->scratchKeys[i].bHeld = XFALSE;
+
     XFlush(pDisplay);
 }
 

@@ -184,6 +184,52 @@ int main(void)
     CHECK(DirectGate_Desktop_WheelNotches(&nAccum, 120) == 1, "mouse notch did not pass through");
     CHECK(DirectGate_Desktop_WheelNotches(&nAccum, -120) == -1, "direction flip lost a notch");
 
+    /* Scratch keycodes for keysyms outside the host layout. Only the paths
+     * that resolve without rewriting the keymap are reachable here: an actual
+     * rebind needs a live X server. Those are exactly the paths that keep
+     * fast typing intact, so they are the ones worth pinning down. */
+    memset(&desktop, 0, sizeof(desktop));
+    desktop.bScratchProbed = XTRUE;
+    desktop.nScratchCount = 3;
+    for (uint32_t i = 0; i < desktop.nScratchCount; i++)
+        desktop.scratchKeys[i].nKeycode = 200 + i;
+
+    const KeySym georgianAn = (KeySym)(0x10D0U | 0x01000000UL);
+    const KeySym georgianBan = (KeySym)(0x10D1U | 0x01000000UL);
+
+    /* Nothing bound yet: the lookup must not claim a slot. It is what keeps a
+     * release from rewriting the keymap for a key that was never pressed. */
+    CHECK(DirectGate_Desktop_X11FindScratch(&desktop, georgianAn) == 0,
+        "lookup allocated a scratch keycode");
+    CHECK(desktop.scratchKeys[0].nKeysym == NoSymbol,
+        "lookup bound a keysym to a scratch slot");
+
+    /* A slot already carrying the keysym is reused as-is. This is what makes
+     * repeat typing in a non-Latin script issue no keymap changes at all, and
+     * therefore stop losing characters to the asynchronous remap. */
+    desktop.scratchKeys[1].nKeysym = (uint64_t)georgianAn;
+    CHECK(DirectGate_Desktop_X11FindScratch(&desktop, georgianAn) == 201,
+        "bound keysym did not reuse its slot");
+    CHECK(desktop.scratchKeys[1].nUsedSeq > desktop.scratchKeys[0].nUsedSeq,
+        "reuse did not refresh the slot's recency");
+
+    /* A slot whose injected press is still outstanding must never be handed
+     * to another keysym: the held key would change meaning mid-press. With
+     * every slot pinned there is no safe choice, so binding is refused. */
+    for (uint32_t i = 0; i < desktop.nScratchCount; i++)
+    {
+        desktop.scratchKeys[i].nKeysym = (uint64_t)(georgianAn + i);
+        desktop.scratchKeys[i].bHeld = XTRUE;
+    }
+    CHECK(DirectGate_Desktop_X11FindScratch(&desktop, georgianBan) == 201,
+        "held slot holding the keysym was not reused");
+    CHECK(DirectGate_Desktop_X11BindScratch(&desktop, (KeySym)0x0100FFFFUL) == 0,
+        "rebound a scratch slot while its key was held");
+
+    DirectGate_Desktop_X11MarkScratchHeld(&desktop, 201, XFALSE);
+    CHECK(desktop.scratchKeys[1].bHeld == XFALSE, "release did not unpin the slot");
+    CHECK(desktop.scratchKeys[0].bHeld == XTRUE, "release unpinned the wrong slot");
+
     printf("desktop_input_smoke: OK\n");
     return 0;
 }
