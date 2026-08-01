@@ -683,6 +683,9 @@ void DirectGate_InitConfig(directgate_cfg_t *pCfg)
     DirectGate_AuthInit(&pCfg->auth);
     DirectGate_LogInit(&pCfg->log, "directgate-agent", (uint16_t)XLOG_DEFAULT);
 
+    pCfg->desktop.bElevatedInput = XTRUE;
+    pCfg->desktop.bLockScreen = XTRUE;
+
     pCfg->nKAInterval = DIRECTGATE_KA_INTERVAL_SEC;
     pCfg->bRotateAgentKey = XFALSE;
     pCfg->bWebRTCVerbose = XFALSE;
@@ -779,6 +782,16 @@ xbool_t DirectGate_LoadConfig(directgate_cfg_t *pCfg, const char *pPath)
 
         const char *pHome = XJSON_GetString(XJSON_GetObject(pShell, "home"));
         if (xstrused(pHome)) xstrncpy(pCfg->sShellHome, sizeof(pCfg->sShellHome), pHome);
+    }
+
+    xjson_obj_t *pDesktop = XJSON_GetObject(pRoot, "desktop");
+    if (pDesktop != NULL && pDesktop->nType == XJSON_TYPE_OBJECT)
+    {
+        xjson_obj_t *pElevated = XJSON_GetObject(pDesktop, "elevatedInput");
+        if (pElevated != NULL) pCfg->desktop.bElevatedInput = XJSON_GetBool(pElevated);
+
+        xjson_obj_t *pLockScreen = XJSON_GetObject(pDesktop, "lockScreen");
+        if (pLockScreen != NULL) pCfg->desktop.bLockScreen = XJSON_GetBool(pLockScreen);
     }
 
     xjson_obj_t *pEnroll = XJSON_GetObject(pRoot, "enrollment");
@@ -917,6 +930,13 @@ xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
             if (xstrused(pCfg->sShellUser)) XJSON_AddString(pShell, "user", pCfg->sShellUser);
             if (xstrused(pCfg->sShellHome)) XJSON_AddString(pShell, "home", pCfg->sShellHome);
         }
+    }
+
+    xjson_obj_t *pDesktop = XJSON_GetOrCreateObject(pRoot, "desktop", 1);
+    if (pDesktop != NULL)
+    {
+        XJSON_AddBool(pDesktop, "elevatedInput", pCfg->desktop.bElevatedInput);
+        XJSON_AddBool(pDesktop, "lockScreen", pCfg->desktop.bLockScreen);
     }
 
     if (xstrused(pCfg->enroll.sApiUrl) ||

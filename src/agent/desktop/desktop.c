@@ -25,6 +25,10 @@
 #include "webrtc.h"
 #include "priv.h"
 
+#if defined(_WIN32)
+#include "elevated.h"
+#endif
+
 /* The raw-RGBA path keeps a conservative FPS budget; the H.264 path
  * picks its own FPS from the active preset. The encoded path supersedes
  * the raw path on macOS unless DIRECTGATE_DESKTOP_FORCE_RAW is set. */
@@ -784,6 +788,20 @@ int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const char *pS
 
 #if defined(_WIN32)
     XJSON_AddBool(pRoot, "fastInput", XTRUE);
+
+    /* Whether privileged UI (a UAC prompt, Task Manager, an elevated window,
+       the lock screen) can be driven from this session, and whether it is
+       happening right now. Without these the viewer has no way to tell a
+       frozen-looking screen from a secure desktop it is not allowed to touch. */
+    XJSON_AddBool(pRoot, "elevatedInput", DirectGate_Elevated_Ready());
+    XJSON_AddBool(pRoot, "secureDesktop", DirectGate_Elevated_SecureDesktopActive());
+
+    /* Ctrl+Alt+Del: available through `action: "sas"` whenever the launcher
+       control channel is up, independently of whether a helper is running. */
+    XJSON_AddBool(pRoot, "secureAttention", DirectGate_Elevated_Supported());
+
+    if (!DirectGate_Elevated_Ready())
+        XJSON_AddStrIfUsed(pRoot, "elevatedReason", DirectGate_Elevated_Reason());
 #else
     XJSON_AddBool(pRoot, "fastInput", XFALSE);
 #endif

@@ -2,7 +2,7 @@
 [![GPLv3 License](https://img.shields.io/badge/License-GPLv3-brightgreen.svg?)](https://github.com/directgate/directgate/blob/main/LICENSE)
 [![Linux](https://github.com/directgate/directgate/actions/workflows/linux.yml/badge.svg)](https://github.com/directgate/directgate/actions/workflows/linux.yml)
 [![MacOS](https://github.com/directgate/directgate/actions/workflows/macos.yml/badge.svg)](https://github.com/directgate/directgate/actions/workflows/macos.yml)
-[![Valgrind](https://github.com/directgate/directgate/actions/workflows/tests.yml/badge.svg)](https://github.com/directgate/directgate/actions/workflows/tests.yml)
+[![Valgrind](https://github.com/directgate/directgate/actions/workflows/valgrind.yml/badge.svg)](https://github.com/directgate/directgate/actions/workflows/valgrind.yml)
 [![Sanitizers](https://github.com/directgate/directgate/actions/workflows/sanitizers.yml/badge.svg)](https://github.com/directgate/directgate/actions/workflows/sanitizers.yml)
 [![CodeQL](https://github.com/directgate/directgate/actions/workflows/codeql.yml/badge.svg)](https://github.com/directgate/directgate/actions/workflows/codeql.yml)
 

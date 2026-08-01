@@ -11,9 +11,14 @@ command -v valgrind >/dev/null 2>&1 || {
     exit 1
 }
 
-cmake -S "$ROOT" -B "$BUILD" \
-    -DDIRECTGATE_BUILD_TESTS=ON \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo
+# Release builds compile the GPU encoder once per libavcodec major; set
+# DIRECTGATE_HWENC_HEADERS to exercise that here too (see docs/building.md).
+set -- -S "$ROOT" -B "$BUILD" -DDIRECTGATE_BUILD_TESTS=ON
+if [ -n "${DIRECTGATE_HWENC_HEADERS:-}" ]; then
+    set -- "$@" "-DDIRECTGATE_HWENC_HEADERS=$DIRECTGATE_HWENC_HEADERS"
+fi
+set -- "$@" -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake "$@"
 cmake --build "$BUILD" -j "$JOBS"
 
 TEST_LIST="$BUILD/valgrind-tests.txt"

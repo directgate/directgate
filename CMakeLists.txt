@@ -125,6 +125,12 @@ if(APPLE)
         set(OPENSSL_ROOT_DIR "${BREW_OPENSSL_PREFIX}")
     endif()
 endif()
+# FindOpenSSL adds ZLIB::ZLIB to OpenSSL::Crypto's link interface whenever
+# OPENSSL_USE_STATIC_LIBS is on, because a static libcrypto may have been built
+# with zlib support and nothing else can resolve it. The target has to exist by
+# then or the link fails with "cannot find -lZLIB::ZLIB". Harmless for the
+# normal dynamic build, which never references it.
+find_package(ZLIB QUIET)
 find_package(OpenSSL REQUIRED)
 
 # libutil provides forkpty()/openpty() used by the agent PTY layer.
@@ -322,22 +328,78 @@ elseif(UNIX)
     # matter what the user installs afterwards. The package builds turn this
     # on so a build image that has lost its FFmpeg headers fails here instead
     # of shipping a permanently software-only agent.
+    #
+    # One set of headers gets one major, and that is only ever right for the
+    # hosts running the same one. DIRECTGATE_HWENC_HEADERS points at a
+    # directory of per-major header trees (misc/ffmpeg-headers.sh builds
+    # one); hwenc.c is then compiled once per tree and
+    # desktop/hwenc_abi.c picks the variant whose library the host actually
+    # has. A plain source build passes nothing and keeps the single
+    # pkg-config variant below, compiled against whatever FFmpeg is installed.
     option(DIRECTGATE_REQUIRE_HWENC "Fail the build if GPU desktop encoding cannot be compiled in" OFF)
+    set(DIRECTGATE_HWENC_HEADERS "" CACHE PATH
+        "Directory of per-libavcodec-major FFmpeg header trees (<major>/libavcodec, <major>/libavutil)")
+
+    set(DIRECTGATE_HWENC_ABIS "")
+    if(DIRECTGATE_HWENC_HEADERS)
+        file(GLOB _dg_hwenc_dirs RELATIVE "${DIRECTGATE_HWENC_HEADERS}" "${DIRECTGATE_HWENC_HEADERS}/*")
+        foreach(_dg_abi IN LISTS _dg_hwenc_dirs)
+            if(_dg_abi MATCHES "^[0-9]+$" AND
+               EXISTS "${DIRECTGATE_HWENC_HEADERS}/${_dg_abi}/libavcodec/avcodec.h" AND
+               EXISTS "${DIRECTGATE_HWENC_HEADERS}/${_dg_abi}/libavutil/avutil.h")
+                list(APPEND DIRECTGATE_HWENC_ABIS "${_dg_abi}")
+            endif()
+        endforeach()
+
+        list(SORT DIRECTGATE_HWENC_ABIS)
+        if(NOT DIRECTGATE_HWENC_ABIS)
+            message(FATAL_ERROR
+                "DIRECTGATE_HWENC_HEADERS is set to '${DIRECTGATE_HWENC_HEADERS}' but holds no "
+                "usable <major>/libavcodec + <major>/libavutil header tree. Run "
+                "misc/ffmpeg-headers.sh to populate it.")
+        endif()
+    endif()
+
     find_package(PkgConfig QUIET)
-    if(PKG_CONFIG_FOUND)
+    if(NOT DIRECTGATE_HWENC_ABIS AND PKG_CONFIG_FOUND)
         pkg_check_modules(LIBAV libavcodec libavutil)
     endif()
-    if(LIBAV_FOUND)
+
+    if(DIRECTGATE_HWENC_ABIS)
+        message(STATUS "GPU desktop encoding: enabled for libavcodec ${DIRECTGATE_HWENC_ABIS} (runtime dlopen)")
+        target_sources(directgate PRIVATE ${AGENT_DIR}/desktop/hwenc_abi.c)
+        target_compile_definitions(directgate PRIVATE DIRECTGATE_HAVE_HWENC=1)
+
+        # An object library per major: the same source has to be compiled with
+        # a different include path each time, which a single target cannot
+        # express. Linking xcommon carries the project's include directories
+        # over without repeating them.
+        foreach(_dg_abi IN LISTS DIRECTGATE_HWENC_ABIS)
+            add_library(directgate_hwenc_${_dg_abi} OBJECT ${AGENT_DIR}/desktop/hwenc.c)
+            target_include_directories(directgate_hwenc_${_dg_abi} BEFORE PRIVATE
+                "${DIRECTGATE_HWENC_HEADERS}/${_dg_abi}")
+            target_include_directories(directgate_hwenc_${_dg_abi} PRIVATE
+                ${AGENT_DIR} ${AGENT_DIR}/desktop)
+            target_compile_definitions(directgate_hwenc_${_dg_abi} PRIVATE
+                DIRECTGATE_HAVE_HWENC=1
+                DIRECTGATE_HWENC_ABI=${_dg_abi})
+            target_link_libraries(directgate_hwenc_${_dg_abi} PRIVATE xcommon)
+
+            target_sources(directgate PRIVATE $<TARGET_OBJECTS:directgate_hwenc_${_dg_abi}>)
+            target_compile_definitions(directgate PRIVATE DIRECTGATE_HWENC_HAS_${_dg_abi}=1)
+        endforeach()
+    elseif(LIBAV_FOUND)
         message(STATUS "GPU desktop encoding: enabled (libavcodec ${LIBAV_libavcodec_VERSION}, runtime dlopen)")
         target_sources(directgate PRIVATE ${AGENT_DIR}/desktop/hwenc.c)
         target_compile_definitions(directgate PRIVATE DIRECTGATE_HAVE_HWENC=1)
         target_include_directories(directgate PRIVATE ${LIBAV_INCLUDE_DIRS})
     elseif(DIRECTGATE_REQUIRE_HWENC)
         message(FATAL_ERROR
-            "GPU desktop encoding was required but the libavcodec/libavutil headers "
-            "were not found. Install the FFmpeg development package for this build "
-            "image (libavcodec-dev + libavutil-dev on Debian, ffmpeg-devel on RHEL) "
-            "or configure with -DDIRECTGATE_REQUIRE_HWENC=OFF to accept a "
+            "GPU desktop encoding was required but no libavcodec/libavutil headers "
+            "were found. Point DIRECTGATE_HWENC_HEADERS at per-major header trees "
+            "(misc/ffmpeg-headers.sh), install the FFmpeg development package for this "
+            "build image (libavcodec-dev + libavutil-dev on Debian, ffmpeg-devel on "
+            "RHEL), or configure with -DDIRECTGATE_REQUIRE_HWENC=OFF to accept a "
             "software-only agent.")
     else()
         message(STATUS "GPU desktop encoding: disabled (libavcodec headers not found)")
@@ -374,8 +436,14 @@ if(WIN32)
     # user32/gdi32: monitors, SendInput, BitBlt. d3d11/dxgi: duplication.
     # ole32/oleaut32: COM apartment + VARIANT for ICodecAPI.
     # uuid/mfuuid/strmiids/dxguid: interface and media type GUIDs.
+    # desktop/elevated.c carries both halves of the elevated-UI bridge: the
+    # agent-side client and the SYSTEM helper the launcher spawns into the
+    # interactive session (--win-desktop-helper), which is what makes UAC
+    # prompts, elevated windows and the lock screen reachable remotely.
+    # wtsapi32: session lock state for the injection gate.
     target_sources(directgate PRIVATE
         ${AGENT_DIR}/desktop/desktop_win.c
+        ${AGENT_DIR}/desktop/elevated.c
         ${AGENT_DIR}/desktop/mfenc.c
         ${AGENT_DIR}/yuv.c)
     # System-audio streaming: Opus encoder (opus.c) + the cross-platform

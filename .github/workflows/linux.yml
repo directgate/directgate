@@ -16,15 +16,69 @@ jobs:
         submodules: recursive
 
     - name: Install dependencies
-      # X11 headers are required by the Linux desktop streaming backend
-      # (find_package(X11 REQUIRED) in CMakeLists.txt), see docs/building.md.
       run: |
         sudo apt-get update
         sudo apt-get install -y cmake build-essential pkg-config \
-          libssl-dev libx11-dev libxrandr-dev libxext-dev libopus-dev
+          libssl-dev libx11-dev libxrandr-dev libxext-dev libopus-dev \
+          libavcodec-dev libavutil-dev
 
     - name: Configure
       run: cmake -B build
 
     - name: Build
       run: cmake --build build -j"$(nproc)"
+
+  # The release builds compile the GPU encoder once per libavcodec major and
+  # choose between them at runtime (docs/building.md). None of that machinery
+  # is reachable from the single-variant build above, so it gets its own job:
+  # fetch every supported major's headers, build them all, and make the
+  # dispatcher pick this runner's own libavcodec.
+  hwenc-abi:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential pkg-config \
+          libssl-dev libx11-dev libxrandr-dev libxext-dev libopus-dev \
+          libavcodec-dev libavutil-dev
+
+    # Keyed on the script, which is where the release pins live, so the
+    # tarballs are fetched again only when the covered set actually changes.
+    # Downloading four releases from a mirror on every push would be both slow
+    # and an avoidable way for an unrelated commit to fail.
+    - name: Cache FFmpeg headers
+      id: ffmpeg-headers
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/ffmpeg-headers
+        key: ffmpeg-headers-${{ hashFiles('misc/ffmpeg-headers.sh') }}
+
+    - name: Fetch FFmpeg headers for every supported libavcodec major
+      if: steps.ffmpeg-headers.outputs.cache-hit != 'true'
+      run: ./misc/ffmpeg-headers.sh "$RUNNER_TEMP/ffmpeg-headers"
+
+    - name: Configure
+      # REQUIRE_HWENC turns a missing or unusable header tree into a configure
+      # failure rather than a silently software-only build.
+      run: |
+        cmake -B build-hwenc \
+          -DDIRECTGATE_BUILD_TESTS=ON \
+          -DDIRECTGATE_REQUIRE_HWENC=ON \
+          -DDIRECTGATE_HWENC_HEADERS="$RUNNER_TEMP/ffmpeg-headers"
+
+    - name: Build
+      run: cmake --build build-hwenc -j"$(nproc)"
+
+    - name: Select an ABI against the runner's libavcodec
+      # Fails, rather than skips, when the runner has a libavcodec that no
+      # compiled variant matches - which is the signal that the image moved to
+      # an FFmpeg generation misc/ffmpeg-headers.sh does not cover yet. The fix
+      # is one more release in that script plus the matching #if blocks in
+      # src/agent/desktop/hwenc_abi.c.
+      run: ctest --test-dir build-hwenc -R hwenc_abi_smoke --output-on-failure

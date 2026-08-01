@@ -69,6 +69,22 @@ typedef struct directgate_keyauth_cfg_ {
     uint8_t nAuthorizedKeyCount;
 } directgate_keyauth_cfg_t;
 
+/*
+ * Remote desktop policy. Only Windows reads these today: they gate the SYSTEM
+ * helper that makes UAC prompts, elevated windows (Task Manager and friends)
+ * and the lock screen reachable from a remote session.
+ *
+ * Both default to enabled, which is a deliberate and consequential choice: an
+ * operator who can approve a UAC prompt is effectively an administrator on the
+ * host, and one who can drive the lock screen can log in. Deployments that do
+ * not want that set "desktop": { "elevatedInput": false } and get exactly the
+ * pre-existing behaviour - privileged UI stays visible but frozen.
+ */
+typedef struct directgate_desktop_cfg_ {
+    xbool_t bElevatedInput;
+    xbool_t bLockScreen;
+} directgate_desktop_cfg_t;
+
 typedef struct directgate_cfg_ {
     directgate_ice_server_t sIceServers[DIRECTGATE_MAX_ICE_SERVERS];
     char sRelayUrl[XPATH_MAX];
@@ -82,6 +98,7 @@ typedef struct directgate_cfg_ {
     char sEnrollKeyPath[XPATH_MAX];
     directgate_enroll_t enroll;
     directgate_keyauth_cfg_t keyauth;
+    directgate_desktop_cfg_t desktop;
     directgate_auth_t auth;
     directgate_log_t log;
     uint8_t nIceSrvCount;

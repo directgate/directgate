@@ -48,6 +48,14 @@ void DirectGate_PathToSlash(char *pPath);
 size_t DirectGate_GetHomeDir(char *pBuf, size_t nSize);
 size_t DirectGate_GetUserName(char *pBuf, size_t nSize);
 
+/* Points OpenSSL at the host's CA bundle when the location compiled into
+ * libcrypto is not present on this machine, which is the normal case for a
+ * statically linked build. Call once, before any TLS connection.
+ *
+ * A no-op on Windows, where the roots come from the system certificate store
+ * rather than a path (see XSock_LoadWinRootCerts in libxutils). */
+void DirectGate_InitTrustStore(void);
+
 xbool_t DirectGate_PromptBool(const char *pLabel, xbool_t *pValue);
 xbool_t DirectGate_PromptU16(const char *pLabel, uint16_t *pValue);
 xbool_t DirectGate_PromptU32(const char *pLabel, uint32_t *pValue);

@@ -367,7 +367,7 @@ static void DirectGate_Desktop_SetXAuthority(const directgate_session_t *pSessio
     if (pSession == NULL || pSession->pCfg == NULL ||
         !xstrused(pSession->pCfg->sShellHome)) return;
 
-    char sPath[XPATH_MAX];
+    char sPath[XPATH_MAX + XSTR_MICRO];
     if (strlen(pSession->pCfg->sShellHome) + sizeof("/.Xauthority") > sizeof(sPath))
         return;
 

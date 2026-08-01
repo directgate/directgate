@@ -23,6 +23,10 @@
 #include "session.h"
 #include "priv.h"
 
+#if defined(_WIN32)
+#include "elevated.h"
+#endif
+
 #if defined(__linux__)
 #include <ctype.h>
 #include <X11/Xlib.h>
@@ -1081,6 +1085,80 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
 
 #elif defined(_WIN32)
 
+/*
+ * Windows refuses synthesized input from this process in two situations the
+ * operator hits constantly, and the two refusals do not behave alike - which
+ * is the whole reason this is not a one-liner.
+ *
+ *   - The secure desktop (a UAC prompt, the lock screen). SendInput returns
+ *     zero, because the calling thread's desktop is not the one receiving
+ *     input. The return value is a usable signal, so the direct call goes
+ *     first and only what it rejected is re-sent through the helper.
+ *
+ *   - A higher-integrity foreground window (Task Manager, an elevated app) on
+ *     the ordinary desktop. UIPI drops the event and says nothing: MSDN is
+ *     explicit that SendInput "fails when it is blocked by UIPI" and that
+ *     "neither GetLastError nor the return value will indicate the failure".
+ *     Nothing after the call can detect it, so it has to be decided before,
+ *     and the direct SendInput is then skipped entirely - issuing it as well
+ *     would double every event on any window that does accept input.
+ *
+ * Both used to fail silently, because none of these calls looked at the return
+ * value at all; that is what "the screen froze" was.
+ */
+static void DirectGate_Desktop_WinSendInput(INPUT *pInputs, UINT nCount)
+{
+    /* Latched so a blocked drag logs once instead of hundreds of times, and
+     * clears again as soon as input flows, which makes each transition into
+     * and out of privileged UI visible in the log exactly once. */
+    static xbool_t bRefused = XFALSE;
+
+    if (DirectGate_Elevated_Ready() && DirectGate_Elevated_ForegroundOutranksAgent())
+    {
+        if (!bRefused)
+        {
+            bRefused = XTRUE;
+            xlogi("Elevated window has focus, routing input through the elevated helper");
+        }
+
+        for (UINT i = 0; i < nCount; i++)
+            (void)DirectGate_Elevated_SendInput(&pInputs[i]);
+
+        return;
+    }
+
+    UINT nSent = SendInput(nCount, pInputs, sizeof(INPUT));
+    if (nSent == nCount)
+    {
+        bRefused = XFALSE;
+        return;
+    }
+
+    DWORD nError = GetLastError();
+    if (!DirectGate_Elevated_Ready())
+    {
+        if (!bRefused)
+        {
+            const char *pReason = DirectGate_Elevated_Reason();
+            bRefused = XTRUE;
+
+            xlogw("Windows refused injected input and no elevated helper is available: "
+                "err(%lu), reason(%s)", (unsigned long)nError, pReason ? pReason : "unknown");
+        }
+
+        return;
+    }
+
+    if (!bRefused)
+    {
+        bRefused = XTRUE;
+        xlogi("Secure desktop is up, routing input through the elevated helper: err(%lu)", (unsigned long)nError);
+    }
+
+    for (UINT i = nSent; i < nCount; i++)
+        (void)DirectGate_Elevated_SendInput(&pInputs[i]);
+}
+
 /* Absolute pointer injection over the whole virtual desktop: SendInput
  * expects 0..65535 normalized coordinates with MOUSEEVENTF_VIRTUALDESK. */
 static void DirectGate_Desktop_SendMouseInput(DWORD nFlags, DWORD nMouseData, int nScreenX, int nScreenY)
@@ -1098,7 +1176,7 @@ static void DirectGate_Desktop_SendMouseInput(DWORD nFlags, DWORD nMouseData, in
     input.mi.dy = (LONG)(((int64_t)(nScreenY - nVirtualY) * 65535LL) / (nVirtualHeight - 1));
     input.mi.mouseData = nMouseData;
     input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | nFlags;
-    SendInput(1, &input, sizeof(input));
+    DirectGate_Desktop_WinSendInput(&input, 1);
 }
 
 static void DirectGate_Desktop_SendMouseRelative(DWORD nFlags, DWORD nMouseData, int nDx, int nDy)
@@ -1111,7 +1189,7 @@ static void DirectGate_Desktop_SendMouseRelative(DWORD nFlags, DWORD nMouseData,
     input.mi.mouseData = nMouseData;
     input.mi.dwFlags = nFlags | ((nDx != 0 || nDy != 0) ?
         (MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE) : 0U);
-    SendInput(1, &input, sizeof(input));
+    DirectGate_Desktop_WinSendInput(&input, 1);
 }
 
 static DWORD DirectGate_Desktop_MouseButtonFlag(uint32_t nButton, xbool_t bDown, DWORD *pMouseData)
@@ -1237,7 +1315,7 @@ static void DirectGate_Desktop_SendKeyInput(WORD nVirtualKey, xbool_t bExtended,
     input.ki.wVk = nVirtualKey;
     input.ki.wScan = (WORD)MapVirtualKeyW(nVirtualKey, MAPVK_VK_TO_VSC);
     input.ki.dwFlags = (bExtended ? KEYEVENTF_EXTENDEDKEY : 0) | (bDown ? 0 : KEYEVENTF_KEYUP);
-    SendInput(1, &input, sizeof(input));
+    DirectGate_Desktop_WinSendInput(&input, 1);
 }
 
 static void DirectGate_Desktop_WinSetLock(WORD nVirtualKey, xjson_obj_t *pValue)
@@ -1288,7 +1366,7 @@ static void DirectGate_Desktop_WinTypeText(const char *pText)
         inputs[0].ki.dwFlags = KEYEVENTF_UNICODE;
         inputs[1] = inputs[0];
         inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-        SendInput(2, inputs, sizeof(INPUT));
+        DirectGate_Desktop_WinSendInput(inputs, 2);
     }
 
     free(pWide);
@@ -1387,14 +1465,33 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
 
         if (bRelative)
         {
+            /* Both calls are desktop-scoped and refused while the secure
+               desktop is up; the helper is on that desktop, so it answers
+               with the real position and moves the real pointer. */
             POINT cursorPoint;
+            int nCursorX = 0, nCursorY = 0;
+            xbool_t bHavePos = XFALSE;
+
             if (GetCursorPos(&cursorPoint))
             {
-                int nCursorX = (int)cursorPoint.x;
-                int nCursorY = (int)cursorPoint.y;
+                nCursorX = (int)cursorPoint.x;
+                nCursorY = (int)cursorPoint.y;
+                bHavePos = XTRUE;
+            }
+            else bHavePos = DirectGate_Elevated_GetCursorPos(&nCursorX, &nCursorY);
 
+            if (bHavePos)
+            {
                 if (DirectGate_Desktop_ClampCursorToCapture(pDesktop, &nCursorX, &nCursorY))
-                    SetCursorPos(nCursorX, nCursorY);
+                {
+                    /* Same split as DirectGate_Desktop_WinSendInput: an
+                       elevated foreground window has to be decided before the
+                       call, the secure desktop reports itself after it. */
+                    if (DirectGate_Elevated_Ready() && DirectGate_Elevated_ForegroundOutranksAgent())
+                        (void)DirectGate_Elevated_SetCursorPos(nCursorX, nCursorY);
+                    else if (!SetCursorPos(nCursorX, nCursorY))
+                        (void)DirectGate_Elevated_SetCursorPos(nCursorX, nCursorY);
+                }
 
                 DirectGate_Desktop_SendCursorPosition(pSession, nCursorX, nCursorY, nSequence);
             }
@@ -1419,6 +1516,15 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
     {
         DirectGate_Desktop_WinSetLock(VK_CAPITAL, XJSON_GetObject(pRoot, "caps"));
         DirectGate_Desktop_WinSetLock(VK_NUMLOCK, XJSON_GetObject(pRoot, "num"));
+    }
+    else if (xstrcmp(pAction, "sas"))
+    {
+        /* Ctrl+Alt+Del cannot be synthesized at all - the secure attention
+         * sequence is reserved by the kernel precisely so that nothing can
+         * fake it. The only legitimate route is SendSAS from a LocalSystem
+         * service, which is the launcher; this just asks it. */
+        if (!DirectGate_Elevated_SendSAS())
+            xlogw("Ctrl+Alt+Del requested but the DirectGate service could not be reached");
     }
 
     XJSON_Destroy(&json);

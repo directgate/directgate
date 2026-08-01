@@ -74,6 +74,7 @@ struct winsize {
 
 #define OPENSSL_API_COMPAT XSSL_MINIMAL_API
 #include <openssl/crypto.h>
+#include <openssl/x509.h>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
 #include <openssl/bn.h>

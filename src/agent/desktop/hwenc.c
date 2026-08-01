@@ -19,11 +19,47 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+/*
+ * Compiled once per libavcodec major when DIRECTGATE_HWENC_ABI is set (the
+ * package builds do this; see hwenc_abi.c for why). Each variant is an
+ * ordinary copy of this file built against that major's headers, so its
+ * struct offsets are right for exactly one runtime library - which is the
+ * whole point, since that is what a soname bump changes.
+ *
+ * The renaming happens before hwenc.h is included so the declarations and the
+ * definitions move together and the variants cannot collide at link time. A
+ * plain source build defines nothing here and keeps the unsuffixed names.
+ */
+#if defined(DIRECTGATE_HWENC_ABI)
+#define DIRECTGATE_HWENC_PASTE(a, b) a##b
+#define DIRECTGATE_HWENC_NAME(name, abi) DIRECTGATE_HWENC_PASTE(name##_abi, abi)
+#define DIRECTGATE_HWENC_ABI_SYM(name) DIRECTGATE_HWENC_NAME(name, DIRECTGATE_HWENC_ABI)
+
+#define DirectGate_HWEnc_Load         DIRECTGATE_HWENC_ABI_SYM(DirectGate_HWEnc_Load)
+#define DirectGate_HWEnc_Version      DIRECTGATE_HWENC_ABI_SYM(DirectGate_HWEnc_Version)
+#define DirectGate_HWEnc_Create       DIRECTGATE_HWENC_ABI_SYM(DirectGate_HWEnc_Create)
+#define DirectGate_HWEnc_Destroy      DIRECTGATE_HWENC_ABI_SYM(DirectGate_HWEnc_Destroy)
+#define DirectGate_HWEnc_Describe     DIRECTGATE_HWENC_ABI_SYM(DirectGate_HWEnc_Describe)
+#define DirectGate_HWEnc_Encode       DIRECTGATE_HWENC_ABI_SYM(DirectGate_HWEnc_Encode)
+#define DirectGate_HWEnc_ApplyQuality DIRECTGATE_HWENC_ABI_SYM(DirectGate_HWEnc_ApplyQuality)
+#define DirectGate_HWEnc_SetBitrate   DIRECTGATE_HWENC_ABI_SYM(DirectGate_HWEnc_SetBitrate)
+#endif
+
 #include "hwenc.h"
 
 #ifdef DIRECTGATE_HAVE_HWENC
 
 #include <dlfcn.h>
+
+/* A variant must be built against the headers it claims: a mismatch would put
+ * the right soname behind the wrong struct offsets, which is precisely the
+ * corruption the soname check exists to prevent. */
+#if defined(DIRECTGATE_HWENC_ABI)
+#include <libavcodec/version.h>
+#if LIBAVCODEC_VERSION_MAJOR != DIRECTGATE_HWENC_ABI
+#error "DIRECTGATE_HWENC_ABI does not match the libavcodec headers on the include path"
+#endif
+#endif
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
@@ -246,18 +282,35 @@ int DirectGate_HWEnc_Load(char *pErrBuf, size_t nErrSize)
     snprintf(sCodecName, sizeof(sCodecName), "libavcodec.so.%d", LIBAVCODEC_VERSION_MAJOR);
     snprintf(sUtilName, sizeof(sUtilName), "libavutil.so.%d", LIBAVUTIL_VERSION_MAJOR);
 
+    char sCodecError[160] = { 0 };
+    char sUtilError[160] = { 0 };
     const char *pEnvCodec = getenv("DIRECTGATE_HWENC_LIB");
+
+    dlerror();
     void *pCodec = dlopen(xstrused(pEnvCodec) ? pEnvCodec : sCodecName, RTLD_NOW | RTLD_LOCAL);
+    if (pCodec == NULL)
+    {
+        const char *pError = dlerror();
+        if (pError != NULL) xstrncpy(sCodecError, sizeof(sCodecError), pError);
+    }
+
     void *pUtil = dlopen(sUtilName, RTLD_NOW | RTLD_LOCAL);
+    if (pUtil == NULL)
+    {
+        const char *pError = dlerror();
+        if (pError != NULL) xstrncpy(sUtilError, sizeof(sUtilError), pError);
+    }
 
     if (pCodec == NULL || pUtil == NULL)
     {
         if (pCodec != NULL) dlclose(pCodec);
         if (pUtil != NULL) dlclose(pUtil);
 
-        DirectGate_HWEnc_SetError(pErrBuf, nErrSize,
-            "libavcodec/libavutil (%s, %s) are not installed; using the software H.264 encoder.",
-            sCodecName, sUtilName);
+        const char *pFailed = (pCodec == NULL) ? sCodecName : sUtilName;
+        const char *pReason = (pCodec == NULL) ? sCodecError : sUtilError;
+
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "%s could not be loaded: %s",
+            pFailed, xstrused(pReason) ? pReason : "no reason reported");
 
         return XSTDERR;
     }

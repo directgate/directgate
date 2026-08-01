@@ -1,4 +1,4 @@
-name: Valgrind
+name: Smoke
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
     branches: [ main, master ]
 
 jobs:
-  test:
+  tests:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,12 +16,11 @@ jobs:
           submodules: recursive
 
       - name: Install dependencies
-        # X11 headers are required by the Linux desktop streaming backend
-        # (find_package(X11 REQUIRED) in CMakeLists.txt), see docs/building.md.
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential pkg-config valgrind \
-            libssl-dev libx11-dev libxrandr-dev libxext-dev libopenh264-dev libopus-dev
+          sudo apt-get install -y cmake build-essential pkg-config \
+            libssl-dev libx11-dev libxrandr-dev libxext-dev libopus-dev \
+            libopenh264-dev libavcodec-dev libavutil-dev
 
-      - name: Build and run smoke tests with Valgrind
-        run: sh ./tests/run-valgrind.sh
+      - name: Build and run smoke tests
+        run: sh ./tests/run-smoke.sh

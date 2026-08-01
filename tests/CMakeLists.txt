@@ -112,6 +112,24 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(opus_smoke PRIVATE ${CMAKE_DL_LIBS} m)
     set_tests_properties(opus_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
+    # Multi-ABI GPU encoder selection, registered only when the build actually
+    # produced per-major variants (DIRECTGATE_HWENC_HEADERS - the package
+    # images always do). Links the same object libraries the agent does, so it
+    # exercises the real dispatch against this host's libavcodec rather than a
+    # stand-in.
+    if(DIRECTGATE_HWENC_ABIS)
+        directgate_smoke(hwenc_abi_smoke ${AGENT_DIR}/desktop/hwenc_abi.c)
+        target_compile_definitions(hwenc_abi_smoke PRIVATE DIRECTGATE_HAVE_HWENC=1)
+        target_link_libraries(hwenc_abi_smoke PRIVATE ${CMAKE_DL_LIBS})
+
+        foreach(_dg_abi IN LISTS DIRECTGATE_HWENC_ABIS)
+            target_sources(hwenc_abi_smoke PRIVATE $<TARGET_OBJECTS:directgate_hwenc_${_dg_abi}>)
+            target_compile_definitions(hwenc_abi_smoke PRIVATE DIRECTGATE_HWENC_HAS_${_dg_abi}=1)
+        endforeach()
+
+        set_tests_properties(hwenc_abi_smoke PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
     # Compiles the X11 input unit directly (like files_static_smoke) to test
     # the browser-key -> keysym mapping; needs Xlib but no running X server.
     directgate_smoke(desktop_input_smoke)

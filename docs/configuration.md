@@ -42,6 +42,10 @@ The agent uses a JSON configuration file. You can point to one with `-c <path>`,
     "user": "username",
     "home": "/home/username"
   },
+  "desktop": {
+    "elevatedInput": true,
+    "lockScreen": true
+  },
   "auth": {
     "srp": {
       "verifier": "<srp_verifier_hex>",
@@ -67,6 +71,8 @@ The agent uses a JSON configuration file. You can point to one with `-c <path>`,
 | `iceServers`                  | string[] | Manual ICE/TURN override (optional; normally delivered by the API - see [WebRTC P2P](webrtc.md#iceturn-server-configuration)) |
 | `shell.user`                  | string   | Unix user for the shell session            |
 | `shell.home`                  | string   | Working directory for the shell            |
+| `desktop.elevatedInput`       | bool     | **Windows only**, default `true`. Lets a desktop session drive privileged UI - UAC prompts, Task Manager, elevated windows - through the service's SYSTEM helper. Setting it to `false` leaves those visible but frozen. Read [Elevated UI and the secure desktop](windows.md#elevated-ui-and-the-secure-desktop) before changing it: with it on, a remote operator who approves a UAC prompt is effectively an administrator on the host |
+| `desktop.lockScreen`          | bool     | **Windows only**, default `true`. Also allows the lock screen and the Ctrl+Alt+Del security screen. Ignored when `desktop.elevatedInput` is `false` |
 | `auth.srp.salt`               | string   | SRP salt in hex (32 bytes / 64 hex chars)  |
 | `auth.srp.verifier`           | string   | SRP verifier in hex                        |
 | `auth.srp.suite`              | number   | SRP credential suite advertised at auth (managed by the agent; older records are upgraded in place on load) |

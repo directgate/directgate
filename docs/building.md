@@ -19,11 +19,37 @@ For H.264 desktop streaming on Linux the agent loads `libopenh264.so` at runtime
 
 Linux desktop sessions prefer the **GPU** encoder when one is usable (NVENC, VAAPI, QSV, AMF or V4L2 M2M), reached through libavcodec. If the `libavcodec`/`libavutil` development headers are present at configure time - `ffmpeg-devel` on Fedora, `libavcodec-dev libavutil-dev` on Debian/Ubuntu - CMake reports `GPU desktop encoding: enabled` and compiles the support in; the libraries themselves are dlopen'd at runtime and never linked, so they stay optional and add no package dependency. Building without those headers, or running on a host with no libavcodec, no GPU or no usable encoder, simply keeps the OpenH264 software path. Set `DIRECTGATE_HWENC=0` to force software encoding, or `DIRECTGATE_HWENC_ENCODER=h264_vaapi` to pin one.
 
-> **Packaging note.** Because the struct layouts come from the build-time headers, the loader only accepts a runtime libavcodec with the *same major soname* it was compiled against, and a mismatch is treated like "not installed" (software encoding, no failure). A binary built against libavcodec 58 therefore enables GPU encoding on hosts that ship 58 and falls back everywhere else.
->
-> The `.deb` image (`pkg/apt/Dockerfile`, Debian 11) installs `libavcodec-dev`/`libavutil-dev`, so released Debian packages have GPU encoding compiled in and declare the matching runtime library as a **weak dependency** - apt installs it automatically, and a host or mirror without it still installs the agent and uses the software encoder. The dependency is derived at package time from what the build image actually provided (`libav_recommends_deb`/`libav_recommends_rpm` in `pkg/package.sh`), so it follows the base image instead of going stale.
->
-> The `.rpm` image (`pkg/dnf/Dockerfile`, Rocky 8) has **no** libavcodec available - neither the base repositories nor EPEL 8 ship ffmpeg - so RPM builds currently have GPU encoding compiled out and emit no libavcodec dependency at all. Enabling it means either adding a third-party repository (RPM Fusion) to the build image or moving the image to EL9, where EPEL provides `libavcodec-free-devel`; both are distribution-policy decisions. Nothing else needs changing: the packaging already picks the dependency up automatically once the headers are present.
+### Talking to more than one libavcodec
+
+The struct layouts come from the build-time headers, so one compiled encoder only accepts a runtime libavcodec with the *same major soname* - a mismatch is treated like "not installed" and falls back to software, silently. A single build would therefore reach the GPU only on hosts running the same FFmpeg generation as the machine that built it.
+
+A binary meant to run on machines other than the one that built it can carry several instead. [`misc/ffmpeg-headers.sh`](../misc/ffmpeg-headers.sh) populates a directory with one FFmpeg public-header tree per major, and `DIRECTGATE_HWENC_HEADERS` points CMake at it:
+
+```
+<dir>/58/libavcodec/*.h   <dir>/58/libavutil/*.h
+<dir>/59/...              <dir>/60/...   <dir>/61/...   <dir>/62/...
+```
+
+`desktop/hwenc.c` is then compiled once against each tree and `desktop/hwenc_abi.c` selects the variant matching whatever the host has, newest first. Nothing is linked or redistributed - the host's own FFmpeg is still what gets loaded, so VAAPI and QSV keep using the drivers that distribution configured, and the binary grows by a few tens of kilobytes per major.
+
+| libavcodec | libavutil | FFmpeg | Covers                               |
+|------------|-----------|--------|--------------------------------------|
+| 58         | 56        | 4.4    | Debian 11, Ubuntu 20.04 / 22.04, EL8 |
+| 59         | 57        | 5.1    | Debian 12, EL9                       |
+| 60         | 58        | 6.1    | Ubuntu 24.04                         |
+| 61         | 59        | 7.1    | Debian 13, current Fedora            |
+| 62         | 60        | 8.0    | rolling releases moving to FFmpeg 8  |
+
+```sh
+./misc/ffmpeg-headers.sh /tmp/ffmpeg-headers
+cmake -B build -DDIRECTGATE_HWENC_HEADERS=/tmp/ffmpeg-headers
+```
+
+The trees are ordinary `libavcodec/` and `libavutil/` directories from an FFmpeg release tarball, plus a `libavutil/avconfig.h` (two macros, which FFmpeg's `configure` normally generates) - so a distribution's own `-dev` package works just as well if you symlink it in. CMake takes whatever majors it finds, so adding one as distributions move on means another release line in that script plus the matching pair of `#if` blocks in `hwenc_abi.c`.
+
+A plain `cmake -B build` passes no header trees and keeps the single-variant behaviour, compiled against whatever FFmpeg is installed - which is what you want on a machine that only has to run its own build.
+
+Two switches guard this for release builds, and the `hwenc-abi` CI job exercises both on every push. `-DDIRECTGATE_REQUIRE_HWENC=ON` fails at configure time when no FFmpeg headers are found at all, instead of quietly producing a permanently software-only binary - the decision is baked in at compile time and no user can repair it afterwards. And the `hwenc_abi_smoke` test loads the build machine's own libavcodec through the dispatcher, so a variant that compiles but cannot be selected fails too.
 
 On macOS and Windows desktop streaming uses only OS components (ScreenCaptureKit + VideoToolbox, and DXGI Desktop Duplication + Media Foundation respectively) - nothing extra to install; see [Building for Windows](windows.md#desktop-streaming) for the Windows specifics.
 

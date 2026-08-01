@@ -65,7 +65,22 @@ Remote desktop cannot function without these; they are the feature, not a side e
 - All desktop control and input traffic is AES-256-SIV encrypted; video is encrypted as described above.
 - They act as `shell.user`, the same account the terminal already runs as. A client that can start a desktop session can already run arbitrary commands as that user through the PTY, so desktop access grants no privilege that shell access does not.
 
-Two things to be aware of when deciding whether to enable it:
+### Privileged UI on Windows
+
+There is one place where the "no more privilege than shell access" property above does **not** hold, and it deserves to be stated plainly rather than buried.
+
+On Windows, `desktop.elevatedInput` (default **true**) lets a desktop session drive UI that `shell.user` cannot reach on their own: UAC consent prompts, Task Manager and other elevated windows, and - with `desktop.lockScreen`, also default true - the lock screen and the Ctrl+Alt+Del security screen. It works by routing the refused input through a SYSTEM helper the service spawns into the interactive session; the mechanics are in [Elevated UI and the secure desktop](windows.md#elevated-ui-and-the-secure-desktop).
+
+**A client that can approve a UAC prompt is, in practice, an administrator on that machine, and one that can drive the lock screen can log in.** That is inherent to the feature: there is no way to show someone a consent dialog remotely and let them answer it without also letting them answer it. Enable it knowing that, or turn it off.
+
+What the design does bound:
+
+- The helper injects only when the input desktop is not `Default`, or when the foreground window belongs to a process of higher integrity than the agent. On the ordinary desktop with an ordinary window focused it drops the event, so a compromised agent gains nothing there that it did not already have as `shell.user`.
+- The helper exists only while a desktop session is live, is spawned only by the launcher, and exits when the agent process does.
+- It never parses network data. It reads only fixed-size records the agent has already validated, over unnamed channels no third process can address, so the privilege-separation rule this whole model rests on - the untrusted parser is never SYSTEM - still holds.
+- `"desktop": { "elevatedInput": false }` removes the capability entirely and restores the previous behaviour: privileged UI stays visible but cannot be interacted with. `"lockScreen": false` keeps UAC working while refusing the lock screen.
+
+Two more things to be aware of when deciding whether to enable desktop access at all:
 
 - The agent does **not** display a local on-screen indicator while a desktop session is live. Someone physically at the machine has no built-in signal that a session is active. Treat desktop access exactly as you treat shell access, and be deliberate about enabling it on shared or multi-user machines where the person at the keyboard may not be the person who configured the agent.
 - On macOS the operating system enforces its own Screen Recording and Accessibility permissions, which must be granted to the agent before capture or input will work at all.

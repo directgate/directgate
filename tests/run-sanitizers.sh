@@ -8,12 +8,15 @@ JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 CC="${CC:-clang}"
 CXX="${CXX:-clang++}"
 
-cmake -S "$ROOT" -B "$BUILD" \
-    -DDIRECTGATE_BUILD_TESTS=ON \
-    -DDIRECTGATE_ENABLE_SANITIZERS=ON \
-    -DCMAKE_BUILD_TYPE=Debug \
-    -DCMAKE_C_COMPILER="$CC" \
-    -DCMAKE_CXX_COMPILER="$CXX"
+# Release builds compile the GPU encoder once per libavcodec major; set
+# DIRECTGATE_HWENC_HEADERS to exercise that here too (see docs/building.md).
+set -- -S "$ROOT" -B "$BUILD" -DDIRECTGATE_BUILD_TESTS=ON
+if [ -n "${DIRECTGATE_HWENC_HEADERS:-}" ]; then
+    set -- "$@" "-DDIRECTGATE_HWENC_HEADERS=$DIRECTGATE_HWENC_HEADERS"
+fi
+set -- "$@" -DDIRECTGATE_ENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX"
+cmake "$@"
 cmake --build "$BUILD" -j "$JOBS"
 
 ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=1:halt_on_error=1:strict_string_checks=1}" \

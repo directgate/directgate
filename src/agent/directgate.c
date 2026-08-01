@@ -39,6 +39,7 @@
 
 #ifdef _WIN32
 #include "launcher.h"
+#include "elevated.h"
 #endif
 
 #define DIRECTGATE_RECONNECT_BASE_MS        3000U
@@ -2925,6 +2926,15 @@ int DirectGate_RunAgent(int argc, char* argv[])
         XLog_Destroy();
         return nStatus;
     }
+
+#ifdef _WIN32
+    /* Remote-desktop policy for privileged UI. The launcher enforces the same
+       switches on its own side; this is what makes the agent stop asking. */
+    DirectGate_Elevated_SetEnabled(args.desktop.bElevatedInput, args.desktop.bLockScreen);
+#endif
+
+    /* Before the first relay or API connection. */
+    DirectGate_InitTrustStore();
 
     xlogn("Starting directgate agent: v%s", DirectGate_GetVersionLong());
     xlogi("libxutils version: %s", XUtils_Version());

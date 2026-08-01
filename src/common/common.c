@@ -628,3 +628,119 @@ xbool_t DirectGate_PromptU32(const char *pLabel, uint32_t *pValue)
     *pValue = nVal;
     return XTRUE;
 }
+
+#ifndef _WIN32
+/*
+ * True when a trust-store path holds something OpenSSL could actually use.
+ *
+ * Existence is not enough, and the difference is the whole point: a directory
+ * that is present but empty makes OpenSSL load a store with no anchors and
+ * reject every server, while looking, to a plain stat(), exactly like a
+ * working one. Distributions that lay their certificates out differently from
+ * the one a package was built on leave precisely that shape behind.
+ */
+static xbool_t DirectGate_TrustStoreUsable(const char *pPath)
+{
+    struct stat status;
+    if (!xstrused(pPath) || stat(pPath, &status) != 0) return XFALSE;
+    if (S_ISREG(status.st_mode)) return (status.st_size > 0) ? XTRUE : XFALSE;
+    if (!S_ISDIR(status.st_mode)) return XFALSE;
+
+    DIR *pDir = opendir(pPath);
+    if (pDir == NULL) return XFALSE;
+
+    struct dirent *pEntry;
+    xbool_t bFound = XFALSE;
+
+    while ((pEntry = readdir(pDir)) != NULL)
+    {
+        if (pEntry->d_name[0] == '.') continue;
+        bFound = XTRUE;
+        break;
+    }
+
+    closedir(pDir);
+    return bFound;
+}
+#endif /* !_WIN32 */
+
+/*
+ * Makes sure OpenSSL can find the host's trust anchors before anything opens a
+ * TLS connection.
+ *
+ * The location is compiled into libcrypto, and a statically linked build
+ * carries whatever the machine that built it had. Get that wrong and
+ * SSL_CTX_set_default_verify_paths() loads an empty store, SSL_VERIFY_PEER
+ * rejects every server, and the agent cannot reach the relay at all - a total
+ * outage rather than a degraded feature.
+ *
+ * On macOS the Homebrew OpenSSL this is built against ships its own cert.pem
+ * and is found by the first check, so this is silent there too; the fallbacks
+ * only matter if that build and the one installed ever disagree.
+ *
+ * The packages compile in the right path for the family they target, so this
+ * normally does nothing. It exists for everywhere else: one .deb serves Debian,
+ * Ubuntu, Mint, Kali and Raspberry Pi OS, one .rpm serves Fedora, RHEL, Rocky
+ * and Alma, and neither list is closed. A derivative that puts its certificates
+ * somewhere else should cost a log line, not the relay connection.
+ *
+ * Nothing is overridden when the compiled-in default is usable, or when the
+ * operator has pointed SSL_CERT_FILE/SSL_CERT_DIR somewhere themselves.
+ */
+void DirectGate_InitTrustStore(void)
+{
+#ifndef _WIN32
+    /* An explicit choice by whoever started us always wins. */
+    if (xstrused(getenv("SSL_CERT_FILE")) || xstrused(getenv("SSL_CERT_DIR"))) return;
+
+    const char *pDefaultFile = X509_get_default_cert_file();
+    const char *pDefaultDir = X509_get_default_cert_dir();
+
+    if (DirectGate_TrustStoreUsable(pDefaultFile) ||
+        DirectGate_TrustStoreUsable(pDefaultDir)) return;
+
+    /* Every layout in use across the distributions apt and dnf packages reach.
+     * A bundle file is preferred over a hashed directory because it needs no
+     * c_rehash to have been run against it. */
+    static const char *pBundles[] = {
+        "/etc/ssl/certs/ca-certificates.crt",                 /* Debian, Ubuntu, Mint, Kali, Raspberry Pi OS, Alpine, Arch */
+        "/etc/pki/tls/certs/ca-bundle.crt",                   /* RHEL, Fedora, Rocky, Alma, CentOS */
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  /* RHEL family, extracted bundle */
+        "/etc/ssl/ca-bundle.pem",                             /* openSUSE, SLES */
+        "/etc/ca-certificates/extracted/tls-ca-bundle.pem",   /* Arch */
+        "/etc/pki/tls/cacert.pem",                            /* older RHEL */
+        "/etc/ssl/cert.pem",                                  /* Alpine, BSD, macOS base system */
+        "/opt/homebrew/etc/openssl@3/cert.pem",               /* macOS, Apple silicon Homebrew */
+        "/usr/local/etc/openssl@3/cert.pem"                   /* macOS, Intel Homebrew */
+    };
+
+    static const char *pDirs[] = {
+        "/etc/ssl/certs",
+        "/etc/pki/tls/certs"
+    };
+
+    size_t i;
+    for (i = 0; i < XARR_SIZE(pBundles); i++)
+    {
+        if (!DirectGate_TrustStoreUsable(pBundles[i])) continue;
+        setenv("SSL_CERT_FILE", pBundles[i], 0);
+
+        xlogi("TLS trust store: %s (the built-in default %s is not usable here)",
+            pBundles[i], xstrused(pDefaultFile) ? pDefaultFile : "(none)");
+
+        return;
+    }
+
+    for (i = 0; i < XARR_SIZE(pDirs); i++)
+    {
+        if (!DirectGate_TrustStoreUsable(pDirs[i])) continue;
+        setenv("SSL_CERT_DIR", pDirs[i], 0);
+        xlogi("TLS trust store directory: %s", pDirs[i]);
+        return;
+    }
+
+    xlogw("No TLS trust store found; certificate verification will reject every server. "
+          "Install ca-certificates (apt/dnf, or brew on macOS), or point SSL_CERT_FILE "
+          "at a CA bundle.");
+#endif /* _WIN32 */
+}
