@@ -400,7 +400,13 @@ static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
      * is the adapter that owns the display by construction rather than a
      * guess. A refusal is not fatal: MFTs that do not want a device answer
      * E_NOTIMPL, and the encoder then runs exactly as it did before. */
-    if (pDevice != NULL && g_mfplat.createDeviceManager != NULL)
+    if (pDevice == NULL || g_mfplat.createDeviceManager == NULL)
+    {
+        xlogw("Encoder MFT gets no D3D device: encoder(%s), device(%s), mfplat(%s)",
+            pEnc->sName, pDevice != NULL ? "yes" : "none",
+            g_mfplat.createDeviceManager != NULL ? "yes" : "unsupported");
+    }
+    else
     {
         UINT nResetToken = 0;
         HRESULT hrDev = g_mfplat.createDeviceManager(&nResetToken, &pEnc->pDeviceMgr);
@@ -412,7 +418,7 @@ static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
         {
             hrDev = IMFTransform_ProcessMessage(pTransform, MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR)pEnc->pDeviceMgr);
 
-            if (FAILED(hrDev)) xlogd("Encoder MFT declined the D3D device: encoder(%s), hr(0x%08lX)", pEnc->sName, (unsigned long)hrDev);
+            if (FAILED(hrDev)) xlogw("Encoder MFT declined the D3D device: encoder(%s), hr(0x%08lX)", pEnc->sName, (unsigned long)hrDev);
             else xlogi("Bound encoder MFT to the capture D3D device: encoder(%s)", pEnc->sName);
         }
         else

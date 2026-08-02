@@ -799,6 +799,8 @@ static int DirectGate_Desktop_WinEnc_InitPipeline(directgate_winenc_t *pEnc)
     pEnc->hWaitTimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (pEnc->hWaitTimer == NULL) pEnc->hWaitTimer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
 
+    pEnc->bUseGdi = (DirectGate_Desktop_WinEnc_InitDxgi(pEnc) != XSTDOK) ? XTRUE : XFALSE;
+
     char sError[DIRECTGATE_DESKTOP_REASON_LEN] = { 0 };
     memset(&pEnc->encoderRejects, 0, sizeof(pEnc->encoderRejects));
 
@@ -817,8 +819,6 @@ static int DirectGate_Desktop_WinEnc_InitPipeline(directgate_winenc_t *pEnc)
         DirectGate_Desktop_WinEnc_SetError(pEnc, "Failed to allocate desktop frame buffers.");
         return XSTDERR;
     }
-
-    pEnc->bUseGdi = (DirectGate_Desktop_WinEnc_InitDxgi(pEnc) != XSTDOK) ? XTRUE : XFALSE;
 
     /* GDI is both the fallback capture and the source of the guaranteed
      * first frame: duplication only delivers frames on screen updates, and
