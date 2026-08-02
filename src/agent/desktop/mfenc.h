@@ -56,9 +56,13 @@ typedef struct directgate_mfenc_ directgate_mfenc_t;
  * then the Microsoft software encoder. The caller owns the list so it
  * survives the Destroy/Create cycle that swaps encoders.
  *
+ * Entries are enumeration keys rather than plain friendly names, because a
+ * name does not identify an MFT: a machine can offer the same encoder name
+ * more than once.
+ *
  * Zero-initialise before the first Create. */
 typedef struct directgate_mfenc_rejects_ {
-    char names[DIRECTGATE_MFENC_MAX_REJECTED][DIRECTGATE_MFENC_NAME_LEN];
+    char keys[DIRECTGATE_MFENC_MAX_REJECTED][DIRECTGATE_MFENC_NAME_LEN];
     uint32_t nCount;
 } directgate_mfenc_rejects_t;
 

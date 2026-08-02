@@ -117,7 +117,7 @@ struct directgate_mfenc_ {
     size_t nSeqHeaderSize;
     HANDLE hPollTimer;                   /* sub-ms waits for MFT event credits */
     char sName[96];
-    char sRawName[DIRECTGATE_MFENC_NAME_LEN]; /* MFT_FRIENDLY_NAME, reject key */
+    char sRejectKey[DIRECTGATE_MFENC_NAME_LEN]; /* Enumeration key, see CandidateKey */
 };
 
 static void DirectGate_MFEnc_SetError(char *pErrBuf, size_t nErrSize, const char *pFmt, ...)
@@ -567,13 +567,13 @@ static void DirectGate_MFEnc_ReleaseTransform(directgate_mfenc_t *pEnc)
 }
 
 static xbool_t DirectGate_MFEnc_IsRejected(const directgate_mfenc_rejects_t *pRejects,
-                                           const char *pName)
+                                           const char *pKey)
 {
-    if (pRejects == NULL || !xstrused(pName)) return XFALSE;
+    if (pRejects == NULL || !xstrused(pKey)) return XFALSE;
 
     for (uint32_t i = 0; i < pRejects->nCount; i++)
     {
-        if (xstrcmp(pRejects->names[i], pName)) return XTRUE;
+        if (xstrcmp(pRejects->keys[i], pKey)) return XTRUE;
     }
 
     return XFALSE;
@@ -591,6 +591,24 @@ static void DirectGate_MFEnc_ActivateName(IMFActivate *pActivate, char *pName, s
         WideCharToMultiByte(CP_UTF8, 0, wsName, -1, pName, (int)nSize - 1, NULL, NULL);
 
     if (!pName[0]) xstrncpy(pName, nSize, "unnamed H.264 encoder MFT");
+}
+
+static void DirectGate_MFEnc_CandidateKey(IMFActivate **ppActivate, UINT32 nIndex,
+                                          const char *pName, char *pKey, size_t nSize)
+{
+    UINT32 nSeen = 1;
+
+    for (UINT32 i = 0; i < nIndex; i++)
+    {
+        char sOther[DIRECTGATE_MFENC_NAME_LEN];
+        DirectGate_MFEnc_ActivateName(ppActivate[i], sOther, sizeof(sOther));
+
+        if (xstrcmp(sOther, pName)) nSeen++;
+    }
+
+    /* The name is what gets truncated if anything must be: the suffix is the
+     * part that makes the key unique. */
+    snprintf(pKey, nSize, "%.*s#%u", (int)(nSize - 6), pName, nSeen);
 }
 
 /* Tries every MFT the enumeration returned (best match first thanks to
@@ -641,14 +659,16 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
 
     for (UINT32 i = 0; i < nCount && nStatus != XSTDOK; i++)
     {
-        /* Read the name first: it is the key a previously-failed MFT is
-         * remembered by, and skipping one must not cost an activation. */
+        /* Identify the entry first: this is how a previously-failed MFT is
+         * recognised, and skipping one must not cost an activation. */
         char sName[DIRECTGATE_MFENC_NAME_LEN];
+        char sKey[DIRECTGATE_MFENC_NAME_LEN];
         DirectGate_MFEnc_ActivateName(ppActivate[i], sName, sizeof(sName));
+        DirectGate_MFEnc_CandidateKey(ppActivate, i, sName, sKey, sizeof(sKey));
 
-        if (DirectGate_MFEnc_IsRejected(pRejects, sName))
+        if (DirectGate_MFEnc_IsRejected(pRejects, sKey))
         {
-            xlogw("Skipping H.264 encoder MFT that already failed: encoder(%s)", sName);
+            xlogw("Skipping H.264 encoder MFT that already failed: encoder(%s), key(%s)", sName, sKey);
             nRetired++;
             continue;
         }
@@ -659,8 +679,7 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
          * already used up. Passing over it silently made it look like the
          * candidate had never been in the list at all. */
         IMFTransform *pTransform = NULL;
-        HRESULT hrActivate = IMFActivate_ActivateObject(ppActivate[i],
-            &IID_IMFTransform, (void**)&pTransform);
+        HRESULT hrActivate = IMFActivate_ActivateObject(ppActivate[i], &IID_IMFTransform, (void**)&pTransform);
 
         if (FAILED(hrActivate) || pTransform == NULL)
         {
@@ -672,7 +691,7 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
         }
 
         pEnc->pTransform = pTransform;
-        xstrncpy(pEnc->sRawName, sizeof(pEnc->sRawName), sName);
+        xstrncpy(pEnc->sRejectKey, sizeof(pEnc->sRejectKey), sKey);
         snprintf(pEnc->sName, sizeof(pEnc->sName), "%s (%s)", bHardware ? "hardware" : "software", sName);
 
         nStatus = DirectGate_MFEnc_Configure(pEnc, pQuality, pDevice, pErrBuf, nErrSize);
@@ -684,7 +703,7 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
             DirectGate_MFEnc_ReleaseTransform(pEnc);
             IMFActivate_ShutdownObject(ppActivate[i]);
 
-            pEnc->sRawName[0] = '\0';
+            pEnc->sRejectKey[0] = '\0';
             pEnc->sName[0] = '\0';
             nRefused++;
             continue;
@@ -1163,14 +1182,14 @@ void DirectGate_MFEnc_Reject(directgate_mfenc_rejects_t *pRejects,
 {
     XCHECK_VOID_NL((pRejects != NULL && pEncoder != NULL));
     XCHECK_VOID_NL((pRejects->nCount < DIRECTGATE_MFENC_MAX_REJECTED));
-    XCHECK_VOID_NL((pEncoder->sRawName[0] != '\0'));
+    XCHECK_VOID_NL((pEncoder->sRejectKey[0] != '\0'));
 
     for (uint32_t i = 0; i < pRejects->nCount; i++)
     {
-        if (xstrcmp(pRejects->names[i], pEncoder->sRawName)) return;
+        if (xstrcmp(pRejects->keys[i], pEncoder->sRejectKey)) return;
     }
 
-    xstrncpy(pRejects->names[pRejects->nCount], DIRECTGATE_MFENC_NAME_LEN, pEncoder->sRawName);
+    xstrncpy(pRejects->keys[pRejects->nCount], DIRECTGATE_MFENC_NAME_LEN, pEncoder->sRejectKey);
     pRejects->nCount++;
 }
 
