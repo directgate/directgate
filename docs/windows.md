@@ -105,7 +105,7 @@ Installing `directgate-<version>-x64.msi` (double-click, or `msiexec /i directga
 - installs the `DirectGate P2P UDP` inbound Windows Firewall rule for `directgate.exe` on every profile, with edge traversal enabled;
 - removes that firewall rule automatically when DirectGate is uninstalled;
 - installs `directgate.exe` and `dgcli.exe` into `C:\Program Files\DirectGate\` and adds that directory to the system `PATH`;
-- creates `C:\ProgramData\directgate\`, the machine-wide config home;
+- creates `C:\ProgramData\directgate\`, the machine-wide config home and the default log directory (`log.path` in `agent.json` overrides it);
 - registers one Windows service, `directgate-agent`, running as **LocalSystem**
   and configured to start automatically at boot with the command line
   `directgate.exe --win-service --win-launcher -c "C:\ProgramData\directgate\agent.json"`;

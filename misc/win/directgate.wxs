@@ -235,10 +235,12 @@
         </StandardDirectory>
 
         <!--
-            Machine-wide config home. The launcher (LocalSystem) reads it; the
-            agent runs as shell.user and reads/writes agent.json there (it is
-            written with a protected, 0600-equivalent DACL by the agent itself).
-            Default ProgramData ACL is kept so shell.user can read/pair its config.
+            Machine-wide config home, and the default log directory. The
+            launcher (LocalSystem) reads it; the agent runs as shell.user and
+            reads/writes agent.json there (it is written with a protected,
+            0600-equivalent DACL by the agent itself). Default ProgramData ACL
+            is kept so shell.user can read/pair its config and, as the owner of
+            the log files it creates, write its own log.
         -->
         <StandardDirectory Id="CommonAppDataFolder">
             <Directory Id="DataFolder" Name="directgate">
