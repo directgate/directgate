@@ -69,14 +69,19 @@ int DirectGate_MFEnc_Load(char *pErrBuf, size_t nErrSize);
 
 /* Creates and initializes an encoder for NV12 input of nWidth x nHeight
  * (both must be even) using the given quality settings. Candidates named in
- * @p pRejects (may be NULL) are skipped. Returns NULL on failure with the
- * reason in pErrBuf. */
-directgate_mfenc_t* DirectGate_MFEnc_Create(uint32_t nWidth,
-                                    uint32_t nHeight,
-                                    const directgate_desktop_quality_t *pQuality,
-                                    const directgate_mfenc_rejects_t *pRejects,
-                                    char *pErrBuf,
-                                    size_t nErrSize);
+ * @p pRejects (may be NULL) are skipped.
+ *
+ * @p pDevice is the capture ID3D11Device (may be NULL), handed to hardware
+ * MFTs so they can open an encode session on the adapter that owns the
+ * display. It must have been created with D3D11_CREATE_DEVICE_VIDEO_SUPPORT
+ * and marked multithread-protected, because Media Foundation drives it from
+ * its own threads.
+ *
+ * Returns NULL on failure with the reason in pErrBuf. */
+directgate_mfenc_t* DirectGate_MFEnc_Create(uint32_t nWidth, uint32_t nHeight,
+                                            const directgate_desktop_quality_t *pQuality,
+                                            const directgate_mfenc_rejects_t *pRejects,
+                                            void *pDevice, char *pErrBuf, size_t nErrSize);
 
 /*!
  * @brief Has this encoder stopped being usable?
@@ -110,11 +115,11 @@ const char* DirectGate_MFEnc_Describe(const directgate_mfenc_t *pEncoder);
  * output yet, XSTDERR on encoder failure. *pKeyframe is set when the
  * output is an intra frame. */
 int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
-                        const uint8_t *pNV12,
-                        uint64_t nPtsUs,
-                        xbool_t bForceKeyframe,
-                        xbyte_buffer_t *pOut,
-                        xbool_t *pKeyframe);
+                            const uint8_t *pNV12,
+                            uint64_t nPtsUs,
+                            xbool_t bForceKeyframe,
+                            xbyte_buffer_t *pOut,
+                            xbool_t *pKeyframe);
 
 /* Collects an access unit the encoder is still holding, without feeding it a
  * new frame. Media Foundation encoders hand output back only when asked, and

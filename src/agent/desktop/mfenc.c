@@ -77,6 +77,7 @@ typedef HRESULT (WINAPI *directgate_mf_enum_fn)(GUID, UINT32,
 typedef HRESULT (WINAPI *directgate_mf_create_type_fn)(IMFMediaType**);
 typedef HRESULT (WINAPI *directgate_mf_create_sample_fn)(IMFSample**);
 typedef HRESULT (WINAPI *directgate_mf_create_buffer_fn)(DWORD, IMFMediaBuffer**);
+typedef HRESULT (WINAPI *directgate_mf_create_devmgr_fn)(UINT*, IMFDXGIDeviceManager**);
 
 typedef struct directgate_mfplat_ {
     HMODULE hModule;
@@ -85,6 +86,7 @@ typedef struct directgate_mfplat_ {
     directgate_mf_create_type_fn createMediaType;
     directgate_mf_create_sample_fn createSample;
     directgate_mf_create_buffer_fn createMemoryBuffer;
+    directgate_mf_create_devmgr_fn createDeviceManager;
     xbool_t bLoadAttempted;
     xbool_t bLoaded;
 } directgate_mfplat_t;
@@ -95,6 +97,7 @@ struct directgate_mfenc_ {
     IMFTransform *pTransform;
     ICodecAPI *pCodecApi;                /* optional: dynamic bitrate / keyframe */
     IMFMediaEventGenerator *pEventGen;   /* asynchronous (hardware) MFTs only */
+    IMFDXGIDeviceManager *pDeviceMgr;    /* GPU binding for hardware MFTs */
     DWORD nInputStreamId;
     DWORD nOutputStreamId;
     DWORD nOutputBufferSize;
@@ -153,6 +156,7 @@ int DirectGate_MFEnc_Load(char *pErrBuf, size_t nErrSize)
     pLib->createMediaType = (directgate_mf_create_type_fn)(void*)GetProcAddress(hModule, "MFCreateMediaType");
     pLib->createSample = (directgate_mf_create_sample_fn)(void*)GetProcAddress(hModule, "MFCreateSample");
     pLib->createMemoryBuffer = (directgate_mf_create_buffer_fn)(void*)GetProcAddress(hModule, "MFCreateMemoryBuffer");
+    pLib->createDeviceManager = (directgate_mf_create_devmgr_fn)(void*)GetProcAddress(hModule, "MFCreateDXGIDeviceManager");
 
     if (pLib->startup == NULL || pLib->enumEx == NULL ||
         pLib->createMediaType == NULL || pLib->createSample == NULL ||
@@ -353,6 +357,7 @@ static HRESULT DirectGate_MFEnc_BuildType(IMFMediaType **ppType, const GUID *pSu
  * start. Returns XSTDOK when the MFT is ready to encode. */
 static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
                                       const directgate_desktop_quality_t *pQuality,
+                                      void *pDevice,
                                       char *pErrBuf, size_t nErrSize)
 {
     IMFTransform *pTransform = pEnc->pTransform;
@@ -383,6 +388,47 @@ static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
 
     if (FAILED(IMFTransform_QueryInterface(pTransform, &IID_ICodecAPI, (void**)&pEnc->pCodecApi)))
         pEnc->pCodecApi = NULL;
+
+    /* Hand the MFT the GPU it should encode on, before the media types. A
+     * hardware encoder is a front end for a GPU engine and has to be bound to
+     * a device to open an encode session; given none, some drivers fall back
+     * to a system-memory path and others accept every configuration call and
+     * then never start, which is indistinguishable from working right up until
+     * the first frame is due.
+     *
+     * The device is the one Desktop Duplication already captures with, so it
+     * is the adapter that owns the display by construction rather than a
+     * guess. A refusal is not fatal: MFTs that do not want a device answer
+     * E_NOTIMPL, and the encoder then runs exactly as it did before. */
+    if (pDevice != NULL && g_mfplat.createDeviceManager != NULL)
+    {
+        UINT nResetToken = 0;
+        HRESULT hrDev = g_mfplat.createDeviceManager(&nResetToken, &pEnc->pDeviceMgr);
+
+        if (SUCCEEDED(hrDev) && pEnc->pDeviceMgr != NULL)
+            hrDev = IMFDXGIDeviceManager_ResetDevice(pEnc->pDeviceMgr, (IUnknown*)pDevice, nResetToken);
+
+        if (SUCCEEDED(hrDev) && pEnc->pDeviceMgr != NULL)
+        {
+            hrDev = IMFTransform_ProcessMessage(pTransform, MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR)pEnc->pDeviceMgr);
+
+            if (FAILED(hrDev)) xlogd("Encoder MFT declined the D3D device: encoder(%s), hr(0x%08lX)", pEnc->sName, (unsigned long)hrDev);
+            else xlogi("Bound encoder MFT to the capture D3D device: encoder(%s)", pEnc->sName);
+        }
+        else
+        {
+            xlogw("Failed to build a D3D device manager for the encoder: encoder(%s), hr(0x%08lX)",
+                pEnc->sName, (unsigned long)hrDev);
+        }
+
+        /* Only the MFT's own reference matters from here; ours is released
+           with the transform. A failed bind leaves the manager unused. */
+        if (FAILED(hrDev) && pEnc->pDeviceMgr != NULL)
+        {
+            IMFDXGIDeviceManager_Release(pEnc->pDeviceMgr);
+            pEnc->pDeviceMgr = NULL;
+        }
+    }
 
     IMFMediaType *pOutType = NULL;
     HRESULT hr = DirectGate_MFEnc_BuildType(&pOutType, &MFVideoFormat_H264, pEnc->nWidth, pEnc->nHeight, pEnc->nFps);
@@ -482,6 +528,12 @@ static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
 
 static void DirectGate_MFEnc_ReleaseTransform(directgate_mfenc_t *pEnc)
 {
+    if (pEnc->pDeviceMgr != NULL)
+    {
+        IMFDXGIDeviceManager_Release(pEnc->pDeviceMgr);
+        pEnc->pDeviceMgr = NULL;
+    }
+
     if (pEnc->pEventGen != NULL)
     {
         IMFMediaEventGenerator_Release(pEnc->pEventGen);
@@ -541,7 +593,7 @@ static void DirectGate_MFEnc_ActivateName(IMFActivate *pActivate, char *pName, s
 static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 nFlags, xbool_t bHardware,
                                                const directgate_desktop_quality_t *pQuality,
                                                const directgate_mfenc_rejects_t *pRejects,
-                                               char *pErrBuf, size_t nErrSize)
+                                               void *pDevice, char *pErrBuf, size_t nErrSize)
 {
     MFT_REGISTER_TYPE_INFO inputInfo = { { 0 }, { 0 } };
     MFT_REGISTER_TYPE_INFO outputInfo = { { 0 }, { 0 } };
@@ -617,7 +669,7 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
         xstrncpy(pEnc->sRawName, sizeof(pEnc->sRawName), sName);
         snprintf(pEnc->sName, sizeof(pEnc->sName), "%s (%s)", bHardware ? "hardware" : "software", sName);
 
-        nStatus = DirectGate_MFEnc_Configure(pEnc, pQuality, pErrBuf, nErrSize);
+        nStatus = DirectGate_MFEnc_Configure(pEnc, pQuality, pDevice, pErrBuf, nErrSize);
         if (nStatus != XSTDOK)
         {
             xlogw("H.264 encoder MFT rejected during setup: encoder(%s), reason(%s)",
@@ -658,7 +710,7 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
 directgate_mfenc_t* DirectGate_MFEnc_Create(uint32_t nWidth, uint32_t nHeight,
                                             const directgate_desktop_quality_t *pQuality,
                                             const directgate_mfenc_rejects_t *pRejects,
-                                            char *pErrBuf, size_t nErrSize)
+                                            void *pDevice, char *pErrBuf, size_t nErrSize)
 {
     XCHECK_NL((pQuality != NULL), NULL);
     XCHECK_NL((nWidth >= 16 && nHeight >= 16), NULL);
@@ -689,14 +741,15 @@ directgate_mfenc_t* DirectGate_MFEnc_Create(uint32_t nWidth, uint32_t nHeight,
      * so a re-create after a wedged encoder walks down this same order
      * instead of picking the liar again. */
     if (DirectGate_MFEnc_CreateFromCategory(pEnc, MFT_ENUM_FLAG_HARDWARE, XTRUE,
-            pQuality, pRejects, pErrBuf, nErrSize) == XSTDOK ||
+            pQuality, pRejects, pDevice, pErrBuf, nErrSize) == XSTDOK ||
         DirectGate_MFEnc_CreateFromCategory(pEnc,
             MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_LOCALMFT,
-            XFALSE, pQuality, pRejects, pErrBuf, nErrSize) == XSTDOK)
+            XFALSE, pQuality, pRejects, NULL, pErrBuf, nErrSize) == XSTDOK)
         return pEnc;
 
     if (pEnc->hPollTimer != NULL) CloseHandle(pEnc->hPollTimer);
     free(pEnc);
+
     return NULL;
 }
 

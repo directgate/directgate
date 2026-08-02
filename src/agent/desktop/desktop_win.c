@@ -346,9 +346,29 @@ static int DirectGate_Desktop_WinEnc_InitDxgi(directgate_winenc_t *pEnc)
     if (pFoundOutput == NULL) return XSTDNON;
 
     /* The duplication must live on the adapter that owns the output
-     * (multi-GPU laptops render each output on a specific adapter). */
-    HRESULT hr = D3D11CreateDevice(pFoundAdapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
-        NULL, 0, D3D11_SDK_VERSION, &pEnc->pDevice, NULL, &pEnc->pContext);
+     * (multi-GPU laptops render each output on a specific adapter).
+     *
+     * VIDEO_SUPPORT is what lets the same device be handed to Media
+     * Foundation as the encoder's D3D device, which is how a hardware encoder
+     * MFT binds to the GPU. Not every driver offers it, and capture matters
+     * more than hardware encoding, so a refusal falls back to a plain device
+     * and the encoder simply runs without one. */
+    HRESULT hr = D3D11CreateDevice(pFoundAdapter, D3D_DRIVER_TYPE_UNKNOWN, NULL,
+        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, NULL, 0, D3D11_SDK_VERSION,
+        &pEnc->pDevice, NULL, &pEnc->pContext);
+
+    if (FAILED(hr) || pEnc->pDevice == NULL)
+    {
+        xlogw("D3D11 device rejected video support, retrying without it: hr(0x%08lX)",
+            (unsigned long)hr);
+
+        pEnc->pDevice = NULL;
+        pEnc->pContext = NULL;
+
+        hr = D3D11CreateDevice(pFoundAdapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
+            NULL, 0, D3D11_SDK_VERSION, &pEnc->pDevice, NULL, &pEnc->pContext);
+    }
+
     IDXGIAdapter_Release(pFoundAdapter);
 
     if (FAILED(hr) || pEnc->pDevice == NULL)
@@ -357,6 +377,15 @@ static int DirectGate_Desktop_WinEnc_InitDxgi(directgate_winenc_t *pEnc)
         pEnc->pDevice = NULL;
         pEnc->pContext = NULL;
         return XSTDNON;
+    }
+
+    /* Media Foundation drives the device from its own threads, so it has to be
+     * thread-safe before it is shared with an encoder MFT. */
+    ID3D10Multithread *pMultithread = NULL;
+    if (SUCCEEDED(ID3D11Device_QueryInterface(pEnc->pDevice, &IID_ID3D10Multithread, (void**)&pMultithread)) && pMultithread != NULL)
+    {
+        ID3D10Multithread_SetMultithreadProtected(pMultithread, TRUE);
+        ID3D10Multithread_Release(pMultithread);
     }
 
     pEnc->pOutput = pFoundOutput;
@@ -684,7 +713,7 @@ static int DirectGate_Desktop_WinEnc_SwapEncoder(directgate_winenc_t *pEnc)
     pEnc->pEncoder = NULL;
 
     pEnc->pEncoder = DirectGate_MFEnc_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
-        &pEnc->pDesktop->quality, &pEnc->encoderRejects, sError, sizeof(sError));
+        &pEnc->pDesktop->quality, &pEnc->encoderRejects, pEnc->pDevice, sError, sizeof(sError));
 
     if (pEnc->pEncoder == NULL)
     {
@@ -774,11 +803,10 @@ static int DirectGate_Desktop_WinEnc_InitPipeline(directgate_winenc_t *pEnc)
     memset(&pEnc->encoderRejects, 0, sizeof(pEnc->encoderRejects));
 
     pEnc->pEncoder = DirectGate_MFEnc_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
-        &pEnc->pDesktop->quality, &pEnc->encoderRejects, sError, sizeof(sError));
+        &pEnc->pDesktop->quality, &pEnc->encoderRejects, pEnc->pDevice, sError, sizeof(sError));
     if (pEnc->pEncoder == NULL)
     {
-        DirectGate_Desktop_WinEnc_SetError(pEnc,
-            sError[0] ? sError : "Media Foundation H.264 encoder initialization failed.");
+        DirectGate_Desktop_WinEnc_SetError(pEnc, sError[0] ? sError : "Media Foundation H.264 encoder initialization failed.");
         return XSTDERR;
     }
 
