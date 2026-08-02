@@ -345,29 +345,26 @@ static int DirectGate_Desktop_WinEnc_InitDxgi(directgate_winenc_t *pEnc)
     IDXGIFactory1_Release(pFactory);
     if (pFoundOutput == NULL) return XSTDNON;
 
-    /* The duplication must live on the adapter that owns the output
-     * (multi-GPU laptops render each output on a specific adapter).
-     *
-     * VIDEO_SUPPORT is what lets the same device be handed to Media
-     * Foundation as the encoder's D3D device, which is how a hardware encoder
-     * MFT binds to the GPU. Not every driver offers it, and capture matters
-     * more than hardware encoding, so a refusal falls back to a plain device
-     * and the encoder simply runs without one. */
-    HRESULT hr = D3D11CreateDevice(pFoundAdapter, D3D_DRIVER_TYPE_UNKNOWN, NULL,
-        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, NULL, 0, D3D11_SDK_VERSION,
-        &pEnc->pDevice, NULL, &pEnc->pContext);
+    /* Which GPU drives the captured display is the first thing every hardware
+     * encoder question turns on, and until now nothing recorded it: a machine
+     * with two GPUs could be capturing on either one, and an encoder MFT that
+     * belongs to the other behaves like a broken encoder rather than like a
+     * mismatch. */
+    DXGI_ADAPTER_DESC adapterDesc;
+    memset(&adapterDesc, 0, sizeof(adapterDesc));
 
-    if (FAILED(hr) || pEnc->pDevice == NULL)
+    if (SUCCEEDED(IDXGIAdapter_GetDesc(pFoundAdapter, &adapterDesc)))
     {
-        xlogw("D3D11 device rejected video support, retrying without it: hr(0x%08lX)",
-            (unsigned long)hr);
+        char sAdapter[128] = { 0 };
+        WideCharToMultiByte(CP_UTF8, 0, adapterDesc.Description, -1, sAdapter, (int)sizeof(sAdapter) - 1, NULL, NULL);
 
-        pEnc->pDevice = NULL;
-        pEnc->pContext = NULL;
-
-        hr = D3D11CreateDevice(pFoundAdapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
-            NULL, 0, D3D11_SDK_VERSION, &pEnc->pDevice, NULL, &pEnc->pContext);
+        xlogi("Desktop capture adapter selected: gpu(%s), vendor(0x%04X), device(0x%04X), vram(%zu MB)",
+            sAdapter[0] ? sAdapter : "unnamed", (unsigned int)adapterDesc.VendorId,
+            (unsigned int)adapterDesc.DeviceId, (size_t)(adapterDesc.DedicatedVideoMemory / (1024U * 1024U)));
     }
+
+    HRESULT hr = D3D11CreateDevice(pFoundAdapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
+        NULL, 0, D3D11_SDK_VERSION, &pEnc->pDevice, NULL, &pEnc->pContext);
 
     IDXGIAdapter_Release(pFoundAdapter);
 
@@ -377,15 +374,6 @@ static int DirectGate_Desktop_WinEnc_InitDxgi(directgate_winenc_t *pEnc)
         pEnc->pDevice = NULL;
         pEnc->pContext = NULL;
         return XSTDNON;
-    }
-
-    /* Media Foundation drives the device from its own threads, so it has to be
-     * thread-safe before it is shared with an encoder MFT. */
-    ID3D10Multithread *pMultithread = NULL;
-    if (SUCCEEDED(ID3D11Device_QueryInterface(pEnc->pDevice, &IID_ID3D10Multithread, (void**)&pMultithread)) && pMultithread != NULL)
-    {
-        ID3D10Multithread_SetMultithreadProtected(pMultithread, TRUE);
-        ID3D10Multithread_Release(pMultithread);
     }
 
     pEnc->pOutput = pFoundOutput;
