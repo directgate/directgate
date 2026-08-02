@@ -266,6 +266,17 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC);
 /* Get the pipe read fd for event loop registration (-1 if not available) */
 int DirectGate_WebRTC_GetPipeFd(const directgate_webrtc_t *pRTC);
 
+/*!
+ * @brief Is this SDP ICE candidate line anything other than UDP?
+ *
+ * The transport is the third whitespace-separated field of the candidate
+ * grammar, with an optional "a=" prefix. Reports TCP only when that field is
+ * positively present and not UDP: anything this cannot read is reported as
+ * UDP so it still reaches libjuice, which is the real authority on candidate
+ * syntax and rejects a malformed line before it can occupy a slot.
+ */
+xbool_t DirectGate_WebRTC_IsTcpCandidate(const char *pCandidate);
+
 #ifdef __cplusplus
 }
 #endif

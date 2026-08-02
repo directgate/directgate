@@ -2109,6 +2109,32 @@ XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSd
     return XSTDOK;
 }
 
+xbool_t DirectGate_WebRTC_IsTcpCandidate(const char *pCandidate)
+{
+    const char *pCursor = pCandidate;
+    while (*pCursor == ' ') pCursor++;
+
+    if (!strncmp(pCursor, "a=", 2)) pCursor += 2;
+    if (!strncmp(pCursor, "candidate:", 10)) pCursor += 10;
+
+    /* Skip the foundation and the component id. */
+    for (int nField = 0; nField < 2; nField++)
+    {
+        while (*pCursor && *pCursor != ' ') pCursor++;
+        while (*pCursor == ' ') pCursor++;
+    }
+
+    if (!*pCursor) return XFALSE;
+
+    size_t nLen = 0;
+    while (pCursor[nLen] && pCursor[nLen] != ' ') nLen++;
+
+    return (nLen == 3 &&
+            (pCursor[0] == 'u' || pCursor[0] == 'U') &&
+            (pCursor[1] == 'd' || pCursor[1] == 'D') &&
+            (pCursor[2] == 'p' || pCursor[2] == 'P')) ? XFALSE : XTRUE;
+}
+
 XSTATUS DirectGate_WebRTC_HandleIceCandidate(directgate_webrtc_t *pRTC,
                                              const char *pCandidate,
                                              const char *pMid,
@@ -2116,6 +2142,14 @@ XSTATUS DirectGate_WebRTC_HandleIceCandidate(directgate_webrtc_t *pRTC,
 {
     XCHECK((pRTC != NULL), XSTDERR);
     XCHECK((pCandidate != NULL), XSTDERR);
+
+    if (!pRTC->bAllowTCP && DirectGate_WebRTC_IsTcpCandidate(pCandidate))
+    {
+        xlogd("Dropping unusable remote TCP ICE candidate: pc(%d), candidate(%s)",
+            DirectGate_WebRTC_GetPC(pRTC), pCandidate);
+
+        return XSTDOK;
+    }
 
     int nTargetPC = pRTC->nPeerConnectionID;
 
