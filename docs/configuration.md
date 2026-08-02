@@ -28,6 +28,8 @@ The agent uses a JSON configuration file. You can point to one with `-c <path>`,
 | `log.toFile`   | boolean | Write logs to file       |
 | `log.path`     | string  | Log file directory       |
 
+The default log directory is platform-specific: `/var/log/directgate` on Linux and macOS, and `%ProgramData%\directgate` (normally `C:\ProgramData\directgate`) on Windows, next to the machine-wide `agent.json`. Setting `log.path` overrides it everywhere; on Windows either separator may be used.
+
 ## Agent configuration
 
 ```json

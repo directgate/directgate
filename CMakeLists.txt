@@ -161,6 +161,24 @@ if(WIN32)
 endif()
 add_subdirectory(${DATACHANNEL_DIR} EXCLUDE_FROM_ALL)
 
+# libjuice keeps each ICE description in a fixed array and silently drops every
+# remote candidate past the limit, which its own default sets at 30. A browser
+# offered several TURN servers produces host, server-reflexive and relay
+# candidates for each of them and goes past that easily, and the ones that fall
+# off are whichever trickled in last - not the least useful. It still connects
+# while a usable pair happens to land inside the limit, so the failure mode is
+# a connection that works until the day it doesn't.
+#
+# 48 leaves comfortable headroom over what browsers actually send. The cost is
+# the fixed array: a juice agent grows from ~67 KB to ~106 KB, so ~1.2 MB
+# across the 32-session ceiling. The header guards the value with #ifndef, so
+# this needs no patch to the vendored source.
+foreach(_juice_target juice juice-static)
+    if(TARGET ${_juice_target})
+        target_compile_definitions(${_juice_target} PRIVATE ICE_MAX_CANDIDATES_COUNT=48)
+    endif()
+endforeach()
+
 # ---- libxutils (submodule) ------------------------------------------------
 # Built from its own CMakeLists (target name: xutils). EXCLUDE_FROM_ALL keeps
 # its install rules out of our `make install`, while still building because the

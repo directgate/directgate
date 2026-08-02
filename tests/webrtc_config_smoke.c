@@ -120,6 +120,29 @@ int main(void)
         "BYO turns url");
     XJSON_Destroy(&json);
 
+    /* Remote ICE candidate transport detection. ICE-TCP is disabled on our
+     * peer connections, so TCP candidates can never form a pair and must not
+     * be allowed to occupy slots in libjuice's fixed remote description. */
+    CHECK(!DirectGate_WebRTC_IsTcpCandidate(
+        "candidate:1 1 udp 2122260223 192.168.1.10 54321 typ host"),
+        "plain UDP host candidate treated as TCP");
+    CHECK(!DirectGate_WebRTC_IsTcpCandidate(
+        "a=candidate:2 1 UDP 1686052607 203.0.113.7 41234 typ srflx raddr 192.168.1.10 rport 54321"),
+        "uppercase UDP with a= prefix treated as TCP");
+    CHECK(DirectGate_WebRTC_IsTcpCandidate(
+        "candidate:3 1 tcp 1518280447 192.168.1.10 9 typ host tcptype active"),
+        "TCP host candidate not detected");
+    CHECK(DirectGate_WebRTC_IsTcpCandidate(
+        "a=candidate:4 1 TCP 847249919 203.0.113.9 3478 typ relay raddr 0.0.0.0 rport 0 tcptype passive"),
+        "TURN/TCP relay candidate not detected");
+    /* Anything unreadable is forwarded rather than dropped: libjuice is the
+     * authority on candidate syntax and refuses a malformed line before it can
+     * occupy a slot, whereas dropping one here could cost a working route. */
+    CHECK(!DirectGate_WebRTC_IsTcpCandidate("candidate:5 1"),
+        "truncated candidate must be forwarded, not dropped");
+    CHECK(!DirectGate_WebRTC_IsTcpCandidate(""),
+        "empty candidate must be forwarded, not dropped");
+
     puts("webrtc_config_smoke: OK");
     return 0;
 }

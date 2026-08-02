@@ -23,7 +23,11 @@
 #include "webrtc.h"
 #include "logger.h"
 
+#ifdef _WIN32
+#define DIRECTGATE_LOG_PATH_DEFAULT "C:/ProgramData/directgate"
+#else
 #define DIRECTGATE_LOG_PATH_DEFAULT "/var/log/directgate"
+#endif
 
 static uint16_t DirectGate_LogFlagFromLevel(const char *pLevel)
 {
@@ -127,6 +131,28 @@ int DirectGate_LogGetRTCLevel(const directgate_log_t *pLog)
     return RTC_LOG_NONE;
 }
 
+/* Writes the platform's default log directory into @p pPath. */
+static void DirectGate_LogDefaultPath(char *pPath, size_t nSize)
+{
+#ifdef _WIN32
+    /* The literal above names the C: drive, but Windows is not always
+     * installed there and ProgramData moves with it. The environment variable
+     * is what the system itself uses to find that directory, so it wins when
+     * it is set and the literal stays as the fallback. */
+    const char *pProgramData = getenv("ProgramData");
+
+    if (xstrused(pProgramData)) xstrncpyf(pPath, nSize, "%s/directgate", pProgramData);
+    else xstrncpy(pPath, nSize, DIRECTGATE_LOG_PATH_DEFAULT);
+
+    /* Windows hands that variable back with backslashes, and the directory
+     * walker that creates the path splits on forward slashes only. */
+    for (size_t i = 0; pPath[i] != XSTR_NUL; i++)
+        if (pPath[i] == '\\') pPath[i] = '/';
+#else
+    xstrncpy(pPath, nSize, DIRECTGATE_LOG_PATH_DEFAULT);
+#endif
+}
+
 void DirectGate_LogInit(directgate_log_t *pLog, const char *pDefaultIdent, uint16_t nDefaultFlags)
 {
     XCHECK_VOID_NL((pLog != NULL));
@@ -141,7 +167,7 @@ void DirectGate_LogInit(directgate_log_t *pLog, const char *pDefaultIdent, uint1
     if (xstrused(pDefaultIdent))
         xstrncpy(pLog->sIdent, sizeof(pLog->sIdent), pDefaultIdent);
 
-    xstrncpy(pLog->sPath, sizeof(pLog->sPath), DIRECTGATE_LOG_PATH_DEFAULT);
+    DirectGate_LogDefaultPath(pLog->sPath, sizeof(pLog->sPath));
 }
 
 XSTATUS DirectGate_LogApply(const directgate_log_t *pLog)
@@ -161,6 +187,14 @@ XSTATUS DirectGate_LogApply(const directgate_log_t *pLog)
         xlog_file(XFALSE);
 
         size_t nLen = xstrncpy(sPath, sizeof(sPath), pLog->sPath);
+
+#ifdef _WIN32
+        /* A path written into the config the way Windows writes paths is
+         * still a valid path; normalising the separators here is what lets
+         * the directory walk below see its components. */
+        for (size_t i = 0; i < nLen; i++) if (sPath[i] == '\\') sPath[i] = '/';
+#endif
+
         while (nLen > 1 && (sPath[nLen - 1] == '/')) sPath[--nLen] = XSTR_NUL;
 
         XCHECK((XDir_Create(sPath, DIRECTGATE_LOG_DIR_MODE) > 0),

@@ -32,6 +32,8 @@
 #include <mferror.h>
 #include <strmif.h>
 #include <codecapi.h>
+#include <d3d11.h>
+#include <dxgi.h>
 
 /* codecapi.h exposes the CODECAPI GUID values only through STATIC_ macros
  * in C mode (the named constants resolve via __uuidof and need C++), so the
@@ -57,6 +59,12 @@ DIRECTGATE_MFENC_GUID(g_MFEncBPictureCount, STATIC_CODECAPI_AVEncMPVDefaultBPict
 #define DIRECTGATE_MFENC_INPUT_WAIT_MS  250U
 #define DIRECTGATE_MFENC_OUTPUT_WAIT_MS 100U
 
+/* Deadline for the first input credit of an encode session, where a cold GPU
+ * and a slow driver are still setting up. Long enough not to mistake that for
+ * a wedged encoder, short enough that walking a list of hardware candidates
+ * that all fail still reaches the software encoder in about a second. */
+#define DIRECTGATE_MFENC_FIRST_INPUT_WAIT_MS 1000U
+
 /* Poll interval while waiting for an MFT event credit. Sleep(1) cannot be
  * used here: it is quantised to the system timer period, which is ~15.6 ms
  * unless some other process happens to have raised the global resolution.
@@ -65,6 +73,11 @@ DIRECTGATE_MFENC_GUID(g_MFEncBPictureCount, STATIC_CODECAPI_AVEncMPVDefaultBPict
  * cap the achievable frame rate at ~64. */
 #define DIRECTGATE_MFENC_POLL_US        200ULL
 
+/* Consecutive stalls tolerated from an encoder that has produced frames
+ * before. One stall is a hiccup worth riding out; three in a row means the
+ * encode session is gone and the frames are never coming back. */
+#define DIRECTGATE_MFENC_MAX_STALLS 3
+
 typedef HRESULT (WINAPI *directgate_mf_startup_fn)(ULONG, DWORD);
 typedef HRESULT (WINAPI *directgate_mf_enum_fn)(GUID, UINT32,
     const MFT_REGISTER_TYPE_INFO*, const MFT_REGISTER_TYPE_INFO*,
@@ -72,6 +85,7 @@ typedef HRESULT (WINAPI *directgate_mf_enum_fn)(GUID, UINT32,
 typedef HRESULT (WINAPI *directgate_mf_create_type_fn)(IMFMediaType**);
 typedef HRESULT (WINAPI *directgate_mf_create_sample_fn)(IMFSample**);
 typedef HRESULT (WINAPI *directgate_mf_create_buffer_fn)(DWORD, IMFMediaBuffer**);
+typedef HRESULT (WINAPI *directgate_mf_create_devmgr_fn)(UINT*, IMFDXGIDeviceManager**);
 
 typedef struct directgate_mfplat_ {
     HMODULE hModule;
@@ -80,6 +94,7 @@ typedef struct directgate_mfplat_ {
     directgate_mf_create_type_fn createMediaType;
     directgate_mf_create_sample_fn createSample;
     directgate_mf_create_buffer_fn createMemoryBuffer;
+    directgate_mf_create_devmgr_fn createDeviceManager;
     xbool_t bLoadAttempted;
     xbool_t bLoaded;
 } directgate_mfplat_t;
@@ -90,6 +105,8 @@ struct directgate_mfenc_ {
     IMFTransform *pTransform;
     ICodecAPI *pCodecApi;                /* optional: dynamic bitrate / keyframe */
     IMFMediaEventGenerator *pEventGen;   /* asynchronous (hardware) MFTs only */
+    IMFDXGIDeviceManager *pDeviceMgr;    /* GPU binding for hardware MFTs */
+    ID3D11Device *pOwnDevice;            /* opened here when the MFT is on another GPU */
     DWORD nInputStreamId;
     DWORD nOutputStreamId;
     DWORD nOutputBufferSize;
@@ -98,6 +115,11 @@ struct directgate_mfenc_ {
     xbool_t bAsync;
     xbool_t bProvidesSamples;            /* MFT allocates its own output samples */
     xbool_t bBitrateLiveFailed;          /* dynamic bitrate rejected; logged once */
+    /* Configuring proves nothing about a GPU encoder; only output does. Until
+     * this is set the MFT is on trial and a single stall retires it. */
+    xbool_t bProven;
+    xbool_t bFirstCredit;                /* first input credit seen and timed */
+    uint32_t nStallCount;                /* consecutive unanswered credit waits */
     uint32_t nWidth;
     uint32_t nHeight;
     uint32_t nFps;
@@ -105,6 +127,7 @@ struct directgate_mfenc_ {
     size_t nSeqHeaderSize;
     HANDLE hPollTimer;                   /* sub-ms waits for MFT event credits */
     char sName[96];
+    char sRejectKey[DIRECTGATE_MFENC_NAME_LEN]; /* Enumeration key, see CandidateKey */
 };
 
 static void DirectGate_MFEnc_SetError(char *pErrBuf, size_t nErrSize, const char *pFmt, ...)
@@ -143,6 +166,7 @@ int DirectGate_MFEnc_Load(char *pErrBuf, size_t nErrSize)
     pLib->createMediaType = (directgate_mf_create_type_fn)(void*)GetProcAddress(hModule, "MFCreateMediaType");
     pLib->createSample = (directgate_mf_create_sample_fn)(void*)GetProcAddress(hModule, "MFCreateSample");
     pLib->createMemoryBuffer = (directgate_mf_create_buffer_fn)(void*)GetProcAddress(hModule, "MFCreateMemoryBuffer");
+    pLib->createDeviceManager = (directgate_mf_create_devmgr_fn)(void*)GetProcAddress(hModule, "MFCreateDXGIDeviceManager");
 
     if (pLib->startup == NULL || pLib->enumEx == NULL ||
         pLib->createMediaType == NULL || pLib->createSample == NULL ||
@@ -190,6 +214,76 @@ static HRESULT DirectGate_MFEnc_SetCodecBool(directgate_mfenc_t *pEnc, const GUI
     var.vt = VT_BOOL;
     var.boolVal = bValue ? VARIANT_TRUE : VARIANT_FALSE;
     return ICodecAPI_SetValue(pEnc->pCodecApi, pGuid, &var);
+}
+
+/* Records a codec property the encoder turned down, so the whole set can be
+ * reported in one line instead of vanishing. */
+static void DirectGate_MFEnc_NoteKnob(const char *pName, HRESULT hr,
+                                      char *pRefused, size_t nSize, uint32_t *pCount)
+{
+    if (SUCCEEDED(hr)) return;
+    (*pCount)++;
+
+    size_t nUsed = strlen(pRefused);
+    if (nUsed + 2 >= nSize) return;
+
+    snprintf(pRefused + nUsed, nSize - nUsed, "%s%s", nUsed ? "," : "", pName);
+}
+
+/* Interactive-latency knobs. CBR keeps frame sizes predictable for the WebRTC
+ * pacer, B-frames would add a frame of reordering delay, and the GOP mirrors
+ * the other platforms (recovery is PLI-driven, see
+ * DirectGate_Desktop_ApplyPreset). Must be called only after the output media
+ * type has been accepted. */
+static void DirectGate_MFEnc_ApplyCodecKnobs(directgate_mfenc_t *pEnc,
+                                             uint32_t nBitrateKbps,
+                                             uint32_t nKeyEvery,
+                                             xbool_t bRealtime)
+{
+    if (pEnc->pCodecApi == NULL)
+    {
+        xlogd("Encoder MFT exposes no ICodecAPI, using media-type defaults: encoder(%s)", pEnc->sName);
+        return;
+    }
+
+    char sRefused[192] = { 0 };
+    uint32_t nRefused = 0;
+
+    DirectGate_MFEnc_NoteKnob("rateControl",
+        DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncRateControlMode, eAVEncCommonRateControlMode_CBR),
+        sRefused, sizeof(sRefused), &nRefused);
+
+    DirectGate_MFEnc_NoteKnob("meanBitrate",
+        DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncMeanBitRate, nBitrateKbps * 1000U),
+        sRefused, sizeof(sRefused), &nRefused);
+
+    DirectGate_MFEnc_NoteKnob("lowLatency",
+        DirectGate_MFEnc_SetCodecBool(pEnc, &g_MFEncLowLatencyMode, XTRUE),
+        sRefused, sizeof(sRefused), &nRefused);
+
+    DirectGate_MFEnc_NoteKnob("bFrames",
+        DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncBPictureCount, 0),
+        sRefused, sizeof(sRefused), &nRefused);
+
+    DirectGate_MFEnc_NoteKnob("gopSize",
+        DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncGopSize, nKeyEvery),
+        sRefused, sizeof(sRefused), &nRefused);
+
+    if (bRealtime)
+    {
+        DirectGate_MFEnc_NoteKnob("realtime",
+            DirectGate_MFEnc_SetCodecBool(pEnc, &g_MFEncCommonRealTime, XTRUE),
+            sRefused, sizeof(sRefused), &nRefused);
+    }
+
+    /* Refusals are not fatal - the output media type already carries the
+     * bitrate and the encoder has usable defaults for the rest - but they are
+     * the kind of thing worth seeing when an encoder then misbehaves. */
+    if (nRefused > 0)
+    {
+        xlogw("Encoder MFT refused codec settings: encoder(%s), count(%u), settings(%s)",
+            pEnc->sName, nRefused, sRefused);
+    }
 }
 
 /* Caches the Annex-B SPS/PPS blob the encoder attached to its output media
@@ -268,12 +362,143 @@ static HRESULT DirectGate_MFEnc_BuildType(IMFMediaType **ppType, const GUID *pSu
     return S_OK;
 }
 
+/* PCI vendor of the GPU behind a D3D11 device, 0 when it cannot be read. */
+static uint32_t DirectGate_MFEnc_DeviceVendor(void *pDevice)
+{
+    IDXGIDevice *pDxgi = NULL;
+    IDXGIAdapter *pAdapter = NULL;
+    uint32_t nVendor = 0;
+
+    if (pDevice == NULL) return 0;
+
+    if (FAILED(ID3D11Device_QueryInterface((ID3D11Device*)pDevice, &IID_IDXGIDevice,
+        (void**)&pDxgi)) || pDxgi == NULL) return 0;
+
+    if (SUCCEEDED(IDXGIDevice_GetAdapter(pDxgi, &pAdapter)) && pAdapter != NULL)
+    {
+        DXGI_ADAPTER_DESC desc;
+        memset(&desc, 0, sizeof(desc));
+
+        if (SUCCEEDED(IDXGIAdapter_GetDesc(pAdapter, &desc))) nVendor = (uint32_t)desc.VendorId;
+        IDXGIAdapter_Release(pAdapter);
+    }
+
+    IDXGIDevice_Release(pDxgi);
+    return nVendor;
+}
+
+/* PCI vendor of the GPU an encoder MFT belongs to, read from its friendly
+ * name, 0 when the name says nothing.
+ *
+ * The enumeration attributes that would answer this outright
+ * (MFT_ENUM_HARDWARE_VENDOR_ID_Attribute, MFT_ENUM_ADAPTER_LUID) are not
+ * declared by the headers this agent cross-builds against, and a wrong GUID
+ * would fail silently and look exactly like a machine that does not publish
+ * them. The friendly name is the one thing every vendor does brand, and it
+ * is already trusted enough to key the reject list on. Answering 0 is safe:
+ * it means "do not second-guess the device the caller supplied". */
+static uint32_t DirectGate_MFEnc_NameVendor(const char *pName)
+{
+    if (!xstrused(pName)) return 0;
+    if (strstr(pName, "NVIDIA") != NULL || strstr(pName, "NVENC") != NULL) return 0x10DEU;
+    if (strstr(pName, "Intel") != NULL || strstr(pName, "QSV") != NULL) return 0x8086U;
+    if (strstr(pName, "AMD") != NULL || strstr(pName, "Radeon") != NULL) return 0x1002U;
+    return 0;
+}
+
+/* Opens a video-capable D3D11 device on the first hardware adapter from
+ * @p nVendorId. Returns NULL when that vendor has no usable adapter. */
+static ID3D11Device* DirectGate_MFEnc_OpenVendorDevice(uint32_t nVendorId)
+{
+    IDXGIFactory1 *pFactory = NULL;
+    IDXGIAdapter1 *pAdapter = NULL;
+    ID3D11Device *pDevice = NULL;
+
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void**)&pFactory)) || pFactory == NULL) return NULL;
+
+    for (UINT i = 0; pDevice == NULL && IDXGIFactory1_EnumAdapters1(pFactory, i, &pAdapter) == S_OK; i++)
+    {
+        DXGI_ADAPTER_DESC1 desc;
+        memset(&desc, 0, sizeof(desc));
+
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(pAdapter, &desc)) &&
+            !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            (uint32_t)desc.VendorId == nVendorId)
+        {
+            HRESULT hr = D3D11CreateDevice((IDXGIAdapter*)pAdapter, D3D_DRIVER_TYPE_UNKNOWN, NULL,
+                D3D11_CREATE_DEVICE_VIDEO_SUPPORT, NULL, 0, D3D11_SDK_VERSION, &pDevice, NULL, NULL);
+
+            if (FAILED(hr) || pDevice == NULL)
+            {
+                xlogw("No video-capable D3D11 device on the encoder's GPU: vendor(0x%04X), hr(0x%08lX)",
+                    nVendorId, (unsigned long)hr);
+
+                pDevice = NULL;
+            }
+        }
+
+        IDXGIAdapter1_Release(pAdapter);
+    }
+
+    IDXGIFactory1_Release(pFactory);
+    if (pDevice == NULL) return NULL;
+
+    /* Media Foundation drives the device from its own threads. */
+    ID3D10Multithread *pMultithread = NULL;
+    if (SUCCEEDED(ID3D11Device_QueryInterface(pDevice, &IID_ID3D10Multithread, (void**)&pMultithread)) &&
+        pMultithread != NULL)
+    {
+        ID3D10Multithread_SetMultithreadProtected(pMultithread, TRUE);
+        ID3D10Multithread_Release(pMultithread);
+    }
+
+    return pDevice;
+}
+
+/* Picks the D3D11 device an encoder MFT should be given.
+ *
+ * The capture device is the adapter that owns the display, which is not
+ * necessarily the adapter that owns the encoder: on a hybrid machine the
+ * screen can be driven by one GPU while the encoder MFT being tried belongs
+ * to the other. Handing such an MFT the wrong vendor's device is worse than
+ * handing it none, and having no device at all on its adapter is why some
+ * vendors refuse to activate at all.
+ *
+ * Frames reach the encoder as system memory NV12, never as shared textures,
+ * so the encode GPU does not have to be the capture GPU - which is what
+ * makes opening a second device safe here.
+ *
+ * Nothing is done when the MFT already belongs to the capture GPU, or when
+ * its GPU cannot be told from its name. That case is left exactly as it was
+ * before any of this existed - no device, no D3D manager, no extra call on
+ * the MFT - because a same-GPU encoder was never the problem, and handing a
+ * device to a configuration that already works could only change it for the
+ * worse. The intervention is limited to the case that is demonstrably wrong.
+ *
+ * @p ppOwned receives the device, for the caller to release. */
+static void* DirectGate_MFEnc_PickDevice(const char *pName, void *pCaptureDevice, ID3D11Device **ppOwned)
+{
+    *ppOwned = NULL;
+
+    uint32_t nMftVendor = DirectGate_MFEnc_NameVendor(pName);
+    uint32_t nCaptureVendor = DirectGate_MFEnc_DeviceVendor(pCaptureDevice);
+    if (nMftVendor == 0 || nMftVendor == nCaptureVendor) return NULL;
+
+    *ppOwned = DirectGate_MFEnc_OpenVendorDevice(nMftVendor);
+
+    xlogi("Encoder MFT belongs to a different GPU than capture: encoder(%s), "
+          "encoder vendor(0x%04X), capture vendor(0x%04X), own device(%s)",
+        pName, nMftVendor, nCaptureVendor, *ppOwned != NULL ? "yes" : "no");
+
+    return (void*)*ppOwned;
+}
+
 /* Configures one activated MFT: async unlock, codec knobs, output then
  * input media type (that order is mandatory for encoders), streaming
  * start. Returns XSTDOK when the MFT is ready to encode. */
 static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
                                       const directgate_desktop_quality_t *pQuality,
-                                      char *pErrBuf, size_t nErrSize)
+                                      void *pDevice, char *pErrBuf, size_t nErrSize)
 {
     IMFTransform *pTransform = pEnc->pTransform;
     uint32_t nBitrateKbps = pQuality->nBitrateKbps ? pQuality->nBitrateKbps : 4000U;
@@ -304,16 +529,50 @@ static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
     if (FAILED(IMFTransform_QueryInterface(pTransform, &IID_ICodecAPI, (void**)&pEnc->pCodecApi)))
         pEnc->pCodecApi = NULL;
 
-    /* Interactive-latency knobs. CBR keeps frame sizes predictable for the
-     * WebRTC pacer, B-frames would add a frame of reordering delay, and the
-     * GOP mirrors the other platforms (recovery is PLI-driven, see
-     * DirectGate_Desktop_ApplyPreset). */
-    DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncRateControlMode, eAVEncCommonRateControlMode_CBR);
-    DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncMeanBitRate, nBitrateKbps * 1000U);
-    DirectGate_MFEnc_SetCodecBool(pEnc, &g_MFEncLowLatencyMode, XTRUE);
-    DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncBPictureCount, 0);
-    DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncGopSize, nKeyEvery);
-    if (pQuality->bRealtime) DirectGate_MFEnc_SetCodecBool(pEnc, &g_MFEncCommonRealTime, XTRUE);
+    /* Point the MFT at the GPU it should encode on, before the media types.
+     *
+     * @p pDevice is set only when this MFT belongs to a GPU other than the one
+     * capture is running on (see PickDevice), which is the one case where the
+     * MFT's own default choice is known to be wrong. Everywhere else it is
+     * NULL and this whole step is skipped, leaving those machines with the
+     * behaviour they had before.
+     *
+     * A refusal is not fatal: MFTs that do not want a device answer E_NOTIMPL
+     * and the encoder runs on whatever it would have picked itself. */
+    if (pDevice == NULL || g_mfplat.createDeviceManager == NULL)
+    {
+        if (pDevice != NULL)
+            xlogw("Cannot bind the encoder MFT to its GPU, mfplat has no device manager: encoder(%s)", pEnc->sName);
+    }
+    else
+    {
+        UINT nResetToken = 0;
+        HRESULT hrDev = g_mfplat.createDeviceManager(&nResetToken, &pEnc->pDeviceMgr);
+
+        if (SUCCEEDED(hrDev) && pEnc->pDeviceMgr != NULL)
+            hrDev = IMFDXGIDeviceManager_ResetDevice(pEnc->pDeviceMgr, (IUnknown*)pDevice, nResetToken);
+
+        if (SUCCEEDED(hrDev) && pEnc->pDeviceMgr != NULL)
+        {
+            hrDev = IMFTransform_ProcessMessage(pTransform, MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR)pEnc->pDeviceMgr);
+
+            if (FAILED(hrDev)) xlogw("Encoder MFT declined the D3D device: encoder(%s), hr(0x%08lX)", pEnc->sName, (unsigned long)hrDev);
+            else xlogi("Bound encoder MFT to a D3D device on its own GPU: encoder(%s)", pEnc->sName);
+        }
+        else
+        {
+            xlogw("Failed to build a D3D device manager for the encoder: encoder(%s), hr(0x%08lX)",
+                pEnc->sName, (unsigned long)hrDev);
+        }
+
+        /* Only the MFT's own reference matters from here; ours is released
+           with the transform. A failed bind leaves the manager unused. */
+        if (FAILED(hrDev) && pEnc->pDeviceMgr != NULL)
+        {
+            IMFDXGIDeviceManager_Release(pEnc->pDeviceMgr);
+            pEnc->pDeviceMgr = NULL;
+        }
+    }
 
     IMFMediaType *pOutType = NULL;
     HRESULT hr = DirectGate_MFEnc_BuildType(&pOutType, &MFVideoFormat_H264, pEnc->nWidth, pEnc->nHeight, pEnc->nFps);
@@ -363,6 +622,14 @@ static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
         return XSTDERR;
     }
 
+    /* Only now. An encoder MFT builds its internal state from the output
+     * media type, so ICodecAPI properties set before SetOutputType land on an
+     * encoder that does not yet exist: at best they are dropped, at worst the
+     * MFT latches a half-configured state. They used to be applied above,
+     * where the return values were also discarded, so a refusal was invisible
+     * twice over. */
+    DirectGate_MFEnc_ApplyCodecKnobs(pEnc, nBitrateKbps, nKeyEvery, pQuality->bRealtime);
+
     MFT_OUTPUT_STREAM_INFO streamInfo;
     memset(&streamInfo, 0, sizeof(streamInfo));
 
@@ -378,8 +645,26 @@ static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
         return XSTDERR;
     }
 
-    IMFTransform_ProcessMessage(pTransform, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    IMFTransform_ProcessMessage(pTransform, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    /* These two are what put an asynchronous MFT into the state where it
+     * starts issuing input credits. Ignoring their result meant a refusal
+     * here surfaced much later, and unrecognisably, as "credit timed out". */
+    hr = IMFTransform_ProcessMessage(pTransform, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+    if (FAILED(hr))
+    {
+        DirectGate_MFEnc_SetError(pErrBuf, nErrSize,
+            "MFT refused BEGIN_STREAMING: hr(0x%08lX)", (unsigned long)hr);
+
+        return XSTDERR;
+    }
+
+    hr = IMFTransform_ProcessMessage(pTransform, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    if (FAILED(hr))
+    {
+        DirectGate_MFEnc_SetError(pErrBuf, nErrSize,
+            "MFT refused START_OF_STREAM: hr(0x%08lX)", (unsigned long)hr);
+
+        return XSTDERR;
+    }
 
     DirectGate_MFEnc_CacheSeqHeader(pEnc);
     return XSTDOK;
@@ -387,6 +672,12 @@ static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
 
 static void DirectGate_MFEnc_ReleaseTransform(directgate_mfenc_t *pEnc)
 {
+    if (pEnc->pDeviceMgr != NULL)
+    {
+        IMFDXGIDeviceManager_Release(pEnc->pDeviceMgr);
+        pEnc->pDeviceMgr = NULL;
+    }
+
     if (pEnc->pEventGen != NULL)
     {
         IMFMediaEventGenerator_Release(pEnc->pEventGen);
@@ -405,19 +696,73 @@ static void DirectGate_MFEnc_ReleaseTransform(directgate_mfenc_t *pEnc)
         pEnc->pTransform = NULL;
     }
 
+    if (pEnc->pOwnDevice != NULL)
+    {
+        ID3D11Device_Release(pEnc->pOwnDevice);
+        pEnc->pOwnDevice = NULL;
+    }
+
     free(pEnc->pSeqHeader);
     pEnc->pSeqHeader = NULL;
     pEnc->nSeqHeaderSize = 0;
+    pEnc->bFirstCredit = XFALSE;
     pEnc->bAsync = XFALSE;
     pEnc->nNeedInput = 0;
     pEnc->nHaveOutput = 0;
 }
 
+static xbool_t DirectGate_MFEnc_IsRejected(const directgate_mfenc_rejects_t *pRejects,
+                                           const char *pKey)
+{
+    if (pRejects == NULL || !xstrused(pKey)) return XFALSE;
+
+    for (uint32_t i = 0; i < pRejects->nCount; i++)
+    {
+        if (xstrcmp(pRejects->keys[i], pKey)) return XTRUE;
+    }
+
+    return XFALSE;
+}
+
+static void DirectGate_MFEnc_ActivateName(IMFActivate *pActivate, char *pName, size_t nSize)
+{
+    WCHAR wsName[DIRECTGATE_MFENC_NAME_LEN] = { 0 };
+    UINT32 nNameLen = 0;
+
+    pName[0] = '\0';
+
+    if (SUCCEEDED(IMFActivate_GetString(pActivate, &MFT_FRIENDLY_NAME_Attribute,
+        wsName, (UINT32)(sizeof(wsName) / sizeof(wsName[0])), &nNameLen)) && nNameLen > 0)
+        WideCharToMultiByte(CP_UTF8, 0, wsName, -1, pName, (int)nSize - 1, NULL, NULL);
+
+    if (!pName[0]) xstrncpy(pName, nSize, "unnamed H.264 encoder MFT");
+}
+
+static void DirectGate_MFEnc_CandidateKey(IMFActivate **ppActivate, UINT32 nIndex,
+                                          const char *pName, char *pKey, size_t nSize)
+{
+    UINT32 nSeen = 1;
+
+    for (UINT32 i = 0; i < nIndex; i++)
+    {
+        char sOther[DIRECTGATE_MFENC_NAME_LEN];
+        DirectGate_MFEnc_ActivateName(ppActivate[i], sOther, sizeof(sOther));
+
+        if (xstrcmp(sOther, pName)) nSeen++;
+    }
+
+    /* The name is what gets truncated if anything must be: the suffix is the
+     * part that makes the key unique. */
+    snprintf(pKey, nSize, "%.*s#%u", (int)(nSize - 6), pName, nSeen);
+}
+
 /* Tries every MFT the enumeration returned (best match first thanks to
- * MFT_ENUM_FLAG_SORTANDFILTER) until one activates and configures. */
+ * MFT_ENUM_FLAG_SORTANDFILTER) until one activates and configures, skipping
+ * any that a previous attempt retired. */
 static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 nFlags, xbool_t bHardware,
                                                const directgate_desktop_quality_t *pQuality,
-                                               char *pErrBuf, size_t nErrSize)
+                                               const directgate_mfenc_rejects_t *pRejects,
+                                               void *pDevice, char *pErrBuf, size_t nErrSize)
 {
     MFT_REGISTER_TYPE_INFO inputInfo = { { 0 }, { 0 } };
     MFT_REGISTER_TYPE_INFO outputInfo = { { 0 }, { 0 } };
@@ -441,33 +786,93 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
         return XSTDERR;
     }
 
+    /* The whole inventory, before anything is chosen. Which encoders a machine
+     * actually offers is the first question every encoder problem raises, and
+     * the selection loop below cannot answer it: it stops at the first
+     * candidate that works and never names the rest. */
+    for (UINT32 i = 0; i < nCount; i++)
+    {
+        char sCandidate[DIRECTGATE_MFENC_NAME_LEN];
+        DirectGate_MFEnc_ActivateName(ppActivate[i], sCandidate, sizeof(sCandidate));
+
+        xlogi("Available %s H.264 encoder MFT: index(%u/%u), encoder(%s)",
+            bHardware ? "hardware" : "software", i + 1U, nCount, sCandidate);
+    }
+
     int nStatus = XSTDERR;
+    UINT32 nRetired = 0, nUnreachable = 0, nRefused = 0;
+
     for (UINT32 i = 0; i < nCount && nStatus != XSTDOK; i++)
     {
-        IMFTransform *pTransform = NULL;
-        if (FAILED(IMFActivate_ActivateObject(ppActivate[i], &IID_IMFTransform,
-            (void**)&pTransform)) || pTransform == NULL) continue;
+        /* Identify the entry first: this is how a previously-failed MFT is
+         * recognised, and skipping one must not cost an activation. */
+        char sName[DIRECTGATE_MFENC_NAME_LEN];
+        char sKey[DIRECTGATE_MFENC_NAME_LEN];
+        DirectGate_MFEnc_ActivateName(ppActivate[i], sName, sizeof(sName));
+        DirectGate_MFEnc_CandidateKey(ppActivate, i, sName, sKey, sizeof(sKey));
 
-        pEnc->pTransform = pTransform;
-        nStatus = DirectGate_MFEnc_Configure(pEnc, pQuality, pErrBuf, nErrSize);
-        if (nStatus != XSTDOK)
+        if (DirectGate_MFEnc_IsRejected(pRejects, sKey))
         {
-            DirectGate_MFEnc_ReleaseTransform(pEnc);
-            IMFActivate_ShutdownObject(ppActivate[i]);
+            xlogw("Skipping H.264 encoder MFT that already failed: encoder(%s), key(%s)", sName, sKey);
+            nRetired++;
             continue;
         }
 
-        WCHAR wsName[64] = { 0 };
-        char sName[sizeof(pEnc->sName)] = { 0 };
-        UINT32 nNameLen = 0;
+        ID3D11Device *pOwnDevice = NULL;
+        void *pUseDevice = DirectGate_MFEnc_PickDevice(sName, pDevice, &pOwnDevice);
 
-        if (SUCCEEDED(IMFActivate_GetString(ppActivate[i], &MFT_FRIENDLY_NAME_Attribute,
-            wsName, (UINT32)(sizeof(wsName) / sizeof(wsName[0])), &nNameLen)) && nNameLen > 0)
-            WideCharToMultiByte(CP_UTF8, 0, wsName, -1, sName, sizeof(sName) - 1, NULL, NULL);
+        /* Activation is where a hardware MFT that the process cannot reach
+         * drops out - an encoder belonging to the GPU this process was not
+         * assigned to, or one whose vendor-imposed concurrent session limit is
+         * already used up. Passing over it silently made it look like the
+         * candidate had never been in the list at all. */
+        IMFTransform *pTransform = NULL;
+        HRESULT hrActivate = IMFActivate_ActivateObject(ppActivate[i], &IID_IMFTransform, (void**)&pTransform);
 
-        snprintf(pEnc->sName, sizeof(pEnc->sName), "%s (%s)",
-            bHardware ? "hardware" : "software",
-            sName[0] ? sName : "unnamed H.264 encoder MFT");
+        if (FAILED(hrActivate) || pTransform == NULL)
+        {
+            xlogw("H.264 encoder MFT could not be activated: encoder(%s), hr(0x%08lX)",
+                sName, (unsigned long)hrActivate);
+
+            if (pOwnDevice != NULL) ID3D11Device_Release(pOwnDevice);
+            nUnreachable++;
+            continue;
+        }
+
+        pEnc->pTransform = pTransform;
+        pEnc->pOwnDevice = pOwnDevice; /* released with the transform */
+        xstrncpy(pEnc->sRejectKey, sizeof(pEnc->sRejectKey), sKey);
+        snprintf(pEnc->sName, sizeof(pEnc->sName), "%s (%s)", bHardware ? "hardware" : "software", sName);
+
+        nStatus = DirectGate_MFEnc_Configure(pEnc, pQuality, pUseDevice, pErrBuf, nErrSize);
+        if (nStatus != XSTDOK)
+        {
+            xlogw("H.264 encoder MFT rejected during setup: encoder(%s), reason(%s)",
+                pEnc->sName, (pErrBuf != NULL && pErrBuf[0]) ? pErrBuf : "unspecified");
+
+            DirectGate_MFEnc_ReleaseTransform(pEnc);
+            IMFActivate_ShutdownObject(ppActivate[i]);
+
+            pEnc->sRejectKey[0] = '\0';
+            pEnc->sName[0] = '\0';
+            nRefused++;
+            continue;
+        }
+
+        xlogi("Selected H.264 encoder MFT: encoder(%s), size(%ux%u), fps(%u)",
+            pEnc->sName, pEnc->nWidth, pEnc->nHeight, pEnc->nFps);
+    }
+
+    if (nStatus != XSTDOK)
+    {
+        /* "None registered" would be a lie here: candidates existed and every
+         * one of them was tried. The breakdown says which wall each hit. */
+        DirectGate_MFEnc_SetError(pErrBuf, nErrSize,
+            "All %u %s H.264 encoder MFTs exhausted: retired(%u), unreachable(%u), refused(%u)",
+            nCount, bHardware ? "hardware" : "software", nRetired, nUnreachable, nRefused);
+
+        xlogw("Exhausted %s H.264 encoder MFTs: total(%u), retired(%u), unreachable(%u), refused(%u)",
+            bHardware ? "hardware" : "software", nCount, nRetired, nUnreachable, nRefused);
     }
 
     for (UINT32 i = 0; i < nCount; i++)
@@ -479,7 +884,8 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
 
 directgate_mfenc_t* DirectGate_MFEnc_Create(uint32_t nWidth, uint32_t nHeight,
                                             const directgate_desktop_quality_t *pQuality,
-                                            char *pErrBuf, size_t nErrSize)
+                                            const directgate_mfenc_rejects_t *pRejects,
+                                            void *pDevice, char *pErrBuf, size_t nErrSize)
 {
     XCHECK_NL((pQuality != NULL), NULL);
     XCHECK_NL((nWidth >= 16 && nHeight >= 16), NULL);
@@ -506,16 +912,19 @@ directgate_mfenc_t* DirectGate_MFEnc_Create(uint32_t nWidth, uint32_t nHeight,
         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
 
     /* GPU vendor encoder first (Quick Sync / NVENC / AMF), Microsoft
-     * software H.264 encoder as the fallback. */
+     * software H.264 encoder as the fallback. Retired candidates are skipped,
+     * so a re-create after a wedged encoder walks down this same order
+     * instead of picking the liar again. */
     if (DirectGate_MFEnc_CreateFromCategory(pEnc, MFT_ENUM_FLAG_HARDWARE, XTRUE,
-            pQuality, pErrBuf, nErrSize) == XSTDOK ||
+            pQuality, pRejects, pDevice, pErrBuf, nErrSize) == XSTDOK ||
         DirectGate_MFEnc_CreateFromCategory(pEnc,
             MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_LOCALMFT,
-            XFALSE, pQuality, pErrBuf, nErrSize) == XSTDOK)
+            XFALSE, pQuality, pRejects, NULL, pErrBuf, nErrSize) == XSTDOK)
         return pEnc;
 
     if (pEnc->hPollTimer != NULL) CloseHandle(pEnc->hPollTimer);
     free(pEnc);
+
     return NULL;
 }
 
@@ -548,11 +957,27 @@ static int DirectGate_MFEnc_PumpEvent(directgate_mfenc_t *pEnc)
     if (FAILED(hr) || pEvent == NULL) return XSTDERR;
 
     MediaEventType eType = MEUnknown;
+    HRESULT hrStatus = S_OK;
+
     IMFMediaEvent_GetType(pEvent, &eType);
+    IMFMediaEvent_GetStatus(pEvent, &hrStatus);
     IMFMediaEvent_Release(pEvent);
 
     if (eType == METransformNeedInput) pEnc->nNeedInput++;
     else if (eType == METransformHaveOutput) pEnc->nHaveOutput++;
+    else if (eType == MEError)
+    {
+        /* The MFT's own explanation of why it went quiet. Discarding this is
+         * what used to leave "credit timed out" as the only clue. */
+        xloge("MF encoder reported an error event: encoder(%s), hr(0x%08lX)",
+            pEnc->sName, (unsigned long)hrStatus);
+    }
+    else
+    {
+        xlogi("MF encoder event ignored: encoder(%s), event(%lu), hr(0x%08lX)",
+            pEnc->sName, (unsigned long)eType, (unsigned long)hrStatus);
+    }
+
     return XSTDOK;
 }
 
@@ -695,6 +1120,54 @@ static int DirectGate_MFEnc_ProcessOutput(directgate_mfenc_t *pEnc, xbyte_buffer
     return nResult;
 }
 
+/* Waits for an input credit, collecting output while it waits.
+ *
+ * Servicing output here is not an optimisation, it is the contract: an
+ * asynchronous MFT stops asking for input while output it has already
+ * announced is still uncollected. A client that waits only for
+ * METransformNeedInput while a METransformHaveOutput sits in the queue waits
+ * forever, and the encoder looks wedged when it is in fact waiting on us.
+ *
+ * That is exactly the shape of a first frame that takes longer to come out
+ * than the output wait allows: the frame is announced just after the client
+ * gave up on it, the next call asks only for input, and nothing moves again.
+ * The encoder is then retired as unusable for doing what it was supposed to.
+ *
+ * @p pOut receives the first access unit collected this way and *pHaveFrame
+ * is set; further announcements are left queued for the next call, which is
+ * enough to unblock the MFT since pOut only carries one frame. */
+static int DirectGate_MFEnc_WaitInput(directgate_mfenc_t *pEnc, uint32_t nTimeoutMs,
+                                      xbyte_buffer_t *pOut, xbool_t *pKeyframe,
+                                      xbool_t *pHaveFrame)
+{
+    ULONGLONG nDeadline = GetTickCount64() + nTimeoutMs;
+
+    while (pEnc->nNeedInput == 0)
+    {
+        if (pEnc->nHaveOutput > 0 && !*pHaveFrame)
+        {
+            pEnc->nHaveOutput--;
+
+            if (DirectGate_MFEnc_ProcessOutput(pEnc, pOut, pKeyframe, NULL) == XSTDOK && pOut->nUsed > 0)
+            {
+                *pHaveFrame = XTRUE;
+                pEnc->bProven = XTRUE;
+            }
+
+            continue;
+        }
+
+        int nStatus = DirectGate_MFEnc_PumpEvent(pEnc);
+        if (nStatus == XSTDERR) return XSTDERR;
+        if (nStatus == XSTDOK) continue;
+        if (GetTickCount64() >= nDeadline) return XSTDNON;
+
+        DirectGate_MFEnc_PollWait(pEnc);
+    }
+
+    return XSTDOK;
+}
+
 /* Wraps one tightly packed NV12 frame into an IMFSample (one copy: the MFT
  * keeps a reference to the buffer while encoding, so the caller's frame
  * buffer must stay reusable). */
@@ -759,12 +1232,62 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
     {
         /* Asynchronous (hardware) model: input goes in only against a
          * METransformNeedInput credit, output comes out only after a
-         * METransformHaveOutput event. */
-        int nStatus = DirectGate_MFEnc_WaitCredit(pEncoder, &pEncoder->nNeedInput, DIRECTGATE_MFENC_INPUT_WAIT_MS);
+         * METransformHaveOutput event.
+         *
+         * The very first credit gets a far longer deadline than the steady
+         * state: it is the one that waits for the driver to spin up an encode
+         * session on a GPU that may have been idle or powered down, which on a
+         * slow driver takes longer than a whole frame. Costing nothing when
+         * the encoder answers promptly - the deadline is a ceiling, not a
+         * delay - it buys the difference between a slow encoder and a dead
+         * one, which the 250 ms steady-state figure could not tell apart. */
+        ULONGLONG nWaitStart = GetTickCount64();
+        uint32_t nWaitMs = pEncoder->bProven ?
+            DIRECTGATE_MFENC_INPUT_WAIT_MS : DIRECTGATE_MFENC_FIRST_INPUT_WAIT_MS;
+
+        xbool_t bHaveFrame = XFALSE;
+        int nStatus = DirectGate_MFEnc_WaitInput(pEncoder, nWaitMs, pOut, pKeyframe, &bHaveFrame);
+
+        if (nStatus == XSTDOK && !pEncoder->bFirstCredit)
+        {
+            pEncoder->bFirstCredit = XTRUE;
+
+            xlogi("MF encoder issued its first input credit: encoder(%s), waited(%llums)",
+                pEncoder->sName, (unsigned long long)(GetTickCount64() - nWaitStart));
+        }
+
         if (nStatus != XSTDOK)
         {
             IMFSample_Release(pSample);
-            xloge("MF encoder input credit timed out: encoder(%s)", pEncoder->sName);
+
+            /* A frame collected while waiting is proof the encoder is alive,
+             * whatever it did about the credit. The capture that could not be
+             * submitted is dropped, which is one frame - not an encoder. */
+            if (bHaveFrame)
+            {
+                pEncoder->nStallCount = 0;
+                return XSTDOK;
+            }
+
+            pEncoder->nStallCount++;
+
+            /* Two different failures used to share one message. XSTDERR means
+             * the event queue itself broke; XSTDNON means the MFT simply never
+             * asked for the frame. The pending counts say which side of the
+             * exchange stopped. */
+            if (nStatus == XSTDERR)
+            {
+                xloge("MF encoder event queue failed: encoder(%s), proven(%s), stalls(%u)",
+                    pEncoder->sName, pEncoder->bProven ? "yes" : "no", pEncoder->nStallCount);
+            }
+            else
+            {
+                xloge("MF encoder did not ask for input within %ums: encoder(%s), proven(%s), "
+                    "stalls(%u), pending input(%u), pending output(%u)",
+                    nWaitMs, pEncoder->sName, pEncoder->bProven ? "yes" : "no",
+                    pEncoder->nStallCount, pEncoder->nNeedInput, pEncoder->nHaveOutput);
+            }
+
             return XSTDERR;
         }
 
@@ -778,12 +1301,24 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
             return XSTDERR;
         }
 
+        /* The frame was accepted, so the encoder is answering even if this
+         * particular output has not surfaced yet. */
+        pEncoder->nStallCount = 0;
+
+        /* Already carrying the frame that was announced while waiting: pOut
+         * holds one access unit, and the one this input produces will be
+         * collected by the next call. */
+        if (bHaveFrame) return XSTDOK;
+
         if (DirectGate_MFEnc_WaitCredit(pEncoder, &pEncoder->nHaveOutput,
             DIRECTGATE_MFENC_OUTPUT_WAIT_MS) != XSTDOK)
-            return XSTDNON; /* still buffered; DirectGate_MFEnc_Drain collects it */
+            return XSTDNON; /* still buffered; the next call or Drain collects it */
 
         pEncoder->nHaveOutput--;
-        return DirectGate_MFEnc_ProcessOutput(pEncoder, pOut, pKeyframe, NULL);
+        nStatus = DirectGate_MFEnc_ProcessOutput(pEncoder, pOut, pKeyframe, NULL);
+        if (nStatus == XSTDOK && pOut->nUsed > 0) pEncoder->bProven = XTRUE;
+
+        return nStatus;
     }
 
     /* Synchronous (software) model: feed the frame, then drain until the
@@ -853,7 +1388,46 @@ int DirectGate_MFEnc_Drain(directgate_mfenc_t *pEncoder,
 
     int nStatus = DirectGate_MFEnc_ProcessOutput(pEncoder, pOut, pKeyframe, pPtsUs);
     if (nStatus == XSTDERR) return XSTDERR;
-    return (nStatus == XSTDOK && pOut->nUsed > 0) ? XSTDOK : XSTDNON;
+
+    if (nStatus == XSTDOK && pOut->nUsed > 0)
+    {
+        /* A drained frame is proof just like an inline one:
+         * the encoder is alive and producing. */
+        pEncoder->bProven = XTRUE;
+        pEncoder->nStallCount = 0;
+        return XSTDOK;
+    }
+
+    return XSTDNON;
+}
+
+xbool_t DirectGate_MFEnc_IsWedged(const directgate_mfenc_t *pEncoder)
+{
+    XCHECK_NL((pEncoder != NULL), XFALSE);
+    if (pEncoder->nStallCount == 0) return XFALSE;
+
+    /* An encoder that has never produced anything gets no second chance: it
+     * configured, claimed to be ready and then ignored the first frame, which
+     * is exactly the lie this whole path exists to catch. One that has been
+     * working may just have hit a driver hiccup, so it gets a few tries. */
+    if (!pEncoder->bProven) return XTRUE;
+    return (pEncoder->nStallCount >= DIRECTGATE_MFENC_MAX_STALLS) ? XTRUE : XFALSE;
+}
+
+void DirectGate_MFEnc_Reject(directgate_mfenc_rejects_t *pRejects,
+                             const directgate_mfenc_t *pEncoder)
+{
+    XCHECK_VOID_NL((pRejects != NULL && pEncoder != NULL));
+    XCHECK_VOID_NL((pRejects->nCount < DIRECTGATE_MFENC_MAX_REJECTED));
+    XCHECK_VOID_NL((pEncoder->sRejectKey[0] != '\0'));
+
+    for (uint32_t i = 0; i < pRejects->nCount; i++)
+    {
+        if (xstrcmp(pRejects->keys[i], pEncoder->sRejectKey)) return;
+    }
+
+    xstrncpy(pRejects->keys[pRejects->nCount], DIRECTGATE_MFENC_NAME_LEN, pEncoder->sRejectKey);
+    pRejects->nCount++;
 }
 
 int DirectGate_MFEnc_SetBitrate(directgate_mfenc_t *pEncoder, uint32_t nBitrateKbps)
