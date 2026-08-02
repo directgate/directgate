@@ -512,6 +512,8 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
     }
 
     int nStatus = XSTDERR;
+    UINT32 nRetired = 0, nUnreachable = 0, nRefused = 0;
+
     for (UINT32 i = 0; i < nCount && nStatus != XSTDOK; i++)
     {
         /* Read the name first: it is the key a previously-failed MFT is
@@ -522,12 +524,27 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
         if (DirectGate_MFEnc_IsRejected(pRejects, sName))
         {
             xlogw("Skipping H.264 encoder MFT that already failed: encoder(%s)", sName);
+            nRetired++;
             continue;
         }
 
+        /* Activation is where a hardware MFT that the process cannot reach
+         * drops out - an encoder belonging to the GPU this process was not
+         * assigned to, or one whose vendor-imposed concurrent session limit is
+         * already used up. Passing over it silently made it look like the
+         * candidate had never been in the list at all. */
         IMFTransform *pTransform = NULL;
-        if (FAILED(IMFActivate_ActivateObject(ppActivate[i], &IID_IMFTransform,
-            (void**)&pTransform)) || pTransform == NULL) continue;
+        HRESULT hrActivate = IMFActivate_ActivateObject(ppActivate[i],
+            &IID_IMFTransform, (void**)&pTransform);
+
+        if (FAILED(hrActivate) || pTransform == NULL)
+        {
+            xlogw("H.264 encoder MFT could not be activated: encoder(%s), hr(0x%08lX)",
+                sName, (unsigned long)hrActivate);
+
+            nUnreachable++;
+            continue;
+        }
 
         pEnc->pTransform = pTransform;
         xstrncpy(pEnc->sRawName, sizeof(pEnc->sRawName), sName);
@@ -545,6 +562,7 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
 
             pEnc->sRawName[0] = '\0';
             pEnc->sName[0] = '\0';
+            nRefused++;
             continue;
         }
 
@@ -554,9 +572,14 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
 
     if (nStatus != XSTDOK)
     {
+        /* "None registered" would be a lie here: candidates existed and every
+         * one of them was tried. The breakdown says which wall each hit. */
         DirectGate_MFEnc_SetError(pErrBuf, nErrSize,
-            "All %u %s H.264 encoder MFTs were exhausted.",
-            nCount, bHardware ? "hardware" : "software");
+            "All %u %s H.264 encoder MFTs exhausted: retired(%u), unreachable(%u), refused(%u)",
+            nCount, bHardware ? "hardware" : "software", nRetired, nUnreachable, nRefused);
+
+        xlogw("Exhausted %s H.264 encoder MFTs: total(%u), retired(%u), unreachable(%u), refused(%u)",
+            bHardware ? "hardware" : "software", nCount, nRetired, nUnreachable, nRefused);
     }
 
     for (UINT32 i = 0; i < nCount; i++)
