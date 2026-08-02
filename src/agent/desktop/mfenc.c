@@ -202,6 +202,76 @@ static HRESULT DirectGate_MFEnc_SetCodecBool(directgate_mfenc_t *pEnc, const GUI
     return ICodecAPI_SetValue(pEnc->pCodecApi, pGuid, &var);
 }
 
+/* Records a codec property the encoder turned down, so the whole set can be
+ * reported in one line instead of vanishing. */
+static void DirectGate_MFEnc_NoteKnob(const char *pName, HRESULT hr,
+                                      char *pRefused, size_t nSize, uint32_t *pCount)
+{
+    if (SUCCEEDED(hr)) return;
+    (*pCount)++;
+
+    size_t nUsed = strlen(pRefused);
+    if (nUsed + 2 >= nSize) return;
+
+    snprintf(pRefused + nUsed, nSize - nUsed, "%s%s", nUsed ? "," : "", pName);
+}
+
+/* Interactive-latency knobs. CBR keeps frame sizes predictable for the WebRTC
+ * pacer, B-frames would add a frame of reordering delay, and the GOP mirrors
+ * the other platforms (recovery is PLI-driven, see
+ * DirectGate_Desktop_ApplyPreset). Must be called only after the output media
+ * type has been accepted. */
+static void DirectGate_MFEnc_ApplyCodecKnobs(directgate_mfenc_t *pEnc,
+                                             uint32_t nBitrateKbps,
+                                             uint32_t nKeyEvery,
+                                             xbool_t bRealtime)
+{
+    if (pEnc->pCodecApi == NULL)
+    {
+        xlogd("Encoder MFT exposes no ICodecAPI, using media-type defaults: encoder(%s)", pEnc->sName);
+        return;
+    }
+
+    char sRefused[192] = { 0 };
+    uint32_t nRefused = 0;
+
+    DirectGate_MFEnc_NoteKnob("rateControl",
+        DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncRateControlMode, eAVEncCommonRateControlMode_CBR),
+        sRefused, sizeof(sRefused), &nRefused);
+
+    DirectGate_MFEnc_NoteKnob("meanBitrate",
+        DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncMeanBitRate, nBitrateKbps * 1000U),
+        sRefused, sizeof(sRefused), &nRefused);
+
+    DirectGate_MFEnc_NoteKnob("lowLatency",
+        DirectGate_MFEnc_SetCodecBool(pEnc, &g_MFEncLowLatencyMode, XTRUE),
+        sRefused, sizeof(sRefused), &nRefused);
+
+    DirectGate_MFEnc_NoteKnob("bFrames",
+        DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncBPictureCount, 0),
+        sRefused, sizeof(sRefused), &nRefused);
+
+    DirectGate_MFEnc_NoteKnob("gopSize",
+        DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncGopSize, nKeyEvery),
+        sRefused, sizeof(sRefused), &nRefused);
+
+    if (bRealtime)
+    {
+        DirectGate_MFEnc_NoteKnob("realtime",
+            DirectGate_MFEnc_SetCodecBool(pEnc, &g_MFEncCommonRealTime, XTRUE),
+            sRefused, sizeof(sRefused), &nRefused);
+    }
+
+    /* Refusals are not fatal - the output media type already carries the
+     * bitrate and the encoder has usable defaults for the rest - but they are
+     * the kind of thing worth seeing when an encoder then misbehaves. */
+    if (nRefused > 0)
+    {
+        xlogw("Encoder MFT refused codec settings: encoder(%s), count(%u), settings(%s)",
+            pEnc->sName, nRefused, sRefused);
+    }
+}
+
 /* Caches the Annex-B SPS/PPS blob the encoder attached to its output media
  * type; prepended to IDR payloads that arrive without in-band parameter
  * sets so every keyframe stays self-contained (matching OpenH264 and the
@@ -314,17 +384,6 @@ static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
     if (FAILED(IMFTransform_QueryInterface(pTransform, &IID_ICodecAPI, (void**)&pEnc->pCodecApi)))
         pEnc->pCodecApi = NULL;
 
-    /* Interactive-latency knobs. CBR keeps frame sizes predictable for the
-     * WebRTC pacer, B-frames would add a frame of reordering delay, and the
-     * GOP mirrors the other platforms (recovery is PLI-driven, see
-     * DirectGate_Desktop_ApplyPreset). */
-    DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncRateControlMode, eAVEncCommonRateControlMode_CBR);
-    DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncMeanBitRate, nBitrateKbps * 1000U);
-    DirectGate_MFEnc_SetCodecBool(pEnc, &g_MFEncLowLatencyMode, XTRUE);
-    DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncBPictureCount, 0);
-    DirectGate_MFEnc_SetCodecU32(pEnc, &g_MFEncGopSize, nKeyEvery);
-    if (pQuality->bRealtime) DirectGate_MFEnc_SetCodecBool(pEnc, &g_MFEncCommonRealTime, XTRUE);
-
     IMFMediaType *pOutType = NULL;
     HRESULT hr = DirectGate_MFEnc_BuildType(&pOutType, &MFVideoFormat_H264, pEnc->nWidth, pEnc->nHeight, pEnc->nFps);
     if (FAILED(hr))
@@ -372,6 +431,14 @@ static int DirectGate_MFEnc_Configure(directgate_mfenc_t *pEnc,
 
         return XSTDERR;
     }
+
+    /* Only now. An encoder MFT builds its internal state from the output
+     * media type, so ICodecAPI properties set before SetOutputType land on an
+     * encoder that does not yet exist: at best they are dropped, at worst the
+     * MFT latches a half-configured state. They used to be applied above,
+     * where the return values were also discarded, so a refusal was invisible
+     * twice over. */
+    DirectGate_MFEnc_ApplyCodecKnobs(pEnc, nBitrateKbps, nKeyEvery, pQuality->bRealtime);
 
     MFT_OUTPUT_STREAM_INFO streamInfo;
     memset(&streamInfo, 0, sizeof(streamInfo));
@@ -548,8 +615,7 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
 
         pEnc->pTransform = pTransform;
         xstrncpy(pEnc->sRawName, sizeof(pEnc->sRawName), sName);
-        snprintf(pEnc->sName, sizeof(pEnc->sName), "%s (%s)",
-            bHardware ? "hardware" : "software", sName);
+        snprintf(pEnc->sName, sizeof(pEnc->sName), "%s (%s)", bHardware ? "hardware" : "software", sName);
 
         nStatus = DirectGate_MFEnc_Configure(pEnc, pQuality, pErrBuf, nErrSize);
         if (nStatus != XSTDOK)
