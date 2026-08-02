@@ -974,7 +974,7 @@ static int DirectGate_MFEnc_PumpEvent(directgate_mfenc_t *pEnc)
     }
     else
     {
-        xlogd("MF encoder event ignored: encoder(%s), event(%lu), hr(0x%08lX)",
+        xlogi("MF encoder event ignored: encoder(%s), event(%lu), hr(0x%08lX)",
             pEnc->sName, (unsigned long)eType, (unsigned long)hrStatus);
     }
 
@@ -1120,6 +1120,54 @@ static int DirectGate_MFEnc_ProcessOutput(directgate_mfenc_t *pEnc, xbyte_buffer
     return nResult;
 }
 
+/* Waits for an input credit, collecting output while it waits.
+ *
+ * Servicing output here is not an optimisation, it is the contract: an
+ * asynchronous MFT stops asking for input while output it has already
+ * announced is still uncollected. A client that waits only for
+ * METransformNeedInput while a METransformHaveOutput sits in the queue waits
+ * forever, and the encoder looks wedged when it is in fact waiting on us.
+ *
+ * That is exactly the shape of a first frame that takes longer to come out
+ * than the output wait allows: the frame is announced just after the client
+ * gave up on it, the next call asks only for input, and nothing moves again.
+ * The encoder is then retired as unusable for doing what it was supposed to.
+ *
+ * @p pOut receives the first access unit collected this way and *pHaveFrame
+ * is set; further announcements are left queued for the next call, which is
+ * enough to unblock the MFT since pOut only carries one frame. */
+static int DirectGate_MFEnc_WaitInput(directgate_mfenc_t *pEnc, uint32_t nTimeoutMs,
+                                      xbyte_buffer_t *pOut, xbool_t *pKeyframe,
+                                      xbool_t *pHaveFrame)
+{
+    ULONGLONG nDeadline = GetTickCount64() + nTimeoutMs;
+
+    while (pEnc->nNeedInput == 0)
+    {
+        if (pEnc->nHaveOutput > 0 && !*pHaveFrame)
+        {
+            pEnc->nHaveOutput--;
+
+            if (DirectGate_MFEnc_ProcessOutput(pEnc, pOut, pKeyframe, NULL) == XSTDOK && pOut->nUsed > 0)
+            {
+                *pHaveFrame = XTRUE;
+                pEnc->bProven = XTRUE;
+            }
+
+            continue;
+        }
+
+        int nStatus = DirectGate_MFEnc_PumpEvent(pEnc);
+        if (nStatus == XSTDERR) return XSTDERR;
+        if (nStatus == XSTDOK) continue;
+        if (GetTickCount64() >= nDeadline) return XSTDNON;
+
+        DirectGate_MFEnc_PollWait(pEnc);
+    }
+
+    return XSTDOK;
+}
+
 /* Wraps one tightly packed NV12 frame into an IMFSample (one copy: the MFT
  * keeps a reference to the buffer while encoding, so the caller's frame
  * buffer must stay reusable). */
@@ -1197,7 +1245,9 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
         uint32_t nWaitMs = pEncoder->bProven ?
             DIRECTGATE_MFENC_INPUT_WAIT_MS : DIRECTGATE_MFENC_FIRST_INPUT_WAIT_MS;
 
-        int nStatus = DirectGate_MFEnc_WaitCredit(pEncoder, &pEncoder->nNeedInput, nWaitMs);
+        xbool_t bHaveFrame = XFALSE;
+        int nStatus = DirectGate_MFEnc_WaitInput(pEncoder, nWaitMs, pOut, pKeyframe, &bHaveFrame);
+
         if (nStatus == XSTDOK && !pEncoder->bFirstCredit)
         {
             pEncoder->bFirstCredit = XTRUE;
@@ -1209,11 +1259,22 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
         if (nStatus != XSTDOK)
         {
             IMFSample_Release(pSample);
+
+            /* A frame collected while waiting is proof the encoder is alive,
+             * whatever it did about the credit. The capture that could not be
+             * submitted is dropped, which is one frame - not an encoder. */
+            if (bHaveFrame)
+            {
+                pEncoder->nStallCount = 0;
+                return XSTDOK;
+            }
+
             pEncoder->nStallCount++;
 
             /* Two different failures used to share one message. XSTDERR means
              * the event queue itself broke; XSTDNON means the MFT simply never
-             * asked for the frame. */
+             * asked for the frame. The pending counts say which side of the
+             * exchange stopped. */
             if (nStatus == XSTDERR)
             {
                 xloge("MF encoder event queue failed: encoder(%s), proven(%s), stalls(%u)",
@@ -1221,8 +1282,10 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
             }
             else
             {
-                xloge("MF encoder did not ask for input within %ums: encoder(%s), proven(%s), stalls(%u)",
-                    nWaitMs, pEncoder->sName, pEncoder->bProven ? "yes" : "no", pEncoder->nStallCount);
+                xloge("MF encoder did not ask for input within %ums: encoder(%s), proven(%s), "
+                    "stalls(%u), pending input(%u), pending output(%u)",
+                    nWaitMs, pEncoder->sName, pEncoder->bProven ? "yes" : "no",
+                    pEncoder->nStallCount, pEncoder->nNeedInput, pEncoder->nHaveOutput);
             }
 
             return XSTDERR;
@@ -1242,9 +1305,14 @@ int DirectGate_MFEnc_Encode(directgate_mfenc_t *pEncoder,
          * particular output has not surfaced yet. */
         pEncoder->nStallCount = 0;
 
+        /* Already carrying the frame that was announced while waiting: pOut
+         * holds one access unit, and the one this input produces will be
+         * collected by the next call. */
+        if (bHaveFrame) return XSTDOK;
+
         if (DirectGate_MFEnc_WaitCredit(pEncoder, &pEncoder->nHaveOutput,
             DIRECTGATE_MFENC_OUTPUT_WAIT_MS) != XSTDOK)
-            return XSTDNON; /* still buffered; DirectGate_MFEnc_Drain collects it */
+            return XSTDNON; /* still buffered; the next call or Drain collects it */
 
         pEncoder->nHaveOutput--;
         nStatus = DirectGate_MFEnc_ProcessOutput(pEncoder, pOut, pKeyframe, NULL);
