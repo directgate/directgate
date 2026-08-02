@@ -135,8 +135,12 @@ typedef struct directgate_winenc_ {
     xbool_t bPublished;                 /* the viewer has had at least one frame */
     uint64_t nFrameCapturedUs;          /* absolute QPC time of freshest pixels */
 
-    directgate_mfenc_t *pEncoder;
+    /* Encoder MFTs that configured and then failed to produce. Owned here so
+     * it outlives the encoder itself and a re-create moves down the candidate
+     * list instead of reselecting the one that just failed. */
+    directgate_mfenc_rejects_t encoderRejects;
     xbyte_buffer_t encoded;             /* encoder output scratch */
+    directgate_mfenc_t *pEncoder;
 
     /* Single-slot mailbox: capture thread (producer) -> main loop
      * (consumer). Buffers are swapped under the lock, never copied.
@@ -659,6 +663,44 @@ static void DirectGate_Desktop_WinEnc_Publish(directgate_winenc_t *pEnc,
     DirectGate_Desktop_WinEnc_WakeMainLoop(pEnc);
 }
 
+/* Retires the encoder that just stopped producing and builds the next
+ * candidate: the other vendor's hardware MFT if the machine has one, then the
+ * Microsoft software encoder. A GPU encoder can be a liar from the start (it
+ * configures, claims to be ready, then never asks for a frame) or die
+ * mid-session on a driver reset, and neither is a reason to give up H.264 -
+ * the raw-RGBA path is orders of magnitude worse on both latency and
+ * bandwidth, and until now it was the only thing this fell back to. */
+static int DirectGate_Desktop_WinEnc_SwapEncoder(directgate_winenc_t *pEnc)
+{
+    char sError[DIRECTGATE_DESKTOP_REASON_LEN] = { 0 };
+    char sFailed[DIRECTGATE_DESKTOP_REASON_LEN] = { 0 };
+
+    /* Describe() points into the encoder, which is about to be freed. */
+    xstrncpy(sFailed, sizeof(sFailed), DirectGate_MFEnc_Describe(pEnc->pEncoder));
+    xlogw("Retiring unusable H.264 encoder, trying the next candidate: encoder(%s)", sFailed);
+
+    DirectGate_MFEnc_Reject(&pEnc->encoderRejects, pEnc->pEncoder);
+    DirectGate_MFEnc_Destroy(pEnc->pEncoder);
+    pEnc->pEncoder = NULL;
+
+    pEnc->pEncoder = DirectGate_MFEnc_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
+        &pEnc->pDesktop->quality, &pEnc->encoderRejects, sError, sizeof(sError));
+
+    if (pEnc->pEncoder == NULL)
+    {
+        xloge("No usable H.264 encoder left: reason(%s)", sError[0] ? sError : "unspecified");
+        return XSTDERR;
+    }
+
+    /* New encoder, new H.264 stream: the decoder needs an IDR before any of
+     * it means anything. */
+    InterlockedExchange(&pEnc->bForceKeyframe, 1);
+    xlogn("Switched H.264 encoder: from(%s), to(%s)", sFailed,
+        DirectGate_MFEnc_Describe(pEnc->pEncoder));
+
+    return XSTDOK;
+}
+
 static int DirectGate_Desktop_WinEnc_EncodeFrame(directgate_winenc_t *pEnc, xbool_t bForceKeyframe)
 {
     DirectGate_YUV_BGRAToNV12(pEnc->pNV12,
@@ -676,6 +718,13 @@ static int DirectGate_Desktop_WinEnc_EncodeFrame(directgate_winenc_t *pEnc, xboo
 
     if (nStatus == XSTDERR)
     {
+        /* Swap first, fail the pipeline only once nothing is left to try.
+         * The dropped frame costs one capture interval; the old behaviour
+         * cost the whole session. */
+        if (DirectGate_MFEnc_IsWedged(pEnc->pEncoder) &&
+            DirectGate_Desktop_WinEnc_SwapEncoder(pEnc) == XSTDOK)
+            return XSTDNON;
+
         DirectGate_Desktop_WinEnc_SetError(pEnc, "Media Foundation frame encoding failed.");
         return XSTDERR;
     }
@@ -722,8 +771,10 @@ static int DirectGate_Desktop_WinEnc_InitPipeline(directgate_winenc_t *pEnc)
     if (pEnc->hWaitTimer == NULL) pEnc->hWaitTimer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
 
     char sError[DIRECTGATE_DESKTOP_REASON_LEN] = { 0 };
+    memset(&pEnc->encoderRejects, 0, sizeof(pEnc->encoderRejects));
+
     pEnc->pEncoder = DirectGate_MFEnc_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
-        &pEnc->pDesktop->quality, sError, sizeof(sError));
+        &pEnc->pDesktop->quality, &pEnc->encoderRejects, sError, sizeof(sError));
     if (pEnc->pEncoder == NULL)
     {
         DirectGate_Desktop_WinEnc_SetError(pEnc,
