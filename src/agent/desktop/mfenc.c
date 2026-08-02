@@ -454,6 +454,20 @@ static xbool_t DirectGate_MFEnc_IsRejected(const directgate_mfenc_rejects_t *pRe
     return XFALSE;
 }
 
+static void DirectGate_MFEnc_ActivateName(IMFActivate *pActivate, char *pName, size_t nSize)
+{
+    WCHAR wsName[DIRECTGATE_MFENC_NAME_LEN] = { 0 };
+    UINT32 nNameLen = 0;
+
+    pName[0] = '\0';
+
+    if (SUCCEEDED(IMFActivate_GetString(pActivate, &MFT_FRIENDLY_NAME_Attribute,
+        wsName, (UINT32)(sizeof(wsName) / sizeof(wsName[0])), &nNameLen)) && nNameLen > 0)
+        WideCharToMultiByte(CP_UTF8, 0, wsName, -1, pName, (int)nSize - 1, NULL, NULL);
+
+    if (!pName[0]) xstrncpy(pName, nSize, "unnamed H.264 encoder MFT");
+}
+
 /* Tries every MFT the enumeration returned (best match first thanks to
  * MFT_ENUM_FLAG_SORTANDFILTER) until one activates and configures, skipping
  * any that a previous attempt retired. */
@@ -484,20 +498,26 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
         return XSTDERR;
     }
 
+    /* The whole inventory, before anything is chosen. Which encoders a machine
+     * actually offers is the first question every encoder problem raises, and
+     * the selection loop below cannot answer it: it stops at the first
+     * candidate that works and never names the rest. */
+    for (UINT32 i = 0; i < nCount; i++)
+    {
+        char sCandidate[DIRECTGATE_MFENC_NAME_LEN];
+        DirectGate_MFEnc_ActivateName(ppActivate[i], sCandidate, sizeof(sCandidate));
+
+        xlogi("Available %s H.264 encoder MFT: index(%u/%u), encoder(%s)",
+            bHardware ? "hardware" : "software", i + 1U, nCount, sCandidate);
+    }
+
     int nStatus = XSTDERR;
     for (UINT32 i = 0; i < nCount && nStatus != XSTDOK; i++)
     {
         /* Read the name first: it is the key a previously-failed MFT is
          * remembered by, and skipping one must not cost an activation. */
-        WCHAR wsName[DIRECTGATE_MFENC_NAME_LEN] = { 0 };
-        char sName[DIRECTGATE_MFENC_NAME_LEN] = { 0 };
-        UINT32 nNameLen = 0;
-
-        if (SUCCEEDED(IMFActivate_GetString(ppActivate[i], &MFT_FRIENDLY_NAME_Attribute,
-            wsName, (UINT32)(sizeof(wsName) / sizeof(wsName[0])), &nNameLen)) && nNameLen > 0)
-            WideCharToMultiByte(CP_UTF8, 0, wsName, -1, sName, sizeof(sName) - 1, NULL, NULL);
-
-        if (!sName[0]) xstrncpy(sName, sizeof(sName), "unnamed H.264 encoder MFT");
+        char sName[DIRECTGATE_MFENC_NAME_LEN];
+        DirectGate_MFEnc_ActivateName(ppActivate[i], sName, sizeof(sName));
 
         if (DirectGate_MFEnc_IsRejected(pRejects, sName))
         {
@@ -530,6 +550,13 @@ static int DirectGate_MFEnc_CreateFromCategory(directgate_mfenc_t *pEnc, UINT32 
 
         xlogi("Selected H.264 encoder MFT: encoder(%s), size(%ux%u), fps(%u)",
             pEnc->sName, pEnc->nWidth, pEnc->nHeight, pEnc->nFps);
+    }
+
+    if (nStatus != XSTDOK)
+    {
+        DirectGate_MFEnc_SetError(pErrBuf, nErrSize,
+            "All %u %s H.264 encoder MFTs were exhausted.",
+            nCount, bHardware ? "hardware" : "software");
     }
 
     for (UINT32 i = 0; i < nCount; i++)
