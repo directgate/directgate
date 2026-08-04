@@ -113,6 +113,10 @@ typedef struct directgate_desktop_monitor_ {
 typedef struct directgate_desktop_held_key_ {
     char sCode[DIRECTGATE_DESKTOP_KEY_CODE_LEN];
     uint32_t nKeycode;
+    /* Whether nKeycode is a physical key or a character: a Wayland session
+     * releases the two through different portal calls, and releasing one as
+     * the other leaves the key down for good. */
+    xbool_t bPhysical;
 } directgate_desktop_held_key_t;
 
 /* One spare X11 keycode and the keysym currently bound to it. */
@@ -178,6 +182,11 @@ typedef struct directgate_desktop_ {
     uint32_t nLastClickButton;
     /* macOS: last accessibility-permission recheck while input is disabled. */
     uint64_t nInputRecheckMs;
+    /* When the last input event of any kind arrived, for the held-key
+     * watchdog: a release that is lost in flight (or that the browser never
+     * saw, because a reserved shortcut stole the keyup) would otherwise leave
+     * a modifier down on the host until the session ends. */
+    uint64_t nLastInputMs;
     /* X11: spare keycodes temporarily bound to keysyms missing from the
      * active layout (e.g. non-Latin text typed from the browser). Bindings
      * persist so a repeated character reuses its slot instead of rewriting
@@ -209,6 +218,11 @@ typedef struct directgate_desktop_ {
     void *pFakeKey;
     void *pDisplay;
     void *pXtst;
+    /* The Wayland portal prompt is on someone's screen and the session is
+     * running only to wait for it: no capture, no input, nothing to encode
+     * until they answer. Answering can take minutes, so the wait belongs on
+     * the tick rather than in the call that started the session. */
+    xbool_t bAwaitingGrant;
     /* directgate_wl_source_t on a Wayland session; NULL everywhere else. It
      * outlives a failed start attempt on purpose: the portal prompt the user
      * has not answered yet is attached to it, and dropping the source would
@@ -276,9 +290,16 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession,
                                      size_t nPayloadLength);
 
 #if defined(__linux__)
-/* Releases every key the session still holds on the X server. Must run
- * while the display is open, or the keys stay latched for other clients. */
+/* Releases every key the session still holds on the host - X server keycodes
+ * on Xorg, portal keysyms on Wayland. Must run while the display connection
+ * or the portal session is still open, or the keys stay latched for everyone
+ * else on that machine. */
 void DirectGate_Desktop_ReleaseHeldKeys(directgate_desktop_t *pDesktop);
+
+/* Lets go of keys that are still down after a long silence, and reports
+ * whether it decided they were stuck. Called every tick; a no-op unless
+ * something is held. */
+xbool_t DirectGate_Desktop_ExpireHeldKeys(directgate_desktop_t *pDesktop);
 #endif
 
 int DirectGate_Desktop_GetTimerFd(const directgate_desktop_t *pDesktop);

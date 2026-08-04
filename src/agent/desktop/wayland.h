@@ -121,9 +121,14 @@ int DirectGate_WL_DBusLoad(char *pErrBuf, size_t nErrSize);
  * compositor accepts it the prompt is skipped. The token it hands back for
  * next time is written to @p pNewToken.
  *
+ * @p pDeclined (may be NULL) separates "they said no" from "it did not work",
+ * so a caller can retry the second without putting a second prompt in front
+ * of someone who already refused the first.
+ *
  * Returns NULL on failure or refusal with the reason in pErrBuf. */
 directgate_wl_portal_t* DirectGate_WL_PortalOpen(const char *pRestoreToken,
                                                  char *pNewToken, size_t nTokenSize,
+                                                 xbool_t *pDeclined,
                                                  char *pErrBuf, size_t nErrSize);
 
 /* PipeWire node id of the granted stream, and a descriptor connected to the
@@ -144,6 +149,12 @@ int DirectGate_WL_PortalPointerMotion(directgate_wl_portal_t *pPortal, uint32_t 
 int DirectGate_WL_PortalPointerButton(directgate_wl_portal_t *pPortal, int32_t nButton, xbool_t bPressed);
 int DirectGate_WL_PortalPointerAxis(directgate_wl_portal_t *pPortal, double nDx, double nDy);
 int DirectGate_WL_PortalKeysym(directgate_wl_portal_t *pPortal, int32_t nKeysym, xbool_t bPressed);
+
+/* A key by position rather than by character: @p nKeycode is the Linux evdev
+ * code, and the compositor's own layout decides what it types. This is how a
+ * host whose keyboard is set to another script types that script - a keysym
+ * asks for a character the host layout may not even have. */
+int DirectGate_WL_PortalKeycode(directgate_wl_portal_t *pPortal, int32_t nKeycode, xbool_t bPressed);
 
 /* Maps a browser/X11 button number (1 left, 2 middle, 3 right, 8/9 side) to
  * the evdev code the portal expects. Returns 0 when there is no mapping. */

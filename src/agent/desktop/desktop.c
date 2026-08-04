@@ -786,9 +786,6 @@ int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const char *pS
     XJSON_AddStrIfUsed(pRoot, "selectedMonitor", pSession->desktop.sSelectedMonitor);
     XJSON_AddBool(pRoot, "input", pSession->desktop.bInputReady);
     XJSON_AddBool(pRoot, "textInput", XTRUE);
-#if defined(__linux__) || defined(_WIN32)
-    XJSON_AddBool(pRoot, "lockSync", XTRUE);
-#endif
     XJSON_AddBool(pRoot, "cursorSync", XTRUE);
     XJSON_AddBool(pRoot, "p2pMigration", XTRUE);
     XJSON_AddBool(pRoot, "captureReady", pSession->desktop.bCaptureReady);
@@ -802,6 +799,25 @@ int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const char *pS
     XJSON_AddU32(pRoot, "screenHeight", pSession->desktop.nScreenHeight);
     XJSON_AddU32(pRoot, "bitrateKbps", pSession->desktop.nCurrentBitrateKbps ?
         pSession->desktop.nCurrentBitrateKbps : pSession->desktop.quality.nBitrateKbps);
+
+#if defined(__linux__) || defined(_WIN32)
+    /* Caps/Num Lock as state rather than as keystrokes, which the browser
+     * only does when the agent can actually apply it. A Wayland session
+     * cannot: the portal offers no way to read or set a lock, only to press
+     * the key. Claiming otherwise made the browser keep the lock keys to
+     * itself and send state the agent then dropped - so a host that ended up
+     * in Caps Lock stayed there, typing in capitals, with nothing the viewer
+     * could press to get it back. Saying no here sends the lock keys through
+     * as ordinary keys, which is what toggles the lock on that host. */
+    xbool_t bLockSync = XTRUE;
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    if (pSession->desktop.pWayland != NULL) bLockSync = XFALSE;
+#endif
+
+    XJSON_AddBool(pRoot, "lockSync", bLockSync);
+#endif
+
 
     /* System-audio state for the viewer's mute control. "capturing" once the
      * opt-in Opus stream is live, "unavailable" when it was requested but could

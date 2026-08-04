@@ -126,6 +126,10 @@ struct directgate_wl_portal_ {
     uint32_t nDevices;        /* device types the portal actually granted */
     uint32_t nInputErrors;    /* refused input events already reported */
     uint32_t nTokenSeq;
+    /* Raised when a person answered the prompt with "no", as opposed to the
+     * request failing. The caller's flag, not this struct's, because the
+     * portal is freed on the way out and the answer has to outlive it. */
+    xbool_t *pDeclined;
 };
 
 static void DirectGate_WL_PortalSetError(char *pErrBuf, size_t nErrSize, const char *pFmt, ...)
@@ -397,6 +401,12 @@ static int DirectGate_WL_WaitResponse(directgate_wl_portal_t *pPortal, const cha
             if (nResponse != 0)
             {
                 g_dbus.msgUnref(pMessage);
+
+                /* Told apart because a refusal must not be answered with
+                 * another prompt, while a request that merely failed may be
+                 * worth retrying without a stale grant. */
+                if (nResponse == 1 && pPortal->pDeclined != NULL) *pPortal->pDeclined = XTRUE;
+
                 DirectGate_WL_PortalSetError(pErrBuf, nErrSize, nResponse == 1 ?
                     "Screen sharing was declined on the remote computer." :
                     "The desktop portal ended the screen sharing request.");
@@ -550,9 +560,12 @@ static int DirectGate_WL_PortalRequest(directgate_wl_portal_t *pPortal,
         return XSTDERR;
     }
 
-    /* The returned path should be the one that was predicted. If a portal
-     * ever disagrees, the subscription is on the wrong path and the wait
-     * below would simply time out - so say which path is which now. */
+    /* The path the portal actually created wins over the predicted one. The
+     * prediction exists only to subscribe before the answer can arrive; the
+     * reply is the authority, and following it is the difference between a
+     * prompt whose answer lands and one that is waited out in full and then
+     * reported as "the portal did not answer" - with the person who pressed
+     * Allow watching nothing happen. */
     DBusMessageIter replyIter;
     if (g_dbus.iterInit(pReply, &replyIter) &&
         g_dbus.iterArgType(&replyIter) == DBUS_TYPE_OBJECT_PATH)
@@ -560,8 +573,27 @@ static int DirectGate_WL_PortalRequest(directgate_wl_portal_t *pPortal,
         const char *pActual = NULL;
         g_dbus.iterGet(&replyIter, &pActual);
 
-        if (pActual != NULL && !xstrcmp(pActual, sPath))
-            xlogw("Portal request path differs from the predicted one: expected(%s), got(%s)", sPath, pActual);
+        if (xstrused(pActual) && !xstrcmp(pActual, sPath))
+        {
+            xlogw("Portal request path differs from the predicted one, following the portal: "
+                  "expected(%s), got(%s)", sPath, pActual);
+
+            snprintf(sRule, sizeof(sRule),
+                "type='signal',interface='%s',member='Response',path='%s'",
+                DIRECTGATE_PORTAL_REQUEST, pActual);
+
+            g_dbus.errorInit(&error);
+            g_dbus.addMatch(pPortal->pConn, sRule, &error);
+
+            if (g_dbus.errorIsSet != NULL && g_dbus.errorIsSet(&error))
+            {
+                xlogw("Failed to subscribe to the portal's own response path: %s",
+                    error.message != NULL ? error.message : "unknown");
+
+                g_dbus.errorFree(&error);
+            }
+            else xstrncpy(sPath, sizeof(sPath), pActual);
+        }
     }
 
     g_dbus.msgUnref(pReply);
@@ -577,16 +609,15 @@ static int DirectGate_WL_PortalRequest(directgate_wl_portal_t *pPortal,
  * specification and lose a session when it is wrong, the richest set is tried
  * and the client steps down until one is accepted - and says which. */
 typedef enum {
-    DIRECTGATE_WL_OPTS_FULL = 0,   /* types + cursor_mode + persistence */
-    DIRECTGATE_WL_OPTS_NO_PERSIST, /* types + cursor_mode */
-    DIRECTGATE_WL_OPTS_MINIMAL,    /* types only: accepted by every version */
+    DIRECTGATE_WL_OPTS_FULL = 0, /* types + persistence + the remembered grant */
+    DIRECTGATE_WL_OPTS_FRESH,    /* ... persistence, but asking anew */
+    DIRECTGATE_WL_OPTS_MINIMAL,  /* types only: accepted by every version */
     DIRECTGATE_WL_OPTS_COUNT
 } directgate_wl_opts_t;
 
 typedef struct directgate_wl_sources_ {
-    const char *pRestoreToken;
     uint32_t nVersion;      /* ScreenCast interface version */
-    uint32_t nCursorModes;  /* AvailableCursorModes bitmask */
+    uint32_t nCursorModes;  /* AvailableCursorModes bitmask, for the log */
     uint32_t nSourceTypes;  /* AvailableSourceTypes bitmask */
     directgate_wl_opts_t eProfile;
 } directgate_wl_sources_t;
@@ -613,42 +644,35 @@ static void DirectGate_WL_SourceOptions(DBusMessageIter *pDict, void *pCtx)
     /* Let the person choose more than one screen. Without this the portal
      * grants exactly one and the monitor list can only ever hold that one,
      * which on a two-screen machine looks like the other screen does not
-     * exist. */
-    DirectGate_WL_DictBool(pDict, "multiple", XTRUE);
+     * exist. Worth one retry without it if a portal objects - one screen
+     * beats no session. */
+    if (pSources->eProfile == DIRECTGATE_WL_OPTS_FULL)
+        DirectGate_WL_DictBool(pDict, "multiple", XTRUE);
 
-    /* The host cursor stays out of the frames, which is what every other
-     * platform streams: the viewer's own pointer is the cursor, and drawing
-     * the host's one into the video as well puts two arrows on screen with
-     * only one of them under their hand. Mouse capture is the one case where
-     * the host pointer has to be visible, and there the browser hides its own
-     * and draws the host cursor from the position the agent echoes - the same
-     * arrangement the X11 path uses. Version 2 is when the portal learned this
-     * option; asking an older one is an error, and asking for a mode it does
-     * not list is an error too. */
-    if (pSources->eProfile <= DIRECTGATE_WL_OPTS_NO_PERSIST &&
-        pSources->nVersion >= 2 && (pSources->nCursorModes & DIRECTGATE_PORTAL_CURSOR_HIDDEN))
-        DirectGate_WL_DictUint(pDict, "cursor_mode", DIRECTGATE_PORTAL_CURSOR_HIDDEN);
+    /* No cursor_mode is asked for, on purpose. The host cursor has to stay
+     * out of the frames - the viewer's own pointer is the cursor, and drawing
+     * the host's one as well puts two arrows on screen with only one of them
+     * under their hand - and "hidden" is exactly what the portal does when it
+     * is not told otherwise. Asking for it anyway would add one more option
+     * for a portal to refuse, and a refused option fails the whole request,
+     * not just that option. (This used to ask for the cursor to be drawn in,
+     * which is not the default and did have to be requested.) */
 
-    /* Persistence arrived in version 4. Without it every connection prompts,
-     * which is worse but still works - so it is never worth failing over. */
-    if (pSources->eProfile == DIRECTGATE_WL_OPTS_FULL && pSources->nVersion >= 4)
-    {
-        DirectGate_WL_DictUint(pDict, "persist_mode", DIRECTGATE_PORTAL_PERSIST_SESSION);
-
-        /* Only a UUID is accepted here; a token file that has been truncated
-         * or hand-edited would otherwise fail the request rather than simply
-         * being ignored. */
-        if (xstrused(pSources->pRestoreToken) && strlen(pSources->pRestoreToken) == 36)
-            DirectGate_WL_DictString(pDict, "restore_token", pSources->pRestoreToken);
-    }
+    /* Persistence is asked for on RemoteDesktop.SelectDevices and nowhere
+     * else. This session belongs to RemoteDesktop - the screens are being
+     * selected onto it, not the other way round - so the grant that gets
+     * remembered is the device grant, and its token is a RemoteDesktop token.
+     * Offering that same token here asked ScreenCast to restore something
+     * that was never its to give: one more option to be refused, and a
+     * refusal fails the entire request. */
 }
 
 static const char* DirectGate_WL_OptsName(directgate_wl_opts_t eProfile)
 {
     switch (eProfile)
     {
-        case DIRECTGATE_WL_OPTS_FULL: return "types+cursor+persist";
-        case DIRECTGATE_WL_OPTS_NO_PERSIST: return "types+cursor";
+        case DIRECTGATE_WL_OPTS_FULL: return "types+persist+restore";
+        case DIRECTGATE_WL_OPTS_FRESH: return "types+persist";
         default: return "types";
     }
 }
@@ -656,6 +680,7 @@ static const char* DirectGate_WL_OptsName(directgate_wl_opts_t eProfile)
 typedef struct directgate_wl_devices_ {
     const char *pRestoreToken;
     uint32_t nVersion;  /* RemoteDesktop interface version */
+    directgate_wl_opts_t eProfile;
 } directgate_wl_devices_t;
 
 static void DirectGate_WL_DeviceOptions(DBusMessageIter *pDict, void *pCtx)
@@ -667,12 +692,24 @@ static void DirectGate_WL_DeviceOptions(DBusMessageIter *pDict, void *pCtx)
 
     /* For a session that owns input, persistence belongs to RemoteDesktop and
      * not to ScreenCast - it is the device grant being remembered, not just
-     * the picture. Version 2 is where the interface gained it. */
+     * the picture. Version 2 is where the interface gained it.
+     *
+     * Asking to be remembered and presenting a remembered grant are separate
+     * steps here, and only the second is given up when the portal refuses.
+     * A token it will not take - expired, spent by another session, granted
+     * for screens that are gone - then costs one prompt, after which a new
+     * one is stored. Dropping both together is how an agent ends up asking on
+     * every connection and never storing anything, which on a machine nobody
+     * is sitting at means nobody can get in at all. */
     if (pDevices != NULL && pDevices->nVersion >= 2)
     {
         DirectGate_WL_DictUint(pDict, "persist_mode", DIRECTGATE_PORTAL_PERSIST_SESSION);
 
-        if (xstrused(pDevices->pRestoreToken) && strlen(pDevices->pRestoreToken) == 36)
+        /* Only a UUID is accepted here; a token file that has been truncated
+         * or hand-edited would otherwise fail the request rather than simply
+         * being ignored. */
+        if (pDevices->eProfile == DIRECTGATE_WL_OPTS_FULL &&
+            xstrused(pDevices->pRestoreToken) && strlen(pDevices->pRestoreToken) == 36)
             DirectGate_WL_DictString(pDict, "restore_token", pDevices->pRestoreToken);
     }
 }
@@ -782,8 +819,10 @@ const directgate_wl_stream_t* DirectGate_WL_PortalStream(const directgate_wl_por
 
 directgate_wl_portal_t* DirectGate_WL_PortalOpen(const char *pRestoreToken,
                                                  char *pNewToken, size_t nTokenSize,
+                                                 xbool_t *pDeclined,
                                                  char *pErrBuf, size_t nErrSize)
 {
+    if (pDeclined != NULL) *pDeclined = XFALSE;
     if (DirectGate_WL_DBusLoad(pErrBuf, nErrSize) != XSTDOK) return NULL;
 
     directgate_wl_portal_t *pPortal = (directgate_wl_portal_t*)calloc(1, sizeof(*pPortal));
@@ -792,6 +831,8 @@ directgate_wl_portal_t* DirectGate_WL_PortalOpen(const char *pRestoreToken,
         DirectGate_WL_PortalSetError(pErrBuf, nErrSize, "Out of memory opening the desktop portal.");
         return NULL;
     }
+
+    pPortal->pDeclined = pDeclined;
 
     DBusError error;
     g_dbus.errorInit(&error);
@@ -862,7 +903,6 @@ directgate_wl_portal_t* DirectGate_WL_PortalOpen(const char *pRestoreToken,
     directgate_wl_sources_t sources;
     memset(&sources, 0, sizeof(sources));
 
-    sources.pRestoreToken = pRestoreToken;
     sources.nVersion = DirectGate_WL_PortalPropertyUint(pPortal, DIRECTGATE_PORTAL_SCREEN, "version", 1);
     sources.nCursorModes = DirectGate_WL_PortalPropertyUint(pPortal, DIRECTGATE_PORTAL_SCREEN, "AvailableCursorModes", 0);
     sources.nSourceTypes = DirectGate_WL_PortalPropertyUint(pPortal, DIRECTGATE_PORTAL_SCREEN, "AvailableSourceTypes", DIRECTGATE_PORTAL_SOURCE_MONITOR);
@@ -876,13 +916,49 @@ directgate_wl_portal_t* DirectGate_WL_PortalOpen(const char *pRestoreToken,
     xlogi("Desktop portal capabilities: screencast(v%u), cursorModes(0x%X), sourceTypes(0x%X), remotedesktop(v%u)",
         sources.nVersion, sources.nCursorModes, sources.nSourceTypes, devices.nVersion);
 
-    /* 3. What to inject. Devices before sources, which is the order the
-     *    portal's own reference flow uses for a session that does both. A
-     *    compositor without RemoteDesktop support fails here, and the message
-     *    says so rather than blaming the capture. */
-    if (DirectGate_WL_PortalRequest(pPortal, DIRECTGATE_PORTAL_REMOTE, "SelectDevices",
+    /* 3. What to inject, and whether to remember it. Devices before sources,
+     *    which is the order the portal's own reference flow uses for a session
+     *    that does both. A compositor without RemoteDesktop support fails here,
+     *    and the message says so rather than blaming the capture.
+     *
+     *    This is also where the remembered grant is presented, so it is where
+     *    the step down happens: a token the portal will not take costs one
+     *    prompt, never the ability to store a new one. */
+    xbool_t bHaveToken = (xstrused(pRestoreToken) && strlen(pRestoreToken) == 36) ? XTRUE : XFALSE;
+    int nDevSelected = XSTDERR;
+
+    for (int i = 0; i <= (int)DIRECTGATE_WL_OPTS_FRESH && nDevSelected != XSTDOK; i++)
+    {
+        devices.eProfile = (directgate_wl_opts_t)i;
+
+        /* With nothing to present, the two sets are the same request twice. */
+        if (devices.eProfile == DIRECTGATE_WL_OPTS_FULL && !bHaveToken) continue;
+
+        nDevSelected = DirectGate_WL_PortalRequest(pPortal, DIRECTGATE_PORTAL_REMOTE, "SelectDevices",
             pPortal->sSessionHandle, NULL, DirectGate_WL_DeviceOptions, &devices,
-            DIRECTGATE_PORTAL_CALL_MS, &pResponse, &results, pErrBuf, nErrSize) != XSTDOK)
+            DIRECTGATE_PORTAL_CALL_MS, &pResponse, &results, pErrBuf, nErrSize);
+
+        if (nDevSelected == XSTDOK)
+        {
+            xlogi("Desktop portal accepted the input options: options(%s)",
+                DirectGate_WL_OptsName(devices.eProfile));
+
+            if (bHaveToken && devices.eProfile != DIRECTGATE_WL_OPTS_FULL)
+                xlogw("The remembered desktop sharing permission was not accepted; "
+                      "asking once more so a new one can be stored");
+
+            if (devices.nVersion < 2)
+                xlogw("This desktop portal cannot remember the permission (remotedesktop v%u); "
+                      "every connection has to be allowed on the remote computer", devices.nVersion);
+
+            break;
+        }
+
+        xlogw("Desktop portal rejected the input options, retrying with fewer: options(%s), reason(%s)",
+            DirectGate_WL_OptsName(devices.eProfile), (pErrBuf != NULL && pErrBuf[0]) ? pErrBuf : "unspecified");
+    }
+
+    if (nDevSelected != XSTDOK)
     {
         DirectGate_WL_PortalClose(pPortal);
         return NULL;
@@ -891,9 +967,13 @@ directgate_wl_portal_t* DirectGate_WL_PortalOpen(const char *pRestoreToken,
     g_dbus.msgUnref(pResponse);
     int nSelected = XSTDERR;
 
+    /* The screens carry no grant of their own on this session, so there is
+     * one thing left that a portal might refuse: being offered more than one
+     * screen to pick. */
     for (int i = 0; i < DIRECTGATE_WL_OPTS_COUNT && nSelected != XSTDOK; i++)
     {
         sources.eProfile = (directgate_wl_opts_t)i;
+        if (sources.eProfile == DIRECTGATE_WL_OPTS_FRESH) continue;
 
         nSelected = DirectGate_WL_PortalRequest(pPortal, DIRECTGATE_PORTAL_SCREEN, "SelectSources",
             pPortal->sSessionHandle, NULL, DirectGate_WL_SourceOptions, &sources,
@@ -902,13 +982,13 @@ directgate_wl_portal_t* DirectGate_WL_PortalOpen(const char *pRestoreToken,
         if (nSelected == XSTDOK)
         {
             xlogi("Desktop portal accepted the capture options: options(%s)",
-                DirectGate_WL_OptsName(sources.eProfile));
+                sources.eProfile == DIRECTGATE_WL_OPTS_FULL ? "types+multiple" : "types");
 
             break;
         }
 
-        xlogw("Desktop portal rejected the capture options, retrying with fewer: options(%s), reason(%s)",
-            DirectGate_WL_OptsName(sources.eProfile), (pErrBuf != NULL && pErrBuf[0]) ? pErrBuf : "unspecified");
+        xlogw("Desktop portal rejected the capture options, retrying with fewer: reason(%s)",
+            (pErrBuf != NULL && pErrBuf[0]) ? pErrBuf : "unspecified");
     }
 
     if (nSelected != XSTDOK)
@@ -1159,6 +1239,14 @@ int DirectGate_WL_PortalKeysym(directgate_wl_portal_t *pPortal, int32_t nKeysym,
 {
     directgate_wl_key_t key = { (dbus_int32_t)nKeysym, bPressed ? 1U : 0U };
     return DirectGate_WL_PortalNotify(pPortal, "NotifyKeyboardKeysym", DirectGate_WL_KeyArgs, &key);
+}
+
+int DirectGate_WL_PortalKeycode(directgate_wl_portal_t *pPortal, int32_t nKeycode, xbool_t bPressed)
+{
+    /* Same wire shape as the keysym call - an int32 and a state,
+     * so the one argument writer serves both. */
+    directgate_wl_key_t key = { (dbus_int32_t)nKeycode, bPressed ? 1U : 0U };
+    return DirectGate_WL_PortalNotify(pPortal, "NotifyKeyboardKeycode", DirectGate_WL_KeyArgs, &key);
 }
 
 int32_t DirectGate_WL_PortalButtonCode(uint32_t nX11Button)

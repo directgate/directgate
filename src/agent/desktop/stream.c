@@ -379,6 +379,42 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
         while (read(pDesktop->nTimerFd, &nTicks, sizeof(nTicks)) > 0) {}
     }
 
+    /* A key whose release never made it across leaves the host holding it -
+     * a stuck Shift types the machine's whole session in capitals - and the
+     * session ending is far too late to notice. */
+    (void)DirectGate_Desktop_ExpireHeldKeys(pDesktop);
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    /* Still on the portal prompt. Nothing else in this function applies: the
+     * capture the rest of it drains does not exist yet. */
+    if (pDesktop->bAwaitingGrant)
+    {
+        int nResume = DirectGate_Desktop_ResumeWayland(pSession);
+        if (nResume == XSTDNON) return XAPI_CONTINUE;
+
+        pDesktop->bAwaitingGrant = XFALSE;
+
+        if (nResume < 0)
+        {
+            xlogw("Desktop sharing was not granted: sid(%u), reason(%s)",
+                pSession->nSessionId, DirectGate_Desktop_GetReason(pDesktop));
+
+            DirectGate_Desktop_SendStatus(pSession, "error", DirectGate_Desktop_GetReason(pDesktop));
+            return DirectGate_Session_SendErrorMsg(pSession, DirectGate_Desktop_GetReason(pDesktop));
+        }
+
+        xlogi("Desktop sharing was allowed: sid(%u), display(%s), screen(%ux%u), input(%s)",
+            pSession->nSessionId, pDesktop->sDisplay,
+            pDesktop->nScreenWidth, pDesktop->nScreenHeight,
+            pDesktop->bInputReady ? "yes" : "no");
+
+        /* The same "ready" the start would have sent, just later: the viewer
+         * picks a screen and the stream begins from here exactly as it does
+         * when the grant was already stored. */
+        return DirectGate_Desktop_SendStatus(pSession, "ready", NULL);
+    }
+#endif
+
 #ifdef DIRECTGATE_DESKTOP_HAS_AUDIO
     /* Ship any encoded Opus frames the capture thread queued. Runs before the
      * video drain so audio is never delayed by this tick's frame, and is a
@@ -419,6 +455,16 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
     XCHECK((pSession != NULL), XAPI_DISCONNECT);
     directgate_desktop_t *pDesktop = &pSession->desktop;
     if (!pDesktop->bRunning || pPayload == NULL || !nPayloadLength) return XAPI_CONTINUE;
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    if (pDesktop->bAwaitingGrant)
+    {
+        /* There is no screen to select, no preset to apply and nothing to encode
+        * until the portal prompt is answered. The tick reports "ready" the
+        * moment it is, and the viewer asks again from there. */
+        return DirectGate_Desktop_SendStatus(pSession, "starting", DirectGate_Desktop_GetReason(pDesktop));
+    }
+#endif
 
     char *pJsonText = (char*)calloc(1, nPayloadLength + 1U);
     XCHECK((pJsonText != NULL), XAPI_CONTINUE);
@@ -1549,12 +1595,14 @@ int DirectGate_Desktop_Start(directgate_session_t *pSession)
     pDesktop->nSessionId = pSession->nSessionId;
 
 #if defined(__linux__)
-    if (DirectGate_Desktop_OpenX11(pSession) < 0)
+    int nOpen = DirectGate_Desktop_OpenX11(pSession);
 #elif defined(__APPLE__)
-    if (DirectGate_Desktop_OpenMacOS(pSession) < 0)
+    int nOpen = DirectGate_Desktop_OpenMacOS(pSession);
 #else
-    if (DirectGate_Desktop_OpenWindows(pSession) < 0)
+    int nOpen = DirectGate_Desktop_OpenWindows(pSession);
 #endif
+
+    if (nOpen < 0)
     {
         xlogw("Desktop mode unavailable: sid(%u), reason(%s)",
             pSession->nSessionId, DirectGate_Desktop_GetReason(pDesktop));
@@ -1574,6 +1622,25 @@ int DirectGate_Desktop_Start(directgate_session_t *pSession)
     }
 
     pDesktop->bRunning = XTRUE;
+
+    /* The desktop is not open yet - someone is still looking at the portal
+     * prompt - but the session is, and the timer that will notice their
+     * answer is running. Reporting an error instead is what used to leave the
+     * viewer stuck on "waiting to be allowed" after they had allowed it:
+     * nothing was left to look again, so only a reconnect picked the grant
+     * up. This status is deliberately not "error"; the viewer keeps the
+     * message and the panel keeps waiting. */
+    if (nOpen == XSTDNON)
+    {
+        pDesktop->bAwaitingGrant = XTRUE;
+
+        xlogi("Desktop mode is waiting for a sharing prompt to be answered: sid(%u)",
+            pSession->nSessionId);
+
+        return DirectGate_Desktop_SendStatus(pSession, "starting",
+            DirectGate_Desktop_GetReason(pDesktop));
+    }
+
 #if defined(__linux__)
     xlogi("Desktop mode activated: sid(%u), backend(%s), display(%s), screen(%ux%u), frame(%ux%u), input(%s)",
         pSession->nSessionId, pDesktop->sBackend, pDesktop->sDisplay,

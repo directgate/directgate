@@ -417,60 +417,14 @@ static void DirectGate_Desktop_WaylandTokenPath(char *pBuf, size_t nSize)
         snprintf(pBuf, nSize, "%s/.config/directgate/wayland.token", sHome);
 }
 
-/* Brings up the Wayland backend, or explains why it is not up yet.
- *
- * The grant is negotiated on the source's own thread, because it waits for a
- * person. This only blocks for as long as it is reasonable to hold the
- * agent's event loop - a stored grant completes far inside that, and so does
- * a prompt someone is already looking at. */
-static int DirectGate_Desktop_OpenWayland(directgate_session_t *pSession)
+/* Everything that follows a granted portal session: geometry, the monitor
+ * list, and whether input came with it. Reached either from the start, when
+ * the grant was already stored or answered quickly, or from the tick that
+ * was waiting for someone to answer the prompt. */
+static int DirectGate_Desktop_FinishWayland(directgate_session_t *pSession,
+                                            directgate_wl_source_t *pSource)
 {
     directgate_desktop_t *pDesktop = &pSession->desktop;
-    xstrncpy(pDesktop->sBackend, sizeof(pDesktop->sBackend), "wayland");
-
-    if (g_pPendingWayland == NULL)
-    {
-        char sTokenPath[XPATH_MAX];
-        DirectGate_Desktop_WaylandTokenPath(sTokenPath, sizeof(sTokenPath));
-
-        g_pPendingWayland = DirectGate_WL_SourceCreate(sTokenPath);
-        if (g_pPendingWayland == NULL)
-        {
-            DirectGate_Desktop_SetReason(pDesktop, "Failed to start Wayland desktop capture.");
-            return XSTDERR;
-        }
-    }
-
-    directgate_wl_source_t *pSource = g_pPendingWayland;
-
-    for (int i = 0; i < DIRECTGATE_DESKTOP_WAYLAND_WAIT_MS / 100 &&
-         DirectGate_WL_SourceState(pSource) == DIRECTGATE_WL_PENDING; i++)
-    {
-        xusleep(100000);
-    }
-
-    directgate_wl_state_t eState = DirectGate_WL_SourceState(pSource);
-    if (eState == DIRECTGATE_WL_FAILED)
-    {
-        DirectGate_Desktop_SetReason(pDesktop, DirectGate_WL_SourceError(pSource));
-
-        /* A refusal is final for this grant; the next attempt starts a new
-         * one rather than reporting the same failure forever. */
-        DirectGate_WL_SourceDestroy(pSource);
-        g_pPendingWayland = NULL;
-
-        return XSTDERR;
-    }
-
-    if (eState == DIRECTGATE_WL_PENDING)
-    {
-        DirectGate_Desktop_SetReason(pDesktop,
-            "Waiting for screen sharing to be allowed on the remote computer. "
-            "Allow it there, then connect again.");
-
-        xlogi("Wayland desktop capture is still waiting for permission");
-        return XSTDERR;
-    }
 
     uint32_t nWidth = 0, nHeight = 0;
     if (!DirectGate_WL_SourceSize(pSource, &nWidth, &nHeight) || nWidth == 0 || nHeight == 0)
@@ -540,6 +494,98 @@ static int DirectGate_Desktop_OpenWayland(directgate_session_t *pSession)
         nWidth, nHeight, pDesktop->bInputReady ? "yes" : "no");
 
     return XSTDOK;
+}
+
+/* Brings up the Wayland backend, or reports that it is not up yet.
+ *
+ * The grant is negotiated on the source's own thread, because it waits for a
+ * person. This only blocks for as long as it is reasonable to hold the
+ * agent's event loop - a stored grant completes far inside that, and so does
+ * a prompt someone is already looking at.
+ *
+ * XSTDNON means the prompt is still on their screen. That is not a failure:
+ * the source keeps waiting on its own thread and the session waits with it,
+ * which is the whole point - the answer arrives minutes later, long after any
+ * call could have stayed here for it. */
+static int DirectGate_Desktop_OpenWayland(directgate_session_t *pSession)
+{
+    directgate_desktop_t *pDesktop = &pSession->desktop;
+    xstrncpy(pDesktop->sBackend, sizeof(pDesktop->sBackend), "wayland");
+
+    if (g_pPendingWayland == NULL)
+    {
+        char sTokenPath[XPATH_MAX];
+        DirectGate_Desktop_WaylandTokenPath(sTokenPath, sizeof(sTokenPath));
+
+        g_pPendingWayland = DirectGate_WL_SourceCreate(sTokenPath);
+        if (g_pPendingWayland == NULL)
+        {
+            DirectGate_Desktop_SetReason(pDesktop, "Failed to start Wayland desktop capture.");
+            return XSTDERR;
+        }
+    }
+
+    directgate_wl_source_t *pSource = g_pPendingWayland;
+
+    for (int i = 0; i < DIRECTGATE_DESKTOP_WAYLAND_WAIT_MS / 100 &&
+         DirectGate_WL_SourceState(pSource) == DIRECTGATE_WL_PENDING; i++)
+    {
+        xusleep(100000);
+    }
+
+    directgate_wl_state_t eState = DirectGate_WL_SourceState(pSource);
+    if (eState == DIRECTGATE_WL_FAILED)
+    {
+        DirectGate_Desktop_SetReason(pDesktop, DirectGate_WL_SourceError(pSource));
+
+        /* A refusal is final for this grant; the next attempt starts a new
+         * one rather than reporting the same failure forever. */
+        DirectGate_WL_SourceDestroy(pSource);
+        g_pPendingWayland = NULL;
+
+        return XSTDERR;
+    }
+
+    if (eState == DIRECTGATE_WL_PENDING)
+    {
+        DirectGate_Desktop_SetReason(pDesktop,
+            "Waiting for screen sharing to be allowed on the remote computer. "
+            "Allow it there and this screen starts on its own.");
+
+        xlogi("Wayland desktop capture is still waiting for permission");
+        return XSTDNON;
+    }
+
+    return DirectGate_Desktop_FinishWayland(pSession, pSource);
+}
+
+/* Called from the tick while the prompt is unanswered. XSTDNON keeps waiting,
+ * XSTDOK means the desktop is up, XSTDERR that the grant will never come. */
+int DirectGate_Desktop_ResumeWayland(directgate_session_t *pSession)
+{
+    XCHECK((pSession != NULL), XSTDERR);
+    directgate_desktop_t *pDesktop = &pSession->desktop;
+
+    directgate_wl_source_t *pSource = g_pPendingWayland;
+    if (pSource == NULL)
+    {
+        DirectGate_Desktop_SetReason(pDesktop, "The Wayland desktop grant was dropped.");
+        return XSTDERR;
+    }
+
+    directgate_wl_state_t eState = DirectGate_WL_SourceState(pSource);
+    if (eState == DIRECTGATE_WL_PENDING) return XSTDNON;
+
+    if (eState == DIRECTGATE_WL_FAILED)
+    {
+        DirectGate_Desktop_SetReason(pDesktop, DirectGate_WL_SourceError(pSource));
+        DirectGate_WL_SourceDestroy(pSource);
+        g_pPendingWayland = NULL;
+
+        return XSTDERR;
+    }
+
+    return DirectGate_Desktop_FinishWayland(pSession, pSource);
 }
 #endif
 

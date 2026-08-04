@@ -93,7 +93,15 @@ int DirectGate_Desktop_SetDisplayResolution(directgate_desktop_t *pDesktop,
 
 #if defined(__linux__)
 void DirectGate_Desktop_InstallX11ErrorHandlers(void);
+
+/* XSTDOK when the desktop is open, XSTDERR when it cannot be, and XSTDNON
+ * when a Wayland portal prompt is still waiting for someone to answer it -
+ * the session then ticks on DirectGate_Desktop_ResumeWayland until they do. */
 int DirectGate_Desktop_OpenX11(directgate_session_t *pSession);
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+int DirectGate_Desktop_ResumeWayland(directgate_session_t *pSession);
+#endif
 #elif defined(__APPLE__)
 int DirectGate_Desktop_OpenMacOS(directgate_session_t *pSession);
 #elif defined(_WIN32)

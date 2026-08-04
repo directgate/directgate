@@ -94,6 +94,15 @@ static void DirectGate_WL_TokenSave(const char *pPath, const char *pToken)
     close(nFd);
 }
 
+/* Throws away a remembered grant that turned out to be unusable, so the next
+ * attempt asks instead of failing the same way for ever. */
+static void DirectGate_WL_TokenForget(const char *pPath)
+{
+    if (!xstrused(pPath)) return;
+    if (unlink(pPath) == 0 || errno == ENOENT) return;
+    xlogw("Failed to forget the stale desktop sharing permission: path(%s), error(%s)", pPath, strerror(errno));
+}
+
 static xbool_t DirectGate_WL_TokenLoad(const char *pPath, char *pBuf, size_t nSize)
 {
     if (!xstrused(pPath)) return XFALSE;
@@ -170,8 +179,26 @@ static void* DirectGate_WL_SetupWorker(void *pCtx)
         xstrused(pSource->sTokenPath) ? pSource->sTokenPath : "none",
         bHaveToken ? "yes - delete this file to be asked again" : "no");
 
+    xbool_t bDeclined = XFALSE;
     pSource->pPortal = DirectGate_WL_PortalOpen(bHaveToken ? sOldToken : NULL,
-        sNewToken, sizeof(sNewToken), sError, sizeof(sError));
+        sNewToken, sizeof(sNewToken), &bDeclined, sError, sizeof(sError));
+
+    /* A remembered grant that cannot be restored is worse than having none:
+     * the portal answers the restore with no stream at all, and because the
+     * token stays on disk every later connection fails the same way - closing
+     * a laptop lid was enough to lock the agent out of the monitor that was
+     * still there. The screens it was granted for are gone, so the grant is
+     * dropped and the prompt is put back up for the screens there are now.
+     * Not after a refusal, though: answering "no" must not summon another. */
+    if (pSource->pPortal == NULL && bHaveToken && !bDeclined)
+    {
+        xlogw("The remembered desktop sharing permission no longer works, asking again: reason(%s)", sError);
+        DirectGate_WL_TokenForget(pSource->sTokenPath);
+
+        sError[0] = '\0';
+        sNewToken[0] = '\0';
+        pSource->pPortal = DirectGate_WL_PortalOpen(NULL, sNewToken, sizeof(sNewToken), &bDeclined, sError, sizeof(sError));
+    }
 
     if (pSource->pPortal == NULL)
     {
@@ -180,7 +207,24 @@ static void* DirectGate_WL_SetupWorker(void *pCtx)
         return NULL;
     }
 
-    if (xstrused(sNewToken)) DirectGate_WL_TokenSave(pSource->sTokenPath, sNewToken);
+    /* The portal hands back a fresh token every time it accepts one, and the
+     * one just used is spent - so this write is not an optimisation, it is
+     * what keeps the next connection from prompting. A grant that came back
+     * with no token at all cannot be resumed by anyone, and keeping the old
+     * file would only make every future attempt present something the portal
+     * has already refused. */
+    if (xstrused(sNewToken))
+    {
+        DirectGate_WL_TokenSave(pSource->sTokenPath, sNewToken);
+        xlogi("Wayland sharing permission stored; the next connection should not prompt");
+    }
+    else if (bHaveToken)
+    {
+        xlogw("The desktop portal granted sharing without a permission to remember; "
+              "the stored one is dropped and the next connection will ask again");
+
+        DirectGate_WL_TokenForget(pSource->sTokenPath);
+    }
 
     int nFd = DirectGate_WL_PortalOpenPipeWire(pSource->pPortal, sError, sizeof(sError));
     if (nFd < 0)
