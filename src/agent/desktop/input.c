@@ -648,43 +648,98 @@ static int DirectGate_Desktop_WaylandHandleInput(directgate_session_t *pSession,
 
         if (nSequence != 0U) pDesktop->nPointerSequence = nSequence;
 
-        /* Relative motion has no portal equivalent that a screen-cast session
-         * can use, and the browser only sends it while the pointer is locked
-         * for a game; absolute motion is what the portal takes. */
-        if (!XJSON_GetBool(XJSON_GetObject(pRoot, "relative")))
+        /* The capture rectangle is the frame of reference for both branches
+         * below: the browser's relative deltas are host pixels of it, and the
+         * cursor position echoed back is measured in it. */
+        uint32_t nCaptureW = pDesktop->nCaptureWidth ? pDesktop->nCaptureWidth : 1U;
+        uint32_t nCaptureH = pDesktop->nCaptureHeight ? pDesktop->nCaptureHeight : 1U;
+
+        xbool_t bRelative = XJSON_GetBool(XJSON_GetObject(pRoot, "relative"));
+        xbool_t bMoved = XFALSE;
+
+        if (bRelative)
+        {
+            /* Mouse capture. The portal does have relative motion, but the
+             * compositor accelerates it, so the pointer would outrun the
+             * cursor the browser draws from these same deltas and clicks
+             * would land where nothing appears to be. Integrating them here
+             * and sending the result as absolute motion keeps the two
+             * identical. */
+            int nDx = XJSON_GetInt(XJSON_GetObject(pRoot, "dx"));
+            int nDy = XJSON_GetInt(XJSON_GetObject(pRoot, "dy"));
+
+            /* Capture starts from wherever the pointer was last put, which is
+             * the click that asked for the lock. A session that has not moved
+             * the pointer at all has nothing to start from, and there the
+             * pointer really is moved to the middle rather than merely
+             * assumed to be there: the position echoed below is what the
+             * browser draws its cursor at, and a guess would put that cursor
+             * somewhere the clicks do not land. */
+            if (!pDesktop->bWlPointerValid)
+            {
+                pDesktop->nWlPointerX = (double)nCaptureW / 2.0;
+                pDesktop->nWlPointerY = (double)nCaptureH / 2.0;
+                pDesktop->bWlPointerValid = XTRUE;
+                bMoved = XTRUE;
+            }
+
+            if (nDx != 0 || nDy != 0)
+            {
+                pDesktop->nWlPointerX += (double)nDx;
+                pDesktop->nWlPointerY += (double)nDy;
+                bMoved = XTRUE;
+            }
+        }
+        else
         {
             int nX = XJSON_GetInt(XJSON_GetObject(pRoot, "x"));
             int nY = XJSON_GetInt(XJSON_GetObject(pRoot, "y"));
 
+            if (nX < 0) nX = 0;
+            if (nY < 0) nY = 0;
+
+            if (pDesktop->nFrameWidth > 0 && (uint32_t)nX >= pDesktop->nFrameWidth)
+                nX = (int)pDesktop->nFrameWidth - 1;
+            if (pDesktop->nFrameHeight > 0 && (uint32_t)nY >= pDesktop->nFrameHeight)
+                nY = (int)pDesktop->nFrameHeight - 1;
+
+            /* Frame pixels are the encoded size, which is not the captured
+             * size whenever the stream was scaled down to fit the preset. */
+            pDesktop->nWlPointerX = (pDesktop->nFrameWidth > 1) ? ((double)nX * (double)nCaptureW) / (double)pDesktop->nFrameWidth : 0.0;
+            pDesktop->nWlPointerY = (pDesktop->nFrameHeight > 1) ? ((double)nY * (double)nCaptureH) / (double)pDesktop->nFrameHeight : 0.0;
+
+            pDesktop->bWlPointerValid = XTRUE;
+            bMoved = XTRUE;
+        }
+
+        /* Off the edge of the shared screen there is nothing to click, and a
+         * position that keeps growing would take seconds of mouse movement to
+         * walk back onto the screen. */
+        if (pDesktop->nWlPointerX < 0.0) pDesktop->nWlPointerX = 0.0;
+        if (pDesktop->nWlPointerY < 0.0) pDesktop->nWlPointerY = 0.0;
+
+        if (pDesktop->nWlPointerX > (double)(nCaptureW - 1U)) pDesktop->nWlPointerX = (double)(nCaptureW - 1U);
+        if (pDesktop->nWlPointerY > (double)(nCaptureH - 1U)) pDesktop->nWlPointerY = (double)(nCaptureH - 1U);
+
+        if (bMoved)
+        {
             /* Stream-relative, not desktop-relative. FrameToScreenX adds the
              * monitor's position on the desktop, which is right for XTest and
              * wrong here: the portal measures from the corner of the stream
              * it granted. On a second monitor that offset is the whole width
-             * of the first one, so every click landed off-screen. */
-            double nStreamX = 0.0, nStreamY = 0.0;
-
-            /* Scale against the size PipeWire actually negotiated, not the
+             * of the first one, so every click landed off-screen.
+             *
+             * Scale against the size PipeWire actually negotiated, not the
              * size the portal described. With display scaling the two differ
              * the portal reports logical pixels while the stream carries
              * physical ones - and the pointer then lands short of where it
              * was put, by exactly the scale factor. */
-            uint32_t nStreamW = pDesktop->nCaptureWidth;
-            uint32_t nStreamH = pDesktop->nCaptureHeight;
+            uint32_t nStreamW = nCaptureW;
+            uint32_t nStreamH = nCaptureH;
             DirectGate_WL_SourceSize((directgate_wl_source_t*)pDesktop->pWayland, &nStreamW, &nStreamH);
 
-            if (pDesktop->nFrameWidth > 1 && nStreamW > 0)
-            {
-                if (nX < 0) nX = 0;
-                if ((uint32_t)nX >= pDesktop->nFrameWidth) nX = (int)pDesktop->nFrameWidth - 1;
-                nStreamX = ((double)nX * (double)nStreamW) / (double)pDesktop->nFrameWidth;
-            }
-
-            if (pDesktop->nFrameHeight > 1 && nStreamH > 0)
-            {
-                if (nY < 0) nY = 0;
-                if ((uint32_t)nY >= pDesktop->nFrameHeight) nY = (int)pDesktop->nFrameHeight - 1;
-                nStreamY = ((double)nY * (double)nStreamH) / (double)pDesktop->nFrameHeight;
-            }
+            double nStreamX = (pDesktop->nWlPointerX * (double)nStreamW) / (double)nCaptureW;
+            double nStreamY = (pDesktop->nWlPointerY * (double)nStreamH) / (double)nCaptureH;
 
             /* Addressed to the screen actually being watched, not to whichever
              * one the portal happened to list first. */
@@ -709,6 +764,18 @@ static int DirectGate_Desktop_WaylandHandleInput(directgate_session_t *pSession,
             double nDx = (double)XJSON_GetInt(XJSON_GetObject(pRoot, "deltaX"));
             double nDy = (double)XJSON_GetInt(XJSON_GetObject(pRoot, "deltaY"));
             if (nDx != 0.0 || nDy != 0.0) DirectGate_WL_PortalPointerAxis(pPortal, nDx, nDy);
+        }
+
+        /* Under mouse capture the browser has hidden its own pointer and is
+         * drawing the host cursor itself, so it has to be told where that
+         * cursor now is - including when the clamp above refused to move it
+         * any further. Absolute motion needs no echo: the browser already
+         * knows, its own pointer is the cursor. */
+        if (bRelative)
+        {
+            DirectGate_Desktop_SendCursorPosition(pSession,
+                pDesktop->nCaptureX + (int)pDesktop->nWlPointerX,
+                pDesktop->nCaptureY + (int)pDesktop->nWlPointerY, nSequence);
         }
 
         return XAPI_CONTINUE;

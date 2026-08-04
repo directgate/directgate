@@ -159,6 +159,16 @@ typedef struct directgate_desktop_ {
      * the platforms that inject discrete wheel clicks (X11 / Windows). */
     int32_t nWheelAccumX;
     int32_t nWheelAccumY;
+    /* Wayland: where the agent last put the pointer, in capture-local pixels.
+     * The other platforms ask the display server where the pointer is; a
+     * Wayland client is never told, so mouse capture integrates the browser's
+     * relative deltas here and replays them as absolute portal motion. That
+     * also keeps the cursor the browser draws and the pointer the compositor
+     * moves on the same arithmetic - relative portal motion is accelerated by
+     * the compositor, and the two would part company within a second. */
+    double nWlPointerX;
+    double nWlPointerY;
+    xbool_t bWlPointerValid;
     /* Double/triple click tracking for platforms where the injected event
      * must carry an explicit click count (macOS kCGMouseEventClickState). */
     uint64_t nLastClickMs;

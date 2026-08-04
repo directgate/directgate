@@ -40,6 +40,7 @@
 
 /* Portal enumerations, spelled out so the call sites read as intent. */
 #define DIRECTGATE_PORTAL_SOURCE_MONITOR  1U
+#define DIRECTGATE_PORTAL_CURSOR_HIDDEN   1U
 #define DIRECTGATE_PORTAL_CURSOR_EMBEDDED 2U
 #define DIRECTGATE_PORTAL_DEVICE_KEYBOARD 1U
 #define DIRECTGATE_PORTAL_DEVICE_POINTER  2U
@@ -615,14 +616,18 @@ static void DirectGate_WL_SourceOptions(DBusMessageIter *pDict, void *pCtx)
      * exist. */
     DirectGate_WL_DictBool(pDict, "multiple", XTRUE);
 
-    /* The cursor has to be drawn into the frames: a Wayland client is not
-     * told where the pointer is, so a separate cursor layer is not something
-     * this agent can reconstruct the way the X11 path does. Version 2 is when
-     * the portal learned this option; asking an older one is an error, and
-     * asking for a mode it does not list is an error too. */
+    /* The host cursor stays out of the frames, which is what every other
+     * platform streams: the viewer's own pointer is the cursor, and drawing
+     * the host's one into the video as well puts two arrows on screen with
+     * only one of them under their hand. Mouse capture is the one case where
+     * the host pointer has to be visible, and there the browser hides its own
+     * and draws the host cursor from the position the agent echoes - the same
+     * arrangement the X11 path uses. Version 2 is when the portal learned this
+     * option; asking an older one is an error, and asking for a mode it does
+     * not list is an error too. */
     if (pSources->eProfile <= DIRECTGATE_WL_OPTS_NO_PERSIST &&
-        pSources->nVersion >= 2 && (pSources->nCursorModes & DIRECTGATE_PORTAL_CURSOR_EMBEDDED))
-        DirectGate_WL_DictUint(pDict, "cursor_mode", DIRECTGATE_PORTAL_CURSOR_EMBEDDED);
+        pSources->nVersion >= 2 && (pSources->nCursorModes & DIRECTGATE_PORTAL_CURSOR_HIDDEN))
+        DirectGate_WL_DictUint(pDict, "cursor_mode", DIRECTGATE_PORTAL_CURSOR_HIDDEN);
 
     /* Persistence arrived in version 4. Without it every connection prompts,
      * which is worse but still works - so it is never worth failing over. */

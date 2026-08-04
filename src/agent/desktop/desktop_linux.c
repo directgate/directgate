@@ -834,6 +834,8 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
      * stream change and never a permission one. */
     if (bWayland)
     {
+        uint32_t nPrevNode = DirectGate_WL_SourceActiveNode((directgate_wl_source_t*)pDesktop->pWayland);
+
         for (uint32_t i = 0; i < pDesktop->nMonitorCount; i++)
         {
             if (!xstrcmp(pDesktop->monitors[i].sId, pDesktop->sSelectedMonitor)) continue;
@@ -844,6 +846,14 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
 
             break;
         }
+
+        /* The tracked pointer position is measured in the capture rectangle,
+         * so on another screen it means somewhere else entirely. Restarting
+         * the pipeline on the same screen leaves it alone: the pointer did
+         * not move, and forgetting it would jerk a captured mouse to the
+         * middle of the screen for a preset change. */
+        if (DirectGate_WL_SourceActiveNode((directgate_wl_source_t*)pDesktop->pWayland) != nPrevNode)
+            pDesktop->bWlPointerValid = XFALSE;
     }
 #endif
 
