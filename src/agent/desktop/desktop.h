@@ -199,6 +199,11 @@ typedef struct directgate_desktop_ {
     void *pFakeKey;
     void *pDisplay;
     void *pXtst;
+    /* directgate_wl_source_t on a Wayland session; NULL everywhere else. It
+     * outlives a failed start attempt on purpose: the portal prompt the user
+     * has not answered yet is attached to it, and dropping the source would
+     * take the prompt away just as they reach for it. */
+    void *pWayland;
     /* Encoded pipeline state */
     directgate_desktop_pipeline_t ePipeline;
     directgate_desktop_quality_t quality;

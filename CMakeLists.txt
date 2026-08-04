@@ -423,6 +423,51 @@ elseif(UNIX)
         message(STATUS "GPU desktop encoding: disabled (libavcodec headers not found)")
     endif()
 
+    # Wayland desktop streaming (desktop/wayland_*.c + desktop/desktop_wayland.c).
+    # A Wayland client cannot read the screen or synthesise input on its own,
+    # so both come from xdg-desktop-portal over D-Bus and the pixels arrive
+    # over PipeWire. Like libavcodec above, only the headers are used here:
+    # libpipewire-0.3 and libdbus-1 are dlopen'd at runtime and never linked,
+    # so this adds no package dependency and an X11 host without either
+    # library runs exactly as it does today. Without the headers the feature
+    # is simply absent and the X11 build is unchanged.
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(PIPEWIRE libpipewire-0.3)
+        pkg_check_modules(DBUS dbus-1)
+    endif()
+
+    if(PIPEWIRE_FOUND AND DBUS_FOUND)
+        message(STATUS "Wayland desktop streaming: enabled (PipeWire ${PIPEWIRE_VERSION} headers, runtime dlopen)")
+        target_sources(directgate PRIVATE
+            ${AGENT_DIR}/desktop/wayland_capture.c
+            ${AGENT_DIR}/desktop/wayland_portal.c
+            ${AGENT_DIR}/desktop/desktop_wayland.c)
+        target_compile_definitions(directgate PRIVATE DIRECTGATE_DESKTOP_HAS_WAYLAND=1)
+        target_include_directories(directgate PRIVATE ${PIPEWIRE_INCLUDE_DIRS} ${DBUS_INCLUDE_DIRS})
+    else()
+        # Name what is missing and what installs it. "Headers not found" on its
+        # own sends people looking at their Wayland session, which is working
+        # fine - the gap is a build dependency, and it is only a header one.
+        set(_dg_wl_missing "")
+        if(NOT PIPEWIRE_FOUND)
+            list(APPEND _dg_wl_missing "libpipewire-0.3")
+        endif()
+        if(NOT DBUS_FOUND)
+            list(APPEND _dg_wl_missing "dbus-1")
+        endif()
+        if(NOT PKG_CONFIG_FOUND)
+            set(_dg_wl_missing "pkg-config")
+        endif()
+        string(REPLACE ";" ", " _dg_wl_missing "${_dg_wl_missing}")
+
+        message(STATUS "Wayland desktop streaming: disabled (missing: ${_dg_wl_missing})")
+        message(STATUS "  Install the development packages to enable it, then re-run cmake:")
+        message(STATUS "    Fedora/RHEL:   sudo dnf install pipewire-devel dbus-devel")
+        message(STATUS "    Debian/Ubuntu: sudo apt install libpipewire-0.3-dev libdbus-1-dev")
+        message(STATUS "    Arch:          sudo pacman -S libpipewire dbus")
+        message(STATUS "  Only headers are needed; neither library is linked. X11 streaming is unaffected.")
+    endif()
+
     target_include_directories(directgate PRIVATE ${X11_INCLUDE_DIR} ${AGENT_DIR}/openh264)
     target_link_libraries(directgate PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
     if(X11_Xrandr_FOUND)

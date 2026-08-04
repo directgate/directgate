@@ -25,6 +25,10 @@
 #include "webrtc.h"
 #include "priv.h"
 
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+#include "wayland.h"
+#endif
+
 #if defined(_WIN32)
 #include "elevated.h"
 #endif
@@ -632,6 +636,14 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
         XCloseDisplay((Display*)pDesktop->pDisplay);
         pDesktop->pDisplay = NULL;
     }
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    if (pDesktop->pWayland != NULL)
+    {
+        DirectGate_WL_SourceDestroy((directgate_wl_source_t*)pDesktop->pWayland);
+        pDesktop->pWayland = NULL;
+    }
+#endif
 
     if (pDesktop->pXtst != NULL)
     {

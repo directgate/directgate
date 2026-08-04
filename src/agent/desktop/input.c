@@ -23,6 +23,10 @@
 #include "session.h"
 #include "priv.h"
 
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+#include "wayland.h"
+#endif
+
 #if defined(_WIN32)
 #include "elevated.h"
 #endif
@@ -617,12 +621,145 @@ static void DirectGate_Desktop_X11TypeText(directgate_desktop_t *pDesktop, const
     }
 }
 
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+/* Input on Wayland goes back through the same portal session the screen is
+ * being captured from. Nothing here can reach the compositor directly - that
+ * is the point of the design - so every event is a D-Bus notification against
+ * the granted session, and the coordinates are the stream's, which on this
+ * backend is also the screen because the portal grants exactly one.
+ *
+ * The keysyms are XKB keysyms, the same values the X11 path resolves, so the
+ * whole key-resolution layer above is reused rather than rewritten. */
+static int DirectGate_Desktop_WaylandHandleInput(directgate_session_t *pSession, xjson_obj_t *pRoot)
+{
+    directgate_desktop_t *pDesktop = &pSession->desktop;
+    directgate_wl_portal_t *pPortal = DirectGate_WL_SourcePortal((directgate_wl_source_t*)pDesktop->pWayland);
+    if (pPortal == NULL) return XAPI_CONTINUE;
+
+    const char *pAction = XJSON_GetString(XJSON_GetObject(pRoot, "action"));
+    const char *pEvent = XJSON_GetString(XJSON_GetObject(pRoot, "event"));
+
+    if (xstrcmp(pAction, "pointer"))
+    {
+        uint32_t nSequence = XJSON_GetU32(XJSON_GetObject(pRoot, "sequence"));
+        if (nSequence != 0U && pDesktop->nPointerSequence != 0U &&
+            (int32_t)(nSequence - pDesktop->nPointerSequence) <= 0)
+            return XAPI_CONTINUE;
+
+        if (nSequence != 0U) pDesktop->nPointerSequence = nSequence;
+
+        /* Relative motion has no portal equivalent that a screen-cast session
+         * can use, and the browser only sends it while the pointer is locked
+         * for a game; absolute motion is what the portal takes. */
+        if (!XJSON_GetBool(XJSON_GetObject(pRoot, "relative")))
+        {
+            int nX = XJSON_GetInt(XJSON_GetObject(pRoot, "x"));
+            int nY = XJSON_GetInt(XJSON_GetObject(pRoot, "y"));
+
+            /* Stream-relative, not desktop-relative. FrameToScreenX adds the
+             * monitor's position on the desktop, which is right for XTest and
+             * wrong here: the portal measures from the corner of the stream
+             * it granted. On a second monitor that offset is the whole width
+             * of the first one, so every click landed off-screen. */
+            double nStreamX = 0.0, nStreamY = 0.0;
+
+            /* Scale against the size PipeWire actually negotiated, not the
+             * size the portal described. With display scaling the two differ
+             * the portal reports logical pixels while the stream carries
+             * physical ones - and the pointer then lands short of where it
+             * was put, by exactly the scale factor. */
+            uint32_t nStreamW = pDesktop->nCaptureWidth;
+            uint32_t nStreamH = pDesktop->nCaptureHeight;
+            DirectGate_WL_SourceSize((directgate_wl_source_t*)pDesktop->pWayland, &nStreamW, &nStreamH);
+
+            if (pDesktop->nFrameWidth > 1 && nStreamW > 0)
+            {
+                if (nX < 0) nX = 0;
+                if ((uint32_t)nX >= pDesktop->nFrameWidth) nX = (int)pDesktop->nFrameWidth - 1;
+                nStreamX = ((double)nX * (double)nStreamW) / (double)pDesktop->nFrameWidth;
+            }
+
+            if (pDesktop->nFrameHeight > 1 && nStreamH > 0)
+            {
+                if (nY < 0) nY = 0;
+                if ((uint32_t)nY >= pDesktop->nFrameHeight) nY = (int)pDesktop->nFrameHeight - 1;
+                nStreamY = ((double)nY * (double)nStreamH) / (double)pDesktop->nFrameHeight;
+            }
+
+            /* Addressed to the screen actually being watched, not to whichever
+             * one the portal happened to list first. */
+            DirectGate_WL_PortalPointerMotion(pPortal,
+                DirectGate_WL_SourceActiveNode((directgate_wl_source_t*)pDesktop->pWayland), nStreamX, nStreamY);
+        }
+
+        if (xstrcmp(pEvent, "button"))
+        {
+            uint32_t nButton = XJSON_GetU32(XJSON_GetObject(pRoot, "button"));
+            int32_t nCode = DirectGate_WL_PortalButtonCode(nButton);
+
+            if (nCode != 0)
+                DirectGate_WL_PortalPointerButton(pPortal, nCode,
+                    XJSON_GetBool(XJSON_GetObject(pRoot, "down")) ? XTRUE : XFALSE);
+        }
+        else if (xstrcmp(pEvent, "wheel"))
+        {
+            /* The portal takes scroll distance, not the wheel-button clicks
+             * X11 emulates, so the notch accumulator is bypassed and the
+             * deltas go through as they arrived. */
+            double nDx = (double)XJSON_GetInt(XJSON_GetObject(pRoot, "deltaX"));
+            double nDy = (double)XJSON_GetInt(XJSON_GetObject(pRoot, "deltaY"));
+            if (nDx != 0.0 || nDy != 0.0) DirectGate_WL_PortalPointerAxis(pPortal, nDx, nDy);
+        }
+
+        return XAPI_CONTINUE;
+    }
+
+    if (xstrcmp(pAction, "key"))
+    {
+        KeySym sym = DirectGate_Desktop_KeySymFromJson(pRoot);
+        if (sym == NoSymbol) return XAPI_CONTINUE;
+
+        DirectGate_WL_PortalKeysym(pPortal, (int32_t)sym,
+            XJSON_GetBool(XJSON_GetObject(pRoot, "down")) ? XTRUE : XFALSE);
+
+        return XAPI_CONTINUE;
+    }
+
+    /* Whole strings arrive as their own action - that is how anything the
+     * browser cannot express as a keystroke gets typed, which is most of a
+     * non-Latin keyboard. Handling only "key" meant those characters were
+     * dropped without a trace, and the keyboard looked dead. */
+    if (xstrcmp(pAction, "text"))
+    {
+        const char *pText = XJSON_GetString(XJSON_GetObject(pRoot, "text"));
+        if (!xstrused(pText)) return XAPI_CONTINUE;
+
+        for (size_t i = 0; pText[i] != '\0'; )
+        {
+            uint32_t nCodepoint = 0;
+            size_t nUsed = DirectGate_Desktop_UTF8Decode(&pText[i], &nCodepoint);
+
+            if (!nUsed) break;
+            i += nUsed;
+
+            KeySym sym = DirectGate_Desktop_KeySymFromCodepoint(nCodepoint);
+            if (sym == NoSymbol) continue;
+
+            DirectGate_WL_PortalKeysym(pPortal, (int32_t)sym, XTRUE);
+            DirectGate_WL_PortalKeysym(pPortal, (int32_t)sym, XFALSE);
+        }
+    }
+
+    return XAPI_CONTINUE;
+}
+#endif
+
 int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t *pPayload, size_t nPayloadLength)
 {
     XCHECK((pSession != NULL), XAPI_DISCONNECT);
     directgate_desktop_t *pDesktop = &pSession->desktop;
 
-    if (!pDesktop->bRunning || pDesktop->pDisplay == NULL || !pDesktop->bInputReady)
+    if (!pDesktop->bRunning || !pDesktop->bInputReady)
         return XAPI_CONTINUE;
 
     if (pPayload == NULL || !nPayloadLength)
@@ -640,6 +777,25 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
     }
 
     xjson_obj_t *pRoot = json.pRootObj;
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    if (pDesktop->pWayland != NULL)
+    {
+        int nWlStatus = DirectGate_Desktop_WaylandHandleInput(pSession, pRoot);
+        XJSON_Destroy(&json);
+        free(pJsonText);
+        return nWlStatus;
+    }
+#endif
+
+    /* Past here is the X11 path, which needs a display connection. */
+    if (pDesktop->pDisplay == NULL)
+    {
+        XJSON_Destroy(&json);
+        free(pJsonText);
+        return XAPI_CONTINUE;
+    }
+
     const char *pAction = XJSON_GetString(XJSON_GetObject(pRoot, "action"));
     const char *pEvent = XJSON_GetString(XJSON_GetObject(pRoot, "event"));
     Display *pDisplay = (Display*)pDesktop->pDisplay;
