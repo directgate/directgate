@@ -841,8 +841,15 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
             if (!xstrcmp(pDesktop->monitors[i].sId, pDesktop->sSelectedMonitor)) continue;
             if (pDesktop->monitors[i].nNativeId == 0) break;
 
-            DirectGate_WL_SourceSelect((directgate_wl_source_t*)pDesktop->pWayland,
-                (uint32_t)pDesktop->monitors[i].nNativeId);
+            /* A screen that will not open leaves the session on the one that
+             * works, which is right but the viewer picked the other one, so
+             * being told beats watching the wrong desktop and wondering. */
+            if (DirectGate_WL_SourceSelect((directgate_wl_source_t*)pDesktop->pWayland,
+                (uint32_t)pDesktop->monitors[i].nNativeId) != XSTDOK)
+            {
+                DirectGate_Desktop_SetFallbackReason(pDesktop,
+                    "That screen could not be opened; still showing the previous one.");
+            }
 
             break;
         }

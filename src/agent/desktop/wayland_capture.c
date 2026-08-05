@@ -116,8 +116,12 @@ struct directgate_wl_capture_ {
 
     /* Diagnostics that answer the two questions a black stream raises. */
     uint64_t nFrames;
+    uint64_t nSkipped;   /* overtaken before they could be converted */
+    uint64_t nEmpty;     /* buffers that reported no data at all */
     uint32_t nUnmappable;
     xbool_t bWarnedUnmappable;
+    xbool_t bWarnedShort;
+    xbool_t bWarnedEmpty;
 };
 
 static void DirectGate_WL_SetError(char *pErrBuf, size_t nErrSize, const char *pFmt, ...)
@@ -232,6 +236,24 @@ static void DirectGate_WL_OnStreamState(void *pCtx, enum pw_stream_state eOld,
         return;
     }
 
+    /* A stream that had a format and is now unconnected is the compositor
+     * taking the screen back: someone pressed "Stop sharing", the session was
+     * revoked, or the compositor restarted. Nothing arrives after this, and
+     * without noticing it the viewer is left looking at the last frame for as
+     * long as they care to wait - a frozen picture that looks like the
+     * network died. */
+    if (eState == PW_STREAM_STATE_UNCONNECTED && pCap->bHaveFormat && !pCap->bFailed)
+    {
+        xstrncpy(pCap->sError, sizeof(pCap->sError),
+            "Screen sharing was stopped on the remote computer.");
+
+        pCap->bFailed = XTRUE;
+        xlogw("Wayland capture stream was disconnected by the compositor");
+
+        g_pw.loopSignal(pCap->pLoop, false);
+        return;
+    }
+
     xlogd("Wayland capture stream state: state(%s)",
         g_pw.streamStateStr != NULL ? g_pw.streamStateStr(eState) : "?");
 }
@@ -272,18 +294,24 @@ static void DirectGate_WL_OnParamChanged(void *pCtx, uint32_t nId, const struct 
     g_pw.loopSignal(pCap->pLoop, false);
 }
 
-static void DirectGate_WL_OnProcess(void *pCtx)
+/* Everything the compositor says about a buffer is checked before a byte of
+ * it is read. These numbers cross a process boundary, and a frame that is
+ * shorter than its own stride says it is - a partial update, a resize that
+ * raced the format change, a compositor bug - would otherwise be read past
+ * the end of the mapping. */
+static xbool_t DirectGate_WL_FrameFromBuffer(directgate_wl_capture_t *pCap,
+                                             struct pw_buffer *pBuffer,
+                                             directgate_wl_frame_t *pFrame)
 {
-    directgate_wl_capture_t *pCap = (directgate_wl_capture_t*)pCtx;
-    struct pw_buffer *pBuffer = g_pw.streamDequeue(pCap->pStream);
-    if (pBuffer == NULL) return;
+    struct spa_buffer *pBuf = pBuffer->buffer;
+    if (pBuf == NULL || pBuf->n_datas < 1) return XFALSE;
 
-    struct spa_data *pData = &pBuffer->buffer->datas[0];
+    struct spa_data *pData = &pBuf->datas[0];
     if (pData->data == NULL)
     {
-        /* Should not happen given the dataType constraint above, but a
-         * compositor that ignores it would otherwise stream black in
-         * silence. Once is enough to say so. */
+        /* Should not happen given the dataType constraint, but a compositor
+         * that ignores it would otherwise stream black in silence. Once is
+         * enough to say so. */
         pCap->nUnmappable++;
 
         if (!pCap->bWarnedUnmappable)
@@ -292,28 +320,103 @@ static void DirectGate_WL_OnProcess(void *pCtx)
             xlogw("Wayland capture received a buffer it cannot map (type %u); "
                   "the compositor ignored the memory-type constraint", pData->type);
         }
+
+        return XFALSE;
     }
-    else if (pCap->fnFrame != NULL && pCap->bHaveFormat)
+
+    if (pCap->fnFrame == NULL || !pCap->bHaveFormat) return XFALSE;
+
+    uint32_t nWidth = pCap->format.size.width;
+    uint32_t nHeight = pCap->format.size.height;
+    if (nWidth == 0 || nHeight == 0) return XFALSE;
+
+    uint32_t nOffset = 0, nStride = 0;
+    if (pData->chunk != NULL)
     {
-        uint32_t nStride = pData->chunk != NULL ? (uint32_t)pData->chunk->stride : 0;
-        /* A zero stride means packed rows; anything smaller than a packed row
-         * would make the frame read past its own buffer. */
-        if (nStride == 0) nStride = pCap->format.size.width * 4U;
-
-        if (nStride >= pCap->format.size.width * 4U)
+        /* Nothing was written into this one. The compositor sends such a
+         * buffer when only metadata changed, and on the very first one the
+         * mapping still holds whatever was in that memory - which is a frame
+         * of garbage, not a picture of the desktop. */
+        if (pData->chunk->size == 0)
         {
-            directgate_wl_frame_t frame;
-            frame.pPixels = (const uint8_t*)pData->data + (pData->chunk != NULL ? pData->chunk->offset : 0);
-            frame.nWidth = pCap->format.size.width;
-            frame.nHeight = pCap->format.size.height;
-            frame.nStride = nStride;
+            /* Unless that is all it ever sends, in which case skipping them
+             * is the reason the screen is black and the log should say so
+             * rather than leaving it to be guessed. */
+            if (++pCap->nEmpty > 60U && pCap->nFrames == 0 && !pCap->bWarnedEmpty)
+            {
+                pCap->bWarnedEmpty = XTRUE;
+                xlogw("Wayland capture has received %llu buffers that report no data and no frames at all; "
+                      "this compositor may not be setting the chunk size",
+                      (unsigned long long)pCap->nEmpty);
+            }
 
-            pCap->nFrames++;
-            pCap->fnFrame(pCap->pUserCtx, &frame);
+            return XFALSE;
         }
+
+        nOffset = (uint32_t)pData->chunk->offset;
+        nStride = (uint32_t)pData->chunk->stride;
     }
 
-    g_pw.streamQueue(pCap->pStream, pBuffer);
+    /* A zero stride means packed rows; anything smaller than a packed row
+     * would make the frame read past its own buffer. */
+    if (nStride == 0) nStride = nWidth * 4U;
+    if (nStride < nWidth * 4U) return XFALSE;
+
+    /* The last row only needs its own width, not a full stride, which is what
+     * a tightly-sized final row in the mapping relies on. */
+    size_t nNeeded = (size_t)nOffset + (size_t)nStride * (nHeight - 1U) + (size_t)nWidth * 4U;
+    if (nNeeded > (size_t)pData->maxsize)
+    {
+        if (!pCap->bWarnedShort)
+        {
+            pCap->bWarnedShort = XTRUE;
+            xlogw("Wayland capture received a buffer shorter than the format it announced: "
+                  "size(%ux%u), stride(%u), offset(%u), mapped(%u)",
+                  nWidth, nHeight, nStride, nOffset, (unsigned)pData->maxsize);
+        }
+
+        return XFALSE;
+    }
+
+    pFrame->pPixels = (const uint8_t*)pData->data + nOffset;
+    pFrame->nWidth = nWidth;
+    pFrame->nHeight = nHeight;
+    pFrame->nStride = nStride;
+
+    return XTRUE;
+}
+
+static void DirectGate_WL_OnProcess(void *pCtx)
+{
+    directgate_wl_capture_t *pCap = (directgate_wl_capture_t*)pCtx;
+    struct pw_buffer *pBuffer = NULL;
+    struct pw_buffer *pNewest = NULL;
+
+    /* Drain to the newest and give the rest straight back. A frame that has
+     * already been overtaken is of no use to a live stream, and converting it
+     * first would put its whole encode time in front of the frame the viewer
+     * is actually waiting for - latency the session never gets back. */
+    while ((pBuffer = g_pw.streamDequeue(pCap->pStream)) != NULL)
+    {
+        if (pNewest != NULL)
+        {
+            pCap->nSkipped++;
+            g_pw.streamQueue(pCap->pStream, pNewest);
+        }
+
+        pNewest = pBuffer;
+    }
+
+    if (pNewest == NULL) return;
+
+    directgate_wl_frame_t frame;
+    if (DirectGate_WL_FrameFromBuffer(pCap, pNewest, &frame))
+    {
+        pCap->nFrames++;
+        pCap->fnFrame(pCap->pUserCtx, &frame);
+    }
+
+    g_pw.streamQueue(pCap->pStream, pNewest);
 }
 
 static const struct pw_stream_events g_streamEvents = {
@@ -382,12 +485,17 @@ directgate_wl_capture_t* DirectGate_WL_CaptureStart(int nPipeWireFd,
     }
 
     /* connect_fd consumes the descriptor the portal opened for us, which is
-     * how this process reaches PipeWire without any socket of its own. */
+     * how this process reaches PipeWire without any socket of its own.
+     *
+     * It owns it from here on either way - "the socket will be closed
+     * automatically on disconnect or error" - so the failure path must not
+     * close it as well. Closing a descriptor twice does not fail quietly in a
+     * threaded process: the number is free by then, and the second close can
+     * take out whatever another thread has just opened on it. */
     pCap->pCore = g_pw.ctxConnectFd(pCap->pContext, nPipeWireFd, NULL, 0);
     if (pCap->pCore == NULL)
     {
         g_pw.loopUnlock(pCap->pLoop);
-        if (nPipeWireFd >= 0) close(nPipeWireFd);
         DirectGate_WL_CaptureStop(pCap);
         DirectGate_WL_SetError(pErrBuf, nErrSize, "Failed to connect to PipeWire through the portal descriptor.");
         return NULL;
@@ -472,6 +580,20 @@ int DirectGate_WL_CaptureWaitFormat(directgate_wl_capture_t *pCapture, uint32_t 
     return bReady ? XSTDOK : XSTDERR;
 }
 
+xbool_t DirectGate_WL_CaptureLost(directgate_wl_capture_t *pCapture, char *pErrBuf, size_t nErrSize)
+{
+    XCHECK_NL((pCapture != NULL), XFALSE);
+
+    g_pw.loopLock(pCapture->pLoop);
+    xbool_t bFailed = pCapture->bFailed;
+
+    if (bFailed && pErrBuf != NULL && nErrSize > 0)
+        xstrncpy(pErrBuf, nErrSize, pCapture->sError);
+
+    g_pw.loopUnlock(pCapture->pLoop);
+    return bFailed;
+}
+
 xbool_t DirectGate_WL_CaptureSize(directgate_wl_capture_t *pCapture,
                                   uint32_t *pWidth, uint32_t *pHeight)
 {
@@ -529,6 +651,12 @@ void DirectGate_WL_CaptureStop(directgate_wl_capture_t *pCapture)
         xlogw("Wayland capture dropped unmappable buffers: frames(%llu), dropped(%u)",
             (unsigned long long)pCapture->nFrames, pCapture->nUnmappable);
     }
+
+    /* Overtaken frames are normal under load - it is the encoder keeping the
+     * stream live rather than falling behind - but the count is the first
+     * thing worth knowing when someone reports a laggy desktop. */
+    xlogd("Wayland capture finished: frames(%llu), overtaken(%llu)",
+        (unsigned long long)pCapture->nFrames, (unsigned long long)pCapture->nSkipped);
 
     free(pCapture);
 }

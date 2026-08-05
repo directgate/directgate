@@ -25,6 +25,10 @@
 #include "webrtc.h"
 #include "priv.h"
 
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+#include "wayland.h"
+#endif
+
 #if defined(__linux__)
 #include <sys/timerfd.h>
 #include <X11/Xlib.h>
@@ -64,7 +68,8 @@ static void DirectGate_Desktop_AdaptBitrate(directgate_session_t *pSession)
 #endif
 
     uint32_t nCurrent = pDesktop->nCurrentBitrateKbps ?
-                        pDesktop->nCurrentBitrateKbps : pDesktop->quality.nBitrateKbps;
+                        pDesktop->nCurrentBitrateKbps :
+                        pDesktop->quality.nBitrateKbps;
 
     uint8_t nFractionLost = 0;
     xbool_t bHaveReport = DirectGate_WebRTC_TakeVideoLossReport(&pSession->webrtc, &nFractionLost);
@@ -150,6 +155,21 @@ static void DirectGate_Desktop_MaybePromoteWebRTCVideo(directgate_session_t *pSe
     DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
 }
 
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+/* The raw path pulls its frames from an X display, and a Wayland session has
+ * none: its pixels arrive from PipeWire and only the encoder pipeline knows
+ * how to take them. Falling back to raw there does not degrade the picture,
+ * it removes it - the capture returns nothing on every tick while the session
+ * reports that it is streaming, which is the worst of both. So the fallback
+ * is refused on Wayland and the real reason is reported instead. */
+static xbool_t DirectGate_Desktop_RawWouldBeBlank(const directgate_desktop_t *pDesktop)
+{
+    XCHECK_NL((pDesktop != NULL), XFALSE);
+    XCHECK_NL((pDesktop->pWayland != NULL), XFALSE);
+    return XTRUE;
+}
+#endif
+
 /* Runtime failure demotion: too many consecutive capture/encode failures
  * flip the session to the raw RGBA path so the operator keeps a picture. */
 #if defined(__linux__) || defined(_WIN32)
@@ -158,6 +178,21 @@ static void DirectGate_Desktop_DemoteToRaw(directgate_session_t *pSession)
     directgate_desktop_t *pDesktop = &pSession->desktop;
 #if defined(__linux__)
     const char *pErr = DirectGate_Desktop_LinuxEncoder_LastError(pSession);
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    if (DirectGate_Desktop_RawWouldBeBlank(pDesktop))
+    {
+        xloge("Wayland H.264 pipeline failed and there is no raw fallback on Wayland: sid(%u), reason(%s)",
+            pSession->nSessionId, xstrused(pErr) ? pErr : "unknown");
+
+        DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
+        DirectGate_Desktop_SetReason(pDesktop, xstrused(pErr) ?
+            pErr : "The desktop encoder failed and this session has no fallback.");
+
+        DirectGate_Desktop_SendStatus(pSession, "error", DirectGate_Desktop_GetReason(pDesktop));
+        return;
+    }
+#endif
 
     xlogw("Linux H.264 pipeline failed, falling back to raw RGBA: sid(%u), reason(%s)",
         pSession->nSessionId, xstrused(pErr) ? pErr : "unknown");
@@ -264,6 +299,19 @@ static int DirectGate_Desktop_StartLinuxPipeline(directgate_session_t *pSession)
 
     if (pDesktop->bForceRaw)
     {
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+        if (DirectGate_Desktop_RawWouldBeBlank(pDesktop))
+        {
+            DirectGate_Desktop_SetReason(pDesktop,
+                "Raw RGBA was forced, but a Wayland session cannot stream it. "
+                "Unset DIRECTGATE_DESKTOP_FORCE_RAW.");
+
+            xloge("Raw RGBA was forced on a Wayland session, which cannot capture that way: sid(%u)",
+                pSession->nSessionId);
+
+            return XSTDERR;
+        }
+#endif
         pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_RAW;
         xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "raw-rgba");
 
@@ -277,6 +325,22 @@ static int DirectGate_Desktop_StartLinuxPipeline(directgate_session_t *pSession)
         pDesktop->nCaptureWidth, pDesktop->nCaptureHeight) < 0)
     {
         const char *pErr = DirectGate_Desktop_LinuxEncoder_LastError(pSession);
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+        /* Nothing to fall back to, so this is the end of the session rather
+         * than the start of a silent one. */
+        if (DirectGate_Desktop_RawWouldBeBlank(pDesktop))
+        {
+            xloge("Wayland H.264 encoder unavailable and there is no raw fallback: sid(%u), reason(%s)",
+                pSession->nSessionId, xstrused(pErr) ? pErr : "unknown");
+
+            DirectGate_Desktop_SetReason(pDesktop, xstrused(pErr) ?
+                pErr : "The desktop encoder could not start and this session has no fallback.");
+
+            return XSTDERR;
+        }
+#endif
+
         xlogw("Linux H.264 encoder unavailable, falling back to raw RGBA: sid(%u), reason(%s)",
             pSession->nSessionId, xstrused(pErr) ? pErr : "unknown");
 
@@ -311,8 +375,36 @@ static int DirectGate_Desktop_CaptureFrame(directgate_session_t *pSession)
 {
     directgate_desktop_t *pDesktop = &pSession->desktop;
     Display *pDisplay = (Display*)pDesktop->pDisplay;
-    XCHECK((pDisplay != NULL), XAPI_CONTINUE);
+
+    /* Nothing is being captured yet. Every session passes through here while
+     * the viewer is still choosing a screen - the pipeline starts out raw and
+     * is built when they pick one - so this is the quiet, ordinary case and
+     * must stay quiet. */
     XCHECK_NL((pDesktop->bCaptureReady), XAPI_CONTINUE);
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    /* Past that, the raw path really is being asked to stream, and on Wayland
+     * it cannot: there is no display to read. Belt and braces for the
+     * fallbacks above, which now refuse to put a session here at all - and
+     * the one thing that must not happen is doing it quietly for the rest of
+     * the session. */
+    if (pDesktop->pWayland != NULL)
+    {
+        if (!pDesktop->bWarnedWaylandRaw)
+        {
+            pDesktop->bWarnedWaylandRaw = XTRUE;
+            xloge("The raw capture path was reached on a Wayland session; it cannot produce frames: sid(%u)",
+                pSession->nSessionId);
+
+            DirectGate_Desktop_SendStatus(pSession, "error",
+                "The desktop stream stopped: this session fell back to a capture mode Wayland cannot use.");
+        }
+
+        return XAPI_CONTINUE;
+    }
+#endif
+
+    XCHECK((pDisplay != NULL), XAPI_CONTINUE);
 
     /* Transport backpressure (mirrors the macOS capture callback). A raw 1080p
      * RGBA frame is ~8 MB - far more than the data channel can drain per tick.
@@ -412,6 +504,27 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
          * picks a screen and the stream begins from here exactly as it does
          * when the grant was already stored. */
         return DirectGate_Desktop_SendStatus(pSession, "ready", NULL);
+    }
+
+    /* The grant can also end while it is being used - someone presses "Stop
+     * sharing", the compositor restarts - and the only symptom is that frames
+     * stop arriving. Said once, then the session stops pretending. */
+    if (pDesktop->pWayland != NULL && !pDesktop->bWaylandLost)
+    {
+        char sLost[DIRECTGATE_DESKTOP_REASON_LEN] = {0};
+
+        if (DirectGate_WL_SourceLost((directgate_wl_source_t*)pDesktop->pWayland, sLost, sizeof(sLost)))
+        {
+            pDesktop->bWaylandLost = XTRUE;
+            xlogw("Wayland desktop sharing ended: sid(%u), reason(%s)", pSession->nSessionId, sLost);
+
+            DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
+            DirectGate_Desktop_SetReason(pDesktop, sLost[0] ? sLost :
+                "Screen sharing was stopped on the remote computer.");
+
+            DirectGate_Desktop_SendStatus(pSession, "error", DirectGate_Desktop_GetReason(pDesktop));
+            return DirectGate_Session_SendErrorMsg(pSession, DirectGate_Desktop_GetReason(pDesktop));
+        }
     }
 #endif
 
@@ -591,7 +704,19 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
         {
             DirectGate_Desktop_SetCapture(pDesktop, pSelected->sId, pSelected->nX,
                 pSelected->nY, pSelected->nWidth, pSelected->nHeight);
-            (void)DirectGate_Desktop_StartLinuxPipeline(pSession);
+
+            /* On X11 this only ever steps down to the raw path, but a Wayland
+             * session has nothing to step down to and reporting "streaming"
+             * over a pipeline that never started is how a frozen picture gets
+             * mistaken for a network problem. */
+            if (DirectGate_Desktop_StartLinuxPipeline(pSession) < 0)
+            {
+                XJSON_Destroy(&json);
+                free(pJsonText);
+
+                DirectGate_Desktop_SendStatus(pSession, "error", DirectGate_Desktop_GetReason(pDesktop));
+                return XAPI_CONTINUE;
+            }
         }
         else if (pDesktop->bCaptureReady &&
             (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||

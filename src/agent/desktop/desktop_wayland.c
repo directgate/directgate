@@ -51,10 +51,31 @@ struct directgate_wl_source_ {
     xbool_t bFrameFresh;
 
     uint32_t nActiveNode;         /* screen the capture is currently bound to */
-    directgate_wl_state_t eState; /* atomic-ish: written by the worker, read by the loop */
+
+    /* The setup thread's result, read by the event loop. Published under this
+     * lock and never bare: the loop decides what to dereference from eState,
+     * and a plain write of it carries no promise that the portal and capture
+     * pointers written just before it are visible yet. One mispredicted store
+     * order is a NULL portal on a session that says it is ready. */
+    xsync_mutex_t stateLock;
+    directgate_wl_state_t eState;
     char sError[512];
+
     char sTokenPath[XPATH_MAX];
 };
+
+/* Both halves of publishing a result, so no caller can do half of it. */
+static void DirectGate_WL_SourcePublish(directgate_wl_source_t *pSource,
+                                        directgate_wl_state_t eState,
+                                        const char *pError)
+{
+    XSync_Lock(&pSource->stateLock);
+
+    if (xstrused(pError)) xstrncpy(pSource->sError, sizeof(pSource->sError), pError);
+    pSource->eState = eState;
+
+    XSync_Unlock(&pSource->stateLock);
+}
 
 /* The token that lets a reconnect skip the permission prompt. It is a
  * capability, so it is written only for its owner. Losing it costs one
@@ -202,8 +223,7 @@ static void* DirectGate_WL_SetupWorker(void *pCtx)
 
     if (pSource->pPortal == NULL)
     {
-        xstrncpy(pSource->sError, sizeof(pSource->sError), sError);
-        pSource->eState = DIRECTGATE_WL_FAILED;
+        DirectGate_WL_SourcePublish(pSource, DIRECTGATE_WL_FAILED, sError);
         return NULL;
     }
 
@@ -229,8 +249,7 @@ static void* DirectGate_WL_SetupWorker(void *pCtx)
     int nFd = DirectGate_WL_PortalOpenPipeWire(pSource->pPortal, sError, sizeof(sError));
     if (nFd < 0)
     {
-        xstrncpy(pSource->sError, sizeof(pSource->sError), sError);
-        pSource->eState = DIRECTGATE_WL_FAILED;
+        DirectGate_WL_SourcePublish(pSource, DIRECTGATE_WL_FAILED, sError);
         return NULL;
     }
 
@@ -240,8 +259,7 @@ static void* DirectGate_WL_SetupWorker(void *pCtx)
 
     if (pSource->pCapture == NULL)
     {
-        xstrncpy(pSource->sError, sizeof(pSource->sError), sError);
-        pSource->eState = DIRECTGATE_WL_FAILED;
+        DirectGate_WL_SourcePublish(pSource, DIRECTGATE_WL_FAILED, sError);
         return NULL;
     }
 
@@ -249,15 +267,17 @@ static void* DirectGate_WL_SetupWorker(void *pCtx)
      * size, so readiness is reported from here and not from the connect. */
     if (DirectGate_WL_CaptureWaitFormat(pSource->pCapture, 4000) != XSTDOK)
     {
-        xstrncpy(pSource->sError, sizeof(pSource->sError),
+        DirectGate_WL_SourcePublish(pSource, DIRECTGATE_WL_FAILED,
             "The desktop stream never agreed on a video format.");
 
-        pSource->eState = DIRECTGATE_WL_FAILED;
         return NULL;
     }
 
     pSource->nActiveNode = DirectGate_WL_PortalNodeId(pSource->pPortal);
-    pSource->eState = DIRECTGATE_WL_READY;
+
+    /* Last, and under the lock: everything above has to be visible to the
+     * loop before it is told it may look. */
+    DirectGate_WL_SourcePublish(pSource, DIRECTGATE_WL_READY, NULL);
     return NULL;
 }
 
@@ -276,8 +296,18 @@ directgate_wl_source_t* DirectGate_WL_SourceCreate(const char *pTokenPath)
         return NULL;
     }
 
+    if (XSync_InitAdv(&pSource->stateLock, XFALSE) < 0)
+    {
+        XSync_Destroy(&pSource->frameLock);
+        free(pSource);
+        return NULL;
+    }
+
+    /* Started last: the thread publishes into this struct from its first
+     * line, so everything it touches has to exist before it runs. */
     if (XThread_Create(&pSource->setupThread, DirectGate_WL_SetupWorker, pSource, XFALSE) < 0)
     {
+        XSync_Destroy(&pSource->stateLock);
         XSync_Destroy(&pSource->frameLock);
         free(pSource);
         return NULL;
@@ -290,13 +320,27 @@ directgate_wl_source_t* DirectGate_WL_SourceCreate(const char *pTokenPath)
 directgate_wl_state_t DirectGate_WL_SourceState(directgate_wl_source_t *pSource)
 {
     XCHECK_NL((pSource != NULL), DIRECTGATE_WL_FAILED);
-    return pSource->eState;
+
+    XSync_Lock(&pSource->stateLock);
+    directgate_wl_state_t eState = pSource->eState;
+    XSync_Unlock(&pSource->stateLock);
+
+    return eState;
 }
 
 const char* DirectGate_WL_SourceError(directgate_wl_source_t *pSource)
 {
-    if (pSource == NULL || !pSource->sError[0]) return "Wayland desktop capture failed.";
-    return pSource->sError;
+    XCHECK_NL((pSource != NULL), "Wayland desktop capture failed.");
+
+    /* Taken and released rather than read bare: the string was written by the
+     * setup thread, and the caller only ever asks once the state it published
+     * with it says there is something to read. The buffer itself outlives
+     * every caller, so handing back a pointer into it is safe. */
+    XSync_Lock(&pSource->stateLock);
+    xbool_t bHaveError = (pSource->sError[0] != '\0') ? XTRUE : XFALSE;
+    XSync_Unlock(&pSource->stateLock);
+
+    return bHaveError ? pSource->sError : "Wayland desktop capture failed.";
 }
 
 xbool_t DirectGate_WL_SourceSize(directgate_wl_source_t *pSource, uint32_t *pWidth, uint32_t *pHeight)
@@ -315,6 +359,17 @@ xbool_t DirectGate_WL_SourceHasInput(directgate_wl_source_t *pSource)
 {
     XCHECK_NL((pSource != NULL), XFALSE);
     return DirectGate_WL_PortalHasInput(pSource->pPortal);
+}
+
+xbool_t DirectGate_WL_SourceLost(directgate_wl_source_t *pSource, char *pErrBuf, size_t nErrSize)
+{
+    XCHECK_NL((pSource != NULL && pSource->pCapture != NULL), XFALSE);
+
+    /* Only a live source can be lost. While the setup thread is still working
+     * the capture belongs to it, and its own result says what happened. */
+    if (DirectGate_WL_SourceState(pSource) != DIRECTGATE_WL_READY) return XFALSE;
+
+    return DirectGate_WL_CaptureLost(pSource->pCapture, pErrBuf, nErrSize);
 }
 
 uint32_t DirectGate_WL_SourceScreenCount(directgate_wl_source_t *pSource)
@@ -426,6 +481,7 @@ void DirectGate_WL_SourceDestroy(directgate_wl_source_t *pSource)
     if (pSource->pCapture != NULL) DirectGate_WL_CaptureStop(pSource->pCapture);
     if (pSource->pPortal != NULL) DirectGate_WL_PortalClose(pSource->pPortal);
 
+    XSync_Destroy(&pSource->stateLock);
     XSync_Destroy(&pSource->frameLock);
     free(pSource->pFrame);
     free(pSource);

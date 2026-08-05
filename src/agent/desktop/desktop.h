@@ -218,6 +218,12 @@ typedef struct directgate_desktop_ {
     void *pFakeKey;
     void *pDisplay;
     void *pXtst;
+    /* One-shot: the raw capture path cannot work on a Wayland session, and
+     * the tick would otherwise report that every frame for the rest of it. */
+    xbool_t bWarnedWaylandRaw;
+    /* The granted Wayland stream has ended (revoked from the remote screen or
+     * broken). Reported once; the tick has nothing left to do after it. */
+    xbool_t bWaylandLost;
     /* The Wayland portal prompt is on someone's screen and the session is
      * running only to wait for it: no capture, no input, nothing to encode
      * until they answer. Answering can take minutes, so the wait belongs on

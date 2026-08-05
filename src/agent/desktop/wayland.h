@@ -86,6 +86,12 @@ int DirectGate_WL_CaptureWaitFormat(directgate_wl_capture_t *pCapture, uint32_t 
 xbool_t DirectGate_WL_CaptureSize(directgate_wl_capture_t *pCapture,
                                   uint32_t *pWidth, uint32_t *pHeight);
 
+/* XTRUE once the stream has stopped for good it errored, or the compositor
+ * took the screen back when someone pressed "Stop sharing". @p pErrBuf gets
+ * the reason. Frames simply stop arriving, so a session that does not ask
+ * shows the last one for ever. */
+xbool_t DirectGate_WL_CaptureLost(directgate_wl_capture_t *pCapture, char *pErrBuf, size_t nErrSize);
+
 void DirectGate_WL_CaptureStop(directgate_wl_capture_t *pCapture);
 
 typedef struct directgate_wl_portal_ directgate_wl_portal_t;
@@ -196,6 +202,11 @@ uint32_t DirectGate_WL_SourceScreenCount(directgate_wl_source_t *pSource);
 const directgate_wl_stream_t* DirectGate_WL_SourceScreen(directgate_wl_source_t *pSource, uint32_t nIndex);
 
 xbool_t DirectGate_WL_SourceHasInput(directgate_wl_source_t *pSource);
+
+/* XTRUE when the granted stream has ended - revoked from the remote screen,
+ * or broken. Polled from the session tick, because the only other symptom is
+ * frames quietly never arriving again. */
+xbool_t DirectGate_WL_SourceLost(directgate_wl_source_t *pSource, char *pErrBuf, size_t nErrSize);
 
 /* Node the capture is bound to right now. Pointer motion is addressed to a
  * stream, so this has to follow the screen the viewer switched to. */

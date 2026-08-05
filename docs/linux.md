@@ -56,6 +56,11 @@ One behaviour differs from X11 and is the compositor's rule, not a choice this a
 
 - **The monitor list is the grant, not the hardware.** The portal offers only the screens the person picked, so a second monitor appears in the list once it has been shared and not before.
 
+Two failures are reported rather than survived, because surviving them means showing something that is not the desktop:
+
+- **Sharing stopped on the remote computer.** Pressing "Stop sharing", revoking the grant, or restarting the compositor ends the stream, and the only symptom is that frames stop arriving. The session notices and says so instead of leaving the viewer on the last frame, which is indistinguishable from a dead network.
+- **No fallback to raw RGBA.** The raw path reads from an X display a Wayland session does not have, so falling back to it produces no frames at all while the session reports "streaming". A Wayland session that cannot encode reports the encoder's own reason and stops. `DIRECTGATE_DESKTOP_FORCE_RAW` is refused there for the same reason.
+
 The cursor works the way it does everywhere else. The host pointer is kept out of the video (`cursor_mode: hidden`), so the viewer sees one cursor - their own - and it is over whatever it is pointing at. Under **mouse capture** the browser hides its own pointer and draws the host cursor instead, from the position the agent echoes back after every relative movement. Because the portal accelerates relative motion but not absolute motion, the agent integrates those movements itself and replays them as absolute portal motion: the drawn cursor and the real pointer then move by exactly the same amount, which is what makes a click land where the cursor is.
 
 **Caps Lock and Num Lock travel as ordinary keys** here, where the Xorg path instead syncs the lock *state* and keeps the keys to itself. The portal can press a key but can neither read nor set a lock, so a Wayland agent reports `lockSync: false` and the browser forwards the lock keys - which is what toggles the lock on that host. Claiming the sync it cannot do was worse than not offering it: the browser swallowed the keys, the state it sent instead went nowhere, and a host that had ended up in Caps Lock typed in capitals with nothing the viewer could press to get out of it.

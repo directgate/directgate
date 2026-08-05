@@ -241,6 +241,21 @@ int DirectGate_Desktop_SetDisplayResolution(directgate_desktop_t *pDesktop,
                                             const directgate_desktop_monitor_t *pMonitor,
                                             uint32_t nWidth, uint32_t nHeight)
 {
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    /* Checked before anything else: on a Wayland session nNativeId is the
+     * PipeWire node the portal granted, not an XRandR output, so it must
+     * never reach the calls below and the portal offers no way to change a
+     * display mode in any case. */
+    if (pDesktop != NULL && pDesktop->pWayland != NULL)
+    {
+        DirectGate_Desktop_SetReason(pDesktop,
+            "This desktop cannot have its resolution changed from here: Wayland "
+            "leaves display modes to the compositor. The picture is scaled instead.");
+
+        return XSTDERR;
+    }
+#endif
+
     Display *pDisplay = (Display*)pDesktop->pDisplay;
     if (pDisplay == NULL || pMonitor == NULL || pMonitor->nNativeId == 0U)
     {
