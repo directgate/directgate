@@ -224,6 +224,9 @@ typedef struct directgate_desktop_ {
     /* The granted Wayland stream has ended (revoked from the remote screen or
      * broken). Reported once; the tick has nothing left to do after it. */
     xbool_t bWaylandLost;
+    /* This portal will not type by character, so a viewer on another keyboard
+     * layout gets nothing for those keys. Reported once. */
+    xbool_t bWaylandNoKeysym;
     /* The Wayland portal prompt is on someone's screen and the session is
      * running only to wait for it: no capture, no input, nothing to encode
      * until they answer. Answering can take minutes, so the wait belongs on

@@ -145,6 +145,12 @@ uint32_t DirectGate_WL_PortalStreamCount(const directgate_wl_portal_t *pPortal);
 
 /* Did the compositor grant keyboard/pointer injection with the capture? */
 xbool_t DirectGate_WL_PortalHasInput(const directgate_wl_portal_t *pPortal);
+
+/* XTRUE once this portal has refused to type by character. Everything the
+ * host keyboard layout carries still works - that goes in by position - but
+ * a character it does not have cannot be typed at all, which is worth saying
+ * out loud rather than dropping the keystroke. */
+xbool_t DirectGate_WL_PortalKeysymRefused(const directgate_wl_portal_t *pPortal);
 const directgate_wl_stream_t* DirectGate_WL_PortalStream(const directgate_wl_portal_t *pPortal, uint32_t nIndex);
 int DirectGate_WL_PortalOpenPipeWire(directgate_wl_portal_t *pPortal, char *pErrBuf, size_t nErrSize);
 

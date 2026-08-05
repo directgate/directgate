@@ -125,6 +125,7 @@ struct directgate_wl_portal_ {
     uint32_t nStreamCount;
     uint32_t nDevices;        /* device types the portal actually granted */
     uint32_t nInputErrors;    /* refused input events already reported */
+    xbool_t bKeysymRefused;   /* this portal will not type by character */
     uint32_t nTokenSeq;
     /* Raised when a person answered the prompt with "no", as opposed to the
      * request failing. The caller's flag, not this struct's, because the
@@ -806,6 +807,11 @@ xbool_t DirectGate_WL_PortalHasInput(const directgate_wl_portal_t *pPortal)
     return (pPortal->nDevices & (DIRECTGATE_PORTAL_DEVICE_KEYBOARD | DIRECTGATE_PORTAL_DEVICE_POINTER)) ? XTRUE : XFALSE;
 }
 
+xbool_t DirectGate_WL_PortalKeysymRefused(const directgate_wl_portal_t *pPortal)
+{
+    return (pPortal != NULL && pPortal->bKeysymRefused) ? XTRUE : XFALSE;
+}
+
 uint32_t DirectGate_WL_PortalStreamCount(const directgate_wl_portal_t *pPortal)
 {
     return pPortal != NULL ? pPortal->nStreamCount : 0;
@@ -1135,10 +1141,20 @@ static void DirectGate_WL_PortalDrainErrors(directgate_wl_portal_t *pPortal, con
          * one without depending on the message-type accessor resolving. */
         const char *pName = g_dbus.msgErrorName != NULL ? g_dbus.msgErrorName(pMessage) : NULL;
 
-        if (xstrused(pName) && pPortal->nInputErrors < 3)
+        if (xstrused(pName))
         {
-            pPortal->nInputErrors++;
-            xloge("The desktop portal refused an input event: method(%s), error(%s)", pMethod, pName);
+            /* Which method was refused decides what it costs. Keysyms are the
+             * only way to type a character the host keyboard layout does not
+             * carry, so a portal that will not take them can still be typed
+             * on - just not in another script - and the viewer is better told
+             * than left wondering why some keys do nothing. */
+            if (xstrcmp(pMethod, "NotifyKeyboardKeysym")) pPortal->bKeysymRefused = XTRUE;
+
+            if (pPortal->nInputErrors < 3)
+            {
+                pPortal->nInputErrors++;
+                xloge("The desktop portal refused an input event: method(%s), error(%s)", pMethod, pName);
+            }
         }
 
         g_dbus.msgUnref(pMessage);

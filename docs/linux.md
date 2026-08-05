@@ -35,6 +35,16 @@ Requirements on the streamed machine:
 - `pipewire` and `dbus` runtime libraries (both already present on a normal desktop install). They are loaded at runtime, not linked, so an X11-only host without them runs the same binary unchanged.
 - A desktop portal with a ScreenCast **and** RemoteDesktop backend - `xdg-desktop-portal-gnome` or `xdg-desktop-portal-kde`. A wlroots-only setup (`xdg-desktop-portal-wlr`) can capture but cannot inject input.
 
+Nothing here talks to a compositor directly, so the backend is interchangeable in principle - but backends differ in what they implement, and three differences are worth knowing about. Each says so in the log rather than failing quietly:
+
+| What differs | If the backend does not do it | Log line |
+|---|---|---|
+| Typing **by character** (`NotifyKeyboardKeysym`) | Keys the host layout carries still work (those go in by position); characters from another layout do not type at all. The viewer is told once. | `The desktop portal refused an input event: method(NotifyKeyboardKeysym...)` |
+| Remembering the grant (`persist_mode` on RemoteDesktop) | Works, but every connection has to be allowed on the remote computer. | `Desktop sharing permission remembered: restore(no)` |
+| Honouring the buffer-type constraint | The compositor hands back DMA-BUFs this agent cannot map, and the stream is black. | `received a buffer it cannot map` |
+
+GNOME (Mutter) does all three; that is where this has been run.
+
 The first connection raises a permission prompt on the remote machine, which someone has to be there to allow. Until they do, the session waits with *"Waiting for screen sharing to be allowed on the remote computer"* rather than streaming a black screen. Once allowed, the grant is remembered in `~/.config/directgate/wayland.token` (owner-only) and later connections start without a prompt.
 
 A remembered grant covers the screens it was granted for, so it stops working when those screens change - closing a laptop lid is enough, and the portal then restores the session with **no stream at all** rather than with the monitors that are still there. The agent treats that as a grant that has expired: the token is deleted and the prompt goes back up once, for the screens that exist now. Answering "no" is different and is taken as an answer - a refusal never summons a second prompt.

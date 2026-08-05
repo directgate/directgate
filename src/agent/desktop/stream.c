@@ -506,6 +506,25 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
         return DirectGate_Desktop_SendStatus(pSession, "ready", NULL);
     }
 
+    /* Some portals take keystrokes by position but refuse them by character.
+     * Everything on the host's own keyboard layout still types; anything that
+     * is not - the whole point of a viewer using another script - silently
+     * does nothing, so it is said once instead. */
+    if (pDesktop->pWayland != NULL && !pDesktop->bWaylandNoKeysym &&
+        DirectGate_WL_PortalKeysymRefused(DirectGate_WL_SourcePortal((directgate_wl_source_t*)pDesktop->pWayland)))
+    {
+        pDesktop->bWaylandNoKeysym = XTRUE;
+        xlogw("The desktop portal refuses keystrokes by character: sid(%u); "
+              "only what the host keyboard layout carries can be typed", pSession->nSessionId);
+
+        DirectGate_Desktop_SetFallbackReason(pDesktop,
+            "This desktop only accepts keys its own keyboard layout carries. "
+            "Characters from another layout cannot be typed on it; switch the "
+            "layout on the remote computer instead.");
+
+        DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
+    }
+
     /* The grant can also end while it is being used - someone presses "Stop
      * sharing", the compositor restarts - and the only symptom is that frames
      * stop arriving. Said once, then the session stops pretending. */
