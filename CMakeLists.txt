@@ -355,6 +355,7 @@ elseif(UNIX)
     # has. A plain source build passes nothing and keeps the single
     # pkg-config variant below, compiled against whatever FFmpeg is installed.
     option(DIRECTGATE_REQUIRE_HWENC "Fail the build if GPU desktop encoding cannot be compiled in" OFF)
+    option(DIRECTGATE_REQUIRE_WAYLAND "Fail the build if Wayland desktop streaming cannot be compiled in" OFF)
     set(DIRECTGATE_HWENC_HEADERS "" CACHE PATH
         "Directory of per-libavcodec-major FFmpeg header trees (<major>/libavcodec, <major>/libavutil)")
 
@@ -459,6 +460,21 @@ elseif(UNIX)
             set(_dg_wl_missing "pkg-config")
         endif()
         string(REPLACE ";" ", " _dg_wl_missing "${_dg_wl_missing}")
+
+        # A released package must never be quietly X11-only: the machines it is
+        # installed on decide whether they run Wayland, not the image it was
+        # built in, and someone finding out from a stranger's desktop is far
+        # too late. The packaging builds therefore ask for this and the build
+        # stops here rather than shipping the feature missing.
+        if(DIRECTGATE_REQUIRE_WAYLAND)
+            message(FATAL_ERROR
+                "Wayland desktop streaming was required but its headers were not found "
+                "(missing: ${_dg_wl_missing}). Install the development packages in this "
+                "build image (libpipewire-0.3-dev + libdbus-1-dev on Debian, "
+                "pipewire-devel + dbus-devel on RHEL), or configure with "
+                "-DDIRECTGATE_REQUIRE_WAYLAND=OFF to accept an X11-only agent. Only "
+                "headers are needed; neither library is linked.")
+        endif()
 
         message(STATUS "Wayland desktop streaming: disabled (missing: ${_dg_wl_missing})")
         message(STATUS "  Install the development packages to enable it, then re-run cmake:")
