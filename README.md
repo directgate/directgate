@@ -229,6 +229,7 @@ See [Configuration & running](docs/configuration.md) for the full config referen
 | [Protocol specification](docs/protocol.md) | Binary framing, message types, and header fields |
 | [File transfer & file manager](docs/file-manager.md) | The `manager` and `file` protocols, chunked transfer, and integrity checks |
 | [Configuration & running](docs/configuration.md) | Config file reference, CLI options, and systemd hardening |
+| [Linux desktop sessions](docs/linux.md) | Xorg and Wayland desktop streaming, portal permissions, and their differences |
 | [Building from source](docs/building.md) | Requirements, build, install, tests, and repository layout |
 
 ## Why open source

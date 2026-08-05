@@ -28,6 +28,10 @@
 #include "priv.h"
 #include "yuv.h"
 
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+#include "wayland.h"
+#endif
+
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/timerfd.h>
@@ -69,6 +73,7 @@
 #define DIRECTGATE_X11ENC_LOAD(pFlag)       __atomic_load_n((pFlag), __ATOMIC_ACQUIRE)
 #define DIRECTGATE_X11ENC_SET(pFlag, nVal)  __atomic_store_n((pFlag), (nVal), __ATOMIC_RELEASE)
 #define DIRECTGATE_X11ENC_TAKE(pFlag)       __atomic_exchange_n((pFlag), 0, __ATOMIC_ACQ_REL)
+#define DIRECTGATE_X11ENC_PEEK(pFlag)       __atomic_load_n((pFlag), __ATOMIC_ACQUIRE)
 
 /* True while the GPU encoder is the active backend. Collapses to XFALSE on
  * builds without libavcodec headers so the call sites stay #ifdef-free. */
@@ -160,6 +165,9 @@ typedef struct directgate_x11enc_ {
 
     char sLastError[DIRECTGATE_DESKTOP_REASON_LEN];
 } directgate_x11enc_t;
+
+static void DirectGate_Desktop_X11Enc_EncodeAndPublish(directgate_x11enc_t *pEnc, 
+                                                       uint32_t nFps, uint64_t nCapturedUs);
 
 static directgate_x11enc_t* DirectGate_Desktop_X11Enc(const directgate_desktop_t *pDesktop)
 {
@@ -609,8 +617,32 @@ static int DirectGate_Desktop_X11Enc_Encode(directgate_x11enc_t *pEnc,
 /* One capture -> convert -> encode -> publish pass. Runs on the worker. */
 static void DirectGate_Desktop_X11Enc_CaptureFrame(directgate_x11enc_t *pEnc, uint32_t nFps)
 {
+    XCHECK_VOID((pEnc != NULL));
     Display *pDisplay = pEnc->pDisplay;
     XImage *pImage = NULL;
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    /* On Wayland the frame is pushed to us by PipeWire instead of being
+     * pulled from a display server, so only this step differs. Everything
+     * below - the unchanged-frame skip, the encoder, the mailbox the main
+     * loop drains - is shared, which is the whole point of splitting here
+     * rather than giving Wayland a pipeline of its own. */
+    if (pEnc->pDesktop != NULL && pEnc->pDesktop->pWayland != NULL)
+    {
+        int nTaken = DirectGate_WL_SourceTakeFrame(
+            (directgate_wl_source_t*)pEnc->pDesktop->pWayland,
+            pEnc->pFrameBGRA, pEnc->nEncodeWidth, pEnc->nEncodeHeight);
+
+        /* No new frame is the idle desktop, not a failure: the compositor
+         * sends nothing while nothing changes. A pending keyframe request
+         * still has to go out, so that case falls through to the encoder. */
+        if (nTaken != XSTDOK && !DIRECTGATE_X11ENC_PEEK(&pEnc->bForceKeyframe)) return;
+
+        uint64_t nWlCapturedUs = DirectGate_Desktop_X11Enc_MonotonicUs();
+        DirectGate_Desktop_X11Enc_EncodeAndPublish(pEnc, nFps, nWlCapturedUs);
+        return;
+    }
+#endif
 
     if (pEnc->pShmImage != NULL)
     {
@@ -649,6 +681,13 @@ static void DirectGate_Desktop_X11Enc_CaptureFrame(directgate_x11enc_t *pEnc, ui
 
     if (pImage != pEnc->pShmImage) XDestroyImage(pImage);
 
+    DirectGate_Desktop_X11Enc_EncodeAndPublish(pEnc, nFps, nCapturedUs);
+}
+
+/* Everything a captured frame goes through once it is BGRA at the encode
+ * size, regardless of where it came from. Runs on the worker. */
+static void DirectGate_Desktop_X11Enc_EncodeAndPublish(directgate_x11enc_t *pEnc, uint32_t nFps, uint64_t nCapturedUs)
+{
     /* Idle desktops are the common case for a remote-admin agent: skip the
      * whole convert+encode+send pass when nothing changed on screen. A
      * pending keyframe request always goes through (new viewer / PLI). */
@@ -781,9 +820,53 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     directgate_desktop_t *pDesktop = &pSession->desktop;
     DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
 
-    if (pDesktop->pDisplay == NULL || nWidth == 0 || nHeight == 0)
+    /* A Wayland session has no display connection at all; its frames come
+     * from PipeWire, so the display is only required for the X11 path. */
+    xbool_t bWayland = XFALSE;
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    bWayland = (pDesktop->pWayland != NULL) ? XTRUE : XFALSE;
+#endif
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    /* Point the capture at the screen that was picked. The monitor entries
+     * carry the PipeWire node the portal granted for each one, so this is a
+     * stream change and never a permission one. */
+    if (bWayland)
     {
-        DirectGate_Desktop_X11Enc_SetError(NULL, pDesktop, "Empty X11 capture rectangle.");
+        uint32_t nPrevNode = DirectGate_WL_SourceActiveNode((directgate_wl_source_t*)pDesktop->pWayland);
+
+        for (uint32_t i = 0; i < pDesktop->nMonitorCount; i++)
+        {
+            if (!xstrcmp(pDesktop->monitors[i].sId, pDesktop->sSelectedMonitor)) continue;
+            if (pDesktop->monitors[i].nNativeId == 0) break;
+
+            /* A screen that will not open leaves the session on the one that
+             * works, which is right but the viewer picked the other one, so
+             * being told beats watching the wrong desktop and wondering. */
+            if (DirectGate_WL_SourceSelect((directgate_wl_source_t*)pDesktop->pWayland,
+                (uint32_t)pDesktop->monitors[i].nNativeId) != XSTDOK)
+            {
+                DirectGate_Desktop_SetFallbackReason(pDesktop,
+                    "That screen could not be opened; still showing the previous one.");
+            }
+
+            break;
+        }
+
+        /* The tracked pointer position is measured in the capture rectangle,
+         * so on another screen it means somewhere else entirely. Restarting
+         * the pipeline on the same screen leaves it alone: the pointer did
+         * not move, and forgetting it would jerk a captured mouse to the
+         * middle of the screen for a preset change. */
+        if (DirectGate_WL_SourceActiveNode((directgate_wl_source_t*)pDesktop->pWayland) != nPrevNode)
+            pDesktop->bWlPointerValid = XFALSE;
+    }
+#endif
+
+    if ((pDesktop->pDisplay == NULL && !bWayland) || nWidth == 0 || nHeight == 0)
+    {
+        DirectGate_Desktop_X11Enc_SetError(NULL, pDesktop, "Empty desktop capture rectangle.");
         return XSTDERR;
     }
 
@@ -808,15 +891,21 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     pEnc->nCaptureHeight = nHeight;
 
     /* The worker must not share the main loop's Xlib connection: input
-     * injection runs on that one from the event loop. */
-    pEnc->pDisplay = XOpenDisplay(xstrused(pDesktop->sDisplay) ? pDesktop->sDisplay : NULL);
-    if (pEnc->pDisplay == NULL)
+     * injection runs on that one from the event loop. A Wayland session has
+     * no connection to open at all - its frames are pushed by PipeWire and
+     * asking Xlib for one named "wayland" is exactly how this used to fail
+     * after the monitor had already been picked. */
+    if (!bWayland)
     {
-        DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop,
-            "Failed to open a second X11 connection for the capture thread.");
+        pEnc->pDisplay = XOpenDisplay(xstrused(pDesktop->sDisplay) ? pDesktop->sDisplay : NULL);
+        if (pEnc->pDisplay == NULL)
+        {
+            DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop,
+                "Failed to open a second X11 connection for the capture thread.");
 
-        DirectGate_Desktop_X11Enc_Free(pEnc);
-        return XSTDERR;
+            DirectGate_Desktop_X11Enc_Free(pEnc);
+            return XSTDERR;
+        }
     }
 
     Display *pDisplay = pEnc->pDisplay;
@@ -872,37 +961,43 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
         return XSTDERR;
     }
 
-    if (DirectGate_Desktop_X11Enc_SetupShm(pEnc, pDisplay) == XSTDNON)
-        xlogw("MIT-SHM unavailable for desktop capture, using XGetImage: sid(%u)", pSession->nSessionId);
+    /* Shared memory and the capture probe are both X11 notions. The Wayland
+     * source has already proved itself by negotiating a format before the
+     * pipeline was allowed to start, so there is nothing left to probe. */
+    if (!bWayland)
+    {
+        if (DirectGate_Desktop_X11Enc_SetupShm(pEnc, pDisplay) == XSTDNON)
+            xlogw("MIT-SHM unavailable for desktop capture, using XGetImage: sid(%u)", pSession->nSessionId);
 
-    /* Probe one capture now so a broken setup fails at start (and desktop.c
-     * falls back to raw RGBA) instead of during the streaming loop. */
-    XImage *pProbe = NULL;
-    if (pEnc->pShmImage != NULL)
-    {
-        if (XShmGetImage(pDisplay, DefaultRootWindow(pDisplay), pEnc->pShmImage,
-            pEnc->nCaptureX, pEnc->nCaptureY, AllPlanes)) pProbe = pEnc->pShmImage;
-    }
-    else
-    {
-        pProbe = XGetImage(pDisplay, DefaultRootWindow(pDisplay),
-            pEnc->nCaptureX, pEnc->nCaptureY,
-            pEnc->nCaptureWidth, pEnc->nCaptureHeight, AllPlanes, ZPixmap);
-    }
+        /* Probe one capture now so a broken setup fails at start (and
+         * desktop.c falls back to raw RGBA) instead of during the loop. */
+        XImage *pProbe = NULL;
+        if (pEnc->pShmImage != NULL)
+        {
+            if (XShmGetImage(pDisplay, DefaultRootWindow(pDisplay), pEnc->pShmImage,
+                pEnc->nCaptureX, pEnc->nCaptureY, AllPlanes)) pProbe = pEnc->pShmImage;
+        }
+        else
+        {
+            pProbe = XGetImage(pDisplay, DefaultRootWindow(pDisplay),
+                pEnc->nCaptureX, pEnc->nCaptureY,
+                pEnc->nCaptureWidth, pEnc->nCaptureHeight, AllPlanes, ZPixmap);
+        }
 
-    if (pProbe == NULL)
-    {
-        DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop, "X11 screen capture probe failed.");
-        DirectGate_Desktop_X11Enc_Free(pEnc);
-        return XSTDERR;
-    }
+        if (pProbe == NULL)
+        {
+            DirectGate_Desktop_X11Enc_SetError(pEnc, pDesktop, "X11 screen capture probe failed.");
+            DirectGate_Desktop_X11Enc_Free(pEnc);
+            return XSTDERR;
+        }
 
-    int nFormat = DirectGate_Desktop_X11Enc_CheckFormat(pEnc, pDesktop, pProbe);
-    if (pProbe != pEnc->pShmImage) XDestroyImage(pProbe);
-    if (nFormat != XSTDOK)
-    {
-        DirectGate_Desktop_X11Enc_Free(pEnc);
-        return XSTDERR;
+        int nFormat = DirectGate_Desktop_X11Enc_CheckFormat(pEnc, pDesktop, pProbe);
+        if (pProbe != pEnc->pShmImage) XDestroyImage(pProbe);
+        if (nFormat != XSTDOK)
+        {
+            DirectGate_Desktop_X11Enc_Free(pEnc);
+            return XSTDERR;
+        }
     }
 
     DIRECTGATE_X11ENC_SET(&pEnc->bForceKeyframe, 1U);

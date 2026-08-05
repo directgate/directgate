@@ -29,6 +29,10 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/Xrandr.h>
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+#include "common.h"
+#include "wayland.h"
+#endif
 #elif defined(__APPLE__)
 #include <stdbool.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -36,6 +40,24 @@
 #endif
 
 #if defined(__linux__)
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+
+/* How long the event loop is held waiting for the portal. Long enough for
+ * someone already looking at the prompt to answer it, short enough that the
+ * rest of the agent's work is not visibly stalled. */
+#define DIRECTGATE_DESKTOP_WAYLAND_WAIT_MS 5000
+
+/* The portal grant belongs to the process, not to one desktop session.
+ *
+ * A grant that is still waiting on a human must survive the session that
+ * asked for it: the prompt is on screen, and tearing the source down when the
+ * first attempt gives up would cancel it just as they reach for Allow - and
+ * the next attempt would put up a second prompt. So a pending source is
+ * parked here, and the next attempt adopts it instead of starting over. */
+static directgate_wl_source_t *g_pPendingWayland;
+
+#endif /* DIRECTGATE_DESKTOP_HAS_WAYLAND */
 
 /* Xlib kills the process on an X error unless the application says otherwise:
  * the default protocol-error handler prints and calls exit(), and so does the
@@ -219,6 +241,21 @@ int DirectGate_Desktop_SetDisplayResolution(directgate_desktop_t *pDesktop,
                                             const directgate_desktop_monitor_t *pMonitor,
                                             uint32_t nWidth, uint32_t nHeight)
 {
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    /* Checked before anything else: on a Wayland session nNativeId is the
+     * PipeWire node the portal granted, not an XRandR output, so it must
+     * never reach the calls below and the portal offers no way to change a
+     * display mode in any case. */
+    if (pDesktop != NULL && pDesktop->pWayland != NULL)
+    {
+        DirectGate_Desktop_SetReason(pDesktop,
+            "This desktop cannot have its resolution changed from here: Wayland "
+            "leaves display modes to the compositor. The picture is scaled instead.");
+
+        return XSTDERR;
+    }
+#endif
+
     Display *pDisplay = (Display*)pDesktop->pDisplay;
     if (pDisplay == NULL || pMonitor == NULL || pMonitor->nNativeId == 0U)
     {
@@ -361,6 +398,212 @@ static const char* DirectGate_Desktop_FindX11Display(char *pBuf, size_t nBufSize
     return xstrused(pBuf) ? pBuf : NULL;
 }
 
+static xbool_t DirectGate_Desktop_SessionIsWayland(void)
+{
+    const char *pSessionType = getenv("XDG_SESSION_TYPE");
+    if (xstrused(pSessionType)) return xstrcmp(pSessionType, "wayland") ? XTRUE : XFALSE;
+    if (xstrused(getenv("WAYLAND_DISPLAY"))) return XTRUE;
+
+    const char *pRuntimeDir = getenv("XDG_RUNTIME_DIR");
+    if (!xstrused(pRuntimeDir)) return XFALSE;
+
+    for (int i = 0; i < 4; i++)
+    {
+        char sSocket[XPATH_MAX];
+        snprintf(sSocket, sizeof(sSocket), "%s/wayland-%d", pRuntimeDir, i);
+        if (access(sSocket, F_OK) == 0) return XTRUE;
+    }
+
+    return XFALSE;
+}
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+
+/* Where the permission token that skips the prompt on a reconnect is kept. */
+static void DirectGate_Desktop_WaylandTokenPath(char *pBuf, size_t nSize)
+{
+    char sHome[XPATH_MAX];
+    DirectGate_GetHomeDir(sHome, sizeof(sHome));
+    pBuf[0] = '\0';
+
+    /* A home path long enough to leave no room for the file name would give a
+     * silently truncated one, which is worse than having no token at all. */
+    if (xstrused(sHome) && strlen(sHome) + sizeof("/.config/directgate/wayland.token") <= nSize)
+        snprintf(pBuf, nSize, "%s/.config/directgate/wayland.token", sHome);
+}
+
+/* Everything that follows a granted portal session: geometry, the monitor
+ * list, and whether input came with it. Reached either from the start, when
+ * the grant was already stored or answered quickly, or from the tick that
+ * was waiting for someone to answer the prompt. */
+static int DirectGate_Desktop_FinishWayland(directgate_session_t *pSession,
+                                            directgate_wl_source_t *pSource)
+{
+    directgate_desktop_t *pDesktop = &pSession->desktop;
+
+    uint32_t nWidth = 0, nHeight = 0;
+    if (!DirectGate_WL_SourceSize(pSource, &nWidth, &nHeight) || nWidth == 0 || nHeight == 0)
+    {
+        DirectGate_Desktop_SetReason(pDesktop, "The Wayland desktop stream reported no size.");
+        DirectGate_WL_SourceDestroy(pSource);
+        g_pPendingWayland = NULL;
+        return XSTDERR;
+    }
+
+    /* Ownership moves to the session now that it is usable; ending that
+     * session is what closes the portal grant. */
+    g_pPendingWayland = NULL;
+    pDesktop->pWayland = pSource;
+    pDesktop->nScreenWidth = nWidth;
+    pDesktop->nScreenHeight = nHeight;
+    xstrncpy(pDesktop->sDisplay, sizeof(pDesktop->sDisplay), "wayland");
+
+    /* One entry per screen the person allowed. The portal never volunteers a
+     * screen they did not pick, so this list is the grant, not the hardware -
+     * a second monitor appears here only once it has been shared. */
+    uint32_t nScreens = DirectGate_WL_SourceScreenCount(pSource);
+
+    for (uint32_t i = 0; i < nScreens; i++)
+    {
+        const directgate_wl_stream_t *pStream = DirectGate_WL_SourceScreen(pSource, i);
+        if (pStream == NULL) continue;
+
+        char sId[DIRECTGATE_DESKTOP_MONITOR_ID_LEN];
+        char sName[DIRECTGATE_DESKTOP_MONITOR_NAME_LEN];
+
+        snprintf(sId, sizeof(sId), "wayland-%u", pStream->nNodeId);
+        if (nScreens > 1) snprintf(sName, sizeof(sName), "Shared screen %u", i + 1U);
+        else xstrncpy(sName, sizeof(sName), "Shared screen");
+
+        /* Fall back to the negotiated size when the compositor did not say. */
+        uint32_t nScreenW = pStream->nWidth ? pStream->nWidth : nWidth;
+        uint32_t nScreenH = pStream->nHeight ? pStream->nHeight : nHeight;
+
+        uint32_t nBefore = pDesktop->nMonitorCount;
+        DirectGate_Desktop_AddMonitor(pDesktop, sId, sName, pStream->nX, pStream->nY, nScreenW, nScreenH, i == 0 ? XTRUE : XFALSE);
+
+        /* The node id is what selecting this entry has to switch the capture
+         * to, so it travels with the monitor rather than being re-derived. */
+        if (pDesktop->nMonitorCount > nBefore)
+            pDesktop->monitors[pDesktop->nMonitorCount - 1U].nNativeId = pStream->nNodeId;
+    }
+
+    if (!nScreens) DirectGate_Desktop_AddMonitor(pDesktop, "wayland-0", "Shared screen", 0, 0, nWidth, nHeight, XTRUE);
+    xlogi("Wayland desktop offers %u shared screen(s)", nScreens ? nScreens : 1U);
+
+    /* Nothing else sets this on Wayland: the X11 path raises it when XTest
+     * loads, and there is no XTest here. Without it the session reports that
+     * it has no input and the viewer refuses to send any - which is what
+     * "remote control is disabled" means. */
+    pDesktop->bInputReady = DirectGate_WL_SourceHasInput(pSource);
+    if (!pDesktop->bInputReady)
+    {
+        DirectGate_Desktop_SetFallbackReason(pDesktop,
+            "Remote control is disabled: this desktop portal shared the screen "
+            "but did not grant keyboard and pointer control.");
+
+        xlogw("Wayland desktop granted capture without input; the session is view-only");
+    }
+
+    xlogi("Wayland desktop capture is ready: size(%ux%u), input(%s)",
+        nWidth, nHeight, pDesktop->bInputReady ? "yes" : "no");
+
+    return XSTDOK;
+}
+
+/* Brings up the Wayland backend, or reports that it is not up yet.
+ *
+ * The grant is negotiated on the source's own thread, because it waits for a
+ * person. This only blocks for as long as it is reasonable to hold the
+ * agent's event loop - a stored grant completes far inside that, and so does
+ * a prompt someone is already looking at.
+ *
+ * XSTDNON means the prompt is still on their screen. That is not a failure:
+ * the source keeps waiting on its own thread and the session waits with it,
+ * which is the whole point - the answer arrives minutes later, long after any
+ * call could have stayed here for it. */
+static int DirectGate_Desktop_OpenWayland(directgate_session_t *pSession)
+{
+    directgate_desktop_t *pDesktop = &pSession->desktop;
+    xstrncpy(pDesktop->sBackend, sizeof(pDesktop->sBackend), "wayland");
+
+    if (g_pPendingWayland == NULL)
+    {
+        char sTokenPath[XPATH_MAX];
+        DirectGate_Desktop_WaylandTokenPath(sTokenPath, sizeof(sTokenPath));
+
+        g_pPendingWayland = DirectGate_WL_SourceCreate(sTokenPath);
+        if (g_pPendingWayland == NULL)
+        {
+            DirectGate_Desktop_SetReason(pDesktop, "Failed to start Wayland desktop capture.");
+            return XSTDERR;
+        }
+    }
+
+    directgate_wl_source_t *pSource = g_pPendingWayland;
+
+    for (int i = 0; i < DIRECTGATE_DESKTOP_WAYLAND_WAIT_MS / 100 &&
+         DirectGate_WL_SourceState(pSource) == DIRECTGATE_WL_PENDING; i++)
+    {
+        xusleep(100000);
+    }
+
+    directgate_wl_state_t eState = DirectGate_WL_SourceState(pSource);
+    if (eState == DIRECTGATE_WL_FAILED)
+    {
+        DirectGate_Desktop_SetReason(pDesktop, DirectGate_WL_SourceError(pSource));
+
+        /* A refusal is final for this grant; the next attempt starts a new
+         * one rather than reporting the same failure forever. */
+        DirectGate_WL_SourceDestroy(pSource);
+        g_pPendingWayland = NULL;
+
+        return XSTDERR;
+    }
+
+    if (eState == DIRECTGATE_WL_PENDING)
+    {
+        DirectGate_Desktop_SetReason(pDesktop,
+            "Waiting for screen sharing to be allowed on the remote computer. "
+            "Allow it there and this screen starts on its own.");
+
+        xlogi("Wayland desktop capture is still waiting for permission");
+        return XSTDNON;
+    }
+
+    return DirectGate_Desktop_FinishWayland(pSession, pSource);
+}
+
+/* Called from the tick while the prompt is unanswered. XSTDNON keeps waiting,
+ * XSTDOK means the desktop is up, XSTDERR that the grant will never come. */
+int DirectGate_Desktop_ResumeWayland(directgate_session_t *pSession)
+{
+    XCHECK((pSession != NULL), XSTDERR);
+    directgate_desktop_t *pDesktop = &pSession->desktop;
+
+    directgate_wl_source_t *pSource = g_pPendingWayland;
+    if (pSource == NULL)
+    {
+        DirectGate_Desktop_SetReason(pDesktop, "The Wayland desktop grant was dropped.");
+        return XSTDERR;
+    }
+
+    directgate_wl_state_t eState = DirectGate_WL_SourceState(pSource);
+    if (eState == DIRECTGATE_WL_PENDING) return XSTDNON;
+
+    if (eState == DIRECTGATE_WL_FAILED)
+    {
+        DirectGate_Desktop_SetReason(pDesktop, DirectGate_WL_SourceError(pSource));
+        DirectGate_WL_SourceDestroy(pSource);
+        g_pPendingWayland = NULL;
+
+        return XSTDERR;
+    }
+
+    return DirectGate_Desktop_FinishWayland(pSession, pSource);
+}
+#endif
+
 static void DirectGate_Desktop_SetXAuthority(const directgate_session_t *pSession)
 {
     if (xstrused(getenv("XAUTHORITY"))) return;
@@ -378,20 +621,27 @@ static void DirectGate_Desktop_SetXAuthority(const directgate_session_t *pSessio
 int DirectGate_Desktop_OpenX11(directgate_session_t *pSession)
 {
     directgate_desktop_t *pDesktop = &pSession->desktop;
+
+    if (DirectGate_Desktop_SessionIsWayland())
+    {
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+        return DirectGate_Desktop_OpenWayland(pSession);
+#else
+        xstrncpy(pDesktop->sBackend, sizeof(pDesktop->sBackend), "wayland");
+        DirectGate_Desktop_SetReason(pDesktop,
+            "This agent was built without Wayland desktop streaming. "
+            "Log in with an Xorg session to stream this desktop.");
+
+        return XSTDERR;
+#endif
+    }
+
     char sDisplay[DIRECTGATE_DESKTOP_DISPLAY_LEN];
     memset(sDisplay, 0, sizeof(sDisplay));
     const char *pDisplayName = DirectGate_Desktop_FindX11Display(sDisplay, sizeof(sDisplay));
 
     if (!xstrused(pDisplayName))
     {
-        if (xstrused(getenv("WAYLAND_DISPLAY")) ||
-            (xstrused(getenv("XDG_SESSION_TYPE")) && xstrcmp(getenv("XDG_SESSION_TYPE"), "wayland")))
-        {
-            xstrncpy(pDesktop->sBackend, sizeof(pDesktop->sBackend), "wayland");
-            DirectGate_Desktop_SetReason(pDesktop, "Wayland desktop streaming is not implemented yet.");
-            return XSTDERR;
-        }
-
         xstrncpy(pDesktop->sBackend, sizeof(pDesktop->sBackend), "none");
         DirectGate_Desktop_SetReason(pDesktop,
             "No display is available on this host. Headless servers without "

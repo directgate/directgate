@@ -51,6 +51,22 @@ static KeySym MapKey(const char *pKey, const char *pCode)
     return sym;
 }
 
+/* Which half of the hybrid model a keystroke takes: non-zero is the physical
+ * key (the host's layout decides), zero means the character is sent instead
+ * (the viewer's layout decides). */
+static uint16_t PhysKey(const char *pKey, const char *pCode)
+{
+    xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, XFALSE);
+    if (pRoot == NULL) return 0;
+
+    if (pKey != NULL) XJSON_AddString(pRoot, "key", pKey);
+    if (pCode != NULL) XJSON_AddString(pRoot, "code", pCode);
+
+    uint16_t nEvdev = DirectGate_Desktop_PhysicalKey(pRoot);
+    XJSON_FreeObject(pRoot);
+    return nEvdev;
+}
+
 int main(void)
 {
     /* UTF-8 decoding. */
@@ -141,27 +157,74 @@ int main(void)
     /* Held-key bookkeeping: a release must target the keycode the press
      * used, keyed by the physical `code`, so a shifted press and unshifted
      * release cannot leave the key stuck and auto-repeating. */
+    /* The hybrid layout model. The host's layout decides a key the viewer's
+     * layout left alone, so a host set to another script types that script;
+     * the viewer's layout decides the moment it produced something the
+     * position would not, which is what keeps a non-US keyboard typing what
+     * its keycaps say. */
+    CHECK(PhysKey("a", "KeyA") == 30, "a plain US key must go in by position");
+    CHECK(PhysKey("A", "KeyA") == 30, "a shifted US key must go in by position");
+    CHECK(PhysKey("@", "Digit2") == 3, "a shifted US digit must go in by position");
+    CHECK(PhysKey("\xE1\x83\x90", "KeyA") == 0, "a Georgian character must go in as a character");
+    CHECK(PhysKey("z", "KeyY") == 0, "a QWERTZ z must go in as a character");
+    CHECK(PhysKey("a", "KeyQ") == 0, "an AZERTY a must go in as a character");
+    CHECK(PhysKey("\"", "Digit2") == 0, "a non-US shifted digit must go in as a character");
+    /* Keys that type nothing mean the same thing under every layout. */
+    CHECK(PhysKey("Enter", "Enter") == 28, "Enter must go in by position");
+    CHECK(PhysKey("Shift", "ShiftLeft") == 42, "a modifier must go in by position");
+    CHECK(PhysKey("F5", "F5") == 63, "a function key must go in by position");
+    CHECK(PhysKey("Unidentified", "KeyQ") == 16, "an IME key must fall back to its position");
+    /* Nothing to place it by: the character is all there is. */
+    CHECK(PhysKey("a", NULL) == 0, "a code-less event cannot go in by position");
+    CHECK(PhysKey("a", "Lang5") == 0, "an unmapped code cannot go in by position");
+
     directgate_desktop_t desktop;
     memset(&desktop, 0, sizeof(desktop));
-    DirectGate_Desktop_X11RememberKey(&desktop, "ShiftRight", 62);
-    DirectGate_Desktop_X11RememberKey(&desktop, "KeyA", 38);
+    DirectGate_Desktop_RememberKey(&desktop, "ShiftRight", 62, XFALSE);
+    DirectGate_Desktop_RememberKey(&desktop, "KeyA", 38, XFALSE);
     CHECK(desktop.nHeldKeyCount == 2, "held keys not tracked");
     /* A repeat press of the same code overwrites, never grows the table. */
-    DirectGate_Desktop_X11RememberKey(&desktop, "KeyA", 38);
+    DirectGate_Desktop_RememberKey(&desktop, "KeyA", 38, XFALSE);
     CHECK(desktop.nHeldKeyCount == 2, "repeat press grew the held-key table");
     /* Release resolves to the exact keycode the press recorded. */
-    CHECK(DirectGate_Desktop_X11ForgetKey(&desktop, "KeyA") == 38, "wrong keycode for release");
+    CHECK(DirectGate_Desktop_ForgetKey(&desktop, "KeyA", NULL) == 38, "wrong keycode for release");
     CHECK(desktop.nHeldKeyCount == 1, "released key still tracked");
-    CHECK(DirectGate_Desktop_X11ForgetKey(&desktop, "KeyA") == 0, "double release returned a keycode");
+    CHECK(DirectGate_Desktop_ForgetKey(&desktop, "KeyA", NULL) == 0, "double release returned a keycode");
     /* An unknown code (press never seen) reports no keycode. */
-    CHECK(DirectGate_Desktop_X11ForgetKey(&desktop, "KeyZ") == 0, "unknown code returned a keycode");
-    CHECK(DirectGate_Desktop_X11ForgetKey(&desktop, "ShiftRight") == 62, "wrong keycode for ShiftRight");
+    CHECK(DirectGate_Desktop_ForgetKey(&desktop, "KeyZ", NULL) == 0, "unknown code returned a keycode");
+    CHECK(DirectGate_Desktop_ForgetKey(&desktop, "ShiftRight", NULL) == 62, "wrong keycode for ShiftRight");
     CHECK(desktop.nHeldKeyCount == 0, "held-key table not empty after releases");
+
+    /* How a key was injected travels with it: a Wayland release has to make
+     * the same kind of call the press did, or the key never comes up. */
+    xbool_t bPhysical = XFALSE;
+    DirectGate_Desktop_RememberKey(&desktop, "KeyA", 30, XTRUE);
+    DirectGate_Desktop_RememberKey(&desktop, "KeyB", 0x10001D0, XFALSE);
+    CHECK(DirectGate_Desktop_ForgetKey(&desktop, "KeyA", &bPhysical) == 30 && bPhysical,
+        "a key pressed by position must be released by position");
+    CHECK(DirectGate_Desktop_ForgetKey(&desktop, "KeyB", &bPhysical) == 0x10001D0 && !bPhysical,
+        "a key pressed as a character must be released as a character");
+
     /* No display attached: teardown release is a guarded no-op, not a crash,
      * and cannot inject, so it leaves the table for the real teardown. */
-    DirectGate_Desktop_X11RememberKey(&desktop, "ShiftLeft", 50);
+    DirectGate_Desktop_RememberKey(&desktop, "ShiftLeft", 50, XFALSE);
     DirectGate_Desktop_ReleaseHeldKeys(&desktop);
     CHECK(desktop.nHeldKeyCount == 1, "guarded teardown must not drop untracked keys");
+
+    /* The stuck-key watchdog. Its whole risk is firing on a key someone is
+     * holding on purpose, so the timing decision is pinned down here: it
+     * waits for the idle window, and any input at all resets it. */
+    desktop.nLastInputMs = 0;
+    CHECK(!DirectGate_Desktop_ExpireHeldKeys(&desktop), "watchdog fired before any input was seen");
+    desktop.nLastInputMs = XTime_GetMs();
+    CHECK(!DirectGate_Desktop_ExpireHeldKeys(&desktop), "watchdog fired on a key held just now");
+    desktop.nLastInputMs = XTime_GetMs() - (DIRECTGATE_DESKTOP_HELD_KEY_IDLE_MS - 1000U);
+    CHECK(!DirectGate_Desktop_ExpireHeldKeys(&desktop), "watchdog fired inside the idle window");
+    desktop.nLastInputMs = XTime_GetMs() - (DIRECTGATE_DESKTOP_HELD_KEY_IDLE_MS + 1000U);
+    CHECK(DirectGate_Desktop_ExpireHeldKeys(&desktop), "watchdog missed a key stuck past the idle window");
+    /* Nothing held is nothing to release, however long the silence. */
+    desktop.nHeldKeyCount = 0;
+    CHECK(!DirectGate_Desktop_ExpireHeldKeys(&desktop), "watchdog fired with no keys held");
 
     /* The table drops the oldest entry instead of overflowing. */
     memset(&desktop, 0, sizeof(desktop));
@@ -169,7 +232,7 @@ int main(void)
     {
         char sCode[DIRECTGATE_DESKTOP_KEY_CODE_LEN];
         snprintf(sCode, sizeof(sCode), "K%d", i);
-        DirectGate_Desktop_X11RememberKey(&desktop, sCode, (KeyCode)(8 + (i & 0xFF)));
+        DirectGate_Desktop_RememberKey(&desktop, sCode, (KeyCode)(8 + (i & 0xFF)), XFALSE);
     }
     CHECK(desktop.nHeldKeyCount == DIRECTGATE_DESKTOP_MAX_HELD_KEYS,
         "held-key table overflowed its bound");

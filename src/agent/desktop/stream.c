@@ -25,6 +25,10 @@
 #include "webrtc.h"
 #include "priv.h"
 
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+#include "wayland.h"
+#endif
+
 #if defined(__linux__)
 #include <sys/timerfd.h>
 #include <X11/Xlib.h>
@@ -64,7 +68,8 @@ static void DirectGate_Desktop_AdaptBitrate(directgate_session_t *pSession)
 #endif
 
     uint32_t nCurrent = pDesktop->nCurrentBitrateKbps ?
-                        pDesktop->nCurrentBitrateKbps : pDesktop->quality.nBitrateKbps;
+                        pDesktop->nCurrentBitrateKbps :
+                        pDesktop->quality.nBitrateKbps;
 
     uint8_t nFractionLost = 0;
     xbool_t bHaveReport = DirectGate_WebRTC_TakeVideoLossReport(&pSession->webrtc, &nFractionLost);
@@ -150,6 +155,21 @@ static void DirectGate_Desktop_MaybePromoteWebRTCVideo(directgate_session_t *pSe
     DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
 }
 
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+/* The raw path pulls its frames from an X display, and a Wayland session has
+ * none: its pixels arrive from PipeWire and only the encoder pipeline knows
+ * how to take them. Falling back to raw there does not degrade the picture,
+ * it removes it - the capture returns nothing on every tick while the session
+ * reports that it is streaming, which is the worst of both. So the fallback
+ * is refused on Wayland and the real reason is reported instead. */
+static xbool_t DirectGate_Desktop_RawWouldBeBlank(const directgate_desktop_t *pDesktop)
+{
+    XCHECK_NL((pDesktop != NULL), XFALSE);
+    XCHECK_NL((pDesktop->pWayland != NULL), XFALSE);
+    return XTRUE;
+}
+#endif
+
 /* Runtime failure demotion: too many consecutive capture/encode failures
  * flip the session to the raw RGBA path so the operator keeps a picture. */
 #if defined(__linux__) || defined(_WIN32)
@@ -158,6 +178,21 @@ static void DirectGate_Desktop_DemoteToRaw(directgate_session_t *pSession)
     directgate_desktop_t *pDesktop = &pSession->desktop;
 #if defined(__linux__)
     const char *pErr = DirectGate_Desktop_LinuxEncoder_LastError(pSession);
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    if (DirectGate_Desktop_RawWouldBeBlank(pDesktop))
+    {
+        xloge("Wayland H.264 pipeline failed and there is no raw fallback on Wayland: sid(%u), reason(%s)",
+            pSession->nSessionId, xstrused(pErr) ? pErr : "unknown");
+
+        DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
+        DirectGate_Desktop_SetReason(pDesktop, xstrused(pErr) ?
+            pErr : "The desktop encoder failed and this session has no fallback.");
+
+        DirectGate_Desktop_SendStatus(pSession, "error", DirectGate_Desktop_GetReason(pDesktop));
+        return;
+    }
+#endif
 
     xlogw("Linux H.264 pipeline failed, falling back to raw RGBA: sid(%u), reason(%s)",
         pSession->nSessionId, xstrused(pErr) ? pErr : "unknown");
@@ -264,6 +299,19 @@ static int DirectGate_Desktop_StartLinuxPipeline(directgate_session_t *pSession)
 
     if (pDesktop->bForceRaw)
     {
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+        if (DirectGate_Desktop_RawWouldBeBlank(pDesktop))
+        {
+            DirectGate_Desktop_SetReason(pDesktop,
+                "Raw RGBA was forced, but a Wayland session cannot stream it. "
+                "Unset DIRECTGATE_DESKTOP_FORCE_RAW.");
+
+            xloge("Raw RGBA was forced on a Wayland session, which cannot capture that way: sid(%u)",
+                pSession->nSessionId);
+
+            return XSTDERR;
+        }
+#endif
         pDesktop->ePipeline = DIRECTGATE_DESKTOP_PIPELINE_RAW;
         xstrncpy(pDesktop->sCodec, sizeof(pDesktop->sCodec), "raw-rgba");
 
@@ -277,6 +325,22 @@ static int DirectGate_Desktop_StartLinuxPipeline(directgate_session_t *pSession)
         pDesktop->nCaptureWidth, pDesktop->nCaptureHeight) < 0)
     {
         const char *pErr = DirectGate_Desktop_LinuxEncoder_LastError(pSession);
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+        /* Nothing to fall back to, so this is the end of the session rather
+         * than the start of a silent one. */
+        if (DirectGate_Desktop_RawWouldBeBlank(pDesktop))
+        {
+            xloge("Wayland H.264 encoder unavailable and there is no raw fallback: sid(%u), reason(%s)",
+                pSession->nSessionId, xstrused(pErr) ? pErr : "unknown");
+
+            DirectGate_Desktop_SetReason(pDesktop, xstrused(pErr) ?
+                pErr : "The desktop encoder could not start and this session has no fallback.");
+
+            return XSTDERR;
+        }
+#endif
+
         xlogw("Linux H.264 encoder unavailable, falling back to raw RGBA: sid(%u), reason(%s)",
             pSession->nSessionId, xstrused(pErr) ? pErr : "unknown");
 
@@ -311,8 +375,36 @@ static int DirectGate_Desktop_CaptureFrame(directgate_session_t *pSession)
 {
     directgate_desktop_t *pDesktop = &pSession->desktop;
     Display *pDisplay = (Display*)pDesktop->pDisplay;
-    XCHECK((pDisplay != NULL), XAPI_CONTINUE);
+
+    /* Nothing is being captured yet. Every session passes through here while
+     * the viewer is still choosing a screen - the pipeline starts out raw and
+     * is built when they pick one - so this is the quiet, ordinary case and
+     * must stay quiet. */
     XCHECK_NL((pDesktop->bCaptureReady), XAPI_CONTINUE);
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    /* Past that, the raw path really is being asked to stream, and on Wayland
+     * it cannot: there is no display to read. Belt and braces for the
+     * fallbacks above, which now refuse to put a session here at all - and
+     * the one thing that must not happen is doing it quietly for the rest of
+     * the session. */
+    if (pDesktop->pWayland != NULL)
+    {
+        if (!pDesktop->bWarnedWaylandRaw)
+        {
+            pDesktop->bWarnedWaylandRaw = XTRUE;
+            xloge("The raw capture path was reached on a Wayland session; it cannot produce frames: sid(%u)",
+                pSession->nSessionId);
+
+            DirectGate_Desktop_SendStatus(pSession, "error",
+                "The desktop stream stopped: this session fell back to a capture mode Wayland cannot use.");
+        }
+
+        return XAPI_CONTINUE;
+    }
+#endif
+
+    XCHECK((pDisplay != NULL), XAPI_CONTINUE);
 
     /* Transport backpressure (mirrors the macOS capture callback). A raw 1080p
      * RGBA frame is ~8 MB - far more than the data channel can drain per tick.
@@ -379,6 +471,82 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
         while (read(pDesktop->nTimerFd, &nTicks, sizeof(nTicks)) > 0) {}
     }
 
+    /* A key whose release never made it across leaves the host holding it -
+     * a stuck Shift types the machine's whole session in capitals - and the
+     * session ending is far too late to notice. */
+    (void)DirectGate_Desktop_ExpireHeldKeys(pDesktop);
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    /* Still on the portal prompt. Nothing else in this function applies: the
+     * capture the rest of it drains does not exist yet. */
+    if (pDesktop->bAwaitingGrant)
+    {
+        int nResume = DirectGate_Desktop_ResumeWayland(pSession);
+        if (nResume == XSTDNON) return XAPI_CONTINUE;
+
+        pDesktop->bAwaitingGrant = XFALSE;
+
+        if (nResume < 0)
+        {
+            xlogw("Desktop sharing was not granted: sid(%u), reason(%s)",
+                pSession->nSessionId, DirectGate_Desktop_GetReason(pDesktop));
+
+            DirectGate_Desktop_SendStatus(pSession, "error", DirectGate_Desktop_GetReason(pDesktop));
+            return DirectGate_Session_SendErrorMsg(pSession, DirectGate_Desktop_GetReason(pDesktop));
+        }
+
+        xlogi("Desktop sharing was allowed: sid(%u), display(%s), screen(%ux%u), input(%s)",
+            pSession->nSessionId, pDesktop->sDisplay,
+            pDesktop->nScreenWidth, pDesktop->nScreenHeight,
+            pDesktop->bInputReady ? "yes" : "no");
+
+        /* The same "ready" the start would have sent, just later: the viewer
+         * picks a screen and the stream begins from here exactly as it does
+         * when the grant was already stored. */
+        return DirectGate_Desktop_SendStatus(pSession, "ready", NULL);
+    }
+
+    /* Some portals take keystrokes by position but refuse them by character.
+     * Everything on the host's own keyboard layout still types; anything that
+     * is not - the whole point of a viewer using another script - silently
+     * does nothing, so it is said once instead. */
+    if (pDesktop->pWayland != NULL && !pDesktop->bWaylandNoKeysym &&
+        DirectGate_WL_PortalKeysymRefused(DirectGate_WL_SourcePortal((directgate_wl_source_t*)pDesktop->pWayland)))
+    {
+        pDesktop->bWaylandNoKeysym = XTRUE;
+        xlogw("The desktop portal refuses keystrokes by character: sid(%u); "
+              "only what the host keyboard layout carries can be typed", pSession->nSessionId);
+
+        DirectGate_Desktop_SetFallbackReason(pDesktop,
+            "This desktop only accepts keys its own keyboard layout carries. "
+            "Characters from another layout cannot be typed on it; switch the "
+            "layout on the remote computer instead.");
+
+        DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
+    }
+
+    /* The grant can also end while it is being used - someone presses "Stop
+     * sharing", the compositor restarts - and the only symptom is that frames
+     * stop arriving. Said once, then the session stops pretending. */
+    if (pDesktop->pWayland != NULL && !pDesktop->bWaylandLost)
+    {
+        char sLost[DIRECTGATE_DESKTOP_REASON_LEN] = {0};
+
+        if (DirectGate_WL_SourceLost((directgate_wl_source_t*)pDesktop->pWayland, sLost, sizeof(sLost)))
+        {
+            pDesktop->bWaylandLost = XTRUE;
+            xlogw("Wayland desktop sharing ended: sid(%u), reason(%s)", pSession->nSessionId, sLost);
+
+            DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
+            DirectGate_Desktop_SetReason(pDesktop, sLost[0] ? sLost :
+                "Screen sharing was stopped on the remote computer.");
+
+            DirectGate_Desktop_SendStatus(pSession, "error", DirectGate_Desktop_GetReason(pDesktop));
+            return DirectGate_Session_SendErrorMsg(pSession, DirectGate_Desktop_GetReason(pDesktop));
+        }
+    }
+#endif
+
 #ifdef DIRECTGATE_DESKTOP_HAS_AUDIO
     /* Ship any encoded Opus frames the capture thread queued. Runs before the
      * video drain so audio is never delayed by this tick's frame, and is a
@@ -419,6 +587,16 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
     XCHECK((pSession != NULL), XAPI_DISCONNECT);
     directgate_desktop_t *pDesktop = &pSession->desktop;
     if (!pDesktop->bRunning || pPayload == NULL || !nPayloadLength) return XAPI_CONTINUE;
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    if (pDesktop->bAwaitingGrant)
+    {
+        /* There is no screen to select, no preset to apply and nothing to encode
+        * until the portal prompt is answered. The tick reports "ready" the
+        * moment it is, and the viewer asks again from there. */
+        return DirectGate_Desktop_SendStatus(pSession, "starting", DirectGate_Desktop_GetReason(pDesktop));
+    }
+#endif
 
     char *pJsonText = (char*)calloc(1, nPayloadLength + 1U);
     XCHECK((pJsonText != NULL), XAPI_CONTINUE);
@@ -545,7 +723,19 @@ int DirectGate_Desktop_HandleControl(directgate_session_t *pSession, const uint8
         {
             DirectGate_Desktop_SetCapture(pDesktop, pSelected->sId, pSelected->nX,
                 pSelected->nY, pSelected->nWidth, pSelected->nHeight);
-            (void)DirectGate_Desktop_StartLinuxPipeline(pSession);
+
+            /* On X11 this only ever steps down to the raw path, but a Wayland
+             * session has nothing to step down to and reporting "streaming"
+             * over a pipeline that never started is how a frozen picture gets
+             * mistaken for a network problem. */
+            if (DirectGate_Desktop_StartLinuxPipeline(pSession) < 0)
+            {
+                XJSON_Destroy(&json);
+                free(pJsonText);
+
+                DirectGate_Desktop_SendStatus(pSession, "error", DirectGate_Desktop_GetReason(pDesktop));
+                return XAPI_CONTINUE;
+            }
         }
         else if (pDesktop->bCaptureReady &&
             (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_WEBRTC_VIDEO ||
@@ -1549,12 +1739,14 @@ int DirectGate_Desktop_Start(directgate_session_t *pSession)
     pDesktop->nSessionId = pSession->nSessionId;
 
 #if defined(__linux__)
-    if (DirectGate_Desktop_OpenX11(pSession) < 0)
+    int nOpen = DirectGate_Desktop_OpenX11(pSession);
 #elif defined(__APPLE__)
-    if (DirectGate_Desktop_OpenMacOS(pSession) < 0)
+    int nOpen = DirectGate_Desktop_OpenMacOS(pSession);
 #else
-    if (DirectGate_Desktop_OpenWindows(pSession) < 0)
+    int nOpen = DirectGate_Desktop_OpenWindows(pSession);
 #endif
+
+    if (nOpen < 0)
     {
         xlogw("Desktop mode unavailable: sid(%u), reason(%s)",
             pSession->nSessionId, DirectGate_Desktop_GetReason(pDesktop));
@@ -1574,6 +1766,25 @@ int DirectGate_Desktop_Start(directgate_session_t *pSession)
     }
 
     pDesktop->bRunning = XTRUE;
+
+    /* The desktop is not open yet - someone is still looking at the portal
+     * prompt - but the session is, and the timer that will notice their
+     * answer is running. Reporting an error instead is what used to leave the
+     * viewer stuck on "waiting to be allowed" after they had allowed it:
+     * nothing was left to look again, so only a reconnect picked the grant
+     * up. This status is deliberately not "error"; the viewer keeps the
+     * message and the panel keeps waiting. */
+    if (nOpen == XSTDNON)
+    {
+        pDesktop->bAwaitingGrant = XTRUE;
+
+        xlogi("Desktop mode is waiting for a sharing prompt to be answered: sid(%u)",
+            pSession->nSessionId);
+
+        return DirectGate_Desktop_SendStatus(pSession, "starting",
+            DirectGate_Desktop_GetReason(pDesktop));
+    }
+
 #if defined(__linux__)
     xlogi("Desktop mode activated: sid(%u), backend(%s), display(%s), screen(%ux%u), frame(%ux%u), input(%s)",
         pSession->nSessionId, pDesktop->sBackend, pDesktop->sDisplay,

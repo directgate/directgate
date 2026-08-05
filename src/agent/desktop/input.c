@@ -23,6 +23,10 @@
 #include "session.h"
 #include "priv.h"
 
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+#include "wayland.h"
+#endif
+
 #if defined(_WIN32)
 #include "elevated.h"
 #endif
@@ -144,6 +148,124 @@ static KeySym DirectGate_Desktop_KeySymFromCodepoint(uint32_t nCodepoint)
     if (nCodepoint < 0x20U || nCodepoint == 0x7FU) return NoSymbol;
     if (nCodepoint < 0x100U) return (KeySym)nCodepoint;
     return (KeySym)(nCodepoint | 0x01000000UL);
+}
+
+/* Which side decides what a keystroke types.
+ *
+ * A browser reports both what a key IS (`code`, the physical position) and
+ * what it PRODUCED (`key`, after the viewer's own layout). Sending the
+ * character makes the viewer's layout win; sending the position makes the
+ * host's layout win. Neither is right on its own: a host set to Georgian
+ * would never type Georgian for a viewer on a Latin keyboard, and a viewer
+ * on a Georgian keyboard would never get Georgian out of a Latin host.
+ *
+ * So the choice is made per keystroke, by asking whether the viewer's layout
+ * did anything to this key. If the character is exactly what the position
+ * would give on a plain US layout - or the key produces no character at all,
+ * like Enter or F5 - the position is sent and the host's layout decides,
+ * which is what makes a Georgian host type Georgian. If the character
+ * differs, the viewer's layout produced it deliberately and the character is
+ * sent instead, which is what keeps a Georgian (or German, or AZERTY)
+ * keyboard typing what it says on the keycaps. */
+typedef struct directgate_evdev_key_ {
+    const char *pCode;   /* W3C KeyboardEvent.code */
+    uint16_t nEvdev;     /* Linux input-event-codes.h KEY_* */
+    char cPlain;         /* what a US layout types unshifted, 0 if nothing */
+    char cShifted;       /* ... and with Shift */
+} directgate_evdev_key_t;
+
+static const directgate_evdev_key_t g_EvdevKeys[] = {
+    { "Escape", 1, 0, 0 },
+    { "Digit1", 2, '1', '!' }, { "Digit2", 3, '2', '@' }, { "Digit3", 4, '3', '#' },
+    { "Digit4", 5, '4', '$' }, { "Digit5", 6, '5', '%' }, { "Digit6", 7, '6', '^' },
+    { "Digit7", 8, '7', '&' }, { "Digit8", 9, '8', '*' }, { "Digit9", 10, '9', '(' },
+    { "Digit0", 11, '0', ')' },
+    { "Minus", 12, '-', '_' }, { "Equal", 13, '=', '+' },
+    { "Backspace", 14, 0, 0 }, { "Tab", 15, 0, 0 },
+    { "KeyQ", 16, 'q', 'Q' }, { "KeyW", 17, 'w', 'W' }, { "KeyE", 18, 'e', 'E' },
+    { "KeyR", 19, 'r', 'R' }, { "KeyT", 20, 't', 'T' }, { "KeyY", 21, 'y', 'Y' },
+    { "KeyU", 22, 'u', 'U' }, { "KeyI", 23, 'i', 'I' }, { "KeyO", 24, 'o', 'O' },
+    { "KeyP", 25, 'p', 'P' },
+    { "BracketLeft", 26, '[', '{' }, { "BracketRight", 27, ']', '}' },
+    { "Enter", 28, 0, 0 }, { "ControlLeft", 29, 0, 0 },
+    { "KeyA", 30, 'a', 'A' }, { "KeyS", 31, 's', 'S' }, { "KeyD", 32, 'd', 'D' },
+    { "KeyF", 33, 'f', 'F' }, { "KeyG", 34, 'g', 'G' }, { "KeyH", 35, 'h', 'H' },
+    { "KeyJ", 36, 'j', 'J' }, { "KeyK", 37, 'k', 'K' }, { "KeyL", 38, 'l', 'L' },
+    { "Semicolon", 39, ';', ':' }, { "Quote", 40, '\'', '"' }, { "Backquote", 41, '`', '~' },
+    { "ShiftLeft", 42, 0, 0 }, { "Backslash", 43, '\\', '|' },
+    { "KeyZ", 44, 'z', 'Z' }, { "KeyX", 45, 'x', 'X' }, { "KeyC", 46, 'c', 'C' },
+    { "KeyV", 47, 'v', 'V' }, { "KeyB", 48, 'b', 'B' }, { "KeyN", 49, 'n', 'N' },
+    { "KeyM", 50, 'm', 'M' },
+    { "Comma", 51, ',', '<' }, { "Period", 52, '.', '>' }, { "Slash", 53, '/', '?' },
+    { "ShiftRight", 54, 0, 0 }, { "NumpadMultiply", 55, '*', '*' },
+    { "AltLeft", 56, 0, 0 }, { "Space", 57, ' ', ' ' }, { "CapsLock", 58, 0, 0 },
+    { "F1", 59, 0, 0 }, { "F2", 60, 0, 0 }, { "F3", 61, 0, 0 }, { "F4", 62, 0, 0 },
+    { "F5", 63, 0, 0 }, { "F6", 64, 0, 0 }, { "F7", 65, 0, 0 }, { "F8", 66, 0, 0 },
+    { "F9", 67, 0, 0 }, { "F10", 68, 0, 0 },
+    { "NumLock", 69, 0, 0 }, { "ScrollLock", 70, 0, 0 },
+    { "Numpad7", 71, '7', '7' }, { "Numpad8", 72, '8', '8' }, { "Numpad9", 73, '9', '9' },
+    { "NumpadSubtract", 74, '-', '-' },
+    { "Numpad4", 75, '4', '4' }, { "Numpad5", 76, '5', '5' }, { "Numpad6", 77, '6', '6' },
+    { "NumpadAdd", 78, '+', '+' },
+    { "Numpad1", 79, '1', '1' }, { "Numpad2", 80, '2', '2' }, { "Numpad3", 81, '3', '3' },
+    { "Numpad0", 82, '0', '0' }, { "NumpadDecimal", 83, '.', '.' },
+    { "IntlBackslash", 86, '\\', '|' }, { "F11", 87, 0, 0 }, { "F12", 88, 0, 0 },
+    { "IntlRo", 89, 0, 0 }, { "Convert", 92, 0, 0 }, { "KanaMode", 93, 0, 0 },
+    { "NonConvert", 94, 0, 0 }, { "NumpadEnter", 96, 0, 0 }, { "ControlRight", 97, 0, 0 },
+    { "NumpadDivide", 98, '/', '/' }, { "PrintScreen", 99, 0, 0 }, { "AltRight", 100, 0, 0 },
+    { "Home", 102, 0, 0 }, { "ArrowUp", 103, 0, 0 }, { "PageUp", 104, 0, 0 },
+    { "ArrowLeft", 105, 0, 0 }, { "ArrowRight", 106, 0, 0 }, { "End", 107, 0, 0 },
+    { "ArrowDown", 108, 0, 0 }, { "PageDown", 109, 0, 0 }, { "Insert", 110, 0, 0 },
+    { "Delete", 111, 0, 0 }, { "NumpadEqual", 117, '=', '=' }, { "Pause", 119, 0, 0 },
+    { "NumpadComma", 121, ',', ',' }, { "Lang1", 122, 0, 0 }, { "Lang2", 123, 0, 0 },
+    { "IntlYen", 124, 0, 0 }, { "MetaLeft", 125, 0, 0 }, { "MetaRight", 126, 0, 0 },
+    { "ContextMenu", 127, 0, 0 },
+    { "F13", 183, 0, 0 }, { "F14", 184, 0, 0 }, { "F15", 185, 0, 0 }, { "F16", 186, 0, 0 },
+    { "F17", 187, 0, 0 }, { "F18", 188, 0, 0 }, { "F19", 189, 0, 0 }, { "F20", 190, 0, 0 },
+    { "F21", 191, 0, 0 }, { "F22", 192, 0, 0 }, { "F23", 193, 0, 0 }, { "F24", 194, 0, 0 },
+};
+
+static const directgate_evdev_key_t* DirectGate_Desktop_EvdevKey(const char *pCode)
+{
+    if (!xstrused(pCode)) return NULL;
+
+    for (size_t i = 0; i < sizeof(g_EvdevKeys) / sizeof(g_EvdevKeys[0]); i++)
+    {
+        /* First byte before the call: this runs on every keystroke, and it
+         * turns a hundred string comparisons into a handful. */
+        if (g_EvdevKeys[i].pCode[0] != pCode[0]) continue;
+        if (xstrcmp(g_EvdevKeys[i].pCode, pCode)) return &g_EvdevKeys[i];
+    }
+
+    return NULL;
+}
+
+/* The evdev code to send for this event, or 0 when the character has to be
+ * sent instead. See the note above for which is which. */
+static uint16_t DirectGate_Desktop_PhysicalKey(xjson_obj_t *pRoot)
+{
+    const char *pCode = XJSON_GetString(XJSON_GetObject(pRoot, "code"));
+    const directgate_evdev_key_t *pKey = DirectGate_Desktop_EvdevKey(pCode);
+    if (pKey == NULL) return 0;
+
+    const char *pChar = XJSON_GetString(XJSON_GetObject(pRoot, "key"));
+    uint32_t nCodepoint = 0;
+    size_t nUsed = xstrused(pChar) ? DirectGate_Desktop_UTF8Decode(pChar, &nCodepoint) : 0;
+
+    /* No single character to compare: a named key ("Enter", "F5", "Shift")
+     * means the same thing under every layout, so position it is. An unusable
+     * value ("Dead", "Unidentified", "Process") is the IME talking, and the
+     * physical key is the only honest thing left to send. */
+    if (!nUsed || pChar[nUsed] != '\0') return pKey->nEvdev;
+
+    /* Anything the viewer's layout renamed goes as a character. This is the
+     * whole non-Latin case - a Georgian keyboard reports "ა" where the US one
+     * reports "a" - and equally the Latin layouts that move keys around, so a
+     * German "z" is not typed as the "y" its position holds. */
+    if (nCodepoint > 0x7FU) return 0;
+    if ((char)nCodepoint != pKey->cPlain && (char)nCodepoint != pKey->cShifted) return 0;
+
+    return pKey->nEvdev;
 }
 
 typedef struct directgate_x11_key_ {
@@ -467,8 +589,14 @@ static xbool_t DirectGate_Desktop_X11ShiftDown(Display *pDisplay)
     return (nMask & ShiftMask) ? XTRUE : XFALSE;
 }
 
-static void DirectGate_Desktop_X11RememberKey(directgate_desktop_t *pDesktop,
-                                              const char *pCode, KeyCode code)
+/* What the browser code that is currently down was injected as: an X11
+ * keycode on an Xorg session, a keysym on a Wayland one. Both backends need
+ * the same bookkeeping - a key that went down must be releasable by the code
+ * that pressed it, and everything still down must be released when the
+ * session ends - so the table is shared and only the value differs. */
+static void DirectGate_Desktop_RememberKey(directgate_desktop_t *pDesktop,
+                                           const char *pCode, uint32_t nValue,
+                                           xbool_t bPhysical)
 {
     if (!xstrused(pCode)) return;
 
@@ -476,7 +604,8 @@ static void DirectGate_Desktop_X11RememberKey(directgate_desktop_t *pDesktop,
     {
         if (xstrcmp(pDesktop->heldKeys[i].sCode, pCode))
         {
-            pDesktop->heldKeys[i].nKeycode = code;
+            pDesktop->heldKeys[i].nKeycode = nValue;
+            pDesktop->heldKeys[i].bPhysical = bPhysical;
             return;
         }
     }
@@ -490,11 +619,15 @@ static void DirectGate_Desktop_X11RememberKey(directgate_desktop_t *pDesktop,
 
     directgate_desktop_held_key_t *pSlot = &pDesktop->heldKeys[pDesktop->nHeldKeyCount++];
     xstrncpy(pSlot->sCode, sizeof(pSlot->sCode), pCode);
-    pSlot->nKeycode = code;
+    pSlot->nKeycode = nValue;
+    pSlot->bPhysical = bPhysical;
 }
 
-static KeyCode DirectGate_Desktop_X11ForgetKey(directgate_desktop_t *pDesktop,
-                                               const char *pCode)
+/* @p pPhysical (may be NULL) receives how the value was injected, which is
+ * what tells a Wayland release which portal call to make. */
+static uint32_t DirectGate_Desktop_ForgetKey(directgate_desktop_t *pDesktop,
+                                             const char *pCode,
+                                             xbool_t *pPhysical)
 {
     if (!xstrused(pCode)) return 0;
 
@@ -502,11 +635,14 @@ static KeyCode DirectGate_Desktop_X11ForgetKey(directgate_desktop_t *pDesktop,
     {
         if (!xstrcmp(pDesktop->heldKeys[i].sCode, pCode)) continue;
 
-        KeyCode code = (KeyCode)pDesktop->heldKeys[i].nKeycode;
+        uint32_t nValue = pDesktop->heldKeys[i].nKeycode;
+        if (pPhysical != NULL) *pPhysical = pDesktop->heldKeys[i].bPhysical;
+
         memmove(&pDesktop->heldKeys[i], &pDesktop->heldKeys[i + 1U],
             sizeof(pDesktop->heldKeys[0]) * (pDesktop->nHeldKeyCount - i - 1U));
+
         pDesktop->nHeldKeyCount--;
-        return code;
+        return nValue;
     }
 
     return 0;
@@ -548,26 +684,64 @@ static void DirectGate_Desktop_X11HandleKey(directgate_desktop_t *pDesktop,
 
     if (!bDown)
     {
-        KeyCode tracked = DirectGate_Desktop_X11ForgetKey(pDesktop, pCode);
+        KeyCode tracked = (KeyCode)DirectGate_Desktop_ForgetKey(pDesktop, pCode, NULL);
         if (tracked != 0)
         {
             DirectGate_Desktop_X11MarkScratchHeld(pDesktop, tracked, XFALSE);
-            ((directgate_xtest_key_fn)pDesktop->pFakeKey)(
-                (Display*)pDesktop->pDisplay, tracked, XFALSE, CurrentTime);
+            ((directgate_xtest_key_fn)pDesktop->pFakeKey)((Display*)pDesktop->pDisplay, tracked, XFALSE, CurrentTime);
             return;
         }
+    }
+
+    /* The host's own layout decides this one. X11 keycodes are the evdev code
+     * plus 8 under the evdev rules every Linux Xorg uses, so the key goes in
+     * at its position and the server applies the layout - the same path a
+     * keyboard plugged into that machine takes. */
+    uint16_t nEvdev = DirectGate_Desktop_PhysicalKey(pRoot);
+    if (nEvdev != 0)
+    {
+        KeyCode code = (KeyCode)(nEvdev + 8U);
+        ((directgate_xtest_key_fn)pDesktop->pFakeKey)((Display*)pDesktop->pDisplay, code, bDown ? XTRUE : XFALSE, CurrentTime);
+
+        if (bDown) DirectGate_Desktop_RememberKey(pDesktop, pCode, code, XTRUE);
+        return;
     }
 
     KeySym sym = DirectGate_Desktop_KeySymFromJson(pRoot);
     if (sym == NoSymbol) return;
 
     KeyCode used = DirectGate_Desktop_X11SendKeysym(pDesktop, sym, bDown);
-    if (bDown && used != 0) DirectGate_Desktop_X11RememberKey(pDesktop, pCode, used);
+    if (bDown && used != 0) DirectGate_Desktop_RememberKey(pDesktop, pCode, used, XFALSE);
 }
 
 void DirectGate_Desktop_ReleaseHeldKeys(directgate_desktop_t *pDesktop)
 {
     XCHECK_VOID_NL((pDesktop != NULL));
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    /* A Wayland session has no display connection, and skipping it here is
+     * how a key that went down without its release stayed down: the portal's
+     * virtual keyboard holds it for the life of the session, so a lost Shift
+     * release turned the whole machine upper-case until the agent itself was
+     * restarted. */
+    if (pDesktop->pWayland != NULL)
+    {
+        directgate_wl_portal_t *pPortal = DirectGate_WL_SourcePortal((directgate_wl_source_t*)pDesktop->pWayland);
+        if (pPortal != NULL)
+        {
+            for (uint32_t i = 0; i < pDesktop->nHeldKeyCount; i++)
+            {
+                const directgate_desktop_held_key_t *pHeld = &pDesktop->heldKeys[i];
+                if (pHeld->bPhysical) DirectGate_WL_PortalKeycode(pPortal, (int32_t)pHeld->nKeycode, XFALSE);
+                else DirectGate_WL_PortalKeysym(pPortal, (int32_t)pHeld->nKeycode, XFALSE);
+            }
+        }
+
+        pDesktop->nHeldKeyCount = 0;
+        return;
+    }
+#endif
+
     if (pDesktop->pDisplay == NULL || pDesktop->pFakeKey == NULL) return;
 
     Display *pDisplay = (Display*)pDesktop->pDisplay;
@@ -581,6 +755,30 @@ void DirectGate_Desktop_ReleaseHeldKeys(directgate_desktop_t *pDesktop)
         pDesktop->scratchKeys[i].bHeld = XFALSE;
 
     XFlush(pDisplay);
+}
+
+/* How long a key may stay down with nothing else arriving before it is taken
+ * to be stuck. Nothing legitimate looks like this: a key held on purpose is
+ * held while something else is happening - the mouse moves, another key
+ * repeats - and every one of those refreshes the clock. What does look like
+ * this is a release that never arrived, and the cost of getting it wrong in
+ * that direction is a machine that types in capitals until it is rebooted. */
+#define DIRECTGATE_DESKTOP_HELD_KEY_IDLE_MS 30000
+
+xbool_t DirectGate_Desktop_ExpireHeldKeys(directgate_desktop_t *pDesktop)
+{
+    XCHECK_NL((pDesktop != NULL), XFALSE);
+    if (!pDesktop->nHeldKeyCount || !pDesktop->nLastInputMs) return XFALSE;
+
+    uint64_t nNowMs = XTime_GetMs();
+    if (nNowMs <= pDesktop->nLastInputMs) return XFALSE;
+    if (nNowMs - pDesktop->nLastInputMs < DIRECTGATE_DESKTOP_HELD_KEY_IDLE_MS) return XFALSE;
+
+    xlogw("Releasing %u desktop key(s) still held after %u seconds of silence: sid(%u)",
+        pDesktop->nHeldKeyCount, DIRECTGATE_DESKTOP_HELD_KEY_IDLE_MS / 1000U, pDesktop->nSessionId);
+
+    DirectGate_Desktop_ReleaseHeldKeys(pDesktop);
+    return XTRUE;
 }
 
 static void DirectGate_Desktop_X11SetLock(Display *pDisplay, KeySym sym, xjson_obj_t *pValue)
@@ -617,16 +815,262 @@ static void DirectGate_Desktop_X11TypeText(directgate_desktop_t *pDesktop, const
     }
 }
 
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+/* Input on Wayland goes back through the same portal session the screen is
+ * being captured from. Nothing here can reach the compositor directly - that
+ * is the point of the design - so every event is a D-Bus notification against
+ * the granted session, and the coordinates are the stream's, which on this
+ * backend is also the screen because the portal grants exactly one.
+ *
+ * The keysyms are XKB keysyms, the same values the X11 path resolves, so the
+ * whole key-resolution layer above is reused rather than rewritten. */
+static int DirectGate_Desktop_WaylandHandleInput(directgate_session_t *pSession, xjson_obj_t *pRoot)
+{
+    directgate_desktop_t *pDesktop = &pSession->desktop;
+    directgate_wl_portal_t *pPortal = DirectGate_WL_SourcePortal((directgate_wl_source_t*)pDesktop->pWayland);
+    if (pPortal == NULL) return XAPI_CONTINUE;
+
+    const char *pAction = XJSON_GetString(XJSON_GetObject(pRoot, "action"));
+    const char *pEvent = XJSON_GetString(XJSON_GetObject(pRoot, "event"));
+
+    if (xstrcmp(pAction, "pointer"))
+    {
+        uint32_t nSequence = XJSON_GetU32(XJSON_GetObject(pRoot, "sequence"));
+        if (nSequence != 0U && pDesktop->nPointerSequence != 0U &&
+            (int32_t)(nSequence - pDesktop->nPointerSequence) <= 0)
+            return XAPI_CONTINUE;
+
+        if (nSequence != 0U) pDesktop->nPointerSequence = nSequence;
+
+        /* The capture rectangle is the frame of reference for both branches
+         * below: the browser's relative deltas are host pixels of it, and the
+         * cursor position echoed back is measured in it. */
+        uint32_t nCaptureW = pDesktop->nCaptureWidth ? pDesktop->nCaptureWidth : 1U;
+        uint32_t nCaptureH = pDesktop->nCaptureHeight ? pDesktop->nCaptureHeight : 1U;
+
+        xbool_t bRelative = XJSON_GetBool(XJSON_GetObject(pRoot, "relative"));
+        xbool_t bMoved = XFALSE;
+
+        if (bRelative)
+        {
+            /* Mouse capture. The portal does have relative motion, but the
+             * compositor accelerates it, so the pointer would outrun the
+             * cursor the browser draws from these same deltas and clicks
+             * would land where nothing appears to be. Integrating them here
+             * and sending the result as absolute motion keeps the two
+             * identical. */
+            int nDx = XJSON_GetInt(XJSON_GetObject(pRoot, "dx"));
+            int nDy = XJSON_GetInt(XJSON_GetObject(pRoot, "dy"));
+
+            /* Capture starts from wherever the pointer was last put, which is
+             * the click that asked for the lock. A session that has not moved
+             * the pointer at all has nothing to start from, and there the
+             * pointer really is moved to the middle rather than merely
+             * assumed to be there: the position echoed below is what the
+             * browser draws its cursor at, and a guess would put that cursor
+             * somewhere the clicks do not land. */
+            if (!pDesktop->bWlPointerValid)
+            {
+                pDesktop->nWlPointerX = (double)nCaptureW / 2.0;
+                pDesktop->nWlPointerY = (double)nCaptureH / 2.0;
+                pDesktop->bWlPointerValid = XTRUE;
+                bMoved = XTRUE;
+            }
+
+            if (nDx != 0 || nDy != 0)
+            {
+                pDesktop->nWlPointerX += (double)nDx;
+                pDesktop->nWlPointerY += (double)nDy;
+                bMoved = XTRUE;
+            }
+        }
+        else
+        {
+            int nX = XJSON_GetInt(XJSON_GetObject(pRoot, "x"));
+            int nY = XJSON_GetInt(XJSON_GetObject(pRoot, "y"));
+
+            if (nX < 0) nX = 0;
+            if (nY < 0) nY = 0;
+
+            if (pDesktop->nFrameWidth > 0 && (uint32_t)nX >= pDesktop->nFrameWidth)
+                nX = (int)pDesktop->nFrameWidth - 1;
+            if (pDesktop->nFrameHeight > 0 && (uint32_t)nY >= pDesktop->nFrameHeight)
+                nY = (int)pDesktop->nFrameHeight - 1;
+
+            /* Frame pixels are the encoded size, which is not the captured
+             * size whenever the stream was scaled down to fit the preset. */
+            pDesktop->nWlPointerX = (pDesktop->nFrameWidth > 1) ? ((double)nX * (double)nCaptureW) / (double)pDesktop->nFrameWidth : 0.0;
+            pDesktop->nWlPointerY = (pDesktop->nFrameHeight > 1) ? ((double)nY * (double)nCaptureH) / (double)pDesktop->nFrameHeight : 0.0;
+
+            pDesktop->bWlPointerValid = XTRUE;
+            bMoved = XTRUE;
+        }
+
+        /* Off the edge of the shared screen there is nothing to click, and a
+         * position that keeps growing would take seconds of mouse movement to
+         * walk back onto the screen. */
+        if (pDesktop->nWlPointerX < 0.0) pDesktop->nWlPointerX = 0.0;
+        if (pDesktop->nWlPointerY < 0.0) pDesktop->nWlPointerY = 0.0;
+
+        if (pDesktop->nWlPointerX > (double)(nCaptureW - 1U)) pDesktop->nWlPointerX = (double)(nCaptureW - 1U);
+        if (pDesktop->nWlPointerY > (double)(nCaptureH - 1U)) pDesktop->nWlPointerY = (double)(nCaptureH - 1U);
+
+        if (bMoved)
+        {
+            /* Stream-relative, not desktop-relative. FrameToScreenX adds the
+             * monitor's position on the desktop, which is right for XTest and
+             * wrong here: the portal measures from the corner of the stream
+             * it granted. On a second monitor that offset is the whole width
+             * of the first one, so every click landed off-screen.
+             *
+             * Scale against the size PipeWire actually negotiated, not the
+             * size the portal described. With display scaling the two differ
+             * the portal reports logical pixels while the stream carries
+             * physical ones - and the pointer then lands short of where it
+             * was put, by exactly the scale factor. */
+            uint32_t nStreamW = nCaptureW;
+            uint32_t nStreamH = nCaptureH;
+            DirectGate_WL_SourceSize((directgate_wl_source_t*)pDesktop->pWayland, &nStreamW, &nStreamH);
+
+            double nStreamX = (pDesktop->nWlPointerX * (double)nStreamW) / (double)nCaptureW;
+            double nStreamY = (pDesktop->nWlPointerY * (double)nStreamH) / (double)nCaptureH;
+
+            /* Addressed to the screen actually being watched, not to whichever
+             * one the portal happened to list first. */
+            DirectGate_WL_PortalPointerMotion(pPortal,
+                DirectGate_WL_SourceActiveNode((directgate_wl_source_t*)pDesktop->pWayland), nStreamX, nStreamY);
+        }
+
+        if (xstrcmp(pEvent, "button"))
+        {
+            uint32_t nButton = XJSON_GetU32(XJSON_GetObject(pRoot, "button"));
+            int32_t nCode = DirectGate_WL_PortalButtonCode(nButton);
+
+            if (nCode != 0)
+                DirectGate_WL_PortalPointerButton(pPortal, nCode,
+                    XJSON_GetBool(XJSON_GetObject(pRoot, "down")) ? XTRUE : XFALSE);
+        }
+        else if (xstrcmp(pEvent, "wheel"))
+        {
+            /* The portal takes scroll distance, not the wheel-button clicks
+             * X11 emulates, so the notch accumulator is bypassed and the
+             * deltas go through as they arrived. */
+            double nDx = (double)XJSON_GetInt(XJSON_GetObject(pRoot, "deltaX"));
+            double nDy = (double)XJSON_GetInt(XJSON_GetObject(pRoot, "deltaY"));
+            if (nDx != 0.0 || nDy != 0.0) DirectGate_WL_PortalPointerAxis(pPortal, nDx, nDy);
+        }
+
+        /* Under mouse capture the browser has hidden its own pointer and is
+         * drawing the host cursor itself, so it has to be told where that
+         * cursor now is - including when the clamp above refused to move it
+         * any further. Absolute motion needs no echo: the browser already
+         * knows, its own pointer is the cursor. */
+        if (bRelative)
+        {
+            DirectGate_Desktop_SendCursorPosition(pSession,
+                pDesktop->nCaptureX + (int)pDesktop->nWlPointerX,
+                pDesktop->nCaptureY + (int)pDesktop->nWlPointerY, nSequence);
+        }
+
+        return XAPI_CONTINUE;
+    }
+
+    if (xstrcmp(pAction, "key"))
+    {
+        const char *pCode = XJSON_GetString(XJSON_GetObject(pRoot, "code"));
+        xbool_t bDown = XJSON_GetBool(XJSON_GetObject(pRoot, "down")) ? XTRUE : XFALSE;
+
+        /* Release exactly what was pressed, which is why the code that
+         * pressed it is what the release is looked up by.
+         *
+         * The browser reports the character a key produced, so typing a
+         * capital and letting Shift go first - which is how anyone types
+         * fast - sends "A" down and "a" up. The portal reaches a shifted
+         * keysym by pressing Shift itself, so releasing "a" released the
+         * letter and left the compositor's own Shift down: from there the
+         * whole machine typed in capitals, and nothing the viewer pressed
+         * could clear it because that Shift was not theirs to release. */
+        if (!bDown)
+        {
+            xbool_t bWasPhysical = XFALSE;
+            uint32_t nTracked = DirectGate_Desktop_ForgetKey(pDesktop, pCode, &bWasPhysical);
+
+            if (nTracked != 0)
+            {
+                if (bWasPhysical) DirectGate_WL_PortalKeycode(pPortal, (int32_t)nTracked, XFALSE);
+                else DirectGate_WL_PortalKeysym(pPortal, (int32_t)nTracked, XFALSE);
+
+                return XAPI_CONTINUE;
+            }
+        }
+
+        /* The host's own layout decides this one; see the note on
+         * DirectGate_Desktop_PhysicalKey. */
+        uint16_t nEvdev = DirectGate_Desktop_PhysicalKey(pRoot);
+        if (nEvdev != 0)
+        {
+            DirectGate_WL_PortalKeycode(pPortal, (int32_t)nEvdev, bDown);
+            if (bDown) DirectGate_Desktop_RememberKey(pDesktop, pCode, nEvdev, XTRUE);
+
+            return XAPI_CONTINUE;
+        }
+
+        KeySym sym = DirectGate_Desktop_KeySymFromJson(pRoot);
+        if (sym == NoSymbol) return XAPI_CONTINUE;
+
+        DirectGate_WL_PortalKeysym(pPortal, (int32_t)sym, bDown);
+
+        /* Tracked so the session cannot end with a key still down; the portal
+         * keyboard outlives any single keystroke. */
+        if (bDown) DirectGate_Desktop_RememberKey(pDesktop, pCode, (uint32_t)sym, XFALSE);
+
+        return XAPI_CONTINUE;
+    }
+
+    /* Whole strings arrive as their own action - that is how anything the
+     * browser cannot express as a keystroke gets typed, which is most of a
+     * non-Latin keyboard. Handling only "key" meant those characters were
+     * dropped without a trace, and the keyboard looked dead. */
+    if (xstrcmp(pAction, "text"))
+    {
+        const char *pText = XJSON_GetString(XJSON_GetObject(pRoot, "text"));
+        if (!xstrused(pText)) return XAPI_CONTINUE;
+
+        for (size_t i = 0; pText[i] != '\0'; )
+        {
+            uint32_t nCodepoint = 0;
+            size_t nUsed = DirectGate_Desktop_UTF8Decode(&pText[i], &nCodepoint);
+
+            if (!nUsed) break;
+            i += nUsed;
+
+            KeySym sym = DirectGate_Desktop_KeySymFromCodepoint(nCodepoint);
+            if (sym == NoSymbol) continue;
+
+            DirectGate_WL_PortalKeysym(pPortal, (int32_t)sym, XTRUE);
+            DirectGate_WL_PortalKeysym(pPortal, (int32_t)sym, XFALSE);
+        }
+    }
+
+    return XAPI_CONTINUE;
+}
+#endif
+
 int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t *pPayload, size_t nPayloadLength)
 {
     XCHECK((pSession != NULL), XAPI_DISCONNECT);
     directgate_desktop_t *pDesktop = &pSession->desktop;
 
-    if (!pDesktop->bRunning || pDesktop->pDisplay == NULL || !pDesktop->bInputReady)
+    if (!pDesktop->bRunning || !pDesktop->bInputReady)
         return XAPI_CONTINUE;
 
     if (pPayload == NULL || !nPayloadLength)
         return XAPI_CONTINUE;
+
+    /* Feeds the held-key watchdog: any event at all, not just a keystroke,
+     * proves the viewer is still there and that a key they are holding is
+     * being held on purpose. */
+    pDesktop->nLastInputMs = XTime_GetMs();
 
     char *pJsonText = (char*)calloc(1, nPayloadLength + 1U);
     XCHECK((pJsonText != NULL), XAPI_CONTINUE);
@@ -640,6 +1084,25 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
     }
 
     xjson_obj_t *pRoot = json.pRootObj;
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    if (pDesktop->pWayland != NULL)
+    {
+        int nWlStatus = DirectGate_Desktop_WaylandHandleInput(pSession, pRoot);
+        XJSON_Destroy(&json);
+        free(pJsonText);
+        return nWlStatus;
+    }
+#endif
+
+    /* Past here is the X11 path, which needs a display connection. */
+    if (pDesktop->pDisplay == NULL)
+    {
+        XJSON_Destroy(&json);
+        free(pJsonText);
+        return XAPI_CONTINUE;
+    }
+
     const char *pAction = XJSON_GetString(XJSON_GetObject(pRoot, "action"));
     const char *pEvent = XJSON_GetString(XJSON_GetObject(pRoot, "event"));
     Display *pDisplay = (Display*)pDesktop->pDisplay;
