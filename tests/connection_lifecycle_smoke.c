@@ -183,6 +183,48 @@ int main(void)
 
     CHECK(dispatch(&conn, &staleReconnect, XAPI_CB_CLOSED) == XAPI_CONTINUE,
         "recovered relay disconnect should be handled");
+
+    /* Keepalive travels on the data channel, so its schedule must not survive
+       a stretch where that channel is down. A frozen pong timestamp used to
+       expire a session the instant a renegotiated channel opened, which took
+       a device offline in the middle of a long file transfer. */
+    xapi_session_t kaRelay;
+    CHECK(dispatch(&conn, &kaRelay, XAPI_CB_CONNECTED) == XAPI_CONTINUE,
+        "keepalive test relay connection should be accepted");
+
+    cfg.nKAInterval = 25;
+    directgate_session_t *pKeepalive = DirectGate_SessionMgr_Create(&conn.mgr, 90);
+    CHECK(pKeepalive != NULL, "keepalive test session should be created");
+    pKeepalive->pWsSession = &kaRelay;
+    pKeepalive->bAuthenticated = XTRUE;
+
+    uint64_t nStaleMs = XTime_GetMs() - (uint64_t)cfg.nKAInterval * 3000ULL * 2ULL;
+    pKeepalive->nLastKAPingMs = nStaleMs;
+    pKeepalive->nLastKAPongMs = nStaleMs;
+    pKeepalive->webrtc.bConnected = XFALSE;
+
+    DirectGate_TestCheckWebRTCKeepalive(&conn);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 90) == pKeepalive,
+        "a session without a data channel must not be expired by keepalive");
+    CHECK(pKeepalive->nLastKAPingMs == 0 && pKeepalive->nLastKAPongMs == 0,
+        "keepalive schedule must be cleared while the data channel is down");
+
+    /* Channel back up: the next pass re-arms the schedule from now instead of
+       measuring the pong age against the gap that just ended. */
+    pKeepalive->webrtc.bConnected = XTRUE;
+    pKeepalive->webrtc.nDataChannelID = 0;
+
+    DirectGate_TestCheckWebRTCKeepalive(&conn);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 90) == pKeepalive,
+        "a session must survive the first keepalive pass after the channel returns");
+    CHECK(pKeepalive->nLastKAPongMs != 0,
+        "keepalive schedule should re-arm once the data channel is back");
+
+    pKeepalive->webrtc.bConnected = XFALSE;
+    pKeepalive->webrtc.nDataChannelID = -1;
+
+    CHECK(dispatch(&conn, &kaRelay, XAPI_CB_CLOSED) == XAPI_CONTINUE,
+        "keepalive test relay disconnect should be handled");
     DirectGate_SessionMgr_Destroy(&conn.mgr);
     puts("connection_lifecycle_smoke: OK");
     return 0;

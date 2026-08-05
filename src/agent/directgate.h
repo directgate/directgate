@@ -75,6 +75,7 @@ typedef struct directgate_conn_ {
 int DirectGate_TestHandleTransportMessage(xapi_session_t *pApiSession,
                                           const uint8_t *pPayload,
                                           size_t nPayload);
+void DirectGate_TestCheckWebRTCKeepalive(directgate_conn_t *pConn);
 #endif
 
 #ifdef __cplusplus

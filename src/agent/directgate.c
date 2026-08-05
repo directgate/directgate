@@ -59,8 +59,8 @@
 #define DIRECTGATE_EVENT_LOOP_WAIT_MS       100U
 #define DIRECTGATE_TRANSFER_WAIT_MS         5U
 #define DIRECTGATE_TRANSFER_BUDGET          4U
-#define DIRECTGATE_TRANSFER_WS_BUFFER_MAX   (8U * 1024U * 1024U)
-#define DIRECTGATE_TRANSFER_RTC_BUFFER_MAX  (8U * 1024U * 1024U)
+#define DIRECTGATE_TRANSFER_WS_BUFFER_MAX   (1U * 1024U * 1024U)
+#define DIRECTGATE_TRANSFER_RTC_BUFFER_MAX  (1U * 1024U * 1024U)
 #define DIRECTGATE_RELAY_KA_TIMEOUT_MS      60000ULL
 #define DIRECTGATE_RELAY_KA_PROBE_MS        20000ULL
 
@@ -2647,7 +2647,19 @@ static void DirectGate_CheckWebRTCKeepalive(directgate_conn_t *pConn)
     {
         directgate_session_t *pSession = pConn->mgr.pSessions[i];
         if (pSession == NULL || !pSession->bAuthenticated) continue;
-        if (!DirectGate_WebRTC_IsConnected(&pSession->webrtc)) continue;
+
+        if (!DirectGate_WebRTC_IsConnected(&pSession->webrtc))
+        {
+            /* Keepalive rides the data channel, so it cannot run while that
+               channel is down, and the session stays perfectly healthy over
+               the relay meanwhile. Clear the schedule instead of freezing it.
+               A pong timestamp left behind from the previous channel makes
+               the first check after a renegotiation see an age of however
+               long the gap lasted and expire a session that just came back. */
+            pSession->nLastKAPingMs = 0;
+            pSession->nLastKAPongMs = 0;
+            continue;
+        }
 
         if (pSession->nLastKAPingMs == 0)
         {
@@ -2688,6 +2700,13 @@ static void DirectGate_CheckWebRTCKeepalive(directgate_conn_t *pConn)
         pSession->nLastKAPingMs = nNowMs;
     }
 }
+
+#ifdef DIRECTGATE_TESTING
+void DirectGate_TestCheckWebRTCKeepalive(directgate_conn_t *pConn)
+{
+    DirectGate_CheckWebRTCKeepalive(pConn);
+}
+#endif
 
 static void DirectGate_RunService(xapi_t *pApi, xapi_endpoint_t *pEndpt, directgate_conn_t *pSessData)
 {
