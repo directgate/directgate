@@ -63,6 +63,7 @@ foreach(test
         base64_smoke
         collections_smoke
         common_utils_smoke
+        common_prompt_smoke
         protocol_smoke
         crypto_smoke
         srp_smoke
@@ -98,6 +99,7 @@ directgate_smoke(enroll_edge_smoke   ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c
 directgate_smoke(add_key_smoke       ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(config_smoke        ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(config_extra_smoke  ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
+directgate_smoke(config_args_smoke   ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(keyfile_apply_smoke ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(search_smoke        ${AGENT_DIR}/search.c ${AGENT_DIR}/files.c)
 directgate_smoke(yuv_smoke   ${AGENT_DIR}/yuv.c)
@@ -150,6 +152,26 @@ directgate_smoke(session_smoke       ${AGENT_DIR}/session.c)
 directgate_smoke(client_devices_smoke ${CLIENT_DIR}/devices.c)
 directgate_smoke(client_config_smoke  ${CLIENT_DIR}/config.c ${CLIENT_DIR}/devices.c)
 directgate_smoke(client_relay_smoke   ${CLIENT_DIR}/relay.c)
+
+# Drives the file-manager handlers against a real session send path, so it
+# needs the same source set as the lifecycle test.
+directgate_smoke(session_files_smoke
+    ${AGENT_DIR}/config.c
+    ${AGENT_DIR}/desktop/desktop.c
+    ${AGENT_DIR}/desktop/display.c
+    ${AGENT_DIR}/desktop/input.c
+    ${AGENT_DIR}/desktop/stream.c
+    ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/files.c
+    ${AGENT_DIR}/search.c
+    ${AGENT_DIR}/session.c
+    ${AGENT_DIR}/term.c
+    ${AGENT_DIR}/directgate.c)
+directgate_smoke_desktop(session_files_smoke)
+target_compile_definitions(session_files_smoke PRIVATE DIRECTGATE_TESTING)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(session_files_smoke PRIVATE -Wno-unused-function)
+endif()
 
 directgate_smoke(connection_lifecycle_smoke
     ${AGENT_DIR}/config.c

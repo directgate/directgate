@@ -647,7 +647,8 @@ static int DirectGate_Session_AddRTCPipeEndpoint(directgate_session_t *pSession)
         xloge("Failed to register WebRTC pipe endpoint: sid(%u), wsfd(%d), pipefd(%d)",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), nPipeFd);
 
-        return DirectGate_Session_Close(pSession, "pipe registration failed");
+        DirectGate_Session_Close(pSession, "pipe registration failed");
+        return XAPI_DISCONNECT;
     }
 
     return XAPI_CONTINUE;
@@ -677,7 +678,9 @@ static int DirectGate_Session_AddSearchPipeEndpoint(directgate_session_t *pSessi
         xloge("Failed to register search pipe endpoint: sid(%u), wsfd(%d), pipefd(%d)",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), nPipeFd);
 
-        return DirectGate_Session_Close(pSession, "search pipe registration failed");
+        /* Session is freed by Close; report failure so no caller touches it. */
+        DirectGate_Session_Close(pSession, "search pipe registration failed");
+        return XAPI_DISCONNECT;
     }
 
     return XAPI_CONTINUE;
@@ -707,7 +710,9 @@ static int DirectGate_Session_AddDesktopEndpoint(directgate_session_t *pSession)
         xloge("Failed to register desktop timer endpoint: sid(%u), wsfd(%d), timerfd(%d)",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), nTimerFd);
 
-        return DirectGate_Session_Close(pSession, "desktop endpoint registration failed");
+        /* Session is freed by Close; report failure so no caller touches it. */
+        DirectGate_Session_Close(pSession, "desktop endpoint registration failed");
+        return XAPI_DISCONNECT;
     }
 
     return XAPI_CONTINUE;
