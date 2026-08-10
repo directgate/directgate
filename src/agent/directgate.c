@@ -480,9 +480,19 @@ void DirectGate_SignalCallback(int sig)
     g_bFinish = XTRUE;
 }
 
+/*
+ * Only the relay endpoint carries a directgate_conn_t in pSessionData. The
+ * PTY, WebRTC pipe and desktop timer endpoints are all registered as the
+ * XAPI_CUSTOM and carry a directgate_term_t or directgate_session_t instead,
+ * so casting those to a connection and following the pointer writes fields
+ * (nReconnectAttempt, nNextReconnectMs) far past the end of an unrelated
+ * object. The relay connection is the one and only XAPI_CLIENT session,
+ * which is what makes the role a reliable discriminator.
+ */
 static directgate_conn_t* DirectGate_GetConn(xapi_session_t *pApiSession)
 {
     XCHECK_NL((pApiSession != NULL), NULL);
+    XCHECK_NL((pApiSession->eRole == XAPI_CLIENT), NULL);
     return (directgate_conn_t*)pApiSession->pSessionData;
 }
 
@@ -508,7 +518,7 @@ int DirectGate_LogStatus(xapi_ctx_t *pCtx, xapi_session_t *pSession)
     XCHECK_NL((!g_bFinish), XAPI_CONTINUE);
     XCHECK_NL((pCtx != NULL), XAPI_CONTINUE);
     XCHECK_NL((pSession != NULL), XAPI_CONTINUE);
-    XCHECK((pConn != NULL), XAPI_CONTINUE);
+    XCHECK_NL((pConn != NULL), XAPI_CONTINUE);
 
     if (pConn->nNextReconnectMs == 0)
     {
@@ -1407,7 +1417,27 @@ static int DirectGate_HandleStatus(xapi_session_t *pApiSession, directgate_pkg_t
     if (xstrused(pStatusPkg->pStatus) && xstrcmp(pStatusPkg->pStatus, "closed"))
     {
         directgate_session_t *pSession = DirectGate_SessionMgr_Find(&pConn->mgr, pPkg->header.nSessionId);
-        if (pSession == NULL || !pSession->bAuthenticated)
+
+        /*
+            The relay reports a departed client as a closed status, so an
+            agent-initiated close always races it: the shell exits, we drop
+            the session and announce it, the client leaves, and the relay
+            tells us about a session we have already removed. That tail is
+            the normal end of every session, not a fault.
+        */
+        if (pSession == NULL)
+        {
+            xlogd("Closed status for an already removed session: id(%u), fd(%d), sid(%u)",
+                DirectGate_Conn_GetID(pConn, pApiSession),
+                DirectGate_Conn_GetFD(pConn, pApiSession),
+                pPkg->header.nSessionId);
+
+            return XAPI_CONTINUE;
+        }
+
+        /* A live but unauthenticated session is a different matter:
+         * nothing legitimate closes a session it never authenticated. */
+        if (!pSession->bAuthenticated)
         {
             xlogw("Closed status rejected, session is not authenticated: id(%u), fd(%d), sid(%u)",
                 DirectGate_Conn_GetID(pConn, pApiSession),

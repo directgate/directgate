@@ -83,11 +83,24 @@ typedef struct directgate_keyauth_ {
     xbool_t bIsAgent;
 } directgate_keyauth_t;
 
+/* ---- Client key file (directgate-client-key-v2) ----
+ *
+ * An identity, not a device binding: one (clientPub, clientSeed) pair that can
+ * be authorized on many hosts. The authoritative agentPub for a device comes
+ * from the backend device list over TLS, never from this file. Mirrored by
+ * front/src/lib/keyauth/parse.ts - the same file must load in both.
+ */
+
+#define DIRECTGATE_CLIENT_KEY_FILE_TYPE "directgate-client-key-v2"
+
+typedef struct directgate_client_key_ {
+    uint8_t clientPub[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
+    uint8_t clientSeed[DIRECTGATE_KEYAUTH_ED25519_SEED_SIZE];
+} directgate_client_key_t;
+
 void DirectGate_KeyAuth_Init(directgate_keyauth_t *pAuth);
 void DirectGate_KeyAuth_Cleanse(directgate_keyauth_t *pAuth);
 const char *DirectGate_KeyAuth_StateName(directgate_keyauth_state_t eState);
-
-/* ---- Low-level primitives (stateless) ---- */
 
 /*! Generate an Ed25519 keypair. pPubOut must be 32 bytes, pSeedOut 32 bytes. */
 xbool_t DirectGate_KeyAuth_Ed25519Generate(uint8_t *pPubOut, uint8_t *pSeedOut);
@@ -138,16 +151,12 @@ xbool_t DirectGate_KeyAuth_BuildTranscript(xbyte_buffer_t *pOut, char cTag,
                                            const uint8_t *pClientEphPub,
                                            const uint8_t *pAgentEphPub);
 
-/* ---- Base64 helpers (url-safe base64 not used here; standard base64) ---- */
-
 xbool_t DirectGate_KeyAuth_Base64Encode(const uint8_t *pData, size_t nLen,
                                         char *pOut, size_t nOutSize);
 
 xbool_t DirectGate_KeyAuth_Base64Decode(const char *pB64,
                                         uint8_t *pOut, size_t nOutSize,
                                         size_t *pOutLen);
-
-/* ---- authorized_keys lookup ---- */
 
 /*!
  * Returns XTRUE if pClientPubKeyB64 matches any entry in pAuthorizedKeys
@@ -198,6 +207,55 @@ xbool_t DirectGate_KeyAuth_HexToBytes(const char *pHex, uint8_t *pOut,
 
 xbool_t DirectGate_KeyAuth_BytesToHex(const uint8_t *pData, size_t nLen,
                                       char *pHex, size_t nHexSize);
+
+void DirectGate_KeyAuth_KeyCleanse(directgate_client_key_t *pKey);
+xbool_t DirectGate_KeyAuth_KeyGenerate(directgate_client_key_t *pKey);
+
+/* Reads and validates the file, including the fixed key lengths */
+xbool_t DirectGate_KeyAuth_KeyLoad(directgate_client_key_t *pKey, const char *pPath);
+
+/* Writes 0600 through a 0700 parent, like every other secret we persist */
+xbool_t DirectGate_KeyAuth_KeySave(const directgate_client_key_t *pKey, const char *pPath);
+
+/* ---- Client-side session state machine ----
+ *
+ * Counterpart of the agent side above, and of the browser's
+ * front/src/lib/keyauth/session.ts:
+ *   1. DirectGate_KeyAuth_ClientInit(...) with the agentPub the backend
+ *      published for this device - that value is what the host is pinned to.
+ *   2. DirectGate_KeyAuth_ClientBuildHello(...) -> send {method:"key",
+ *      deviceId, clientPubKey, clientEph, nonce}
+ *   3. On auth/challenge: DirectGate_KeyAuth_ClientProcessChallenge(...)
+ *      -> send {method:"key", clientSig}
+ *   4. On auth/result ok: DirectGate_KeyAuth_DeriveShared(...)
+ */
+
+xbool_t DirectGate_KeyAuth_ClientInit(directgate_keyauth_t *pAuth,
+                                      const char *pDeviceId,
+                                      const directgate_client_key_t *pKey,
+                                      const char *pExpectedAgentPubB64);
+
+xbool_t DirectGate_KeyAuth_ClientBuildHello(directgate_keyauth_t *pAuth,
+                                            char *pClientPubB64Out, size_t nClientPubB64Size,
+                                            char *pClientEphB64Out, size_t nClientEphB64Size,
+                                            char *pClientNonceHexOut, size_t nClientNonceHexSize);
+
+/*!
+ * Verifies that the host presented the pinned identity and signed the
+ * transcript with it, then signs the client half. The long-term seed is
+ * passed in rather than retained, matching the agent-side convention.
+ */
+xbool_t DirectGate_KeyAuth_ClientProcessChallenge(directgate_keyauth_t *pAuth,
+                                                  const directgate_client_key_t *pKey,
+                                                  const char *pAgentPubKeyB64,
+                                                  const char *pAgentEphPubB64,
+                                                  const char *pAgentNonceHex,
+                                                  const char *pChallengeHex,
+                                                  const char *pAgentSigB64,
+                                                  char *pClientSigB64Out,
+                                                  size_t nClientSigB64Size);
+
+xbool_t DirectGate_KeyAuth_ClientAccept(directgate_keyauth_t *pAuth);
 
 #ifdef __cplusplus
 }

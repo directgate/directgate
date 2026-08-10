@@ -457,116 +457,6 @@ static xbool_t DirectGate_AppendAuthorizedKey(directgate_cfg_t *pCfg, const char
     return XTRUE;
 }
 
-#define DIRECTGATE_CLIENT_KEY_FILE_TYPE "directgate-client-key-v2"
-
-typedef struct directgate_client_key_file_ {
-    char sClientPubB64[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
-    char sClientSeedB64[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
-} directgate_client_key_file_t;
-
-static void DirectGate_KeyFile_Cleanse(directgate_client_key_file_t *pFile)
-{
-    if (pFile == NULL) return;
-    OPENSSL_cleanse(pFile->sClientSeedB64, sizeof(pFile->sClientSeedB64));
-    OPENSSL_cleanse(pFile, sizeof(*pFile));
-}
-
-static int DirectGate_KeyFile_Read(const char *pPath, directgate_client_key_file_t *pOut)
-{
-    XCHECK((xstrused(pPath) && pOut != NULL), XSTDERR);
-    memset(pOut, 0, sizeof(*pOut));
-
-    xbyte_buffer_t buffer;
-    if (XPath_LoadBuffer(pPath, &buffer) <= 0)
-    {
-        xloge("Failed to load client key file: path(%s), errno(%d)", pPath, errno);
-        return XSTDERR;
-    }
-
-    xjson_t json;
-    if (!XJSON_Parse(&json, NULL, (const char*)buffer.pData, buffer.nUsed))
-    {
-        char sError[256];
-        XJSON_GetErrorStr(&json, sError, sizeof(sError));
-        xloge("Failed to parse client key file: path(%s), error(%s)", pPath, sError);
-
-        XByteBuffer_Clear(&buffer);
-        XJSON_Destroy(&json);
-        return XSTDERR;
-    }
-
-    xjson_obj_t *pRoot = json.pRootObj;
-    const char *pType = XJSON_GetString(XJSON_GetObject(pRoot, "type"));
-
-    if (!xstrused(pType) || !xstrcmp(pType, DIRECTGATE_CLIENT_KEY_FILE_TYPE))
-    {
-        xloge("Unsupported client key file type: path(%s), type(%s)", pPath, pType ? pType : "(null)");
-        XByteBuffer_Clear(&buffer);
-        XJSON_Destroy(&json);
-        return XSTDERR;
-    }
-
-    const char *pClientPub = XJSON_GetString(XJSON_GetObject(pRoot, "clientPub"));
-    const char *pClientSeed = XJSON_GetString(XJSON_GetObject(pRoot, "clientSeed"));
-
-    if (!xstrused(pClientPub) || !xstrused(pClientSeed))
-    {
-        xloge("Client key file missing clientPub/clientSeed: path(%s)", pPath);
-        XByteBuffer_Clear(&buffer);
-        XJSON_Destroy(&json);
-        return XSTDERR;
-    }
-
-    xstrncpy(pOut->sClientPubB64, sizeof(pOut->sClientPubB64), pClientPub);
-    xstrncpy(pOut->sClientSeedB64, sizeof(pOut->sClientSeedB64), pClientSeed);
-
-    OPENSSL_cleanse(buffer.pData, buffer.nUsed);
-    XByteBuffer_Clear(&buffer);
-    XJSON_Destroy(&json);
-    return XSTDOK;
-}
-
-static int DirectGate_KeyFile_Write(const char *pPath, const directgate_client_key_file_t *pFile)
-{
-    XCHECK((xstrused(pPath) && pFile != NULL), XSTDERR);
-    XCHECK((xstrused(pFile->sClientPubB64) && xstrused(pFile->sClientSeedB64)), XSTDERR);
-
-    if (!DirectGate_EnsurePrivateFileParent(pPath))
-    {
-        xloge("Failed to create private client key directory: path(%s), errno(%d)",
-            pPath, errno);
-
-        return XSTDERR;
-    }
-
-    xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, XFALSE);
-    XCHECK((pRoot != NULL), xthrowr(XSTDERR, "Failed to allocate key-file JSON"));
-
-    XJSON_AddString(pRoot, "type", DIRECTGATE_CLIENT_KEY_FILE_TYPE);
-    XJSON_AddString(pRoot, "clientPub", pFile->sClientPubB64);
-    XJSON_AddString(pRoot, "clientSeed", pFile->sClientSeedB64);
-
-    size_t nLength = 0;
-    char *pDump = XJSON_DumpObj(pRoot, 2, &nLength);
-    XJSON_FreeObject(pRoot);
-
-    XCHECK((pDump != NULL && nLength > 0),
-        xthrowr(XSTDERR, "Failed to serialize client key JSON: path(%s)", pPath));
-
-    xbool_t bWrote = DirectGate_WritePrivateFile(pPath, (uint8_t*)pDump, nLength);
-
-    OPENSSL_cleanse(pDump, nLength);
-    free(pDump);
-
-    if (!bWrote)
-    {
-        xloge("Failed to write client key file: path(%s), errno(%d)", pPath, errno);
-        return XSTDERR;
-    }
-
-    return XSTDOK;
-}
-
 static int DirectGate_GenKeyFile(const directgate_cfg_t *pCfg)
 {
     XCHECK((pCfg != NULL), XSTDERR);
@@ -584,48 +474,37 @@ static int DirectGate_GenKeyFile(const directgate_cfg_t *pCfg)
     directgate_cfg_t cfg = *pCfg;
     if (!DirectGate_EnsureagentIdentity(&cfg)) return XSTDERR;
 
-    uint8_t seed[DIRECTGATE_KEYAUTH_ED25519_SEED_SIZE];
-    uint8_t pub[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
-
-    if (!DirectGate_KeyAuth_Ed25519Generate(pub, seed))
+    directgate_client_key_t key;
+    if (!DirectGate_KeyAuth_KeyGenerate(&key))
     {
-        OPENSSL_cleanse(seed, sizeof(seed));
         xloge("Failed to generate client keypair: cfg(%s)", cfg.sCfgPath);
         return XSTDERR;
     }
 
-    directgate_client_key_file_t file;
-    memset(&file, 0, sizeof(file));
-
-    if (!DirectGate_KeyAuth_Base64Encode(pub, sizeof(pub),
-            file.sClientPubB64, sizeof(file.sClientPubB64)) ||
-        !DirectGate_KeyAuth_Base64Encode(seed, sizeof(seed),
-            file.sClientSeedB64, sizeof(file.sClientSeedB64)))
+    char sClientPubB64[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
+    if (!DirectGate_KeyAuth_Base64Encode(key.clientPub, sizeof(key.clientPub), sClientPubB64, sizeof(sClientPubB64)))
     {
-        OPENSSL_cleanse(seed, sizeof(seed));
-        DirectGate_KeyFile_Cleanse(&file);
-        xloge("Failed to encode client keypair: cfg(%s)", cfg.sCfgPath);
+        DirectGate_KeyAuth_KeyCleanse(&key);
+        xloge("Failed to encode client public key: cfg(%s)", cfg.sCfgPath);
         return XSTDERR;
     }
 
-    OPENSSL_cleanse(seed, sizeof(seed));
-
-    if (!DirectGate_AppendAuthorizedKey(&cfg, file.sClientPubB64))
+    if (!DirectGate_AppendAuthorizedKey(&cfg, sClientPubB64))
     {
-        DirectGate_KeyFile_Cleanse(&file);
+        DirectGate_KeyAuth_KeyCleanse(&key);
         return XSTDERR;
     }
 
     if (!DirectGate_SaveConfig(&cfg))
     {
-        DirectGate_KeyFile_Cleanse(&file);
+        DirectGate_KeyAuth_KeyCleanse(&key);
         xloge("Failed to persist updated agent config: cfg(%s)", cfg.sCfgPath);
         return XSTDERR;
     }
 
-    int nStatus = DirectGate_KeyFile_Write(cfg.sGenKeyPath, &file);
-    DirectGate_KeyFile_Cleanse(&file);
-    if (nStatus != XSTDOK) return nStatus;
+    xbool_t bWrote = DirectGate_KeyAuth_KeySave(&key, cfg.sGenKeyPath);
+    DirectGate_KeyAuth_KeyCleanse(&key);
+    if (!bWrote) return XSTDERR;
 
     xlogn("Client key file written: path(%s), dev(%s), cfg(%s)",
         cfg.sGenKeyPath, cfg.sDeviceId, cfg.sCfgPath);
@@ -651,23 +530,28 @@ static int DirectGate_EnrollKeyFile(const directgate_cfg_t *pCfg)
     directgate_cfg_t cfg = *pCfg;
     if (!DirectGate_EnsureagentIdentity(&cfg)) return XSTDERR;
 
-    directgate_client_key_file_t file;
-    if (DirectGate_KeyFile_Read(cfg.sEnrollKeyPath, &file) != XSTDOK) return XSTDERR;
+    directgate_client_key_t key;
+    if (!DirectGate_KeyAuth_KeyLoad(&key, cfg.sEnrollKeyPath)) return XSTDERR;
 
-    if (!DirectGate_AppendAuthorizedKey(&cfg, file.sClientPubB64))
+    char sClientPubB64[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
+    xbool_t bEncoded = DirectGate_KeyAuth_Base64Encode(key.clientPub,
+        sizeof(key.clientPub), sClientPubB64, sizeof(sClientPubB64));
+
+    DirectGate_KeyAuth_KeyCleanse(&key);
+
+    if (!bEncoded)
     {
-        DirectGate_KeyFile_Cleanse(&file);
+        xloge("Failed to encode client public key: path(%s)", cfg.sEnrollKeyPath);
         return XSTDERR;
     }
+
+    if (!DirectGate_AppendAuthorizedKey(&cfg, sClientPubB64)) return XSTDERR;
 
     if (!DirectGate_SaveConfig(&cfg))
     {
-        DirectGate_KeyFile_Cleanse(&file);
         xloge("Failed to persist updated agent config: cfg(%s)", cfg.sCfgPath);
         return XSTDERR;
     }
-
-    DirectGate_KeyFile_Cleanse(&file);
 
     xlogn("Agent authorized against existing key file: key(%s), dev(%s), cfg(%s)",
         cfg.sEnrollKeyPath, cfg.sDeviceId, cfg.sCfgPath);

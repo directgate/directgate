@@ -20,6 +20,7 @@
  */
 
 #include "includes.h"
+#include "common.h"
 #include "keyauth.h"
 
 #define DIRECTGATE_KEYAUTH_DOMAIN       "directgate-key-auth-v1"
@@ -551,5 +552,340 @@ xbool_t DirectGate_KeyAuth_DeriveShared(directgate_keyauth_t *pAuth)
     /* Ephemeral private key has served its purpose; wipe it. */
     OPENSSL_cleanse(pAuth->localEphPriv, sizeof(pAuth->localEphPriv));
     pAuth->bHaveSharedSecret = XTRUE;
+    return XTRUE;
+}
+
+void DirectGate_KeyAuth_KeyCleanse(directgate_client_key_t *pKey)
+{
+    XCHECK_VOID_NL((pKey != NULL));
+    OPENSSL_cleanse(pKey, sizeof(*pKey));
+}
+
+xbool_t DirectGate_KeyAuth_KeyGenerate(directgate_client_key_t *pKey)
+{
+    XCHECK_NL((pKey != NULL), XFALSE);
+    memset(pKey, 0, sizeof(*pKey));
+
+    if (!DirectGate_KeyAuth_Ed25519Generate(pKey->clientPub, pKey->clientSeed))
+    {
+        DirectGate_KeyAuth_KeyCleanse(pKey);
+        return XFALSE;
+    }
+
+    return XTRUE;
+}
+
+static xbool_t DirectGate_KeyAuth_DecodeFixed(const char *pB64, uint8_t *pOut,
+                                              size_t nExpected, const char *pLabel,
+                                              const char *pPath)
+{
+    size_t nLength = 0;
+
+    if (!DirectGate_KeyAuth_Base64Decode(pB64, pOut, nExpected, &nLength) || nLength != nExpected)
+    {
+        xloge("Client key file has an invalid %s: path(%s)", pLabel, pPath);
+        return XFALSE;
+    }
+
+    return XTRUE;
+}
+
+xbool_t DirectGate_KeyAuth_KeyLoad(directgate_client_key_t *pKey, const char *pPath)
+{
+    XCHECK_NL((pKey != NULL), XFALSE);
+    memset(pKey, 0, sizeof(*pKey));
+    XCHECK_NL((xstrused(pPath)), XFALSE);
+
+    xbyte_buffer_t buffer;
+    if (XPath_LoadBuffer(pPath, &buffer) <= 0)
+    {
+        xloge("Failed to load client key file: path(%s), errno(%d)", pPath, errno);
+        return XFALSE;
+    }
+
+    xjson_t json;
+    if (!XJSON_Parse(&json, NULL, (const char*)buffer.pData, buffer.nUsed))
+    {
+        char sError[XSTR_TINY];
+        XJSON_GetErrorStr(&json, sError, sizeof(sError));
+        xloge("Failed to parse client key file: path(%s), error(%s)", pPath, sError);
+
+        OPENSSL_cleanse(buffer.pData, buffer.nUsed);
+        XByteBuffer_Clear(&buffer);
+        XJSON_Destroy(&json);
+        return XFALSE;
+    }
+
+    xjson_obj_t *pRoot = json.pRootObj;
+    const char *pType = XJSON_GetString(XJSON_GetObject(pRoot, "type"));
+    const char *pClientPub = XJSON_GetString(XJSON_GetObject(pRoot, "clientPub"));
+    const char *pClientSeed = XJSON_GetString(XJSON_GetObject(pRoot, "clientSeed"));
+
+    xbool_t bOk = XFALSE;
+
+    if (!xstrused(pType) || !xstrcmp(pType, DIRECTGATE_CLIENT_KEY_FILE_TYPE))
+    {
+        xloge("Unsupported client key file type: path(%s), type(%s)",
+            pPath, xstrused(pType) ? pType : "(null)");
+    }
+    else if (!xstrused(pClientPub) || !xstrused(pClientSeed))
+    {
+        xloge("Client key file is missing clientPub/clientSeed: path(%s)", pPath);
+    }
+    else if (DirectGate_KeyAuth_DecodeFixed(pClientPub, pKey->clientPub, sizeof(pKey->clientPub), "clientPub", pPath) &&
+             DirectGate_KeyAuth_DecodeFixed(pClientSeed, pKey->clientSeed, sizeof(pKey->clientSeed), "clientSeed", pPath))
+    {
+        /* A seed that does not produce the recorded public key means the file
+         * was edited or corrupted; using it would fail authentication with a
+         * far less obvious error at the other end of the handshake. */
+        uint8_t derived[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
+
+        if (!DirectGate_KeyAuth_Ed25519DerivePub(pKey->clientSeed, derived))
+            xloge("Failed to derive the public key from the client seed: path(%s)", pPath);
+        else if (CRYPTO_memcmp(derived, pKey->clientPub, sizeof(derived)) != 0)
+            xloge("Client key file seed does not match its public key: path(%s)", pPath);
+        else bOk = XTRUE;
+
+        OPENSSL_cleanse(derived, sizeof(derived));
+    }
+
+    if (!bOk) DirectGate_KeyAuth_KeyCleanse(pKey);
+
+    OPENSSL_cleanse(buffer.pData, buffer.nUsed);
+    XByteBuffer_Clear(&buffer);
+    XJSON_Destroy(&json);
+    return bOk;
+}
+
+xbool_t DirectGate_KeyAuth_KeySave(const directgate_client_key_t *pKey, const char *pPath)
+{
+    XCHECK_NL((pKey != NULL), XFALSE);
+    XCHECK_NL((xstrused(pPath)), XFALSE);
+
+    if (!DirectGate_EnsurePrivateFileParent(pPath))
+    {
+        xloge("Failed to create private client key directory: path(%s), errno(%d)", pPath, errno);
+        return XFALSE;
+    }
+
+    char sPubB64[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
+    char sSeedB64[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
+
+    if (!DirectGate_KeyAuth_Base64Encode(pKey->clientPub, sizeof(pKey->clientPub), sPubB64, sizeof(sPubB64)) ||
+        !DirectGate_KeyAuth_Base64Encode(pKey->clientSeed, sizeof(pKey->clientSeed), sSeedB64, sizeof(sSeedB64)))
+    {
+        OPENSSL_cleanse(sSeedB64, sizeof(sSeedB64));
+        xloge("Failed to encode the client keypair: path(%s)", pPath);
+        return XFALSE;
+    }
+
+    xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, XFALSE);
+    if (pRoot == NULL)
+    {
+        OPENSSL_cleanse(sSeedB64, sizeof(sSeedB64));
+        xloge("Failed to allocate the client key JSON: path(%s)", pPath);
+        return XFALSE;
+    }
+
+    XJSON_AddString(pRoot, "type", DIRECTGATE_CLIENT_KEY_FILE_TYPE);
+    XJSON_AddString(pRoot, "clientPub", sPubB64);
+    XJSON_AddString(pRoot, "clientSeed", sSeedB64);
+
+    size_t nLength = 0;
+    char *pDump = XJSON_DumpObj(pRoot, 2, &nLength);
+
+    XJSON_FreeObject(pRoot);
+    OPENSSL_cleanse(sSeedB64, sizeof(sSeedB64));
+
+    if (pDump == NULL || !nLength)
+    {
+        free(pDump);
+        xloge("Failed to serialize the client key JSON: path(%s)", pPath);
+        return XFALSE;
+    }
+
+    xbool_t bWrote = DirectGate_WritePrivateFile(pPath, (uint8_t*)pDump, nLength);
+
+    OPENSSL_cleanse(pDump, nLength);
+    free(pDump);
+
+    if (!bWrote) xloge("Failed to write the client key file: path(%s), errno(%d)", pPath, errno);
+    return bWrote;
+}
+
+xbool_t DirectGate_KeyAuth_ClientInit(directgate_keyauth_t *pAuth,
+                                      const char *pDeviceId,
+                                      const directgate_client_key_t *pKey,
+                                      const char *pExpectedAgentPubB64)
+{
+    XCHECK_NL((pAuth != NULL && pKey != NULL), XFALSE);
+    XCHECK_NL((xstrused(pDeviceId)), XFALSE);
+    XCHECK_NL((xstrused(pExpectedAgentPubB64)), XFALSE);
+
+    DirectGate_KeyAuth_Init(pAuth);
+
+    /* The pinned host identity. Anything else on the wire is rejected. */
+    size_t nPubLen = 0;
+    if (!DirectGate_KeyAuth_Base64Decode(pExpectedAgentPubB64,
+        pAuth->agentPubKey, sizeof(pAuth->agentPubKey), &nPubLen) ||
+        nPubLen != DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE) return XFALSE;
+
+    memcpy(pAuth->clientPubKey, pKey->clientPub, sizeof(pAuth->clientPubKey));
+    xstrncpy(pAuth->sDeviceId, sizeof(pAuth->sDeviceId), pDeviceId);
+
+    pAuth->bIsAgent = XFALSE;
+    pAuth->eState = DIRECTGATE_KEYAUTH_STATE_IDLE;
+    return XTRUE;
+}
+
+xbool_t DirectGate_KeyAuth_ClientBuildHello(directgate_keyauth_t *pAuth,
+                                            char *pClientPubB64Out, size_t nClientPubB64Size,
+                                            char *pClientEphB64Out, size_t nClientEphB64Size,
+                                            char *pClientNonceHexOut, size_t nClientNonceHexSize)
+{
+    XCHECK_NL((pAuth != NULL), XFALSE);
+    XCHECK_NL((pClientPubB64Out != NULL && pClientEphB64Out != NULL), XFALSE);
+    XCHECK_NL((pClientNonceHexOut != NULL), XFALSE);
+    XCHECK_NL((pAuth->eState == DIRECTGATE_KEYAUTH_STATE_IDLE), XFALSE);
+
+    if (!DirectGate_KeyAuth_X25519Generate(pAuth->localEphPub, pAuth->localEphPriv)) return XFALSE;
+    if (RAND_bytes(pAuth->localNonce, sizeof(pAuth->localNonce)) != 1) return XFALSE;
+
+    if (!DirectGate_KeyAuth_Base64Encode(pAuth->clientPubKey, sizeof(pAuth->clientPubKey), pClientPubB64Out, nClientPubB64Size) ||
+        !DirectGate_KeyAuth_Base64Encode(pAuth->localEphPub, sizeof(pAuth->localEphPub), pClientEphB64Out, nClientEphB64Size) ||
+        !DirectGate_KeyAuth_BytesToHex(pAuth->localNonce, sizeof(pAuth->localNonce), pClientNonceHexOut, nClientNonceHexSize))
+            return XFALSE;
+
+    pAuth->eState = DIRECTGATE_KEYAUTH_STATE_HELLO_RECEIVED;
+    return XTRUE;
+}
+
+xbool_t DirectGate_KeyAuth_ClientProcessChallenge(directgate_keyauth_t *pAuth,
+                                                  const directgate_client_key_t *pKey,
+                                                  const char *pAgentPubKeyB64,
+                                                  const char *pAgentEphPubB64,
+                                                  const char *pAgentNonceHex,
+                                                  const char *pChallengeHex,
+                                                  const char *pAgentSigB64,
+                                                  char *pClientSigB64Out, size_t nClientSigB64Size)
+{
+    XCHECK_NL((pAuth != NULL && pKey != NULL && pClientSigB64Out != NULL), XFALSE);
+    XCHECK_NL((pAuth->eState == DIRECTGATE_KEYAUTH_STATE_HELLO_RECEIVED), XFALSE);
+
+    if (!xstrused(pAgentPubKeyB64) || !xstrused(pAgentEphPubB64) ||
+        !xstrused(pAgentNonceHex) || !xstrused(pChallengeHex) || !xstrused(pAgentSigB64))
+    {
+        xloge("KeyAuth: Incomplete key challenge");
+        pAuth->eState = DIRECTGATE_KEYAUTH_STATE_FAILED;
+        return XFALSE;
+    }
+
+    uint8_t agentPub[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
+    size_t nLength = 0;
+
+    if (!DirectGate_KeyAuth_Base64Decode(pAgentPubKeyB64, agentPub, sizeof(agentPub), &nLength) || nLength != sizeof(agentPub))
+    {
+        xloge("KeyAuth: Invalid agent public key in challenge");
+        pAuth->eState = DIRECTGATE_KEYAUTH_STATE_FAILED;
+        return XFALSE;
+    }
+
+    /*
+        Pin the host identity: the backend published this device's agentPub
+        over TLS, so a host presenting anything else is not the device we
+        asked for, however well formed the rest of the challenge is.
+    */
+    if (CRYPTO_memcmp(agentPub, pAuth->agentPubKey, sizeof(agentPub)) != 0)
+    {
+        xloge("KeyAuth: Host identity mismatch, refusing to authenticate");
+        pAuth->eState = DIRECTGATE_KEYAUTH_STATE_FAILED;
+        return XFALSE;
+    }
+
+    if (!DirectGate_KeyAuth_Base64Decode(pAgentEphPubB64, pAuth->peerEphPub, sizeof(pAuth->peerEphPub), &nLength) ||
+        nLength != DIRECTGATE_KEYAUTH_X25519_PUB_SIZE ||
+        !DirectGate_KeyAuth_HexToBytes(pAgentNonceHex, pAuth->peerNonce, sizeof(pAuth->peerNonce), &nLength) ||
+        nLength != DIRECTGATE_KEYAUTH_NONCE_SIZE ||
+        !DirectGate_KeyAuth_HexToBytes(pChallengeHex, pAuth->challenge, sizeof(pAuth->challenge), &nLength) ||
+        nLength != DIRECTGATE_KEYAUTH_CHALLENGE_SIZE)
+    {
+        xloge("KeyAuth: Malformed key challenge fields");
+        pAuth->eState = DIRECTGATE_KEYAUTH_STATE_FAILED;
+        return XFALSE;
+    }
+
+    uint8_t agentSig[DIRECTGATE_KEYAUTH_ED25519_SIG_SIZE];
+    if (!DirectGate_KeyAuth_Base64Decode(pAgentSigB64, agentSig, sizeof(agentSig), &nLength) || nLength != sizeof(agentSig))
+    {
+        xloge("KeyAuth: Invalid agent signature in challenge");
+        pAuth->eState = DIRECTGATE_KEYAUTH_STATE_FAILED;
+        return XFALSE;
+    }
+
+    xbyte_buffer_t transcript;
+    XByteBuffer_Init(&transcript, 0, 0);
+
+    if (!DirectGate_KeyAuth_BuildTranscript(&transcript, 'h',
+            pAuth->sDeviceId, pAuth->clientPubKey, pAuth->agentPubKey,
+            pAuth->challenge, pAuth->localNonce /* clientNonce */,
+            pAuth->peerNonce /* agentNonce */,
+            pAuth->localEphPub /* clientEphPub */,
+            pAuth->peerEphPub /* agentEphPub */))
+    {
+        XByteBuffer_Clear(&transcript);
+        pAuth->eState = DIRECTGATE_KEYAUTH_STATE_FAILED;
+        return XFALSE;
+    }
+
+    xbool_t bVerified = DirectGate_KeyAuth_Ed25519Verify(pAuth->agentPubKey, transcript.pData, transcript.nUsed, agentSig);
+    XByteBuffer_Clear(&transcript);
+
+    if (!bVerified)
+    {
+        xloge("KeyAuth: Host signature verification failed");
+        pAuth->eState = DIRECTGATE_KEYAUTH_STATE_FAILED;
+        return XFALSE;
+    }
+
+    XByteBuffer_Init(&transcript, 0, 0);
+
+    if (!DirectGate_KeyAuth_BuildTranscript(&transcript, 'c',
+            pAuth->sDeviceId, pAuth->clientPubKey, pAuth->agentPubKey,
+            pAuth->challenge, pAuth->localNonce, pAuth->peerNonce,
+            pAuth->localEphPub, pAuth->peerEphPub))
+    {
+        XByteBuffer_Clear(&transcript);
+        pAuth->eState = DIRECTGATE_KEYAUTH_STATE_FAILED;
+        return XFALSE;
+    }
+
+    uint8_t clientSig[DIRECTGATE_KEYAUTH_ED25519_SIG_SIZE];
+    xbool_t bSigned = DirectGate_KeyAuth_Ed25519Sign(pKey->clientSeed, transcript.pData, transcript.nUsed, clientSig);
+    XByteBuffer_Clear(&transcript);
+
+    if (!bSigned || !DirectGate_KeyAuth_Base64Encode(clientSig, sizeof(clientSig), pClientSigB64Out, nClientSigB64Size))
+    {
+        OPENSSL_cleanse(clientSig, sizeof(clientSig));
+        xloge("KeyAuth: Failed to sign the client transcript");
+        pAuth->eState = DIRECTGATE_KEYAUTH_STATE_FAILED;
+        return XFALSE;
+    }
+
+    OPENSSL_cleanse(clientSig, sizeof(clientSig));
+    pAuth->eState = DIRECTGATE_KEYAUTH_STATE_CHALLENGE_SENT;
+    return XTRUE;
+}
+
+/*!
+ * The client learns the handshake succeeded from the host's auth result
+ * rather than by verifying a proof of its own, so the transition to
+ * authenticated is explicit before the shared secret may be derived.
+ */
+xbool_t DirectGate_KeyAuth_ClientAccept(directgate_keyauth_t *pAuth)
+{
+    XCHECK_NL((pAuth != NULL), XFALSE);
+    XCHECK_NL((pAuth->eState == DIRECTGATE_KEYAUTH_STATE_CHALLENGE_SENT), XFALSE);
+
+    pAuth->eState = DIRECTGATE_KEYAUTH_STATE_AUTHENTICATED;
     return XTRUE;
 }
