@@ -27,8 +27,8 @@
 extern char *optarg;
 extern int optind;
 
-#define DIRECTGATE_CLIENT_CONFIG    ".config/directgate/client.json"
 #define DIRECTGATE_CLIENT_DEVICES   ".config/directgate/devices"
+#define DIRECTGATE_CLIENT_CONFIG    ".config/directgate/client.json"
 #define DIRECTGATE_CLIENT_AUTH      ".config/directgate/auth/auth.json"
 #define DIRECTGATE_CLIENT_KEY       ".config/directgate/auth/key.json"
 
@@ -119,13 +119,13 @@ static void DirectGate_SetDefaultConfigPath(directgate_cfg_t *pCfg)
     const char *pAppData = getenv("APPDATA");
     if (xstrused(pAppData))
     {
-        xstrncpyf(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), "%s/directgate/client.json", pAppData);
         xstrncpyf(pCfg->sDeviceList, sizeof(pCfg->sDeviceList), "%s/directgate/devices", pAppData);
+        xstrncpyf(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), "%s/directgate/client.json", pAppData);
         xstrncpyf(pCfg->sAuthPath, sizeof(pCfg->sAuthPath), "%s/directgate/auth/auth.json", pAppData);
         xstrncpyf(pCfg->sKeyPath, sizeof(pCfg->sKeyPath), "%s/directgate/auth/key.json", pAppData);
 
-        DirectGate_PathToSlash(pCfg->sCfgPath);
         DirectGate_PathToSlash(pCfg->sDeviceList);
+        DirectGate_PathToSlash(pCfg->sCfgPath);
         DirectGate_PathToSlash(pCfg->sAuthPath);
         DirectGate_PathToSlash(pCfg->sKeyPath);
         return;
@@ -137,15 +137,15 @@ static void DirectGate_SetDefaultConfigPath(directgate_cfg_t *pCfg)
 
     if (!xstrused(sHomeDir))
     {
-        xstrncpy(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), "./client.json");
         xstrncpyf(pCfg->sDeviceList, sizeof(pCfg->sDeviceList), "./devices");
+        xstrncpy(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), "./client.json");
         xstrncpy(pCfg->sAuthPath, sizeof(pCfg->sAuthPath), "./auth.json");
         xstrncpy(pCfg->sKeyPath, sizeof(pCfg->sKeyPath), "./key.json");
     }
     else
     {
-        xstrncpyf(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), "%s/%s", sHomeDir, DIRECTGATE_CLIENT_CONFIG);
         xstrncpyf(pCfg->sDeviceList, sizeof(pCfg->sDeviceList), "%s/%s", sHomeDir, DIRECTGATE_CLIENT_DEVICES);
+        xstrncpyf(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), "%s/%s", sHomeDir, DIRECTGATE_CLIENT_CONFIG);
         xstrncpyf(pCfg->sAuthPath, sizeof(pCfg->sAuthPath), "%s/%s", sHomeDir, DIRECTGATE_CLIENT_AUTH);
         xstrncpyf(pCfg->sKeyPath, sizeof(pCfg->sKeyPath), "%s/%s", sHomeDir, DIRECTGATE_CLIENT_KEY);
     }
@@ -287,8 +287,8 @@ static xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
     if (xstrused(pCfg->sDeviceList)) XJSON_AddString(pRoot, "deviceList", pCfg->sDeviceList);
     if (xstrused(pCfg->sRoutingKey)) XJSON_AddString(pRoot, "routingKey", pCfg->sRoutingKey);
     if (xstrused(pCfg->sAccessToken)) XJSON_AddString(pRoot, "accessToken", pCfg->sAccessToken);
-    if (xstrused(pCfg->sApiUrl)) XJSON_AddString(pRoot, "apiUrl", pCfg->sApiUrl);
     if (xstrused(pCfg->sApiToken)) XJSON_AddString(pRoot, "apiToken", pCfg->sApiToken);
+    if (xstrused(pCfg->sApiUrl)) XJSON_AddString(pRoot, "apiUrl", pCfg->sApiUrl);
     if (xstrused(pCfg->sWebUrl)) XJSON_AddString(pRoot, "webUrl", pCfg->sWebUrl);
 
     if (pCfg->nIceSrvCount > 0)
