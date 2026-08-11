@@ -123,9 +123,77 @@ static int test_long_header(void)
     return 0;
 }
 
+/*
+ * Nest reports validation failures as an array of reasons under "message" and
+ * leaves "error" as the bare status text, so a reader that only understands
+ * strings turns a precise "code is required" into "Bad Request". That is the
+ * CLI's only window into why a request was refused, and it cost a real
+ * debugging session once already.
+ */
+static int test_error_reporting(void)
+{
+    char sError[XSTR_TINY];
+    xjson_t json;
+
+    const char *pNestValidation =
+        "{\"message\":[\"code is required\",\"codeVerifier must be a string\"],"
+        "\"error\":\"Bad Request\",\"statusCode\":400}";
+
+    CHECK(XJSON_Parse(&json, NULL, pNestValidation, strlen(pNestValidation)),
+        "parse a Nest validation body");
+    CHECK(DirectGate_WebApi_FormatError(sError, sizeof(sError), json.pRootObj, 400) > 0,
+        "format a validation body");
+    CHECK(strcmp(sError, "code is required, codeVerifier must be a string") == 0,
+        "every validation reason is reported, not the bare status text");
+    XJSON_Destroy(&json);
+
+    /* Nest's single-string form */
+    const char *pSingle = "{\"message\":\"Session not found\",\"statusCode\":404}";
+    CHECK(XJSON_Parse(&json, NULL, pSingle, strlen(pSingle)), "parse a single message");
+    CHECK(DirectGate_WebApi_FormatError(sError, sizeof(sError), json.pRootObj, 404) > 0,
+        "format a single message");
+    CHECK(strcmp(sError, "Session not found") == 0, "single message is used as is");
+    XJSON_Destroy(&json);
+
+    /* GoTrue's wording */
+    const char *pGoTrue = "{\"error\":\"invalid_grant\",\"error_description\":\"code expired\"}";
+    CHECK(XJSON_Parse(&json, NULL, pGoTrue, strlen(pGoTrue)), "parse a provider body");
+    CHECK(DirectGate_WebApi_FormatError(sError, sizeof(sError), json.pRootObj, 400) > 0,
+        "format a provider body");
+    CHECK(strcmp(sError, "code expired") == 0, "the description beats the error code");
+    XJSON_Destroy(&json);
+
+    /* An empty array must not swallow the fallback fields */
+    const char *pEmptyArray = "{\"message\":[],\"error\":\"Bad Request\"}";
+    CHECK(XJSON_Parse(&json, NULL, pEmptyArray, strlen(pEmptyArray)), "parse an empty array");
+    CHECK(DirectGate_WebApi_FormatError(sError, sizeof(sError), json.pRootObj, 400) > 0,
+        "format an empty array");
+    CHECK(strcmp(sError, "Bad Request") == 0, "an empty array falls through");
+    XJSON_Destroy(&json);
+
+    /* Bodies with nothing usable still say something actionable */
+    const char *pOpaque = "{\"statusCode\":503}";
+    CHECK(XJSON_Parse(&json, NULL, pOpaque, strlen(pOpaque)), "parse an opaque body");
+    CHECK(DirectGate_WebApi_FormatError(sError, sizeof(sError), json.pRootObj, 503) > 0,
+        "format an opaque body");
+    CHECK(strstr(sError, "503") != NULL, "the status code is reported");
+    XJSON_Destroy(&json);
+
+    CHECK(DirectGate_WebApi_FormatError(sError, sizeof(sError), NULL, 500) > 0,
+        "format without a body");
+    CHECK(strstr(sError, "500") != NULL, "a missing body still reports the status");
+    CHECK(DirectGate_WebApi_FormatError(NULL, sizeof(sError), NULL, 500) == 0,
+        "reject NULL output");
+
+    return 0;
+}
+
 int main(void)
 {
     xlog_setfl(XLOG_NONE);
+
+    int nErrStatus = test_error_reporting();
+    if (nErrStatus) return nErrStatus;
 
     int nStatus = test_long_header();
     if (nStatus) return nStatus;

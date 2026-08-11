@@ -220,28 +220,6 @@ xbool_t DirectGate_Login_Challenge(const char *pVerifier, char *pOut, size_t nSi
     return bOk;
 }
 
-size_t DirectGate_Login_AuthUrl(char *pOut, size_t nSize,
-                                const directgate_login_ctx_t *pCtx,
-                                const char *pRedirect,
-                                const char *pChallenge)
-{
-    XCHECK((pOut != NULL && nSize > 0), XSTDNON);
-    pOut[0] = XSTR_NUL;
-
-    XCHECK((pCtx != NULL), XSTDNON);
-    XCHECK((xstrused(pCtx->pSupabaseUrl)), XSTDNON);
-    XCHECK((xstrused(pRedirect) && xstrused(pChallenge)), XSTDNON);
-
-    char sRedirect[XPATH_MAX];
-    if (!DirectGate_WebApi_UrlEncode(sRedirect, sizeof(sRedirect), pRedirect)) return XSTDNON;
-
-    const char *pProvider = xstrused(pCtx->pProvider) ? pCtx->pProvider : DIRECTGATE_LOGIN_PROVIDER;
-
-    return xstrncpyf(pOut, nSize,
-        "%s/auth/v1/authorize?provider=%s&redirect_to=%s"
-        "&code_challenge=%s&code_challenge_method=s256",
-        pCtx->pSupabaseUrl, pProvider, sRedirect, pChallenge);
-}
 
 size_t DirectGate_Login_StartUrl(char *pOut, size_t nSize,
                                  const directgate_login_ctx_t *pCtx,
@@ -391,7 +369,7 @@ xbool_t DirectGate_Login_ApplyToken(directgate_account_t *pAccount, xjson_obj_t 
     XCHECK((pAccount != NULL), XFALSE);
     XCHECK((pRoot != NULL), XFALSE);
 
-    const char *pAccess = XJSON_GetString(XJSON_GetObject(pRoot, "access_token"));
+    const char *pAccess = XJSON_GetString(XJSON_GetObject(pRoot, "accessToken"));
     XCHECK((xstrused(pAccess)), xthrowr(XFALSE, "Token response is missing access_token"));
 
     if (strlen(pAccess) >= sizeof(pAccount->sAccessToken))
@@ -399,27 +377,19 @@ xbool_t DirectGate_Login_ApplyToken(directgate_account_t *pAccount, xjson_obj_t 
 
     xstrncpy(pAccount->sAccessToken, sizeof(pAccount->sAccessToken), pAccess);
 
-    const char *pRefresh = XJSON_GetString(XJSON_GetObject(pRoot, "refresh_token"));
+    const char *pRefresh = XJSON_GetString(XJSON_GetObject(pRoot, "refreshToken"));
     if (xstrused(pRefresh)) xstrncpy(pAccount->sRefreshToken, sizeof(pAccount->sRefreshToken), pRefresh);
 
-    /* GoTrue sends both an absolute expires_at and a relative expires_in;
-     * prefer the absolute one and synthesize it otherwise. */
-    xjson_obj_t *pExpiresAt = XJSON_GetObject(pRoot, "expires_at");
-    xjson_obj_t *pExpiresIn = XJSON_GetObject(pRoot, "expires_in");
+    /* The API normalises the provider's payload, including turning a relative
+     * expiry into an absolute one, so there is a single shape to parse here. */
+    xjson_obj_t *pExpiresAt = XJSON_GetObject(pRoot, "expiresAt");
+    pAccount->nExpiresAt = pExpiresAt != NULL ? XJSON_GetU64(pExpiresAt) : 0;
 
-    if (pExpiresAt != NULL) pAccount->nExpiresAt = XJSON_GetU64(pExpiresAt);
-    else if (pExpiresIn != NULL) pAccount->nExpiresAt = (uint64_t)time(NULL) + XJSON_GetU64(pExpiresIn);
-    else pAccount->nExpiresAt = 0;
+    const char *pEmail = XJSON_GetString(XJSON_GetObject(pRoot, "email"));
+    const char *pUserId = XJSON_GetString(XJSON_GetObject(pRoot, "userId"));
 
-    xjson_obj_t *pUser = XJSON_GetObject(pRoot, "user");
-    if (pUser != NULL)
-    {
-        const char *pEmail = XJSON_GetString(XJSON_GetObject(pUser, "email"));
-        const char *pUserId = XJSON_GetString(XJSON_GetObject(pUser, "id"));
-
-        if (xstrused(pEmail)) xstrncpy(pAccount->sEmail, sizeof(pAccount->sEmail), pEmail);
-        if (xstrused(pUserId)) xstrncpy(pAccount->sUserId, sizeof(pAccount->sUserId), pUserId);
-    }
+    if (xstrused(pEmail)) xstrncpy(pAccount->sEmail, sizeof(pAccount->sEmail), pEmail);
+    if (xstrused(pUserId)) xstrncpy(pAccount->sUserId, sizeof(pAccount->sUserId), pUserId);
 
     return XTRUE;
 }
@@ -430,7 +400,7 @@ static xbool_t DirectGate_Login_Exchange(directgate_account_t *pAccount,
                                          const char *pBody)
 {
     directgate_webapi_res_t res;
-    xbool_t bOk = DirectGate_WebApi_Request(&res, XHTTP_POST, pCtx->pSupabaseUrl, pPath, NULL, pCtx->pSupabaseKey, pBody);
+    xbool_t bOk = DirectGate_WebApi_Request(&res, XHTTP_POST, pCtx->pApiUrl, pPath, NULL, NULL, pBody);
 
     if (!bOk)
     {
@@ -444,17 +414,16 @@ static xbool_t DirectGate_Login_Exchange(directgate_account_t *pAccount,
     return bOk;
 }
 
-xbool_t DirectGate_Login_Refresh(directgate_account_t *pAccount,
-                                 const directgate_login_ctx_t *pCtx)
+xbool_t DirectGate_Login_Refresh(directgate_account_t *pAccount, const directgate_login_ctx_t *pCtx)
 {
     XCHECK((pAccount != NULL && pCtx != NULL), XFALSE);
     XCHECK_NL((xstrused(pAccount->sRefreshToken)), XFALSE);
-    XCHECK((xstrused(pCtx->pSupabaseUrl) && xstrused(pCtx->pSupabaseKey)), XFALSE);
+    XCHECK((xstrused(pCtx->pApiUrl)), XFALSE);
 
     char sBody[XSTR_MID + XSTR_TINY];
-    xstrncpyf(sBody, sizeof(sBody), "{\"refresh_token\":\"%s\"}", pAccount->sRefreshToken);
+    xstrncpyf(sBody, sizeof(sBody), "{\"refreshToken\":\"%s\"}", pAccount->sRefreshToken);
 
-    xbool_t bOk = DirectGate_Login_Exchange(pAccount, pCtx, "/auth/v1/token?grant_type=refresh_token", sBody);
+    xbool_t bOk = DirectGate_Login_Exchange(pAccount, pCtx, "/api/v1/auth/cli/refresh", sBody);
     if (bOk) xlogi("Refreshed account session: user(%s)", pAccount->sEmail);
 
     OPENSSL_cleanse(sBody, sizeof(sBody));
@@ -467,9 +436,9 @@ static xbool_t DirectGate_Login_Redeem(directgate_account_t *pAccount,
                                        const char *pVerifier)
 {
     char sBody[XSTR_MID + XSTR_TINY];
-    xstrncpyf(sBody, sizeof(sBody), "{\"auth_code\":\"%s\",\"code_verifier\":\"%s\"}", pCode, pVerifier);
+    xstrncpyf(sBody, sizeof(sBody), "{\"code\":\"%s\",\"codeVerifier\":\"%s\"}", pCode, pVerifier);
 
-    xbool_t bOk = DirectGate_Login_Exchange(pAccount, pCtx, "/auth/v1/token?grant_type=pkce", sBody);
+    xbool_t bOk = DirectGate_Login_Exchange(pAccount, pCtx, "/api/v1/auth/cli/token", sBody);
 
     OPENSSL_cleanse(sBody, sizeof(sBody));
     return bOk;
@@ -761,8 +730,8 @@ xbool_t DirectGate_Login_Interactive(directgate_account_t *pAccount,
                                      const directgate_login_ctx_t *pCtx)
 {
     XCHECK((pAccount != NULL && pCtx != NULL), XFALSE);
-    XCHECK((xstrused(pCtx->pSupabaseUrl)), xthrowr(XFALSE, "Supabase URL is not configured"));
-    XCHECK((xstrused(pCtx->pSupabaseKey)), xthrowr(XFALSE, "Supabase publishable key is not configured"));
+    XCHECK((xstrused(pCtx->pApiUrl)), xthrowr(XFALSE, "API URL is not configured"));
+    XCHECK((xstrused(pCtx->pWebUrl)), xthrowr(XFALSE, "Web URL is not configured"));
 
     char sVerifier[DIRECTGATE_PKCE_VERIFIER_SIZE];
     char sChallenge[DIRECTGATE_PKCE_CHALLENGE_SIZE];
@@ -792,30 +761,13 @@ xbool_t DirectGate_Login_Interactive(directgate_account_t *pAccount,
     */
     xbool_t bUseBrowser = !pCtx->bNoBrowser && DirectGate_Login_HasDisplay();
 
-    if (!bUseBrowser && !xstrused(pCtx->pWebUrl))
-    {
-        xloge("Headless sign-in needs a web URL for the sign-in bounce page");
-        XSock_Close(&listener);
-        OPENSSL_cleanse(sVerifier, sizeof(sVerifier));
-        return XFALSE;
-    }
-
     /*
-        Prefer our own entry point so the printed link is a directgate.io URL
-        rather than the auth provider's project host. Without a web URL there
-        is nothing to point at, so a local browser still gets the provider URL
-        directly - the flow is identical either way.
+        The printed link is always our own entry point: the CLI holds no
+        provider configuration, so /cli-auth/start is what knows where to
+        forward the browser.
     */
     char sAuthUrl[XPATH_MAX];
     size_t nUrlLength = DirectGate_Login_StartUrl(sAuthUrl, sizeof(sAuthUrl), pCtx, nPort, !bUseBrowser, sChallenge);
-
-    if (!nUrlLength)
-    {
-        char sRedirect[XPATH_MAX];
-        xstrncpyf(sRedirect, sizeof(sRedirect), "http://127.0.0.1:%u/callback", nPort);
-        nUrlLength = DirectGate_Login_AuthUrl(sAuthUrl, sizeof(sAuthUrl), pCtx, sRedirect, sChallenge);
-    }
-
     if (!nUrlLength)
     {
         xloge("Failed to build the sign-in URL");

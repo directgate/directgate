@@ -50,8 +50,12 @@ typedef struct directgate_account_ {
 } directgate_account_t;
 
 typedef struct directgate_login_ctx_ {
-    const char *pSupabaseUrl;       /* https://<ref>.supabase.co */
-    const char *pSupabaseKey;       /* Publishable (anon) key */
+    /*
+        The CLI talks to exactly two hosts and holds no identity-provider
+        configuration: the API exchanges tokens on its behalf, and the web app
+        forwards the browser to the provider.
+    */
+    const char *pApiUrl;            /* https://api.directgate.io */
     const char *pWebUrl;            /* https://directgate.io, hosts /cli-auth */
     const char *pProvider;          /* OAuth provider, defaults to "google" */
     xbool_t bNoBrowser;             /* Force the paste-the-code flow */
@@ -86,10 +90,6 @@ xbool_t DirectGate_Login_Refresh(directgate_account_t *pAccount,
 xbool_t DirectGate_Login_NewVerifier(char *pOut, size_t nSize);
 xbool_t DirectGate_Login_Challenge(const char *pVerifier, char *pOut, size_t nSize);
 
-size_t DirectGate_Login_AuthUrl(char *pOut, size_t nSize,
-                                const directgate_login_ctx_t *pCtx,
-                                const char *pRedirect,
-                                const char *pChallenge);
 
 /*
  * The URL actually shown to the user: our own /cli-auth/start, which rebuilds

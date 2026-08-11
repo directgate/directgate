@@ -48,53 +48,20 @@ static int test_pkce(void)
     return 0;
 }
 
-static int test_auth_url(void)
-{
-    directgate_login_ctx_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.pSupabaseUrl = "https://ref.supabase.co";
-    ctx.pSupabaseKey = "publishable";
-
-    char sUrl[XPATH_MAX];
-    CHECK(DirectGate_Login_AuthUrl(sUrl, sizeof(sUrl), &ctx,
-        "http://127.0.0.1:40777/callback", "chal") > 0, "build auth URL");
-
-    CHECK(strstr(sUrl, "https://ref.supabase.co/auth/v1/authorize?") == sUrl,
-        "authorize endpoint");
-    CHECK(strstr(sUrl, "provider=google") != NULL, "default provider");
-    CHECK(strstr(sUrl, "code_challenge=chal") != NULL, "challenge parameter");
-    CHECK(strstr(sUrl, "code_challenge_method=s256") != NULL, "challenge method");
-    CHECK(strstr(sUrl,
-        "redirect_to=http%3A%2F%2F127.0.0.1%3A40777%2Fcallback") != NULL,
-        "redirect is percent encoded");
-
-    ctx.pProvider = "github";
-    CHECK(DirectGate_Login_AuthUrl(sUrl, sizeof(sUrl), &ctx, "https://x.test/cb", "c") > 0,
-        "build auth URL with provider");
-    CHECK(strstr(sUrl, "provider=github") != NULL, "explicit provider");
-
-    ctx.pSupabaseUrl = NULL;
-    CHECK(!DirectGate_Login_AuthUrl(sUrl, sizeof(sUrl), &ctx, "https://x.test/cb", "c"),
-        "reject missing supabase URL");
-    CHECK(!DirectGate_Login_AuthUrl(sUrl, sizeof(sUrl), NULL, "https://x.test/cb", "c"),
-        "reject NULL context");
-
-    return 0;
-}
 
 static int test_start_url(void)
 {
     directgate_login_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.pSupabaseUrl = "https://ref.supabase.co";
-    ctx.pSupabaseKey = "publishable";
+    ctx.pApiUrl = "https://api.directgate.io";
     ctx.pWebUrl = "https://directgate.io";
 
     char sUrl[XPATH_MAX];
     CHECK(DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 40777, XFALSE, "chal") > 0,
         "build start URL");
 
-    /* The printed link has to be ours, not the auth provider's host */
+    /* The printed link has to be ours, and the binary must not carry the
+     * identity provider's host at all any more. */
     CHECK(strstr(sUrl, "https://directgate.io/cli-auth/start?") == sUrl, "start endpoint");
     CHECK(strstr(sUrl, "port=40777") != NULL, "loopback port");
     CHECK(strstr(sUrl, "mode=loopback") != NULL, "loopback mode");
@@ -179,40 +146,52 @@ static int test_apply_token(void)
     directgate_account_t account;
     DirectGate_Account_Init(&account);
 
+    /* The API normalises the provider payload, so this is the only shape the
+     * CLI ever parses - no GoTrue snake_case, no relative expiry. */
     const char *pBody =
-        "{\"access_token\":\"jwt-value\",\"refresh_token\":\"refresh-value\","
-        "\"expires_in\":3600,\"expires_at\":2000000000,"
-        "\"user\":{\"id\":\"user-1\",\"email\":\"kala@example.test\"}}";
+        "{\"accessToken\":\"jwt-value\",\"refreshToken\":\"refresh-value\","
+        "\"expiresAt\":2000000000,\"email\":\"kala@example.test\","
+        "\"userId\":\"user-1\"}";
 
     xjson_t json;
-    CHECK(XJSON_Parse(&json, NULL, pBody, strlen(pBody)), "parse token body");
-    CHECK(DirectGate_Login_ApplyToken(&account, json.pRootObj), "apply token body");
+    CHECK(XJSON_Parse(&json, NULL, pBody, strlen(pBody)), "parse session body");
+    CHECK(DirectGate_Login_ApplyToken(&account, json.pRootObj), "apply session body");
     XJSON_Destroy(&json);
 
     CHECK(strcmp(account.sAccessToken, "jwt-value") == 0, "access token");
     CHECK(strcmp(account.sRefreshToken, "refresh-value") == 0, "refresh token");
     CHECK(strcmp(account.sEmail, "kala@example.test") == 0, "account email");
     CHECK(strcmp(account.sUserId, "user-1") == 0, "account user id");
-    CHECK(account.nExpiresAt == 2000000000ULL, "absolute expiry wins");
+    CHECK(account.nExpiresAt == 2000000000ULL, "absolute expiry");
 
-    /* Without expires_at the relative expires_in has to be turned into one */
-    const char *pRelative =
-        "{\"access_token\":\"jwt-2\",\"refresh_token\":\"r2\",\"expires_in\":600}";
+    /* A session without an expiry is usable; the API decides, not the clock */
+    const char *pMinimal =
+        "{\"accessToken\":\"jwt-2\",\"refreshToken\":\"r2\"}";
 
     DirectGate_Account_Init(&account);
-    CHECK(XJSON_Parse(&json, NULL, pRelative, strlen(pRelative)), "parse relative body");
-    CHECK(DirectGate_Login_ApplyToken(&account, json.pRootObj), "apply relative body");
+    CHECK(XJSON_Parse(&json, NULL, pMinimal, strlen(pMinimal)), "parse minimal body");
+    CHECK(DirectGate_Login_ApplyToken(&account, json.pRootObj), "apply minimal body");
     XJSON_Destroy(&json);
 
-    uint64_t nNow = (uint64_t)time(NULL);
-    CHECK(account.nExpiresAt >= nNow + 590 && account.nExpiresAt <= nNow + 610,
-        "relative expiry is anchored to now");
+    CHECK(account.nExpiresAt == 0, "missing expiry stays unknown");
+    CHECK(!DirectGate_Account_IsExpired(&account, 60), "unknown expiry is live");
 
-    const char *pBroken = "{\"refresh_token\":\"r\"}";
+    /* The provider's own field names must no longer be accepted, or a
+     * regression in the API contract would pass silently here. */
+    const char *pLegacy =
+        "{\"access_token\":\"jwt-3\",\"refresh_token\":\"r3\"}";
+
+    DirectGate_Account_Init(&account);
+    CHECK(XJSON_Parse(&json, NULL, pLegacy, strlen(pLegacy)), "parse legacy body");
+    CHECK(!DirectGate_Login_ApplyToken(&account, json.pRootObj),
+        "reject the raw provider payload shape");
+    XJSON_Destroy(&json);
+
+    const char *pBroken = "{\"refreshToken\":\"r\"}";
     DirectGate_Account_Init(&account);
     CHECK(XJSON_Parse(&json, NULL, pBroken, strlen(pBroken)), "parse broken body");
     CHECK(!DirectGate_Login_ApplyToken(&account, json.pRootObj),
-        "reject body without access token");
+        "reject a session without an access token");
     XJSON_Destroy(&json);
 
     CHECK(!DirectGate_Login_ApplyToken(NULL, NULL), "reject NULL arguments");
@@ -279,9 +258,6 @@ int main(void)
     xlog_setfl(XLOG_NONE);
 
     int nStatus = test_pkce();
-    if (nStatus) return nStatus;
-
-    nStatus = test_auth_url();
     if (nStatus) return nStatus;
 
     nStatus = test_start_url();

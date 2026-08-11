@@ -6,7 +6,7 @@ DirectGate has three pieces. Only the first one lives in this repository.
 
 - **Agent** (`directgate`, this repo) - runs on your machine. It performs authentication, spawns a PTY with an interactive shell, encrypts all traffic end-to-end, serves the remote file manager, and establishes a direct WebRTC data channel to the client.
 - **Relay / signaling** - operated by directgate.io. It pairs agents and clients by identifier, relays the authentication and WebRTC signaling traffic, and forwards encrypted payloads when a direct P2P link is not possible. It is never able to read terminal, file manager, or code editor data. It is **not** part of this repository.
-- **Client** - the web client at directgate.io (recommended), or the experimental `dgcli` CLI in this repo. The client authenticates with the agent and renders the terminal, file manager, and editor.
+- **Client** - the web client at directgate.io, or the `dgcli` CLI in this repo. The client authenticates with the agent and renders the terminal, file manager, and editor.
 
 After authentication, the client and agent automatically negotiate a WebRTC peer-to-peer data channel. Once it is open, all terminal I/O and file transfers flow **directly between the two peers**, bypassing the relay entirely.
 

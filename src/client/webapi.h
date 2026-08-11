@@ -57,6 +57,14 @@ xbool_t DirectGate_WebApi_Request(directgate_webapi_res_t *pRes,
 
 void DirectGate_WebApi_Clear(directgate_webapi_res_t *pRes);
 
+/*
+ * Renders an API error body into one human-readable line. Nest reports
+ * validation failures as an array under "message" and leaves "error" as the
+ * bare status text, so reading strings only would turn a precise reason into
+ * "Bad Request". Exposed because it is the CLI's only window into a refusal.
+ */
+size_t DirectGate_WebApi_FormatError(char *pOut, size_t nSize, xjson_obj_t *pRoot, uint16_t nStatusCode);
+
 /* Percent-encodes everything outside the RFC 3986 unreserved set. Returns
  * the written length, or 0 when the output buffer is too small. */
 size_t DirectGate_WebApi_UrlEncode(char *pOut, size_t nSize, const char *pInput);

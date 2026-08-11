@@ -140,22 +140,88 @@ Administrators are also encouraged to apply further systemd sandboxing restricti
 
 As with any remote access software, the appropriate hardening profile depends on the balance between functionality and security required by your environment.
 
-## Experimental CLI client
+## CLI client
 
-The experimental `dgcli` client reads a minimal config:
+`dgcli` signs in to your DirectGate account, lists the devices on it and connects
+to the one you pick - the same path the workspace UI takes.
+
+### Signing in
+
+```sh
+dgcli login
+```
+
+This runs an OAuth 2.0 authorization code flow with PKCE. The CLI opens a short-lived listener on `127.0.0.1` (ports 40777-40784), opens your browser, and exchanges the returned authorization code for a session. Tokens are written
+to `auth.json` next to the client config with `0600` permissions, and refreshed automatically as they expire - you only sign in again when the refresh token is gone.
+
+The CLI holds no identity-provider configuration of its own. It knows exactly two hosts - the API and the web app - and the code exchange and refresh go through `POST /api/v1/auth/cli/token` and `/api/v1/auth/cli/refresh`, which the
+API performs against the provider on its behalf. Swapping the provider therefore needs no new CLI release, and the repository carries no provider credentials.
+
+The link it prints points at `https://directgate.io/cli-auth/start`, which forwards to the auth provider. The web app never shows this URL - `supabase-js` navigates to it from JavaScript - but the CLI has to print it, so it goes through our own domain rather than asking you to trust a raw project host. The page takes only a loopback port and a mode; it rebuilds the redirect target itself, so the link cannot be rewritten to send an authorization code elsewhere. Set `webUrl` to empty at build time and the CLI falls back to printing the provider URL directly.
+
+On a machine with no browser (a box you reached over SSH, for example) the CLI detects the missing display - or you pass `-B` - and asks for the code to come back through `https://directgate.io/cli-auth` instead. That page hands the code to the listener when it can reach it and otherwise shows it for you to paste back into the terminal.
+
+`dgcli logout` deletes the stored session; `dgcli whoami` prints the account it belongs to.
+
+### Connecting
+
+```sh
+dgcli                # pick a device with the arrow keys, then connect
+dgcli homelab        # connect by device name, exact or unique prefix
+dgcli -d <device-id> # connect by device id
+dgcli devices        # just list the account's devices
+```
+
+The picker marks each device online (green), offline (yellow) or unavailable (red) and refuses to connect to devices the backend would reject anyway - unpaired, expired enrollment, or a share invitation you have not accepted. When stdin is not a terminal it falls back to a numbered prompt.
+
+Once a device is chosen the CLI calls `POST /api/v1/sessions/connect`, which returns the relay URL, the short-lived browser JWT, the routing key and the ICE servers in one round trip. The routing key becomes the `?rk=` query parameter on the relay WebSocket handshake; without it the relay has no route to the agent and drops the connection.
+
+The device password is prompted for after the device is chosen and is never written to disk.
+
+### Key authentication
+
+`dgcli` can authenticate with an Ed25519 key instead of typing the device password every time. The key is always tried first; the password is only reached when there is no usable key or the host refuses the one offered.
+
+```sh
+dgcli -g                 # generate a key at ~/.config/directgate/auth/key.json
+dgcli -k /path/to/key.json <device>
+```
+
+`-g` writes the key `0600` inside a `0700` directory and prints the public half. That public half still has to be authorized on each device, which is done on the device itself:
+
+```sh
+directgate -a /path/to/key.json
+```
+
+Without `-k`, `~/.config/directgate/auth/key.json` is used when it exists; `-k` always wins over it. The distinction matters on failure: an unusable `-k` is an error, because the key was asked for by name, while the default path simply not existing is the ordinary password-only setup.
+
+Two things have to line up for a key attempt to happen. The key file has to load, and the device has to have published an `agentPub` during enrollment - that value comes from the API over TLS and is what the host is pinned to. A
+host presenting any other identity is refused outright rather than falling back, since it is not provably the device that was asked for. A host that proves its identity but has not authorized the key is a different case: that is what the password is for, so the CLI reconnects and runs SRP instead.
+
+The file is the same `directgate-client-key-v2` identity the agent generates and the web client loads, so one key works across all three.
+
+### Client config
+
+`dgcli` runs with no config at all. A `client.json` is only needed to override the built-in endpoints:
 
 ```json
 {
+  "apiUrl": "https://api.directgate.io",
+  "webUrl": "https://directgate.io",
   "signalingUrl": "wss://relay1.directgate.io/websock",
-  "deviceId": "<agent_unique_uuidv4>",
   "iceServers": ["stun:stun.cloudflare.com:3478"]
 }
 ```
 
-| Field          | Type     | Description                                |
-|----------------|----------|--------------------------------------------|
-| `signalingUrl` | string   | WebSocket relay endpoint URL               |
-| `deviceId`     | string   | Agent ID to connect to                     |
-| `iceServers`   | string[] | ICE/TURN server URLs for WebRTC (optional) |
+| Field          | Type     | Description                                              |
+|----------------|----------|----------------------------------------------------------|
+| `apiUrl`       | string   | Control-plane API origin                                  |
+| `webUrl`       | string   | Web app origin, hosts the `/cli-auth` sign-in page        |
+| `signalingUrl` | string   | Relay endpoint; normally supplied by the session envelope |
+| `apiToken`     | string   | Pre-issued bearer token; replaces the browser sign-in     |
+| `keyPath`      | string   | Client key file tried before the password                 |
+| `iceServers`   | string[] | ICE/TURN server URLs for WebRTC (optional)                |
 
-The client password is entered interactively at runtime and is never stored in the client config.
+`apiUrl` and `webUrl` may also be set per shell through `DIRECTGATE_API_URL` and `DIRECTGATE_WEB_URL`, which take precedence over the config file. Their compiled-in defaults come from the CMake cache variables of the same names, so a self-hosted build ships a binary that points at its own stack - and since those are the only endpoints it carries, that is all a fork has to change.
+
+Setting `apiToken` skips the account sign-in entirely and is the path to use for automation, where no browser is available to authorize anything.

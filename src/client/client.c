@@ -1562,8 +1562,7 @@ static int DirectGate_Client_ServiceCallback(xapi_ctx_t *pCtx, xapi_session_t *p
 static void DirectGate_Client_LoginContext(directgate_login_ctx_t *pCtx, const directgate_cfg_t *pCfg)
 {
     memset(pCtx, 0, sizeof(*pCtx));
-    pCtx->pSupabaseUrl = pCfg->sSupabaseUrl;
-    pCtx->pSupabaseKey = pCfg->sSupabaseKey;
+    pCtx->pApiUrl = pCfg->sApiUrl;
     pCtx->pWebUrl = pCfg->sWebUrl;
     pCtx->bNoBrowser = pCfg->bNoBrowser;
 }

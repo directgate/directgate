@@ -79,23 +79,50 @@ void DirectGate_WebApi_Clear(directgate_webapi_res_t *pRes)
     pRes->pRoot = NULL;
 }
 
-/* Lifts the first human-usable message out of an API error body. Nest's
- * exception filter uses "message", Supabase GoTrue uses "error_description"
- * or "msg"; anything else falls back to the raw status line. */
-static void DirectGate_WebApi_ReadError(directgate_webapi_res_t *pRes)
+size_t DirectGate_WebApi_FormatError(char *pOut, size_t nSize, xjson_obj_t *pRoot, uint16_t nStatusCode)
 {
-    static const char *pFields[] = { "message", "error_description", "msg", "error", NULL };
+    XCHECK((pOut != NULL && nSize > 0), XSTDNON);
+    pOut[0] = XSTR_NUL;
 
-    for (int i = 0; pFields[i] != NULL; i++)
+    static const char *pFields[] = {
+        "message",
+        "error_description",
+        "msg",
+        "error",
+        NULL
+    };
+
+    for (int i = 0; pRoot != NULL && pFields[i] != NULL; i++)
     {
-        const char *pText = XJSON_GetString(XJSON_GetObject(pRes->pRoot, pFields[i]));
+        xjson_obj_t *pField = XJSON_GetObject(pRoot, pFields[i]);
+        if (pField == NULL) continue;
+
+        if (pField->nType == XJSON_TYPE_ARRAY)
+        {
+            size_t nItems = XJSON_GetArrayLength(pField);
+
+            for (size_t j = 0; j < nItems; j++)
+            {
+                const char *pItem = XJSON_GetString(XJSON_GetArrayItem(pField, j));
+                if (!xstrused(pItem)) continue;
+
+                size_t nUsed = strlen(pOut);
+                if (nUsed + 2 >= nSize) break;
+
+                xstrncatf(pOut, nSize - nUsed, "%s%s", nUsed ? ", " : "", pItem);
+            }
+
+            if (xstrused(pOut)) return strlen(pOut);
+            continue;
+        }
+
+        const char *pText = XJSON_GetString(pField);
         if (!xstrused(pText)) continue;
 
-        xstrncpy(pRes->sError, sizeof(pRes->sError), pText);
-        return;
+        return xstrncpy(pOut, nSize, pText);
     }
 
-    xstrncpyf(pRes->sError, sizeof(pRes->sError), "endpoint returned HTTP %u", pRes->nStatusCode);
+    return xstrncpyf(pOut, nSize, "endpoint returned HTTP %u", nStatusCode);
 }
 
 xbool_t DirectGate_WebApi_Request(directgate_webapi_res_t *pRes,
@@ -196,7 +223,7 @@ xbool_t DirectGate_WebApi_Request(directgate_webapi_res_t *pRes,
 
     if (!XHTTP_IsSuccessCode(&handle))
     {
-        DirectGate_WebApi_ReadError(pRes);
+        DirectGate_WebApi_FormatError(pRes->sError, sizeof(pRes->sError), pRes->pRoot, pRes->nStatusCode);
         XHTTP_Clear(&handle);
         return XFALSE;
     }

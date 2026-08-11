@@ -44,14 +44,6 @@ extern int optind;
 #define DIRECTGATE_WEB_URL          "https://directgate.io"
 #endif
 
-#ifndef DIRECTGATE_SUPABASE_URL
-#define DIRECTGATE_SUPABASE_URL     ""
-#endif
-
-#ifndef DIRECTGATE_SUPABASE_KEY
-#define DIRECTGATE_SUPABASE_KEY     ""
-#endif
-
 void DirectGate_DisplayUsage(const char *pName)
 {
     printf("Usage: %s [command] [options] [device]\n\n", pName);
@@ -103,9 +95,7 @@ void DirectGate_ApplyEnvConfig(directgate_cfg_t *pCfg)
         size_t nSize;
     } fields[] = {
         { "DIRECTGATE_API_URL", offsetof(directgate_cfg_t, sApiUrl), sizeof(pCfg->sApiUrl) },
-        { "DIRECTGATE_WEB_URL", offsetof(directgate_cfg_t, sWebUrl), sizeof(pCfg->sWebUrl) },
-        { "DIRECTGATE_SUPABASE_URL", offsetof(directgate_cfg_t, sSupabaseUrl), sizeof(pCfg->sSupabaseUrl) },
-        { "DIRECTGATE_SUPABASE_KEY", offsetof(directgate_cfg_t, sSupabaseKey), sizeof(pCfg->sSupabaseKey) }
+        { "DIRECTGATE_WEB_URL", offsetof(directgate_cfg_t, sWebUrl), sizeof(pCfg->sWebUrl) }
     };
 
     for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
@@ -200,8 +190,6 @@ void DirectGate_InitConfig(directgate_cfg_t *pCfg)
 
     xstrncpy(pCfg->sApiUrl, sizeof(pCfg->sApiUrl), DIRECTGATE_API_URL);
     xstrncpy(pCfg->sWebUrl, sizeof(pCfg->sWebUrl), DIRECTGATE_WEB_URL);
-    xstrncpy(pCfg->sSupabaseUrl, sizeof(pCfg->sSupabaseUrl), DIRECTGATE_SUPABASE_URL);
-    xstrncpy(pCfg->sSupabaseKey, sizeof(pCfg->sSupabaseKey), DIRECTGATE_SUPABASE_KEY);
 
     pCfg->eCommand = DIRECTGATE_CMD_CONNECT;
     pCfg->nVerbose = XSTDNON;
@@ -265,12 +253,6 @@ xbool_t DirectGate_LoadConfig(directgate_cfg_t *pCfg, const char *pPath)
     const char *pKeyPath = XJSON_GetString(XJSON_GetObject(pRoot, "keyPath"));
     if (xstrused(pKeyPath)) xstrncpy(pCfg->sKeyPath, sizeof(pCfg->sKeyPath), pKeyPath);
 
-    const char *pSupabaseUrl = XJSON_GetString(XJSON_GetObject(pRoot, "supabaseUrl"));
-    if (xstrused(pSupabaseUrl)) xstrncpy(pCfg->sSupabaseUrl, sizeof(pCfg->sSupabaseUrl), pSupabaseUrl);
-
-    const char *pSupabaseKey = XJSON_GetString(XJSON_GetObject(pRoot, "supabaseKey"));
-    if (xstrused(pSupabaseKey)) xstrncpy(pCfg->sSupabaseKey, sizeof(pCfg->sSupabaseKey), pSupabaseKey);
-
     DirectGate_LogLoad(&pCfg->log, pRoot);
     DirectGate_AuthLoad(&pCfg->auth, pRoot);
     DirectGate_WebRTC_LoadIceServers(pCfg->sIceServers, &pCfg->nIceSrvCount, pRoot);
@@ -303,8 +285,6 @@ static xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
     if (xstrused(pCfg->sApiUrl)) XJSON_AddString(pRoot, "apiUrl", pCfg->sApiUrl);
     if (xstrused(pCfg->sApiToken)) XJSON_AddString(pRoot, "apiToken", pCfg->sApiToken);
     if (xstrused(pCfg->sWebUrl)) XJSON_AddString(pRoot, "webUrl", pCfg->sWebUrl);
-    if (xstrused(pCfg->sSupabaseUrl)) XJSON_AddString(pRoot, "supabaseUrl", pCfg->sSupabaseUrl);
-    if (xstrused(pCfg->sSupabaseKey)) XJSON_AddString(pRoot, "supabaseKey", pCfg->sSupabaseKey);
 
     if (pCfg->nIceSrvCount > 0)
     {

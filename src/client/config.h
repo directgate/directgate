@@ -47,8 +47,6 @@ typedef struct directgate_cfg_ {
     char sRoutingKey[XSTR_MID];
     char sApiUrl[XPATH_MAX];
     char sApiToken[XSTR_MID];
-    char sSupabaseUrl[XPATH_MAX];
-    char sSupabaseKey[XSTR_MID];
     char sWebUrl[XPATH_MAX];
     char sAuthPath[XPATH_MAX];
     char sKeyPath[XPATH_MAX];
@@ -80,9 +78,9 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[]);
  * Returns XFALSE when the token is not a verb, leaving it as a device query. */
 xbool_t DirectGate_ParseCommand(const char *pArg, directgate_cmd_t *pCommand);
 
-/* Applies the DIRECTGATE_API_URL / DIRECTGATE_WEB_URL / DIRECTGATE_SUPABASE_URL
- * / DIRECTGATE_SUPABASE_KEY overrides, which sit between the config file and
- * the command line so a dev shell can retarget the CLI without editing JSON. */
+/* Applies the DIRECTGATE_API_URL / DIRECTGATE_WEB_URL overrides, which sit
+ * between the config file and the command line so a dev shell can retarget
+ * the CLI without editing JSON. */
 void DirectGate_ApplyEnvConfig(directgate_cfg_t *pCfg);
 
 /* Prompts for the device's SRP password, once a device has been chosen.
