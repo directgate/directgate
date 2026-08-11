@@ -75,7 +75,7 @@ This produces:
 | Binary | Path               | Description                      |
 |--------|--------------------|----------------------------------|
 | Agent  | `build/directgate` | PTY agent                        |
-| Client | `build/dgcli`      | Experimental CLI terminal client |
+| Client | `build/dgcli`      | CLI terminal client              |
 
 ## Install from source
 
@@ -152,7 +152,7 @@ directgate-agent/
 ├── src/
 │   ├── common/          # Shared code (protocol, auth, e2e, hkdf, srp, webrtc, transfer)
 │   ├── agent/           # Agent source (config, enroll, files, search, session, term, directgate)
-│   └── client/          # Experimental CLI client source
+│   └── client/          # CLI client source code
 ├── tests/               # Smoke tests + run-smoke.sh
 ├── docs/                # Detailed documentation
 ├── misc/                # Screenshots and helper snippets

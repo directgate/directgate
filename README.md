@@ -90,7 +90,7 @@ DirectGate has three pieces; only the agent lives in this repository:
 
 - **Agent** (this repo) - runs on your machine: authenticates the client, spawns a PTY, serves the remote desktop, file manager, and encrypts all traffic end-to-end.
 - **Relay / signaling** - operated by directgate.io. Pairs agents and clients, carries signaling, and forwards encrypted payloads when a direct link isn't possible. It never sees plaintext.
-- **Client** - the web client at directgate.io, or the experimental `dgcli` in this repo.
+- **Client** - the web client at directgate.io, or the `dgcli` terminal client in this repo. `dgcli login` signs in through your browser, and running `dgcli` on its own lists your devices and connects to the one you pick. `dgcli -g` generates an Ed25519 key so connections authenticate without typing the device password. See [Configuration](docs/configuration.md#cli-client).
 
 After authentication, the client and agent negotiate a WebRTC peer-to-peer data channel. Once it opens, terminal I/O and file transfers flow **directly between the two peers**, bypassing the relay:
 

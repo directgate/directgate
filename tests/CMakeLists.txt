@@ -73,6 +73,7 @@ foreach(test
         webrtc_audio_smoke
         api_invalid_role_smoke
         keyauth_smoke
+        keyauth_client_smoke
         files_static_smoke
         auth_logger_smoke
         hash_vectors_smoke
@@ -149,9 +150,21 @@ directgate_smoke(files_smoke         ${AGENT_DIR}/files.c)
 directgate_smoke(session_smoke       ${AGENT_DIR}/session.c)
 
 # Client utility tests that compile the client-only implementation files.
-directgate_smoke(client_devices_smoke ${CLIENT_DIR}/devices.c)
-directgate_smoke(client_config_smoke  ${CLIENT_DIR}/config.c ${CLIENT_DIR}/devices.c)
-directgate_smoke(client_relay_smoke   ${CLIENT_DIR}/relay.c)
+directgate_smoke(client_devices_smoke ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/webapi.c)
+directgate_smoke(client_config_smoke  ${CLIENT_DIR}/config.c ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/webapi.c)
+directgate_smoke(client_login_smoke   ${CLIENT_DIR}/login.c ${CLIENT_DIR}/webapi.c)
+directgate_smoke(client_relay_smoke   ${CLIENT_DIR}/relay.c ${CLIENT_DIR}/webapi.c)
+directgate_smoke(client_webapi_smoke  ${CLIENT_DIR}/webapi.c)
+
+# The client sources include their neighbour headers by bare name
+foreach(test
+        client_devices_smoke
+        client_config_smoke
+        client_login_smoke
+        client_relay_smoke
+        client_webapi_smoke)
+    target_include_directories(${test} PRIVATE ${CLIENT_DIR})
+endforeach()
 
 # Drives the file-manager handlers against a real session send path, so it
 # needs the same source set as the lifecycle test.

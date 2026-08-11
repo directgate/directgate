@@ -558,17 +558,34 @@ if(UTIL_LIBRARY)
 endif()
 
 # ---- client binary: dgcli ------------------------------------------------
+# Control-plane endpoints are baked in so a downloaded binary needs no config
+# to sign in. A self-hosted or staging build overrides them here; a developer
+# overrides them per-shell with the matching DIRECTGATE_* environment vars.
+#
+# Identity-provider configuration is deliberately absent: the API exchanges
+# tokens on the client's behalf and the web app forwards the browser, so the
+# only hosts the binary knows are our own.
+set(DIRECTGATE_API_URL "https://api.directgate.io" CACHE STRING "Default control-plane API origin")
+set(DIRECTGATE_WEB_URL "https://directgate.io" CACHE STRING "Default web app origin (hosts /cli-auth)")
+
 add_executable(dgcli
     ${CLIENT_DIR}/client.c
     ${CLIENT_DIR}/config.c
     ${CLIENT_DIR}/devices.c
-    ${CLIENT_DIR}/relay.c)
+    ${CLIENT_DIR}/login.c
+    ${CLIENT_DIR}/relay.c
+    ${CLIENT_DIR}/webapi.c)
 target_include_directories(dgcli PRIVATE ${CLIENT_DIR})
 target_link_libraries(dgcli PRIVATE xcommon)
+target_compile_definitions(dgcli PRIVATE
+    DIRECTGATE_API_URL="${DIRECTGATE_API_URL}"
+    DIRECTGATE_WEB_URL="${DIRECTGATE_WEB_URL}")
 
 if(WIN32)
     enable_language(RC)
     target_sources(dgcli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/misc/win/dgcli.rc")
+    # ShellExecuteA() hands the sign-in URL to the default browser
+    target_link_libraries(dgcli PRIVATE shell32)
 endif()
 
 if(UTIL_LIBRARY)

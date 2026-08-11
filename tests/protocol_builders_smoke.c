@@ -174,6 +174,35 @@ int main(void)
     }
     DirectGate_Package_Clear(&pkg);
 
+    /*
+     * The exact shape `dgcli -A` puts on the wire. The agent keys its handler
+     * off action == "add-key" and reads clientPub, so a rename on either side
+     * would silently stop authorizing keys.
+     */
+    CHECK(roundtrip(&pkg, &wire,
+        DirectGate_Proto_BuildAdmin("add-key", "AAAAB3NzaC1lZDI1NTE5", NULL, NULL, 42), NULL, 0) == 0,
+        "admin add-key");
+    CHECK(pkg.header.eType == DIRECTGATE_PKG_ADMIN, "add-key type");
+    CHECK(pkg.header.nSessionId == 42, "add-key session id");
+    {
+        directgate_pkg_admin_t *pAdmin = (directgate_pkg_admin_t*)pkg.pPackage;
+        CHECK(pAdmin != NULL && STREQ(pAdmin->pAction, "add-key"), "add-key action");
+        CHECK(STREQ(pAdmin->pClientPub, "AAAAB3NzaC1lZDI1NTE5"), "add-key carries the public key");
+        CHECK(!xstrused(pAdmin->pStatus), "a request carries no status");
+    }
+    DirectGate_Package_Clear(&pkg);
+
+    /* And the answer the agent sends back */
+    CHECK(roundtrip(&pkg, &wire,
+        DirectGate_Proto_BuildAdmin("add-key-result", NULL, "already", NULL, 42), NULL, 0) == 0,
+        "add-key result");
+    {
+        directgate_pkg_admin_t *pAdmin = (directgate_pkg_admin_t*)pkg.pPackage;
+        CHECK(pAdmin != NULL && STREQ(pAdmin->pAction, "add-key-result"), "result action");
+        CHECK(STREQ(pAdmin->pStatus, "already"), "result status");
+    }
+    DirectGate_Package_Clear(&pkg);
+
     /* ---- file ack / cancel ---- */
     CHECK(roundtrip(&pkg, &wire,
         DirectGate_Proto_BuildFileAck("tid-1", 12), NULL, 0) == 0, "file ack");
