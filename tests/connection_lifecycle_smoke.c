@@ -143,6 +143,13 @@ int main(void)
     CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 51) == NULL,
         "authenticated closed status should remove its session");
 
+    /* The relay turns a departed client into a closed status, which always
+       arrives after an agent-initiated close has already dropped the
+       session. Re-delivering it must stay a quiet no-op. */
+    CHECK(send_header(&conn, &firstRelay,
+        DirectGate_Proto_BuildStatus("closed", 51)) == XAPI_CONTINUE,
+        "closed status for an already removed session should be ignored");
+
     directgate_session_t *pSession = DirectGate_SessionMgr_Create(&conn.mgr, 1);
     CHECK(pSession != NULL, "logical session should be created");
     pSession->pWsSession = &firstRelay;
@@ -226,6 +233,43 @@ int main(void)
     CHECK(dispatch(&conn, &kaRelay, XAPI_CB_CLOSED) == XAPI_CONTINUE,
         "keepalive test relay disconnect should be handled");
     DirectGate_SessionMgr_Destroy(&conn.mgr);
+
+    /*
+       A PTY reaching EOF raises a status event on its own XAPI_CUSTOM
+       endpoint, whose pSessionData is a terminal - not a connection. Treating
+       it as one used to schedule a relay reconnect and write the attempt
+       counter far past the end of the terminal object, which wedged the agent
+       and dropped the device offline every time a remote shell exited.
+
+       The buffer is connection-sized so a regression lands inside it rather
+       than corrupting unrelated memory, and zeroed because that is what a
+       real terminal object looks like: a non-zero nNextReconnectMs would
+       make the buggy path skip the reconnect and hide the write.
+    */
+    unsigned char sForeign[sizeof(directgate_conn_t)];
+    memset(sForeign, 0, sizeof(sForeign));
+
+    xapi_session_t custom;
+    memset(&custom, 0, sizeof(custom));
+    custom.eRole = XAPI_CUSTOM;
+    custom.pSessionData = sForeign;
+    custom.sock.nFD = XSOCK_INVALID;
+
+    xapi_ctx_t statusCtx;
+    memset(&statusCtx, 0, sizeof(statusCtx));
+    statusCtx.eCbType = XAPI_CB_STATUS;
+    statusCtx.eStatType = XAPI_SELF;
+    statusCtx.nStatus = XAPI_HUNGED;
+
+    CHECK(DirectGate_ServiceCallback(&statusCtx, &custom) == XAPI_CONTINUE,
+        "a hung custom endpoint should be reported without further action");
+
+    for (size_t i = 0; i < sizeof(sForeign); i++)
+    {
+        CHECK(sForeign[i] == 0,
+            "custom endpoint data must never be written through as a connection");
+    }
+
     puts("connection_lifecycle_smoke: OK");
     return 0;
 }

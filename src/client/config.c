@@ -29,23 +29,92 @@ extern int optind;
 
 #define DIRECTGATE_CLIENT_CONFIG    ".config/directgate/client.json"
 #define DIRECTGATE_CLIENT_DEVICES   ".config/directgate/devices"
+#define DIRECTGATE_CLIENT_AUTH      ".config/directgate/auth.json"
+#define DIRECTGATE_CLIENT_KEY       ".config/directgate/auth/key.json"
 #define DIRECTGATE_SIGNALING_URL    "wss://directgate.io/websock"
+
+/* Control-plane endpoints. Overridable at build time so a self-hosted or
+ * staging deployment ships a binary that points at its own stack, and at
+ * run time through the matching environment variables. */
+#ifndef DIRECTGATE_API_URL
+#define DIRECTGATE_API_URL          "https://api.directgate.io"
+#endif
+
+#ifndef DIRECTGATE_WEB_URL
+#define DIRECTGATE_WEB_URL          "https://directgate.io"
+#endif
+
+#ifndef DIRECTGATE_SUPABASE_URL
+#define DIRECTGATE_SUPABASE_URL     ""
+#endif
+
+#ifndef DIRECTGATE_SUPABASE_KEY
+#define DIRECTGATE_SUPABASE_KEY     ""
+#endif
 
 void DirectGate_DisplayUsage(const char *pName)
 {
-    printf("Usage: %s [options]\n\n", pName);
+    printf("Usage: %s [command] [options] [device]\n\n", pName);
+    printf("Run without arguments to pick a device from your account and connect.\n");
+    printf("A device may also be given by id, exact name or unique name prefix.\n\n");
+    printf("Commands are:\n");
+    printf("  login                # Sign in through the browser\n");
+    printf("  logout               # Forget the stored session\n");
+    printf("  devices              # List the devices on your account\n");
+    printf("  whoami               # Show the signed in account\n\n");
     printf("Options are:\n");
-    printf("  -n <name>            # Device name for device ID\n");
+    printf("  -d <id|name>         # Device to connect to\n");
+    printf("  -k <path>            # Client key file, tried before the password\n");
+    printf("  -a <url>             # API base URL\n");
     printf("  -w <url>             # WebSocket signaling URL\n");
-    printf("  -d <id>              # Device ID for this client\n");
     printf("  -c <path>            # Config JSON path\n");
     printf("  -p <path>            # Device list file path\n");
+    printf("  -n <name>            # Device name for the local device list\n");
     printf("  -l <path>            # Log directory path\n");
     printf("  -v <level>           # Verbose level (0-5)\n");
+    printf("  -g                   # Generate a client key and exit\n");
+    printf("  -B                   # Sign in without opening a browser\n");
     printf("  -f                   # Force overwrite device in list\n");
     printf("  -s                   # Save device in the list file\n");
     printf("  -i                   # Init config and exit\n");
     printf("  -h                   # Version and usage\n\n");
+}
+
+xbool_t DirectGate_ParseCommand(const char *pArg, directgate_cmd_t *pCommand)
+{
+    XCHECK_NL((xstrused(pArg) && pCommand != NULL), XFALSE);
+
+    if (!strcmp(pArg, "login")) *pCommand = DIRECTGATE_CMD_LOGIN;
+    else if (!strcmp(pArg, "logout")) *pCommand = DIRECTGATE_CMD_LOGOUT;
+    else if (!strcmp(pArg, "devices") || !strcmp(pArg, "ls")) *pCommand = DIRECTGATE_CMD_DEVICES;
+    else if (!strcmp(pArg, "whoami")) *pCommand = DIRECTGATE_CMD_WHOAMI;
+    else return XFALSE;
+
+    return XTRUE;
+}
+
+void DirectGate_ApplyEnvConfig(directgate_cfg_t *pCfg)
+{
+    XCHECK_VOID_NL((pCfg != NULL));
+
+    static const struct {
+        const char *pName;
+        size_t nOffset;
+        size_t nSize;
+    } fields[] = {
+        { "DIRECTGATE_API_URL", offsetof(directgate_cfg_t, sApiUrl), sizeof(pCfg->sApiUrl) },
+        { "DIRECTGATE_WEB_URL", offsetof(directgate_cfg_t, sWebUrl), sizeof(pCfg->sWebUrl) },
+        { "DIRECTGATE_SUPABASE_URL", offsetof(directgate_cfg_t, sSupabaseUrl), sizeof(pCfg->sSupabaseUrl) },
+        { "DIRECTGATE_SUPABASE_KEY", offsetof(directgate_cfg_t, sSupabaseKey), sizeof(pCfg->sSupabaseKey) }
+    };
+
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+    {
+        const char *pValue = getenv(fields[i].pName);
+        if (!xstrused(pValue)) continue;
+
+        xstrncpy((char*)pCfg + fields[i].nOffset, fields[i].nSize, pValue);
+    }
 }
 
 static void DirectGate_SetDefaultConfigPath(directgate_cfg_t *pCfg)
@@ -56,13 +125,15 @@ static void DirectGate_SetDefaultConfigPath(directgate_cfg_t *pCfg)
     const char *pAppData = getenv("APPDATA");
     if (xstrused(pAppData))
     {
-        xstrncpyf(pCfg->sCfgPath, sizeof(pCfg->sCfgPath),
-            "%s/directgate/client.json", pAppData);
-        xstrncpyf(pCfg->sDeviceList, sizeof(pCfg->sDeviceList),
-            "%s/directgate/devices", pAppData);
+        xstrncpyf(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), "%s/directgate/client.json", pAppData);
+        xstrncpyf(pCfg->sDeviceList, sizeof(pCfg->sDeviceList), "%s/directgate/devices", pAppData);
+        xstrncpyf(pCfg->sAuthPath, sizeof(pCfg->sAuthPath), "%s/directgate/auth.json", pAppData);
+        xstrncpyf(pCfg->sKeyPath, sizeof(pCfg->sKeyPath), "%s/directgate/auth/key.json", pAppData);
 
         DirectGate_PathToSlash(pCfg->sCfgPath);
         DirectGate_PathToSlash(pCfg->sDeviceList);
+        DirectGate_PathToSlash(pCfg->sAuthPath);
+        DirectGate_PathToSlash(pCfg->sKeyPath);
         return;
     }
 #endif
@@ -74,33 +145,22 @@ static void DirectGate_SetDefaultConfigPath(directgate_cfg_t *pCfg)
     {
         xstrncpy(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), "./client.json");
         xstrncpyf(pCfg->sDeviceList, sizeof(pCfg->sDeviceList), "./devices");
+        xstrncpy(pCfg->sAuthPath, sizeof(pCfg->sAuthPath), "./auth.json");
+        xstrncpy(pCfg->sKeyPath, sizeof(pCfg->sKeyPath), "./key.json");
     }
     else
     {
         xstrncpyf(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), "%s/%s", sHomeDir, DIRECTGATE_CLIENT_CONFIG);
         xstrncpyf(pCfg->sDeviceList, sizeof(pCfg->sDeviceList), "%s/%s", sHomeDir, DIRECTGATE_CLIENT_DEVICES);
+        xstrncpyf(pCfg->sAuthPath, sizeof(pCfg->sAuthPath), "%s/%s", sHomeDir, DIRECTGATE_CLIENT_AUTH);
+        xstrncpyf(pCfg->sKeyPath, sizeof(pCfg->sKeyPath), "%s/%s", sHomeDir, DIRECTGATE_CLIENT_KEY);
     }
 }
 
-static xbool_t DirectGate_PromptAuth(directgate_cfg_t *pCfg, xbool_t bForce)
+static xbool_t DirectGate_PromptApiUrl(directgate_cfg_t *pCfg)
 {
-    XCHECK((pCfg != NULL), XFALSE);
-
-    if (bForce)
-    {
-        pCfg->sSecret[0] = XSTR_NUL;
-        return XTRUE;
-    }
-    else if (xstrused(pCfg->sDeviceId) && xstrused(pCfg->sSecret))
-    {
-        xlogd("Client auth is already configured");
-        return XTRUE;
-    }
-
-    if (XCLI_GetPass("Auth password: ", pCfg->sSecret,
-        sizeof(pCfg->sSecret)) <= 0) return XFALSE;
-
-    return XTRUE;
+    return DirectGate_PromptString("API URL", pCfg->sApiUrl,
+        sizeof(pCfg->sApiUrl), DIRECTGATE_API_URL, XTRUE);
 }
 
 static xbool_t DirectGate_PromptSignalingUrl(directgate_cfg_t *pCfg)
@@ -137,8 +197,18 @@ void DirectGate_InitConfig(directgate_cfg_t *pCfg)
     pCfg->log.bToScreen = XTRUE;
 
     DirectGate_SetDefaultConfigPath(pCfg);
+
+    xstrncpy(pCfg->sApiUrl, sizeof(pCfg->sApiUrl), DIRECTGATE_API_URL);
+    xstrncpy(pCfg->sWebUrl, sizeof(pCfg->sWebUrl), DIRECTGATE_WEB_URL);
+    xstrncpy(pCfg->sSupabaseUrl, sizeof(pCfg->sSupabaseUrl), DIRECTGATE_SUPABASE_URL);
+    xstrncpy(pCfg->sSupabaseKey, sizeof(pCfg->sSupabaseKey), DIRECTGATE_SUPABASE_KEY);
+
+    pCfg->eCommand = DIRECTGATE_CMD_CONNECT;
     pCfg->nVerbose = XSTDNON;
     pCfg->bSaveDevice = XFALSE;
+    pCfg->bNoBrowser = XFALSE;
+    pCfg->bKeyRequired = XFALSE;
+    pCfg->bGenKey = XFALSE;
     pCfg->bForce = XFALSE;
     pCfg->bInit = XFALSE;
 }
@@ -186,6 +256,21 @@ xbool_t DirectGate_LoadConfig(directgate_cfg_t *pCfg, const char *pPath)
     const char *pApiToken = XJSON_GetString(XJSON_GetObject(pRoot, "apiToken"));
     if (xstrused(pApiToken)) xstrncpy(pCfg->sApiToken, sizeof(pCfg->sApiToken), pApiToken);
 
+    const char *pWebUrl = XJSON_GetString(XJSON_GetObject(pRoot, "webUrl"));
+    if (xstrused(pWebUrl)) xstrncpy(pCfg->sWebUrl, sizeof(pCfg->sWebUrl), pWebUrl);
+
+    const char *pAuthPath = XJSON_GetString(XJSON_GetObject(pRoot, "authPath"));
+    if (xstrused(pAuthPath)) xstrncpy(pCfg->sAuthPath, sizeof(pCfg->sAuthPath), pAuthPath);
+
+    const char *pKeyPath = XJSON_GetString(XJSON_GetObject(pRoot, "keyPath"));
+    if (xstrused(pKeyPath)) xstrncpy(pCfg->sKeyPath, sizeof(pCfg->sKeyPath), pKeyPath);
+
+    const char *pSupabaseUrl = XJSON_GetString(XJSON_GetObject(pRoot, "supabaseUrl"));
+    if (xstrused(pSupabaseUrl)) xstrncpy(pCfg->sSupabaseUrl, sizeof(pCfg->sSupabaseUrl), pSupabaseUrl);
+
+    const char *pSupabaseKey = XJSON_GetString(XJSON_GetObject(pRoot, "supabaseKey"));
+    if (xstrused(pSupabaseKey)) xstrncpy(pCfg->sSupabaseKey, sizeof(pCfg->sSupabaseKey), pSupabaseKey);
+
     DirectGate_LogLoad(&pCfg->log, pRoot);
     DirectGate_AuthLoad(&pCfg->auth, pRoot);
     DirectGate_WebRTC_LoadIceServers(pCfg->sIceServers, &pCfg->nIceSrvCount, pRoot);
@@ -217,6 +302,9 @@ static xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
     if (xstrused(pCfg->sAccessToken)) XJSON_AddString(pRoot, "accessToken", pCfg->sAccessToken);
     if (xstrused(pCfg->sApiUrl)) XJSON_AddString(pRoot, "apiUrl", pCfg->sApiUrl);
     if (xstrused(pCfg->sApiToken)) XJSON_AddString(pRoot, "apiToken", pCfg->sApiToken);
+    if (xstrused(pCfg->sWebUrl)) XJSON_AddString(pRoot, "webUrl", pCfg->sWebUrl);
+    if (xstrused(pCfg->sSupabaseUrl)) XJSON_AddString(pRoot, "supabaseUrl", pCfg->sSupabaseUrl);
+    if (xstrused(pCfg->sSupabaseKey)) XJSON_AddString(pRoot, "supabaseKey", pCfg->sSupabaseKey);
 
     if (pCfg->nIceSrvCount > 0)
     {
@@ -282,19 +370,34 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
         }
     }
 
-    optind = 1;
-    while ((nChar = getopt(argc, argv, "n:d:c:p:l:v:w:f1:s1:ih")) != -1)
+    DirectGate_ApplyEnvConfig(pCfg);
+
+    /* A leading verb selects the command; everything after it is parsed
+     * as usual, so "dgcli login -v 3" and "dgcli laptop" both work. */
+    int nFirst = 1;
+    if (argc > 1 && DirectGate_ParseCommand(argv[1], &pCfg->eCommand)) nFirst = 2;
+
+    optind = nFirst;
+    while ((nChar = getopt(argc, argv, "n:d:a:c:p:l:v:w:k:fgsiBh")) != -1)
     {
         switch (nChar)
         {
+            case 'a':
+                xstrncpy(pCfg->sApiUrl, sizeof(pCfg->sApiUrl), optarg);
+                break;
             case 'n':
                 xstrncpy(pCfg->sDeviceName, sizeof(pCfg->sDeviceName), optarg);
                 break;
             case 'w':
                 xstrncpy(pCfg->sSignalingUrl, sizeof(pCfg->sSignalingUrl), optarg);
                 break;
+            case 'k':
+                xstrncpy(pCfg->sKeyPath, sizeof(pCfg->sKeyPath), optarg);
+                pCfg->bKeyRequired = XTRUE;
+                break;
             case 'd':
                 xstrncpy(pCfg->sDeviceId, sizeof(pCfg->sDeviceId), optarg);
+                xstrncpy(pCfg->sDeviceQuery, sizeof(pCfg->sDeviceQuery), optarg);
                 break;
             case 'p':
                 xstrncpy(pCfg->sDeviceList, sizeof(pCfg->sDeviceList), optarg);
@@ -304,6 +407,12 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
                 break;
             case 'v':
                 pCfg->nVerbose = (uint16_t)atoi(optarg);
+                break;
+            case 'B':
+                pCfg->bNoBrowser = XTRUE;
+                break;
+            case 'g':
+                pCfg->bGenKey = XTRUE;
                 break;
             case 's':
                 pCfg->bSaveDevice = XTRUE;
@@ -339,9 +448,9 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
 
     if (pCfg->bInit)
     {
+        if (!DirectGate_PromptApiUrl(pCfg)) return XSTDNON;
         if (!DirectGate_PromptSignalingUrl(pCfg)) return XSTDNON;
         if (!DirectGate_PromptDevicesPath(pCfg)) return XSTDNON;
-        if (!DirectGate_PromptAuth(pCfg, XTRUE)) return XSTDNON;
 
         if (!DirectGate_PromptBool("Log to screen", &pCfg->log.bToScreen)) return XSTDNON;
         if (!DirectGate_PromptBool("Log to file", &pCfg->log.bToFile)) return XSTDNON;
@@ -364,6 +473,10 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
 
     DirectGate_LogApply(&pCfg->log);
 
+    /* Whatever is left after the options is the device to connect to */
+    if (optind < argc && xstrused(argv[optind]))
+        xstrncpy(pCfg->sDeviceQuery, sizeof(pCfg->sDeviceQuery), argv[optind]);
+
     xmap_t deviceMap;
     XMap_Init(&deviceMap, NULL, XMAP_INITIAL_SIZE);
     deviceMap.clearCb = DirectGate_ClearDevicePair;
@@ -376,22 +489,15 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
         DirectGate_Devices_Search(&deviceMap, pCfg->sDeviceName, pCfg->sDeviceId, sizeof(pCfg->sDeviceId)))
         xlogi("Using device ID from list: %s", pCfg->sDeviceId);
 
-    if (!xstrused(pCfg->sSignalingUrl) && !DirectGate_PromptSignalingUrl(pCfg))
-    {
-        xloge("Missing signaling URL");
-        XMap_Destroy(&deviceMap);
-        return XSTDNON;
-    }
-
-    if (!xstrused(pCfg->sDeviceId) && !DirectGate_PromptDeviceId(pCfg))
-    {
-        xloge("Missing device ID");
-        XMap_Destroy(&deviceMap);
-        return XSTDNON;
-    }
-
     if (pCfg->bSaveDevice)
     {
+        if (!xstrused(pCfg->sDeviceId) && !DirectGate_PromptDeviceId(pCfg))
+        {
+            xloge("Missing device ID");
+            XMap_Destroy(&deviceMap);
+            return XSTDNON;
+        }
+
         if (!xstrused(pCfg->sDeviceName) && !DirectGate_PromptDeviceName(pCfg))
         {
             xloge("Missing device name");
@@ -427,11 +533,18 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
     // No longer needed
     XMap_Destroy(&deviceMap);
 
-    if (!DirectGate_PromptAuth(pCfg, XFALSE))
-    {
-        xloge("Failed to get auth credentials");
-        return XSTDNON;
-    }
-
+    /* The device secret is only prompted for once a device is actually
+     * chosen, which happens after the account device list is fetched. */
     return XSTDOK;
+}
+
+xbool_t DirectGate_PromptDeviceSecret(directgate_cfg_t *pCfg, const char *pDeviceName)
+{
+    XCHECK((pCfg != NULL), XFALSE);
+    if (xstrused(pCfg->sSecret)) return XTRUE;
+
+    char sPrompt[XSTR_TINY];
+    xstrncpyf(sPrompt, sizeof(sPrompt), "Password for %s: ", xstrused(pDeviceName) ? pDeviceName : "device");
+
+    return XCLI_GetPass(sPrompt, pCfg->sSecret, sizeof(pCfg->sSecret)) > 0 ? XTRUE : XFALSE;
 }

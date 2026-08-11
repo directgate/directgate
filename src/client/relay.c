@@ -21,6 +21,7 @@
 
 #include "includes.h"
 #include "common.h"
+#include "webapi.h"
 #include "relay.h"
 
 /*
@@ -30,6 +31,10 @@
  * dance with a single POST /api/v1/sessions/connect call. The API returns
  * the session id, session/device envelope, and the relay connection
  * envelope (relayUrl, browserJwt, routingKey, iceServers, exp) atomically.
+ *
+ * The browserJwt and routingKey it returns are what let the client open the
+ * relay socket at all: the routing key becomes the "?rk=" query parameter
+ * on the WebSocket handshake, exactly as the workspace UI does it.
  */
 xbool_t DirectGate_Relay_FetchEnvelope(directgate_cfg_t *pCfg)
 {
@@ -38,91 +43,30 @@ xbool_t DirectGate_Relay_FetchEnvelope(directgate_cfg_t *pCfg)
     XCHECK((xstrused(pCfg->sApiToken)), XFALSE);
     XCHECK((xstrused(pCfg->sDeviceId)), XFALSE);
 
-    if (!DirectGate_IsAPIEndpointAllowed(pCfg->sApiUrl))
-    {
-        xloge("Invalid or unencrypted API endpoint not allowed: apiUrl(%s)", pCfg->sApiUrl);
-        return XFALSE;
-    }
-
-    char sUrl[XPATH_MAX + 64];
-    xstrncpyf(sUrl, sizeof(sUrl), "%s/api/v1/sessions/connect", pCfg->sApiUrl);
-
     char sBody[XSTR_MID];
     xstrncpyf(sBody, sizeof(sBody), "{\"deviceId\": \"%s\"}", pCfg->sDeviceId);
 
-    char sAuth[XSTR_MID];
-    xstrncpyf(sAuth, sizeof(sAuth), "Bearer %s", pCfg->sApiToken);
-
-    xhttp_t handle;
-    XHTTP_InitRequest(&handle, XHTTP_POST, "/api/v1/sessions/connect", NULL);
-    XHTTP_AddHeader(&handle, "Content-Type", "application/json");
-    XHTTP_AddHeader(&handle, "Accept", "application/json");
-    XHTTP_AddHeader(&handle, "Authorization", sAuth);
-
-    xhttp_status_t status = XHTTP_EasyPerform(&handle,
-        sUrl, (const uint8_t*)sBody, strlen(sBody));
-
-    if (status != XHTTP_COMPLETE)
+    directgate_webapi_res_t res;
+    if (!DirectGate_WebApi_Request(&res, XHTTP_POST, pCfg->sApiUrl, "/api/v1/sessions/connect", pCfg->sApiToken, NULL, sBody))
     {
-        xloge("Session connect request failed: url(%s), status(%s)",
-            sUrl, XHTTP_GetStatusStr(status));
-
-        XHTTP_Clear(&handle);
+        xloge("Session connect failed: url(%s), reason(%s)", pCfg->sApiUrl, res.sError);
+        DirectGate_WebApi_Clear(&res);
         return XFALSE;
     }
 
-    if (!XHTTP_IsSuccessCode(&handle))
-    {
-        const uint8_t *pErrBody = XHTTP_GetBody(&handle);
-        size_t nErrBodySize = XHTTP_GetBodySize(&handle);
-
-        xloge("Session connect API returned HTTP error: url(%s), code(%u)",
-            sUrl, handle.nStatusCode);
-
-        if (pErrBody && nErrBodySize > 0)
-            xloge("Session connect response body: %.*s",
-                (int)nErrBodySize, (const char*)pErrBody);
-
-        XHTTP_Clear(&handle);
-        return XFALSE;
-    }
-
-    const uint8_t *pRespBody = XHTTP_GetBody(&handle);
-    size_t nRespSize = XHTTP_GetBodySize(&handle);
-
-    if (pRespBody == NULL || nRespSize == 0)
-    {
-        xloge("Session connect response is empty");
-        XHTTP_Clear(&handle);
-        return XFALSE;
-    }
-
-    xjson_t json;
-    if (!XJSON_Parse(&json, NULL, (const char*)pRespBody, nRespSize))
-    {
-        xloge("Failed to parse session connect response JSON");
-        XJSON_Destroy(&json);
-        XHTTP_Clear(&handle);
-        return XFALSE;
-    }
-
-    xjson_obj_t *pRoot = json.pRootObj;
-    const char *pSessionId = XJSON_GetString(XJSON_GetObject(pRoot, "sessionId"));
-
+    const char *pSessionId = XJSON_GetString(XJSON_GetObject(res.pRoot, "sessionId"));
     if (!xstrused(pSessionId))
     {
         xloge("Session connect response is missing sessionId");
-        XJSON_Destroy(&json);
-        XHTTP_Clear(&handle);
+        DirectGate_WebApi_Clear(&res);
         return XFALSE;
     }
 
-    xjson_obj_t *pRelay = XJSON_GetObject(pRoot, "relay");
+    xjson_obj_t *pRelay = XJSON_GetObject(res.pRoot, "relay");
     if (pRelay == NULL)
     {
         xloge("Session connect response is missing relay envelope");
-        XJSON_Destroy(&json);
-        XHTTP_Clear(&handle);
+        DirectGate_WebApi_Clear(&res);
         return XFALSE;
     }
 
@@ -133,24 +77,20 @@ xbool_t DirectGate_Relay_FetchEnvelope(directgate_cfg_t *pCfg)
     if (!xstrused(pBrowserJwt))
     {
         xloge("Session connect response is missing relay.browserJwt");
-        XJSON_Destroy(&json);
-        XHTTP_Clear(&handle);
+        DirectGate_WebApi_Clear(&res);
         return XFALSE;
     }
 
     if (!xstrused(pRoutingKey))
     {
         xloge("Session connect response is missing relay.routingKey");
-        XJSON_Destroy(&json);
-        XHTTP_Clear(&handle);
+        DirectGate_WebApi_Clear(&res);
         return XFALSE;
     }
 
     xstrncpy(pCfg->sAccessToken, sizeof(pCfg->sAccessToken), pBrowserJwt);
     xstrncpy(pCfg->sRoutingKey, sizeof(pCfg->sRoutingKey), pRoutingKey);
-
-    if (xstrused(pRelayUrl))
-        xstrncpy(pCfg->sSignalingUrl, sizeof(pCfg->sSignalingUrl), pRelayUrl);
+    if (xstrused(pRelayUrl)) xstrncpy(pCfg->sSignalingUrl, sizeof(pCfg->sSignalingUrl), pRelayUrl);
 
     /* Load ICE servers from relay envelope if present */
     xjson_obj_t *pIce = XJSON_GetObject(pRelay, "iceServers");
@@ -177,7 +117,6 @@ xbool_t DirectGate_Relay_FetchEnvelope(directgate_cfg_t *pCfg)
     xlogi("Session connect: sessionId(%s), relayUrl(%s), routingKey(%s)",
         pSessionId, pCfg->sSignalingUrl, pCfg->sRoutingKey);
 
-    XJSON_Destroy(&json);
-    XHTTP_Clear(&handle);
+    DirectGate_WebApi_Clear(&res);
     return XTRUE;
 }

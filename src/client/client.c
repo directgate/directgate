@@ -23,8 +23,11 @@
 #include "version.h"
 #include "protocol.h"
 #include "transfer.h"
+#include "keyauth.h"
 #include "common.h"
 #include "config.h"
+#include "devices.h"
+#include "login.h"
 #include "relay.h"
 #include "webrtc.h"
 #include "e2e.h"
@@ -77,6 +80,13 @@ typedef struct directgate_client_ctx_ {
     directgate_srp_client_t srp;
     directgate_client_io_t io;
     directgate_e2e_t e2e;
+
+    /* Public-key auth, attempted before the password when a key is usable */
+    directgate_keyauth_t keyauth;
+    directgate_client_key_t key;
+    char sAgentPub[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
+    xbool_t bUseKeyAuth;
+    xbool_t bKeyAuthFailed;
 
     xapi_session_t *pPipeSession;
     xapi_session_t *pWsSession;
@@ -152,6 +162,7 @@ void DirectGate_Client_Init(directgate_ctx_t *pClient)
     pClient->nSessionId = 0;
 
     DirectGate_E2E_Init(&pClient->e2e);
+    DirectGate_KeyAuth_Init(&pClient->keyauth);
     DirectGate_SRP_ClientCleanse(&pClient->srp);
 
     if (!DirectGate_SRP_ClientInit(&pClient->srp))
@@ -466,6 +477,110 @@ static xbool_t DirectGate_Client_RequiresEncryption(directgate_ctx_t *pCli, cons
             pPkg->header.eType == DIRECTGATE_PKG_ADMIN);
 }
 
+/* Terminal session is up: bring the P2P data channel online.
+ * Shared by both authentication methods so they cannot drift apart. */
+static void DirectGate_Client_StartWebRTC(directgate_ctx_t *pCli)
+{
+    pCli->webrtc.signalCb = DirectGate_Client_WebRTC_SignalCb;
+    pCli->webrtc.pSignalCtx = pCli;
+    pCli->webrtc.dataCb = DirectGate_Client_WebRTC_DataCb;
+    pCli->webrtc.pDataCtx = pCli;
+
+    if (pCli->pCfg != NULL && pCli->pCfg->nIceSrvCount > 0)
+        DirectGate_WebRTC_SetIceServers(&pCli->webrtc, pCli->pCfg->sIceServers, pCli->pCfg->nIceSrvCount);
+
+    if (DirectGate_WebRTC_CreateOffer(&pCli->webrtc) < 0)
+        xlogw("RTC: Offer failed, continuing with WebSocket relay");
+    else
+        xlogn("RTC: P2P offer sent, waiting for answer");
+}
+
+/* Completes a successful key handshake: derive the shared secret from the two
+ * ephemeral halves and turn it into the directional E2E keys. */
+static xbool_t DirectGate_Client_KeyAuthDone(directgate_ctx_t *pCli)
+{
+    if (!DirectGate_KeyAuth_ClientAccept(&pCli->keyauth) ||
+        !DirectGate_KeyAuth_DeriveShared(&pCli->keyauth))
+    {
+        xloge("KeyAuth: Failed to derive the shared secret");
+        return XFALSE;
+    }
+
+    xbool_t bDerived = DirectGate_E2E_DeriveFromKey(&pCli->e2e,
+        pCli->keyauth.sharedSecret, sizeof(pCli->keyauth.sharedSecret),
+        pCli->keyauth.peerNonce /* agentNonce */,
+        pCli->keyauth.localNonce /* clientNonce */,
+        DIRECTGATE_KEYAUTH_NONCE_SIZE, pCli->pCfg->sDeviceId, XFALSE);
+
+    DirectGate_KeyAuth_Cleanse(&pCli->keyauth);
+
+    if (!bDerived) xloge("KeyAuth: Failed to derive E2E keys");
+    return bDerived;
+}
+
+static int DirectGate_Client_HandleKeyAuthMsg(directgate_ctx_t *pCli, directgate_pkg_auth_t *pAuth)
+{
+    if (xstrused(pAuth->pAction) && xstrcmp(pAuth->pAction, "challenge"))
+    {
+        char sClientSigB64[DIRECTGATE_KEYAUTH_SIG_B64_SIZE];
+
+        if (!DirectGate_KeyAuth_ClientProcessChallenge(&pCli->keyauth, &pCli->key,
+                pAuth->pAgentPub, pAuth->pAgentEph, pAuth->pNonce,
+                pAuth->pChallenge, pAuth->pAgentSig,
+                sClientSigB64, sizeof(sClientSigB64)))
+        {
+            /*
+                A rejected challenge is not a reason to fall back to the
+                password: either the host is not the one the backend
+                published, or it signed badly. Both mean the peer is not
+                provably the device we asked for, so the connection ends.
+            */
+            xloge("KeyAuth: Refusing the host challenge");
+            return XAPI_DISCONNECT;
+        }
+
+        xjson_obj_t *pProof = DirectGate_Proto_BuildAuthKeyProof(sClientSigB64, pCli->nSessionId);
+        XCHECK((pProof != NULL), XAPI_DISCONNECT);
+
+        int nStatus = DirectGate_Client_SendMsg(pCli, pProof, NULL, 0);
+        XJSON_FreeObject(pProof);
+
+        if (nStatus >= 0) xlogi("KeyAuth: Auth proof sent");
+        return nStatus;
+    }
+
+    if (xstrused(pAuth->pAction) && xstrcmp(pAuth->pAction, "result"))
+    {
+        if (xstrused(pAuth->pStatus) && xstrcmp(pAuth->pStatus, "ok"))
+        {
+            if (!DirectGate_Client_KeyAuthDone(pCli)) return XAPI_DISCONNECT;
+
+            xlogn("KeyAuth: Authentication successful, E2E encryption enabled");
+            pCli->bAuthDone = XTRUE;
+
+            if (DirectGate_Client_SendCmdStart(pCli, "terminal") < 0) return XAPI_DISCONNECT;
+            DirectGate_Client_SendResize(pCli);
+            DirectGate_Client_StartWebRTC(pCli);
+
+            return XAPI_CONTINUE;
+        }
+
+        /*
+            The host is who it claims to be but has not authorized this key.
+            That is exactly what the password is for, so the caller reconnects
+            and runs SRP instead of failing outright.
+        */
+        xlogn("KeyAuth: Key was not accepted (%s), falling back to the password",
+            xstrused(pAuth->pReason) ? pAuth->pReason : "rejected");
+
+        pCli->bKeyAuthFailed = XTRUE;
+        g_bFinish = XTRUE;
+        return XAPI_DISCONNECT;
+    }
+
+    return XAPI_CONTINUE;
+}
+
 static int DirectGate_Client_HandleAuthMsg(directgate_ctx_t *pCli, directgate_pkg_t *pMsg)
 {
     directgate_pkg_auth_t *pAuth = (directgate_pkg_auth_t*)pMsg->pPackage;
@@ -476,6 +591,8 @@ static int DirectGate_Client_HandleAuthMsg(directgate_ctx_t *pCli, directgate_pk
         xloge("Invalid auth message or client context");
         return XAPI_DISCONNECT;
     }
+
+    if (pCli->bUseKeyAuth) return DirectGate_Client_HandleKeyAuthMsg(pCli, pAuth);
 
     if (!xstrused(pCfg->sDeviceId) || !xstrused(pCfg->sSecret))
     {
@@ -543,19 +660,7 @@ static int DirectGate_Client_HandleAuthMsg(directgate_ctx_t *pCli, directgate_pk
             return XAPI_DISCONNECT;
 
         DirectGate_Client_SendResize(pCli);
-
-        pCli->webrtc.signalCb = DirectGate_Client_WebRTC_SignalCb;
-        pCli->webrtc.pSignalCtx = pCli;
-        pCli->webrtc.dataCb = DirectGate_Client_WebRTC_DataCb;
-        pCli->webrtc.pDataCtx = pCli;
-
-        if (pCli->pCfg != NULL && pCli->pCfg->nIceSrvCount > 0)
-            DirectGate_WebRTC_SetIceServers(&pCli->webrtc, pCli->pCfg->sIceServers, pCli->pCfg->nIceSrvCount);
-
-        if (DirectGate_WebRTC_CreateOffer(&pCli->webrtc) < 0)
-            xlogw("RTC: Offer failed, continuing with WebSocket relay");
-        else
-            xlogn("RTC: P2P offer sent, waiting for answer");
+        DirectGate_Client_StartWebRTC(pCli);
 
         return XAPI_CONTINUE;
     }
@@ -876,6 +981,39 @@ static int DirectGate_Client_SendRole(directgate_ctx_t *pCli, const char *pRole,
     return nStatus;
 }
 
+static int DirectGate_Client_SendKeyHello(directgate_ctx_t *pCli)
+{
+    const directgate_cfg_t *pCfg = pCli->pCfg;
+
+    if (!DirectGate_KeyAuth_ClientInit(&pCli->keyauth, pCfg->sDeviceId, &pCli->key, pCli->sAgentPub))
+    {
+        xloge("KeyAuth: Failed to initialize client state");
+        return XAPI_DISCONNECT;
+    }
+
+    char sClientPubB64[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
+    char sClientEphB64[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
+    char sNonceHex[(DIRECTGATE_KEYAUTH_NONCE_SIZE * 2) + 1];
+
+    if (!DirectGate_KeyAuth_ClientBuildHello(&pCli->keyauth,
+            sClientPubB64, sizeof(sClientPubB64),
+            sClientEphB64, sizeof(sClientEphB64),
+            sNonceHex, sizeof(sNonceHex)))
+    {
+        xloge("KeyAuth: Failed to build hello");
+        return XAPI_DISCONNECT;
+    }
+
+    xjson_obj_t *pHeader = DirectGate_Proto_BuildAuthKeyHello(pCfg->sDeviceId, sClientPubB64, sClientEphB64, sNonceHex, pCli->nSessionId);
+    XCHECK((pHeader != NULL), XAPI_DISCONNECT);
+
+    int nStatus = DirectGate_Client_SendMsg(pCli, pHeader, NULL, 0);
+    XJSON_FreeObject(pHeader);
+
+    if (nStatus >= 0) xlogi("KeyAuth: Auth hello sent");
+    return nStatus;
+}
+
 static int DirectGate_Client_SendAuthHello(directgate_ctx_t *pCli)
 {
     XCHECK((pCli != NULL), XAPI_DISCONNECT);
@@ -883,6 +1021,10 @@ static int DirectGate_Client_SendAuthHello(directgate_ctx_t *pCli)
 
     const directgate_cfg_t *pCfg = pCli->pCfg;
     XCHECK((pCfg != NULL), XAPI_DISCONNECT);
+
+    /* The key is tried first; the password is only reached when there is no
+     * usable key, or after the host has turned one down. */
+    if (pCli->bUseKeyAuth) return DirectGate_Client_SendKeyHello(pCli);
 
     if (!xstrused(pCfg->sDeviceId) || !xstrused(pCfg->sSecret))
     {
@@ -1123,13 +1265,17 @@ static int DirectGate_Client_HandshakeResponse(xapi_ctx_t *pCtx, xapi_session_t 
         int nStatus = DirectGate_Client_SendRole(pCli, "client", pDeviceId);
         if (nStatus < 0) return nStatus;
 
-        if (!xstrused(pCfg->sDeviceId) || !xstrused(pCfg->sSecret))
+        /* Key auth carries no password, so only the SRP path needs a secret
+         * here; both wait for the same start command before saying hello. */
+        if (!pCli->bUseKeyAuth && !xstrused(pCfg->sSecret))
         {
             xloge("SRP: Auth is not configured");
             return XAPI_DISCONNECT;
         }
 
-        xlogi("Waiting for start command to begin SRP authentication");
+        xlogi("Waiting for start command to begin %s authentication",
+            pCli->bUseKeyAuth ? "key" : "SRP");
+
         return nStatus;
     }
 
@@ -1156,10 +1302,10 @@ static int DirectGate_Client_HandleStdin(xapi_session_t *pSession)
         {
             if (!pCli->pWsSession->bHandshakeDone) continue;
 
-            /* Don't let client input break the session while auth is pending. */
-            if (pCli->pCfg != NULL && !pCli->bAuthDone &&
-                xstrused(pCli->pCfg->sDeviceId) &&
-                xstrused(pCli->pCfg->sSecret))
+            /* Don't let client input break the session while auth is pending.
+             * Keyed on the handshake itself, not on the password, or a key
+             * authenticated session would pass keystrokes through early. */
+            if (!pCli->bAuthDone)
             {
                 if (!pCli->bInputBlocked)
                 {
@@ -1413,6 +1559,439 @@ static int DirectGate_Client_ServiceCallback(xapi_ctx_t *pCtx, xapi_session_t *p
     return XAPI_CONTINUE;
 }
 
+static void DirectGate_Client_LoginContext(directgate_login_ctx_t *pCtx, const directgate_cfg_t *pCfg)
+{
+    memset(pCtx, 0, sizeof(*pCtx));
+    pCtx->pSupabaseUrl = pCfg->sSupabaseUrl;
+    pCtx->pSupabaseKey = pCfg->sSupabaseKey;
+    pCtx->pWebUrl = pCfg->sWebUrl;
+    pCtx->bNoBrowser = pCfg->bNoBrowser;
+}
+
+/*
+ * Generates the client identity used for key authentication. The key file is
+ * only half the story: the public half still has to be authorized on each
+ * device, so it is printed rather than left for the user to dig out of JSON.
+ */
+static XSTATUS DirectGate_Client_GenerateKey(const directgate_cfg_t *pCfg)
+{
+    if (XPath_Exists(pCfg->sKeyPath))
+    {
+        xbool_t bOverwrite = XFALSE;
+
+        printf("  A client key already exists at %s\n", pCfg->sKeyPath);
+        printf("  Overwriting it means re-authorizing the new key on every device.\n");
+
+        if (!DirectGate_PromptBool("  Overwrite it", &bOverwrite) || !bOverwrite)
+        {
+            printf("  Keeping the existing key.\n");
+            return XSTDNON;
+        }
+    }
+
+    directgate_client_key_t key;
+    if (!DirectGate_KeyAuth_KeyGenerate(&key))
+    {
+        xloge("Failed to generate a client keypair");
+        return XSTDERR;
+    }
+
+    char sClientPubB64[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
+    xbool_t bEncoded = DirectGate_KeyAuth_Base64Encode(key.clientPub,
+        sizeof(key.clientPub), sClientPubB64, sizeof(sClientPubB64));
+
+    xbool_t bSaved = bEncoded && DirectGate_KeyAuth_KeySave(&key, pCfg->sKeyPath);
+    DirectGate_KeyAuth_KeyCleanse(&key);
+
+    if (!bSaved)
+    {
+        xloge("Failed to write the client key: %s", pCfg->sKeyPath);
+        return XSTDERR;
+    }
+
+    printf("\n  Client key written to %s\n\n", pCfg->sKeyPath);
+    printf("  Public key:\n    %s\n\n", sClientPubB64);
+    printf("  Authorize it on a device by running this there:\n");
+    printf("    directgate -a <path to this key file>\n\n");
+
+    return XSTDNON;
+}
+
+/*
+ * Decides whether this connection can try the key first. Both halves have to
+ * be present: a usable key file on this side, and an agentPub published by
+ * the device on the other, since that is what the host gets pinned to.
+ */
+static void DirectGate_Client_PrepareKeyAuth(directgate_ctx_t *pCli,
+                                             const directgate_cfg_t *pCfg,
+                                             const directgate_device_t *pDevice)
+{
+    pCli->bUseKeyAuth = XFALSE;
+
+    if (!xstrused(pCfg->sKeyPath)) return;
+
+    if (!XPath_Exists(pCfg->sKeyPath))
+    {
+        /* Only an explicit -k is worth complaining about; the default path
+         * simply not existing is the normal password-only setup. */
+        if (pCfg->bKeyRequired) xloge("Client key file not found: %s", pCfg->sKeyPath);
+        return;
+    }
+
+    if (!DirectGate_KeyAuth_KeyLoad(&pCli->key, pCfg->sKeyPath)) return;
+
+    if (!xstrused(pDevice->sAgentPub))
+    {
+        xlogw("Device '%s' has not published a host key, using the password",
+            pDevice->sName);
+
+        DirectGate_KeyAuth_KeyCleanse(&pCli->key);
+        return;
+    }
+
+    xstrncpy(pCli->sAgentPub, sizeof(pCli->sAgentPub), pDevice->sAgentPub);
+    pCli->bUseKeyAuth = XTRUE;
+
+    xlogi("Using client key for authentication: %s", pCfg->sKeyPath);
+}
+
+static xbool_t DirectGate_Client_IsInteractive(void)
+{
+#ifdef _WIN32
+    return _isatty(_fileno(stdin)) ? XTRUE : XFALSE;
+#else
+    return isatty(STDIN_FILENO) ? XTRUE : XFALSE;
+#endif
+}
+
+/*
+ * Fetches the account device list, refreshing the session once if the API
+ * turns the token down. Ensure() already refreshes ahead of the expiry, so
+ * this only covers a token that went stale between the two calls.
+ */
+static xbool_t DirectGate_Client_LoadDevices(directgate_device_list_t *pList,
+                                             directgate_cfg_t *pCfg,
+                                             directgate_account_t *pAccount,
+                                             const directgate_login_ctx_t *pLogin)
+{
+    char sError[XSTR_TINY];
+
+    if (DirectGate_Devices_Fetch(pList, pCfg->sApiUrl, pCfg->sApiToken, sError, sizeof(sError)))
+        return XTRUE;
+
+    if (pAccount == NULL || !xstrused(pAccount->sRefreshToken) || !DirectGate_Login_Refresh(pAccount, pLogin))
+    {
+        xloge("Failed to list devices: %s", sError);
+        return XFALSE;
+    }
+
+    DirectGate_Account_Save(pAccount, pCfg->sAuthPath);
+    xstrncpy(pCfg->sApiToken, sizeof(pCfg->sApiToken), pAccount->sAccessToken);
+
+    if (DirectGate_Devices_Fetch(pList, pCfg->sApiUrl, pCfg->sApiToken, sError, sizeof(sError)))
+        return XTRUE;
+
+    xloge("Failed to list devices: %s", sError);
+    return XFALSE;
+}
+
+/*
+ * Turns "which device?" into a concrete device id: an explicit -d / trailing
+ * argument is matched against the account list, and with nothing given the
+ * arrow-key picker runs. Fills in the config's device id and name, or fails
+ * when nothing matched, nothing was picked, or the match cannot be connected.
+ */
+static const directgate_device_t* DirectGate_Client_ResolveDevice(directgate_cfg_t *pCfg,
+                                                                  const directgate_device_list_t *pList)
+{
+    if (!pList->nCount)
+    {
+        xloge("No devices on this account yet. Add one from %s first.", pCfg->sWebUrl);
+        return NULL;
+    }
+
+    int nIndex = DIRECTGATE_DEVICE_NO_PICK;
+
+    if (xstrused(pCfg->sDeviceQuery))
+    {
+        nIndex = DirectGate_Devices_Find(pList, pCfg->sDeviceQuery);
+        if (nIndex == DIRECTGATE_DEVICE_NO_PICK)
+        {
+            xloge("No device matches '%s'. Known devices:", pCfg->sDeviceQuery);
+            DirectGate_Devices_Print(pList);
+            return NULL;
+        }
+    }
+    else
+    {
+        nIndex = DirectGate_Devices_Select(pList);
+        if (nIndex < 0)
+        {
+            xlogn("No device selected");
+            return NULL;
+        }
+    }
+
+    const directgate_device_t *pDevice = &pList->devices[nIndex];
+    if (!pDevice->bConnectable)
+    {
+        xloge("Device '%s' cannot be connected: %s", pDevice->sName,
+            xstrused(pDevice->sReason) ? pDevice->sReason : "unavailable");
+
+        return NULL;
+    }
+
+    if (!pDevice->bOnline) xlogw("Device '%s' looks offline, connecting anyway", pDevice->sName);
+
+    xstrncpy(pCfg->sDeviceId, sizeof(pCfg->sDeviceId), pDevice->sId);
+    xstrncpy(pCfg->sDeviceName, sizeof(pCfg->sDeviceName), pDevice->sName);
+
+    printf("\n  Connecting to %s...\n\n", pDevice->sName);
+    return pDevice;
+}
+
+/*
+ * Everything that has to happen before the relay socket is opened: sign in,
+ * choose a device and collect its password. Returns XSTDNON when the command
+ * was a standalone one (login / logout / devices / whoami) that is already
+ * finished, XSTDERR on failure and XSTDOK when the client should connect.
+ */
+static XSTATUS DirectGate_Client_Prepare(directgate_ctx_t *pCli, directgate_cfg_t *pCfg,
+                                        directgate_account_t *pAccount)
+{
+    directgate_login_ctx_t login;
+    DirectGate_Client_LoginContext(&login, pCfg);
+
+    if (pCfg->bGenKey) return DirectGate_Client_GenerateKey(pCfg);
+
+    if (pCfg->eCommand == DIRECTGATE_CMD_LOGOUT)
+    {
+        if (!DirectGate_Account_Forget(pCfg->sAuthPath))
+        {
+            xloge("Failed to remove the stored session: %s", pCfg->sAuthPath);
+            return XSTDERR;
+        }
+
+        printf("  Signed out.\n");
+        return XSTDNON;
+    }
+
+    if (pCfg->eCommand == DIRECTGATE_CMD_LOGIN)
+    {
+        /* An explicit login always re-runs the browser flow, so a stale or
+         * wrong-account session can be replaced without logging out first. */
+        if (!DirectGate_Login_Interactive(pAccount, &login)) return XSTDERR;
+
+        if (!DirectGate_Account_Save(pAccount, pCfg->sAuthPath))
+        {
+            xloge("Failed to store the session: %s", pCfg->sAuthPath);
+            return XSTDERR;
+        }
+
+        return XSTDNON;
+    }
+
+    /*
+        A configured apiToken is an explicit override for automation: it
+        replaces the account session entirely and never opens a browser.
+    */
+    xbool_t bManualToken = xstrused(pCfg->sApiToken) ? XTRUE : XFALSE;
+    if (!bManualToken)
+    {
+        xbool_t bInteractive = DirectGate_Client_IsInteractive();
+        if (!DirectGate_Login_Ensure(pAccount, &login, pCfg->sAuthPath, bInteractive)) return XSTDERR;
+
+        xstrncpy(pCfg->sApiToken, sizeof(pCfg->sApiToken), pAccount->sAccessToken);
+    }
+
+    if (pCfg->eCommand == DIRECTGATE_CMD_WHOAMI)
+    {
+        printf("  %s\n", xstrused(pAccount->sEmail) ? pAccount->sEmail :
+            (bManualToken ? "signed in with a configured API token" : "signed in"));
+
+        return XSTDNON;
+    }
+
+    directgate_device_list_t devices;
+    if (!DirectGate_Client_LoadDevices(&devices, pCfg, bManualToken ? NULL : pAccount, &login))
+        return XSTDERR;
+
+    if (pCfg->eCommand == DIRECTGATE_CMD_DEVICES)
+    {
+        if (!devices.nCount) printf("  No devices on this account yet.\n");
+        else DirectGate_Devices_Print(&devices);
+
+        return XSTDNON;
+    }
+
+    const directgate_device_t *pDevice = DirectGate_Client_ResolveDevice(pCfg, &devices);
+    if (pDevice == NULL) return XSTDERR;
+
+    DirectGate_Client_PrepareKeyAuth(pCli, pCfg, pDevice);
+
+    /* An explicit -k means the user asked for that key specifically, so a
+     * silent downgrade to the password would be the wrong answer. */
+    if (!pCli->bUseKeyAuth && pCfg->bKeyRequired)
+    {
+        xloge("Client key is unusable and -k was given, refusing to fall back");
+        return XSTDERR;
+    }
+
+    if (!pCli->bUseKeyAuth && !DirectGate_PromptDeviceSecret(pCfg, pCfg->sDeviceName))
+    {
+        xloge("A device password is required to authenticate");
+        return XSTDERR;
+    }
+
+    return XSTDOK;
+}
+
+/*
+ * One connection attempt: mint a relay envelope, wire up the endpoints and
+ * service them until the session ends. Run twice at most - a host that
+ * refuses the client key sends us back here to authenticate with the
+ * password instead.
+ */
+static XSTATUS DirectGate_Client_Run(directgate_ctx_t *pClient, directgate_cfg_t *pArgs)
+{
+    /* Relay URL, browser JWT, routing key and ICE servers in one call */
+    if (xstrused(pArgs->sApiUrl) && xstrused(pArgs->sApiToken))
+    {
+        xlogi("Fetching relay connection envelope from API: %s", pArgs->sApiUrl);
+        if (!DirectGate_Relay_FetchEnvelope(pArgs))
+        {
+            xloge("Failed to fetch relay connection envelope");
+            return XSTDERR;
+        }
+    }
+
+    xapi_t api;
+    xlink_t link;
+    XAPI_Init(&api, DirectGate_Client_ServiceCallback, pClient);
+
+    if (!xstrused(pArgs->sSignalingUrl))
+    {
+        xloge("Signaling URL is required");
+        return XSTDERR;
+    }
+
+    if (XLink_Parse(&link, pArgs->sSignalingUrl) < 0)
+    {
+        xloge("Failed to parse URL: %s", pArgs->sSignalingUrl);
+        return XSTDERR;
+    }
+
+    xapi_endpoint_t endpt;
+    XAPI_InitEndpoint(&endpt);
+
+    endpt.eType = XAPI_WS;
+    endpt.eRole = XAPI_CLIENT;
+    endpt.pAddr = link.sAddr;
+    endpt.nPort = link.nPort;
+    endpt.pUri = link.sUri;
+    endpt.bTLS = xstrcmp(link.sProtocol, "wss");
+    endpt.pSessionData = pClient;
+
+    if (XAPI_AddEndpoint(&api, &endpt) < 0)
+    {
+        XAPI_Destroy(&api);
+        return XSTDERR;
+    }
+
+    xapi_endpoint_t stdinEndpt;
+    XAPI_InitEndpoint(&stdinEndpt);
+
+    stdinEndpt.eType = XAPI_EVENT;
+    stdinEndpt.eRole = XAPI_CUSTOM;
+    stdinEndpt.nEvents = XPOLLIN;
+    stdinEndpt.bUnix = XTRUE;
+    stdinEndpt.pSessionData = pClient;
+
+    /*
+        XAPI owns and closes every endpoint socket it is handed, and an
+        attempt that ends tears the whole API down. Handing it the real
+        stdin would therefore close fd 0 - which used to be harmless at
+        exit, but now leaves the key-auth fallback with no terminal to read
+        the password from. Both platforms give it a disposable handle.
+    */
+#ifdef _WIN32
+    if (XSock_CreatePair(g_nStdinBridge) != XSTDOK)
+    {
+        xloge("Failed to create stdin bridge socket pair: error(%d)", WSAGetLastError());
+        XAPI_Destroy(&api);
+        return XSTDERR;
+    }
+
+    u_long nNonBlock = 1;
+    ioctlsocket(g_nStdinBridge[0], FIONBIO, &nNonBlock);
+
+    HANDLE hStdinPump = CreateThread(NULL, 0, DirectGate_Client_StdinPump, NULL, 0, NULL);
+    if (hStdinPump == NULL)
+    {
+        xloge("Failed to start stdin pump thread: error(%lu)", GetLastError());
+        XAPI_Destroy(&api);
+        return XSTDERR;
+    }
+
+    stdinEndpt.nFD = g_nStdinBridge[0];
+#else
+    int nStdinFd = dup(STDIN_FILENO);
+    if (nStdinFd < 0)
+    {
+        xloge("Failed to duplicate stdin: errno(%d)", errno);
+        XAPI_Destroy(&api);
+        return XSTDERR;
+    }
+
+    stdinEndpt.nFD = nStdinFd;
+#endif
+
+    if (XAPI_AddEndpoint(&api, &stdinEndpt) < 0)
+    {
+        XAPI_Destroy(&api);
+        return XSTDERR;
+    }
+
+    int nPipeFd = DirectGate_WebRTC_GetPipeFd(&pClient->webrtc);
+    if (nPipeFd >= 0)
+    {
+        xapi_endpoint_t pipeEndpt;
+        XAPI_InitEndpoint(&pipeEndpt);
+
+        pipeEndpt.eType = XAPI_EVENT;
+        pipeEndpt.eRole = XAPI_CUSTOM;
+        pipeEndpt.nFD = nPipeFd;
+        pipeEndpt.nEvents = XPOLLIN;
+        pipeEndpt.bUnix = XTRUE;
+        pipeEndpt.pSessionData = pClient;
+
+        if (XAPI_AddEndpoint(&api, &pipeEndpt) < 0)
+            xlogw("Failed to register WebRTC notification pipe");
+    }
+
+    xevent_status_t status;
+    do status = XAPI_Service(&api, 100);
+    while (status == XEVENTS_SUCCESS && !g_bFinish);
+
+    DirectGate_Client_RestoreIO(&pClient->io);
+    pClient->pPipeSession = NULL;
+    DirectGate_WebRTC_Clear(&pClient->webrtc);
+
+#ifdef _WIN32
+    /*
+        The pump thread blocks in ReadFile on the console, so it has to be
+        unblocked before the next prompt or it would swallow the password
+        the user types for the fallback.
+    */
+    CancelIoEx(GetStdHandle(STD_INPUT_HANDLE), NULL);
+    WaitForSingleObject(hStdinPump, 1000);
+    CloseHandle(hStdinPump);
+#endif
+
+    XAPI_Destroy(&api);
+    return XSTDOK;
+}
+
 int main(int argc, char* argv[])
 {
     xlog_defaults();
@@ -1421,13 +2000,19 @@ int main(int argc, char* argv[])
     xlog_indent(XTRUE);
     xlog_setfl(XLOG_FATAL | XLOG_ERROR | XLOG_WARN);
 
+    /*
+        SIGWINCH is deliberately left alone until the PTY session exists.
+        The sign-in and device-picker loops below block in poll()/read()
+        with no SA_RESTART, so a terminal resize registered this early
+        would surface there as an interrupt and cancel the sign-in.
+    */
 #ifdef _WIN32
     /* No SIGPIPE/SIGWINCH on Windows: resize is polled on the loop tick */
     int nSignals[2] = { SIGTERM, SIGINT };
     XSig_Register(nSignals, 2, DirectGate_Client_SignalCallback);
 #else
-    int nSignals[4] = { SIGTERM, SIGINT, SIGPIPE, SIGWINCH };
-    XSig_Register(nSignals, 4, DirectGate_Client_SignalCallback);
+    int nSignals[3] = { SIGTERM, SIGINT, SIGPIPE };
+    XSig_Register(nSignals, 3, DirectGate_Client_SignalCallback);
 #endif
 
     /* Before the first relay or API connection; see common.c. */
@@ -1447,8 +2032,9 @@ int main(int argc, char* argv[])
     }
     else if (!nStatus)
     {
+        /* -i and -s finish their work inside the parser */
         XLog_Destroy();
-        return XSTDERR;
+        return XSTDNON;
     }
 
     xlogn("Starting directgate client v%s", DirectGate_GetVersionLong());
@@ -1457,127 +2043,71 @@ int main(int argc, char* argv[])
     client.pCfg = &args;
     client.bAuthDone = XFALSE;
 
-    /* Fetch relay envelope from API when apiUrl and apiToken are configured */
-    if (xstrused(args.sApiUrl) && xstrused(args.sApiToken))
-    {
-        xlogi("Fetching relay connection envelope from API: %s", args.sApiUrl);
-        if (!DirectGate_Relay_FetchEnvelope(&args))
-        {
-            xloge("Failed to fetch relay connection envelope");
-            XLog_Destroy();
-            return XSTDERR;
-        }
-    }
+    /*
+        Sign in, list the account's devices and pick one. Standalone
+        commands (login / logout / devices / whoami) finish here.
+    */
+    directgate_account_t account;
+    DirectGate_Account_Init(&account);
 
-    xapi_t api;
-    xlink_t link;
-    XAPI_Init(&api, DirectGate_Client_ServiceCallback, &client);
-
-    if (!xstrused(args.sSignalingUrl))
+    nStatus = DirectGate_Client_Prepare(&client, &args, &account);
+    if (nStatus != XSTDOK)
     {
-        xloge("Signaling URL is required");
+        DirectGate_Account_Cleanse(&account);
+        DirectGate_Client_CleanseSecret(&args);
         XLog_Destroy();
-        return XSTDERR;
+
+        return nStatus == XSTDNON ? XSTDNON : XSTDERR;
     }
 
-    if (XLink_Parse(&link, args.sSignalingUrl) < 0)
-    {
-        xloge("Failed to parse URL: %s", args.sSignalingUrl);
-        XLog_Destroy();
-        return XSTDERR;
-    }
+    /* The relay envelope carries its own short-lived JWT from here on */
+    DirectGate_Account_Cleanse(&account);
 
-    xapi_endpoint_t endpt;
-    XAPI_InitEndpoint(&endpt);
-
-    endpt.eType = XAPI_WS;
-    endpt.eRole = XAPI_CLIENT;
-    endpt.pAddr = link.sAddr;
-    endpt.nPort = link.nPort;
-    endpt.pUri = link.sUri;
-    endpt.bTLS = xstrcmp(link.sProtocol, "wss");
-    endpt.pSessionData = &client;
-
-    if (XAPI_AddEndpoint(&api, &endpt) < 0)
-    {
-        XAPI_Destroy(&api);
-        XLog_Destroy();
-        return XSTDERR;
-    }
-
-    xapi_endpoint_t stdinEndpt;
-    XAPI_InitEndpoint(&stdinEndpt);
-
-    stdinEndpt.eType = XAPI_EVENT;
-    stdinEndpt.eRole = XAPI_CUSTOM;
-    stdinEndpt.nEvents = XPOLLIN;
-    stdinEndpt.bUnix = XTRUE;
-    stdinEndpt.pSessionData = &client;
-
-#ifdef _WIN32
-    if (XSock_CreatePair(g_nStdinBridge) != XSTDOK)
-    {
-        xloge("Failed to create stdin bridge socket pair: error(%d)", WSAGetLastError());
-        XAPI_Destroy(&api);
-        XLog_Destroy();
-        return XSTDERR;
-    }
-
-    u_long nNonBlock = 1;
-    ioctlsocket(g_nStdinBridge[0], FIONBIO, &nNonBlock);
-
-    HANDLE hStdinPump = CreateThread(NULL, 0, DirectGate_Client_StdinPump, NULL, 0, NULL);
-    if (hStdinPump == NULL)
-    {
-        xloge("Failed to start stdin pump thread: error(%lu)", GetLastError());
-        XAPI_Destroy(&api);
-        XLog_Destroy();
-        return XSTDERR;
-    }
-    CloseHandle(hStdinPump);
-
-    stdinEndpt.nFD = g_nStdinBridge[0];
-#else
-    stdinEndpt.nFD = STDIN_FILENO;
+#ifndef _WIN32
+    /* Safe to watch for resizes now that the interactive prompts are done */
+    int nWinch = SIGWINCH;
+    XSig_Register(&nWinch, 1, DirectGate_Client_SignalCallback);
 #endif
 
-    if (XAPI_AddEndpoint(&api, &stdinEndpt) < 0)
+    int nResult = XSTDNON;
+
+    for (;;)
     {
-        XAPI_Destroy(&api);
-        XLog_Destroy();
-        return XSTDERR;
+        if (DirectGate_Client_Run(&client, &args) != XSTDOK)
+        {
+            nResult = XSTDERR;
+            break;
+        }
+
+        /* The host accepted the handshake or ended the session: done either
+         * way. Only an explicitly refused key sends us round again. */
+        if (!client.bKeyAuthFailed) break;
+
+        client.bKeyAuthFailed = XFALSE;
+        client.bUseKeyAuth = XFALSE;
+        DirectGate_KeyAuth_KeyCleanse(&client.key);
+
+        if (!DirectGate_PromptDeviceSecret(&args, args.sDeviceName))
+        {
+            xloge("A device password is required to authenticate");
+            nResult = XSTDERR;
+            break;
+        }
+
+        /* Fresh transport state for the second attempt; the previous one
+         * tore its own down when the socket closed. */
+        g_bFinish = XFALSE;
+        DirectGate_Client_Init(&client);
+        client.pCfg = &args;
     }
-
-    int nPipeFd = DirectGate_WebRTC_GetPipeFd(&client.webrtc);
-    if (nPipeFd >= 0)
-    {
-        xapi_endpoint_t pipeEndpt;
-        XAPI_InitEndpoint(&pipeEndpt);
-
-        pipeEndpt.eType = XAPI_EVENT;
-        pipeEndpt.eRole = XAPI_CUSTOM;
-        pipeEndpt.nFD = nPipeFd;
-        pipeEndpt.nEvents = XPOLLIN;
-        pipeEndpt.bUnix = XTRUE;
-        pipeEndpt.pSessionData = &client;
-
-        if (XAPI_AddEndpoint(&api, &pipeEndpt) < 0)
-            xlogw("Failed to register WebRTC notification pipe");
-    }
-
-    xevent_status_t status;
-    do status = XAPI_Service(&api, 100);
-    while (status == XEVENTS_SUCCESS && !g_bFinish);
 
     DirectGate_Client_RestoreIO(&client.io);
     DirectGate_Client_CleanseSecret(&args);
+    DirectGate_KeyAuth_KeyCleanse(&client.key);
 
     DirectGate_WebRTC_Clear(&client.webrtc);
     DirectGate_WebRTC_Cleanup();
 
-    client.pPipeSession = NULL;
-    XAPI_Destroy(&api);
     XLog_Destroy();
-
-    return 0;
+    return nResult;
 }
