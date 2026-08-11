@@ -516,14 +516,14 @@ static void DirectGate_Pick_Render(const directgate_device_list_t *pList, size_t
         const char *pUnreachable = XSTR_CLR_RED "x" XSTR_CLR_NONE;
         const char *pMark = pDevice->bConnectable ? (pDevice->bOnline ? pOnlineMark : pOfflineMark) : pUnreachable;
 
-        char sLabel[XSTR_TINY * 2];
+        char sLabel[XSTR_MIN];
         xstrncpyf(sLabel, sizeof(sLabel), "%-26.26s %s%s%s", pDevice->sName,
             DirectGate_Devices_StateText(pDevice),
-            xstrused(pDevice->sOwner) ? " - shared by " : "",
-            xstrused(pDevice->sOwner) ? pDevice->sOwner : "");
+            xstrused(pDevice->sOwner) ? " - shared by " : XSTR_EMPTY,
+            xstrused(pDevice->sOwner) ? pDevice->sOwner : XSTR_EMPTY);
 
         printf("\x1b[2K  %s %s %s%s\n",
-            bActive ? XSTR_CLR_CYAN ">" XSTR_CLR_NONE : " ", pMark,
+            bActive ? XSTR_CLR_CYAN ">" XSTR_CLR_NONE : XSTR_SPACE, pMark,
             bActive ? XSTR_FMT_BOLD : XSTR_FMT_DIM, sLabel);
 
         printf(XSTR_CLR_NONE);
@@ -531,8 +531,12 @@ static void DirectGate_Pick_Render(const directgate_device_list_t *pList, size_t
 
     printf("\x1b[2K\n");
     printf("\x1b[2K  " XSTR_FMT_DIM
-        "up/down select, enter confirm, q quit" XSTR_CLR_NONE "%s%s\n",
-        xstrused(pStatus) ? "  -  " : "", xstrused(pStatus) ? pStatus : "");
+        "up/down select, enter confirm, q quit" XSTR_CLR_NONE "\n");
+
+    printf("\x1b[2K  " XSTR_FMT_DIM
+        "run dgcli with '-h' for additional help" XSTR_CLR_NONE "%s%s\n",
+        xstrused(pStatus) ? "  -  " : XSTR_EMPTY,
+        xstrused(pStatus) ? pStatus : XSTR_EMPTY);
 
     fflush(stdout);
 }
@@ -541,7 +545,7 @@ static void DirectGate_Pick_Render(const directgate_device_list_t *pList, size_t
  * sequences; keeps `dgcli` usable when stdin is not a TTY. */
 static int DirectGate_Pick_Numbered(const directgate_device_list_t *pList, const char *pPurpose)
 {
-    printf("\n  Select a device to %s:\n\n", pPurpose);
+    printf("\n  Select a device to %s:\n", pPurpose);
 
     for (size_t i = 0; i < pList->nCount; i++)
     {
@@ -567,7 +571,10 @@ static int DirectGate_Pick_Numbered(const directgate_device_list_t *pList, const
     size_t nIndex = (size_t)nChoice - 1;
     if (!pList->devices[nIndex].bConnectable)
     {
-        xloge("Device is not connectable: %s (%s)", pList->devices[nIndex].sName, pList->devices[nIndex].sReason);
+        xloge("Device is not connectable: %s (%s)",
+            pList->devices[nIndex].sName,
+            pList->devices[nIndex].sReason);
+
         return DIRECTGATE_DEVICE_ABORTED;
     }
 
@@ -614,7 +621,7 @@ int DirectGate_Devices_Select(const directgate_device_list_t *pList, const char 
 
     for (;;)
     {
-        if (bDrawn) printf("\x1b[%zuA", nRows + 2);
+        if (bDrawn) printf("\x1b[%zuA", nRows + 3);
         DirectGate_Pick_Render(pList, nCursor, nOffset, nRows, pStatus);
         bDrawn = XTRUE;
 
