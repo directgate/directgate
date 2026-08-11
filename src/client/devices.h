@@ -75,10 +75,12 @@ int DirectGate_Devices_Find(const directgate_device_list_t *pList, const char *p
 
 void DirectGate_Devices_Print(const directgate_device_list_t *pList);
 
-/* Full-screen arrow-key picker. Returns the chosen index, or
+/* Full-screen arrow-key picker. pPurpose is the verb shown in the heading
+ * ("connect to", "authorize this key on") so the operator can see which
+ * action they are about to take. Returns the chosen index, or returns the
  * DIRECTGATE_DEVICE_ABORTED when the user quits. Falls back to a numbered
  * prompt when stdin or stdout is not a terminal. */
-int DirectGate_Devices_Select(const directgate_device_list_t *pList);
+int DirectGate_Devices_Select(const directgate_device_list_t *pList, const char *pPurpose);
 
 #ifdef __cplusplus
 }

@@ -29,13 +29,16 @@ extern int optind;
 
 #define DIRECTGATE_CLIENT_CONFIG    ".config/directgate/client.json"
 #define DIRECTGATE_CLIENT_DEVICES   ".config/directgate/devices"
-#define DIRECTGATE_CLIENT_AUTH      ".config/directgate/auth.json"
+#define DIRECTGATE_CLIENT_AUTH      ".config/directgate/auth/auth.json"
 #define DIRECTGATE_CLIENT_KEY       ".config/directgate/auth/key.json"
-#define DIRECTGATE_SIGNALING_URL    "wss://directgate.io/websock"
 
 /* Control-plane endpoints. Overridable at build time so a self-hosted or
  * staging deployment ships a binary that points at its own stack, and at
  * run time through the matching environment variables. */
+#ifndef DIRECTGATE_SIGNALING_URL
+#define DIRECTGATE_SIGNALING_URL    "wss://directgate.io/websock"
+#endif
+
 #ifndef DIRECTGATE_API_URL
 #define DIRECTGATE_API_URL          "https://api.directgate.io"
 #endif
@@ -56,16 +59,17 @@ void DirectGate_DisplayUsage(const char *pName)
     printf("  whoami               # Show the signed in account\n\n");
     printf("Options are:\n");
     printf("  -d <id|name>         # Device to connect to\n");
-    printf("  -k <path>            # Client key file, tried before the password\n");
     printf("  -a <url>             # API base URL\n");
     printf("  -w <url>             # WebSocket signaling URL\n");
     printf("  -c <path>            # Config JSON path\n");
-    printf("  -p <path>            # Device list file path\n");
-    printf("  -n <name>            # Device name for the local device list\n");
     printf("  -l <path>            # Log directory path\n");
     printf("  -v <level>           # Verbose level (0-5)\n");
-    printf("  -g                   # Generate a client key and exit\n");
+    printf("  -p <path>            # Device list file path\n");
+    printf("  -n <name>            # Device name for the local device list\n");
+    printf("  -k <path>            # Client key file, tried before the password\n");
+    printf("  -A                   # Authorize the client key on a device and exit\n");
     printf("  -B                   # Sign in without opening a browser\n");
+    printf("  -g                   # Generate a client key and exit\n");
     printf("  -f                   # Force overwrite device in list\n");
     printf("  -s                   # Save device in the list file\n");
     printf("  -i                   # Init config and exit\n");
@@ -117,7 +121,7 @@ static void DirectGate_SetDefaultConfigPath(directgate_cfg_t *pCfg)
     {
         xstrncpyf(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), "%s/directgate/client.json", pAppData);
         xstrncpyf(pCfg->sDeviceList, sizeof(pCfg->sDeviceList), "%s/directgate/devices", pAppData);
-        xstrncpyf(pCfg->sAuthPath, sizeof(pCfg->sAuthPath), "%s/directgate/auth.json", pAppData);
+        xstrncpyf(pCfg->sAuthPath, sizeof(pCfg->sAuthPath), "%s/directgate/auth/auth.json", pAppData);
         xstrncpyf(pCfg->sKeyPath, sizeof(pCfg->sKeyPath), "%s/directgate/auth/key.json", pAppData);
 
         DirectGate_PathToSlash(pCfg->sCfgPath);
@@ -197,6 +201,7 @@ void DirectGate_InitConfig(directgate_cfg_t *pCfg)
     pCfg->bNoBrowser = XFALSE;
     pCfg->bKeyRequired = XFALSE;
     pCfg->bGenKey = XFALSE;
+    pCfg->bAddKey = XFALSE;
     pCfg->bForce = XFALSE;
     pCfg->bInit = XFALSE;
 }
@@ -358,7 +363,7 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
     if (argc > 1 && DirectGate_ParseCommand(argv[1], &pCfg->eCommand)) nFirst = 2;
 
     optind = nFirst;
-    while ((nChar = getopt(argc, argv, "n:d:a:c:p:l:v:w:k:fgsiBh")) != -1)
+    while ((nChar = getopt(argc, argv, "n:d:a:c:p:l:v:w:k:AfgsiBh")) != -1)
     {
         switch (nChar)
         {
@@ -387,6 +392,9 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
                 break;
             case 'v':
                 pCfg->nVerbose = (uint16_t)atoi(optarg);
+                break;
+            case 'A':
+                pCfg->bAddKey = XTRUE;
                 break;
             case 'B':
                 pCfg->bNoBrowser = XTRUE;

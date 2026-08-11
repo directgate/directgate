@@ -64,6 +64,7 @@ typedef struct directgate_cfg_ {
     xbool_t bNoBrowser;
     xbool_t bKeyRequired;
     xbool_t bGenKey;
+    xbool_t bAddKey;
     xbool_t bForce;
     xbool_t bInit;
 } directgate_cfg_t;

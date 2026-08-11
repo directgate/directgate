@@ -88,6 +88,11 @@ typedef struct directgate_client_ctx_ {
     xbool_t bUseKeyAuth;
     xbool_t bKeyAuthFailed;
 
+    /* -a: authorize a client key on the device instead of opening a shell */
+    char sAddKeyPub[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
+    xbool_t bAddKeyMode;
+    xbool_t bAddKeyDone;
+
     xapi_session_t *pPipeSession;
     xapi_session_t *pWsSession;
     uint32_t nSessionId;
@@ -477,6 +482,55 @@ static xbool_t DirectGate_Client_RequiresEncryption(directgate_ctx_t *pCli, cons
             pPkg->header.eType == DIRECTGATE_PKG_ADMIN);
 }
 
+/*
+ * Hands the client key to the device for authorization. This is the whole
+ * point of -a: one admin message on an authenticated, encrypted session, the
+ * same thing the workspace UI does when you add a key from the browser.
+ */
+static int DirectGate_Client_SendAddKey(directgate_ctx_t *pCli)
+{
+    xjson_obj_t *pHeader = DirectGate_Proto_BuildAdmin("add-key", pCli->sAddKeyPub, NULL, NULL, pCli->nSessionId);
+    XCHECK((pHeader != NULL), XAPI_DISCONNECT);
+
+    int nStatus = DirectGate_Client_SendMsg(pCli, pHeader, NULL, 0);
+    XJSON_FreeObject(pHeader);
+
+    if (nStatus >= 0) xlogi("Sent the key authorization request");
+    return nStatus;
+}
+
+/*
+ * The device answers add-key with ok, already or error. Any of the three ends
+ * the session: -a authorizes a key and stops, it never opens a shell.
+ */
+static int DirectGate_Client_HandleAdminMsg(directgate_ctx_t *pCli, directgate_pkg_t *pMsg)
+{
+    directgate_pkg_admin_t *pAdmin = (directgate_pkg_admin_t*)pMsg->pPackage;
+    XCHECK((pAdmin != NULL), XAPI_DISCONNECT);
+
+    if (!xstrused(pAdmin->pAction) || !xstrcmp(pAdmin->pAction, "add-key-result"))
+    {
+        xlogw("Ignoring unexpected admin response: action(%s)", xstrused(pAdmin->pAction) ? pAdmin->pAction : "N/A");
+        return XAPI_CONTINUE;
+    }
+
+    const char *pStatus = xstrused(pAdmin->pStatus) ? pAdmin->pStatus : "error";
+
+    if (xstrcmp(pStatus, "ok")) printf("\n  Key authorized. You can now connect without the password.\n\n");
+    else if (xstrcmp(pStatus, "already")) printf("\n  Key was already authorized on this device.\n\n");
+    else
+    {
+        xloge("Device refused the key: %s", xstrused(pAdmin->pReason) ? pAdmin->pReason : "unknown reason");
+        pCli->bAddKeyDone = XFALSE;
+        g_bFinish = XTRUE;
+        return XAPI_DISCONNECT;
+    }
+
+    pCli->bAddKeyDone = XTRUE;
+    g_bFinish = XTRUE;
+    return XAPI_DISCONNECT;
+}
+
 /* Terminal session is up: bring the P2P data channel online.
  * Shared by both authentication methods so they cannot drift apart. */
 static void DirectGate_Client_StartWebRTC(directgate_ctx_t *pCli)
@@ -558,7 +612,12 @@ static int DirectGate_Client_HandleKeyAuthMsg(directgate_ctx_t *pCli, directgate
             xlogn("KeyAuth: Authentication successful, E2E encryption enabled");
             pCli->bAuthDone = XTRUE;
 
-            if (DirectGate_Client_SendCmdStart(pCli, "terminal") < 0) return XAPI_DISCONNECT;
+            if (pCli->bAddKeyMode)
+                return DirectGate_Client_SendAddKey(pCli);
+
+            if (DirectGate_Client_SendCmdStart(pCli, "terminal") < 0)
+                return XAPI_DISCONNECT;
+
             DirectGate_Client_SendResize(pCli);
             DirectGate_Client_StartWebRTC(pCli);
 
@@ -655,6 +714,10 @@ static int DirectGate_Client_HandleAuthMsg(directgate_ctx_t *pCli, directgate_pk
         xlogn("SRP: Authentication successful, E2E encryption enabled");
         DirectGate_Client_CleanseSecretCtx(pCli);
         pCli->bAuthDone = XTRUE;
+
+        /* Authorizes a key and stops; it never opens a shell. */
+        if (pCli->bAddKeyMode)
+            return DirectGate_Client_SendAddKey(pCli);
 
         if (DirectGate_Client_SendCmdStart(pCli, "terminal") < 0)
             return XAPI_DISCONNECT;
@@ -858,6 +921,8 @@ static int DirectGate_Client_DispatchMessage(directgate_ctx_t *pCli, directgate_
             return DirectGate_Client_HandleStatusMsg(pMsg, pTransport);
         case DIRECTGATE_PKG_DATA:
             return DirectGate_Client_HandleDataMsg(pCli, pMsg);
+        case DIRECTGATE_PKG_ADMIN:
+            return DirectGate_Client_HandleAdminMsg(pCli, pMsg);
         case DIRECTGATE_PKG_KEEPALIVE:
             return DirectGate_Client_HandleKeepaliveMsg(pCli, pMsg);
         default:
@@ -1610,10 +1675,44 @@ static XSTATUS DirectGate_Client_GenerateKey(const directgate_cfg_t *pCfg)
 
     printf("\n  Client key written to %s\n\n", pCfg->sKeyPath);
     printf("  Public key:\n    %s\n\n", sClientPubB64);
-    printf("  Authorize it on a device by running this there:\n");
-    printf("    directgate -a <path to this key file>\n\n");
+    printf("  Authorize it on your devices:\n");
+    printf("    dgcli -A  %s# interactive device select%s\n", XSTR_FMT_DIM, XSTR_FMT_RESET);
+    printf("    dgcli -A -d <deviceId>\n\n");
 
     return XSTDNON;
+}
+
+/*
+ * Loads the key that -a will authorize. The key comes from -k when given and
+ * from the default path otherwise; having neither is the common first-run
+ * case, so it says where the key would live and how to get one rather than
+ * just failing.
+ */
+static xbool_t DirectGate_Client_LoadKeyToAdd(directgate_ctx_t *pCli, const directgate_cfg_t *pCfg)
+{
+    if (!xstrused(pCfg->sKeyPath) || !XPath_Exists(pCfg->sKeyPath))
+    {
+        printf("\n  No client key at %s\n\n", pCfg->sKeyPath);
+        printf("  Generate one:            dgcli -g\n");
+        printf("  Or point at an existing: dgcli -A -k <path to key file>\n\n");
+        return XFALSE;
+    }
+
+    directgate_client_key_t key;
+    if (!DirectGate_KeyAuth_KeyLoad(&key, pCfg->sKeyPath)) return XFALSE;
+
+    if (!DirectGate_KeyAuth_Base64Encode(key.clientPub, sizeof(key.clientPub), pCli->sAddKeyPub, sizeof(pCli->sAddKeyPub)))
+    {
+        xloge("Failed to encode the client public key: %s", pCfg->sKeyPath);
+        DirectGate_KeyAuth_KeyCleanse(&key);
+        return XFALSE;
+    }
+
+    DirectGate_KeyAuth_KeyCleanse(&key);
+    pCli->bAddKeyMode = XTRUE;
+
+    printf("\n  Authorizing key %s\n  from %s\n", pCli->sAddKeyPub, pCfg->sKeyPath);
+    return XTRUE;
 }
 
 /*
@@ -1701,7 +1800,8 @@ static xbool_t DirectGate_Client_LoadDevices(directgate_device_list_t *pList,
  * when nothing matched, nothing was picked, or the match cannot be connected.
  */
 static const directgate_device_t* DirectGate_Client_ResolveDevice(directgate_cfg_t *pCfg,
-                                                                  const directgate_device_list_t *pList)
+                                                                  const directgate_device_list_t *pList,
+                                                                  const char *pPurpose)
 {
     if (!pList->nCount)
     {
@@ -1723,7 +1823,7 @@ static const directgate_device_t* DirectGate_Client_ResolveDevice(directgate_cfg
     }
     else
     {
-        nIndex = DirectGate_Devices_Select(pList);
+        nIndex = DirectGate_Devices_Select(pList, pPurpose);
         if (nIndex < 0)
         {
             xlogn("No device selected");
@@ -1745,7 +1845,7 @@ static const directgate_device_t* DirectGate_Client_ResolveDevice(directgate_cfg
     xstrncpy(pCfg->sDeviceId, sizeof(pCfg->sDeviceId), pDevice->sId);
     xstrncpy(pCfg->sDeviceName, sizeof(pCfg->sDeviceName), pDevice->sName);
 
-    printf("\n  Connecting to %s...\n\n", pDevice->sName);
+    printf("\n  %s %s...\n\n", pCfg->bAddKey ? "Authorizing the key on" : "Connecting to", pDevice->sName);
     return pDevice;
 }
 
@@ -1755,13 +1855,19 @@ static const directgate_device_t* DirectGate_Client_ResolveDevice(directgate_cfg
  * was a standalone one (login / logout / devices / whoami) that is already
  * finished, XSTDERR on failure and XSTDOK when the client should connect.
  */
-static XSTATUS DirectGate_Client_Prepare(directgate_ctx_t *pCli, directgate_cfg_t *pCfg,
-                                        directgate_account_t *pAccount)
+static XSTATUS DirectGate_Client_Prepare(directgate_ctx_t *pCli, directgate_cfg_t *pCfg, directgate_account_t *pAccount)
 {
     directgate_login_ctx_t login;
     DirectGate_Client_LoginContext(&login, pCfg);
 
     if (pCfg->bGenKey) return DirectGate_Client_GenerateKey(pCfg);
+
+    /*
+        Authorizes a key rather than opening a shell. Loading it first
+        makes a missing key fail immediately: there is no point signing in
+        and picking a device to add a key that is not there.
+    */
+    if (pCfg->bAddKey && !DirectGate_Client_LoadKeyToAdd(pCli, pCfg)) return XSTDERR;
 
     if (pCfg->eCommand == DIRECTGATE_CMD_LOGOUT)
     {
@@ -1823,14 +1929,20 @@ static XSTATUS DirectGate_Client_Prepare(directgate_ctx_t *pCli, directgate_cfg_
         return XSTDNON;
     }
 
-    const directgate_device_t *pDevice = DirectGate_Client_ResolveDevice(pCfg, &devices);
+    const directgate_device_t *pDevice = DirectGate_Client_ResolveDevice(pCfg, &devices, pCfg->bAddKey ? "authorize this key on" : "connect to");
     if (pDevice == NULL) return XSTDERR;
 
-    DirectGate_Client_PrepareKeyAuth(pCli, pCfg, pDevice);
+    /*
+        A key file holds a single identity, so in -a mode the key being added
+        is the one that would authenticate - and it is not authorized yet.
+        The password is what proves ownership here, the same way ssh-copy-id
+        works.
+    */
+    if (!pCfg->bAddKey) DirectGate_Client_PrepareKeyAuth(pCli, pCfg, pDevice);
 
     /* An explicit -k means the user asked for that key specifically, so a
      * silent downgrade to the password would be the wrong answer. */
-    if (!pCli->bUseKeyAuth && pCfg->bKeyRequired)
+    if (!pCli->bUseKeyAuth && !pCfg->bAddKey && pCfg->bKeyRequired)
     {
         xloge("Client key is unusable and -k was given, refusing to fall back");
         return XSTDERR;
@@ -2080,7 +2192,11 @@ int main(int argc, char* argv[])
 
         /* The host accepted the handshake or ended the session: done either
          * way. Only an explicitly refused key sends us round again. */
-        if (!client.bKeyAuthFailed) break;
+        if (!client.bKeyAuthFailed)
+        {
+            if (args.bAddKey && !client.bAddKeyDone) nResult = XSTDERR;
+            break;
+        }
 
         client.bKeyAuthFailed = XFALSE;
         client.bUseKeyAuth = XFALSE;

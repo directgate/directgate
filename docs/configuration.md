@@ -152,7 +152,7 @@ dgcli login
 ```
 
 This runs an OAuth 2.0 authorization code flow with PKCE. The CLI opens a short-lived listener on `127.0.0.1` (ports 40777-40784), opens your browser, and exchanges the returned authorization code for a session. Tokens are written
-to `auth.json` next to the client config with `0600` permissions, and refreshed automatically as they expire - you only sign in again when the refresh token is gone.
+to `~/.config/directgate/auth/auth.json` with `0600` permissions inside a `0700` directory, created on demand alongside the client key, and refreshed automatically as they expire - you only sign in again when the refresh token is gone.
 
 The CLI holds no identity-provider configuration of its own. It knows exactly two hosts - the API and the web app - and the code exchange and refresh go through `POST /api/v1/auth/cli/token` and `/api/v1/auth/cli/refresh`, which the
 API performs against the provider on its behalf. Swapping the provider therefore needs no new CLI release, and the repository carries no provider credentials.
@@ -187,7 +187,19 @@ dgcli -g                 # generate a key at ~/.config/directgate/auth/key.json
 dgcli -k /path/to/key.json <device>
 ```
 
-`-g` writes the key `0600` inside a `0700` directory and prints the public half. That public half still has to be authorized on each device, which is done on the device itself:
+`-g` writes the key `0600` inside a `0700` directory and prints the public half. `-A` then hands that public half to a device over an authenticated session - the same `admin/add-key` the workspace UI uses - so a device can be authorized from anywhere the CLI already reaches it:
+
+```sh
+dgcli -A                 # pick a device, authorize the key, exit
+dgcli -A -d homelab      # or name the device
+dgcli -A -k /path/to/other-key.json
+```
+
+Without `-d` it shows the usual device picker, headed with what it is about to do so the operator can see this is not a connection attempt. The key it adds is the one `-k` names, or the default path; with neither present it prints where the key would live and how to get one.
+
+Since a key file holds a single identity, the key being authorized is by definition not yet authorized, so `-A` authenticates with the device password the way `ssh-copy-id` does. After that the password is no longer needed for that device.
+
+A device can also authorize a key locally, without the CLI:
 
 ```sh
 directgate -a /path/to/key.json

@@ -531,7 +531,7 @@ static void DirectGate_Pick_Render(const directgate_device_list_t *pList, size_t
 
     printf("\x1b[2K\n");
     printf("\x1b[2K  " XSTR_FMT_DIM
-        "up/down select, enter connect, q quit" XSTR_CLR_NONE "%s%s\n",
+        "up/down select, enter confirm, q quit" XSTR_CLR_NONE "%s%s\n",
         xstrused(pStatus) ? "  -  " : "", xstrused(pStatus) ? pStatus : "");
 
     fflush(stdout);
@@ -539,9 +539,9 @@ static void DirectGate_Pick_Render(const directgate_device_list_t *pList, size_t
 
 /* Numbered prompt for pipes, CI and terminals we cannot drive with escape
  * sequences; keeps `dgcli` usable when stdin is not a TTY. */
-static int DirectGate_Pick_Numbered(const directgate_device_list_t *pList)
+static int DirectGate_Pick_Numbered(const directgate_device_list_t *pList, const char *pPurpose)
 {
-    printf("\n  Devices:\n\n");
+    printf("\n  Select a device to %s:\n\n", pPurpose);
 
     for (size_t i = 0; i < pList->nCount; i++)
     {
@@ -574,11 +574,12 @@ static int DirectGate_Pick_Numbered(const directgate_device_list_t *pList)
     return (int)nIndex;
 }
 
-int DirectGate_Devices_Select(const directgate_device_list_t *pList)
+int DirectGate_Devices_Select(const directgate_device_list_t *pList, const char *pPurpose)
 {
     XCHECK((pList != NULL), DIRECTGATE_DEVICE_ABORTED);
     XCHECK((pList->nCount > 0), DIRECTGATE_DEVICE_ABORTED);
 
+    if (!xstrused(pPurpose)) pPurpose = "connect to";
     if (pList->nCount == 1 && pList->devices[0].bConnectable) return 0;
 
 #ifdef _WIN32
@@ -586,12 +587,12 @@ int DirectGate_Devices_Select(const directgate_device_list_t *pList)
 #else
     xbool_t bTty = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
 #endif
-    if (!bTty) return DirectGate_Pick_Numbered(pList);
+    if (!bTty) return DirectGate_Pick_Numbered(pList, pPurpose);
 
     directgate_pick_io_t io;
     memset(&io, 0, sizeof(io));
 
-    if (!DirectGate_Pick_Enter(&io)) return DirectGate_Pick_Numbered(pList);
+    if (!DirectGate_Pick_Enter(&io)) return DirectGate_Pick_Numbered(pList, pPurpose);
 
     /* Start on the first device that can actually be connected */
     size_t nCursor = 0;
@@ -608,7 +609,7 @@ int DirectGate_Devices_Select(const directgate_device_list_t *pList)
     const char *pStatus = NULL;
     xbool_t bDrawn = XFALSE;
 
-    printf("\n  Select a device to connect:\n\n");
+    printf("\n  Select a device to %s:\n\n", pPurpose);
     printf("\x1b[?25l");
 
     for (;;)
