@@ -24,8 +24,8 @@
 
 #define DIRECTGATE_VERSION_MAJOR 1
 #define DIRECTGATE_VERSION_MINOR 0
-#define DIRECTGATE_VERSION_BUILD 20
-#define DIRECTGATE_VERSION_PKG   9
+#define DIRECTGATE_VERSION_BUILD 21
+#define DIRECTGATE_VERSION_PKG   1
 
 /* The Windows resource compiler (windres / rc.exe) defines RC_INVOKED and only
    understands the numeric macros above; hide the C declarations from it so the
