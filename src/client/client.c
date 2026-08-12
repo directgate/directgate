@@ -2085,6 +2085,22 @@ static XSTATUS DirectGate_Client_Run(directgate_ctx_t *pClient, directgate_cfg_t
     while (status == XEVENTS_SUCCESS && !g_bFinish);
 
     DirectGate_Client_RestoreIO(&pClient->io);
+
+    /*
+        Never exit without saying why. Everything the teardown logs is at
+        note level, which the default verbosity hides, so a session dropped
+        before authentication left the terminal with no output at all -
+        indistinguishable from a crash. This one prints unconditionally.
+    */
+    if (!pClient->bAuthDone && !pClient->bKeyAuthFailed)
+    {
+        printf("\n  The session ended before authentication completed.\n");
+        printf("  Re-run with -v 5 to see the exchange.\n\n");
+
+        xlogn("Session ended unauthenticated: status(%d), relay(%s)",
+            (int)status, pArgs->sSignalingUrl);
+    }
+
     pClient->pPipeSession = NULL;
     DirectGate_WebRTC_Clear(&pClient->webrtc);
 

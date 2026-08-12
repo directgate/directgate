@@ -208,6 +208,7 @@ xbool_t DirectGate_EnsurePrivateFileParent(const char *pPath)
 
     char *pSlash = strrchr(sDir, '/');
     char *pBackSlash = strrchr(sDir, '\\');
+
     if (pBackSlash != NULL && (pSlash == NULL || pBackSlash > pSlash)) pSlash = pBackSlash;
     XCHECK_NL((pSlash != NULL), XTRUE);
 
@@ -232,17 +233,70 @@ xbool_t DirectGate_EnsurePrivateFileParent(const char *pPath)
     if (!DirectGate_BuildPrivateSecAttrs(&secAttrs, &pDescriptor, XTRUE))
         return XFALSE;
 
-    BOOL bCreated = CreateDirectoryA(sDir, &secAttrs);
-    DWORD nError = bCreated ? 0 : GetLastError();
-    LocalFree(pDescriptor);
+    /*
+        Create the whole chain, not just the last component: CreateDirectory
+        fails with ERROR_PATH_NOT_FOUND when an ancestor is missing, and the
+        client's own tree under %APPDATA% starts out absent because the agent
+        keeps its machine-wide config under %ProgramData% instead. Every
+        directory this creates gets the same private ACL; ones that already
+        exist are left exactly as they are, matching the POSIX side.
+    */
+    char *pWalk = sDir;
 
-    if (!bCreated && nError != ERROR_ALREADY_EXISTS)
+    if (nDirLen > 1 && sDir[1] == ':')
     {
-        xloge("Failed to create private directory: dir(%s), error(%lu)", sDir, nError);
-        return XFALSE;
+        /* "C:" is a root, never a component to create */
+        pWalk = sDir + 2;
+    }
+    else if (nDirLen > 1 &&
+             (sDir[0] == '\\' || sDir[0] == '/') &&
+             (sDir[1] == '\\' || sDir[1] == '/'))
+    {
+        /* UNC "\\server\share\...": the server and the share exist already
+         * and cannot be created, so the walk has to start below them. AD
+         * domains really do serve roaming profiles this way. */
+        pWalk = sDir + 2;
+
+        for (int nSkip = 0; nSkip < 2 && *pWalk != XSTR_NUL; nSkip++)
+        {
+            while (*pWalk != '/' && *pWalk != '\\' && *pWalk != XSTR_NUL) pWalk++;
+            while (*pWalk == '/' || *pWalk == '\\') pWalk++;
+        }
     }
 
-    return XTRUE;
+    while (*pWalk == '/' || *pWalk == '\\') pWalk++;
+
+    xbool_t bOk = XTRUE;
+
+    for (char *pIt = pWalk; bOk; pIt++)
+    {
+        xbool_t bEnd = (*pIt == XSTR_NUL);
+        if (!bEnd && *pIt != '/' && *pIt != '\\') continue;
+
+        char cSaved = *pIt;
+        *pIt = XSTR_NUL;
+
+        if (xstrused(sDir))
+        {
+            DWORD nPartAttrs = GetFileAttributesA(sDir);
+
+            if (nPartAttrs != INVALID_FILE_ATTRIBUTES)
+            {
+                if (!(nPartAttrs & FILE_ATTRIBUTE_DIRECTORY)) bOk = XFALSE;
+            }
+            else if (!CreateDirectoryA(sDir, &secAttrs) && GetLastError() != ERROR_ALREADY_EXISTS)
+            {
+                xloge("Failed to create private directory: dir(%s), error(%lu)", sDir, GetLastError());
+                bOk = XFALSE;
+            }
+        }
+
+        *pIt = cSaved;
+        if (bEnd) break;
+    }
+
+    LocalFree(pDescriptor);
+    return bOk;
 }
 
 xbool_t DirectGate_WritePrivateFile(const char *pPath, const uint8_t *pData, size_t nSize)
