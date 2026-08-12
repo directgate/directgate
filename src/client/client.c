@@ -1551,6 +1551,7 @@ static int DirectGate_Client_DestroySession(xapi_ctx_t *pCtx, xapi_session_t *pS
 
 static int DirectGate_Client_Interrupt(xapi_ctx_t *pCtx)
 {
+    if (g_bFinish) return XAPI_DISCONNECT;
     directgate_ctx_t *pCli = (directgate_ctx_t*)pCtx->pApi->pUserCtx;
 
 #ifndef _WIN32
@@ -1564,12 +1565,12 @@ static int DirectGate_Client_Interrupt(xapi_ctx_t *pCtx)
     (void)pCli;
 #endif
 
-    if (g_bFinish) return XAPI_DISCONNECT;
     return XAPI_CONTINUE;
 }
 
 static int DirectGate_Client_Tick(xapi_ctx_t *pCtx)
 {
+    if (g_bFinish) return XAPI_DISCONNECT;
     directgate_ctx_t *pCli = (directgate_ctx_t*)pCtx->pApi->pUserCtx;
 
     if (pCli != NULL && pCli->transfer.eState == XTRANSFER_STATE_SENDING)
@@ -1591,14 +1592,13 @@ static int DirectGate_Client_Tick(xapi_ctx_t *pCtx)
         bAuthDone and not on bRaw. The post-auth path sends the initial
         resize itself, so nothing is lost by waiting.
     */
-    if (pCli != NULL && pCli->bAuthDone && !pCli->bAddKeyMode)
+    if (pCli != NULL && pCli->bAuthDone && pCli->pWsSession != NULL && !pCli->bAddKeyMode)
     {
         int nResize = DirectGate_Client_SendResize(pCli);
         if (nResize < 0) return nResize;
     }
 #endif
 
-    if (g_bFinish) return XAPI_DISCONNECT;
     return XAPI_CONTINUE;
 }
 
