@@ -241,6 +241,42 @@ int main(void)
         DirectGate_Package_Clear(&pkg);
     }
 
+    /*
+     * What a client is allowed to put on the wire before it authenticates.
+     * The relay disconnects a client session that sends anything but role or
+     * auth while unauthenticated, and dgcli's Windows tick used to poll the
+     * console geometry from the moment the socket connected - so the first
+     * resize, one second in, killed every Windows session before the password
+     * was ever checked. The types are taken off real builders through the
+     * wire, so renaming one is caught here too.
+     */
+    {
+        struct { xjson_obj_t *pHdr; xbool_t bAllowed; const char *pName; } cases[] = {
+            { DirectGate_Proto_BuildRole("client", "dev-42"), XTRUE, "role" },
+            { DirectGate_Proto_BuildAuthHello("dev-42", "0aff", "n0nce", 5), XTRUE, "auth hello" },
+            { DirectGate_Proto_BuildAuthKeyHello("dev-42", "cpub", "ceph", "ab12", 5), XTRUE, "key hello" },
+            { DirectGate_Proto_BuildResize(30, 120, 0, 0, 5), XFALSE, "resize" },
+            { DirectGate_Proto_BuildCmd("start", NULL, NULL, "terminal", 5), XFALSE, "cmd start" },
+            { DirectGate_Proto_BuildKeepalive("pong", 5), XFALSE, "keepalive pong" },
+            { DirectGate_Proto_BuildData(5), XFALSE, "data" },
+            { DirectGate_Proto_BuildAdmin("add-key", "cpub", NULL, NULL, 5), XFALSE, "admin add-key" },
+        };
+
+        size_t nCases = sizeof(cases) / sizeof(cases[0]);
+        for (size_t i = 0; i < nCases; i++)
+        {
+            CHECK(roundtrip(&pkg, &wire, cases[i].pHdr, NULL, 0) == 0, cases[i].pName);
+            CHECK(DirectGate_Proto_IsClientPreAuthType(pkg.header.pType) == cases[i].bAllowed,
+                cases[i].pName);
+            DirectGate_Package_Clear(&pkg);
+        }
+
+        CHECK(!DirectGate_Proto_IsClientPreAuthType(NULL), "NULL type is not sendable");
+        CHECK(!DirectGate_Proto_IsClientPreAuthType(""), "empty type is not sendable");
+        CHECK(!DirectGate_Proto_IsClientPreAuthType("no-such-type"),
+            "unknown type is not sendable");
+    }
+
     /* ---- malformed wire: must be rejected, never crash ---- */
 
     /* Keep one valid packet around to mutate */

@@ -396,6 +396,23 @@ static int DirectGate_Client_SendMsg(directgate_ctx_t *pCli, xjson_obj_t *pHeade
     XCHECK((pCli != NULL), XAPI_DISCONNECT);
     XCHECK((pHeader != NULL), XAPI_DISCONNECT);
 
+    /*
+        The relay disconnects an unauthenticated client the moment it sends
+        anything other than role or auth. Dropping such a message here costs
+        nothing - every one of them is a periodic or event-driven update that
+        is resent once the session is up - and it keeps a single stray send
+        from tearing down the whole connection.
+    */
+    if (!pCli->bAuthDone)
+    {
+        const char *pType = XJSON_GetString(XJSON_GetObject(pHeader, "type"));
+        if (!DirectGate_Proto_IsClientPreAuthType(pType))
+        {
+            xlogw("Suppressed pre-authentication message: type(%s)", xstrused(pType) ? pType : "none");
+            return XAPI_CONTINUE;
+        }
+    }
+
     /* Add packet counter for authenticated sessions */
     if (pCli->bAuthDone && DirectGate_E2E_IsInitialized(&pCli->e2e))
         DirectGate_Proto_AddCC(pHeader, &pCli->e2e,
@@ -1562,9 +1579,19 @@ static int DirectGate_Client_Tick(xapi_ctx_t *pCtx)
     }
 
 #ifdef _WIN32
-    /* No SIGWINCH on Windows: poll the console geometry on the loop tick.
-       SendResize only transmits when the size actually changed. */
-    if (pCli != NULL && pCli->io.bRaw)
+    /*
+        No SIGWINCH on Windows: poll the console geometry on the loop tick.
+        SendResize only transmits when the size actually changed.
+
+        Raw mode is entered as soon as the socket connects, well before
+        authentication, but the relay disconnects a client that sends
+        anything other than auth traffic while unauthenticated. Sending
+        the very first resize from here therefore killed every Windows
+        session one tick after connecting, which is why the gate is on
+        bAuthDone and not on bRaw. The post-auth path sends the initial
+        resize itself, so nothing is lost by waiting.
+    */
+    if (pCli != NULL && pCli->bAuthDone && !pCli->bAddKeyMode)
     {
         int nResize = DirectGate_Client_SendResize(pCli);
         if (nResize < 0) return nResize;

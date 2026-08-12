@@ -453,6 +453,13 @@ xbool_t DirectGate_Package_Parse(directgate_pkg_t *pPkg, const uint8_t *pData, s
     return XTRUE;
 }
 
+xbool_t DirectGate_Proto_IsClientPreAuthType(const char *pType)
+{
+    XCHECK_NL((xstrused(pType)), XFALSE);
+    directgate_pkg_type_t eType = DirectGate_Proto_TypeFromStr(pType);
+    return (eType == DIRECTGATE_PKG_ROLE || eType == DIRECTGATE_PKG_AUTH);
+}
+
 xjson_obj_t* DirectGate_Proto_BuildRole(const char *pRole, const char *pDeviceId)
 {
     xjson_obj_t *pHeader = DirectGate_Proto_NewHeader("role", XSTDNON);

@@ -272,6 +272,14 @@ xbool_t DirectGate_Proto_AddCC(xjson_obj_t *pHeader, directgate_e2e_t *pE2E,
 xbool_t DirectGate_Proto_CheckCC(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E);
 xbool_t DirectGate_Proto_BindInnerSessionId(uint32_t nOuterSessionId, directgate_pkg_t *pInnerPkg);
 
+/*
+    The relay accepts only 'role' and 'auth' from a client session that has
+    not authenticated yet; anything else earns an immediate disconnect with
+    reason "auth required". Clients call this before transmitting so a stray
+    pre-auth message is dropped locally instead of killing the session.
+*/
+xbool_t DirectGate_Proto_IsClientPreAuthType(const char *pType);
+
 #ifdef __cplusplus
 }
 #endif
