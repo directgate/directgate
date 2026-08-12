@@ -82,6 +82,7 @@ foreach(test
         protocol_builders_smoke
         siv_smoke
         sockpair_events_smoke
+        sock_timeout_smoke
         str_buf_smoke
         websock_frame_smoke
         term_priv_smoke)
