@@ -33,21 +33,22 @@ This repository is the **agent**: the program you install on a machine you want 
 
 These are the experiences the agent powers once it is paired with your account.
 
+https://github.com/user-attachments/assets/50337ba3-db01-4299-9d25-035b21ffeb5b
 <p align="center">
   <sub>
     Ultra-low-latency remote desktop, responsive enough to play story-driven games directly in your browser.
   </sub>
 </p>
 
-https://github.com/user-attachments/assets/5b57ef36-301b-494d-8fc8-561d4d2567b9
+<br />
+
+https://github.com/user-attachments/assets/e0ac308f-fe0f-4628-bcfc-edd889b087b1
 
 <p align="center">
   <sub>
     A customizable window manager with multiple sessions in one workspace tab. Terminals, file managers, and code editors - each showing its own transport mode (P2P, TURN, or relayed) and end-to-end encryption status.
   </sub>
 </p>
-
-https://github.com/user-attachments/assets/8a9b366a-ff06-4817-920c-a49c9b30cbc7
 
 <br />
 
