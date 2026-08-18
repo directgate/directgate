@@ -251,6 +251,50 @@ int main(void)
         "cancel removes partial inbound file");
     DirectGate_Transfer_Destroy(&cancelRx);
 
+    /* HandleStart joins a peer-supplied name to a directory this side chose,
+       so the name must not be able to walk out of it. */
+    {
+        char sEscapeDir[] = "/tmp/directgate_transfer_escape.XXXXXX";
+        CHECK(mkdtemp(sEscapeDir) != NULL, "mkdtemp escape dir");
+
+        char sEscapeTarget[512];
+        snprintf(sEscapeTarget, sizeof(sEscapeTarget), "%s/../directgate_escaped.bin", sEscapeDir);
+        unlink(sEscapeTarget);
+
+        directgate_transfer_t escapeRx;
+        DirectGate_Transfer_Init(&escapeRx);
+
+        pHeader = DirectGate_Proto_BuildFileStart("esc-1",
+            "../directgate_escaped.bin", 4, 1, 4);
+        CHECK(pHeader != NULL, "build traversing start");
+        CHECK(build_file_pkg(&wire, &pkg, pHeader, NULL, 0), "parse traversing start");
+        CHECK(DirectGate_Transfer_HandleStart(&escapeRx, &pkg, sEscapeDir) == XSTDOK,
+            "a traversing name is reduced to its last component, not refused");
+        clear_file_pkg(&wire, &pkg);
+
+        CHECK(access(sEscapeTarget, F_OK) != 0,
+            "the transfer did not write outside the destination directory");
+
+        char sInside[512];
+        snprintf(sInside, sizeof(sInside), "%s/directgate_escaped.bin", sEscapeDir);
+        CHECK(access(sInside, F_OK) == 0, "it wrote inside the destination directory");
+        DirectGate_Transfer_Destroy(&escapeRx);
+
+        /* A name that is nothing but a walk has no last component to keep. */
+        directgate_transfer_t dotRx;
+        DirectGate_Transfer_Init(&dotRx);
+        pHeader = DirectGate_Proto_BuildFileStart("esc-2", "..", 4, 1, 4);
+        CHECK(pHeader != NULL, "build dotdot start");
+        CHECK(build_file_pkg(&wire, &pkg, pHeader, NULL, 0), "parse dotdot start");
+        CHECK(DirectGate_Transfer_HandleStart(&dotRx, &pkg, sEscapeDir) == XSTDERR,
+            "a bare parent reference is refused");
+        clear_file_pkg(&wire, &pkg);
+        DirectGate_Transfer_Destroy(&dotRx);
+
+        unlink(sInside);
+        rmdir(sEscapeDir);
+    }
+
     char sLinkPath[] = "/tmp/directgate_transfer_link.XXXXXX";
     int nLinkFd = mkstemp(sLinkPath);
     CHECK(nLinkFd >= 0, "mkstemp symlink path");

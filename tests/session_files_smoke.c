@@ -621,6 +621,29 @@ int main(void)
             DirectGate_Package_Clear(&pkg);
             drain(&fix);
         }
+
+        /* A second file/end for the same transfer - a retry, or one replayed
+           inside the counter window - must not take the committed file with
+           it. The transfer is finished by then, and its path is the file that
+           was just saved rather than a partial upload to clean up. */
+        {
+            xjson_obj_t *pRepeat = DirectGate_Proto_BuildFileEnd("up-1", sSha);
+            CHECK(pRepeat != NULL, "build a duplicate file/end");
+            XJSON_AddU32(pRepeat, "sessionId", 11);
+            CHECK(deliver(&fix, pRepeat) == XAPI_CONTINUE, "deliver the duplicate file/end");
+
+            CHECK(XPath_Exists(sUpload),
+                "a duplicate file/end leaves the committed upload alone");
+
+            char sBody[64] = {0};
+            FILE *pFile = fopen(sUpload, "rb");
+            CHECK(pFile != NULL, "reopen the committed upload");
+            size_t nRead = fread(sBody, 1, sizeof(sBody) - 1, pFile);
+            fclose(pFile);
+            CHECK(nRead == nBody && strcmp(sBody, pBody) == 0,
+                "the committed upload still holds its bytes");
+            drain(&fix);
+        }
     }
 
     /* A bad hash must be refused and the partial file must not survive. */

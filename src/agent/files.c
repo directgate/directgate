@@ -28,6 +28,132 @@
 #define DIRECTGATE_UPLOAD_TEMP_RANDOM_SIZE 16
 #define DIRECTGATE_UPLOAD_TEMP_ATTEMPTS    16
 
+/* How much of the target name the temp file keeps. The temp name also carries
+   a fixed 19-char prefix, 32 hex characters of random material, a separator
+   and a ".part" suffix, and the whole thing has to fit in one filesystem
+   component (255 bytes on every filesystem we run on). Without the cap a long
+   upload name pushed the temp name past that limit and the upload failed at
+   file/start with a bare ENAMETOOLONG. */
+#define DIRECTGATE_UPLOAD_TEMP_NAME_MAX    64
+
+#ifndef _WIN32
+/* getpwuid_r/getgrgid_r are a name-service call each, and a listing makes two
+   per entry - on a plain /etc/passwd host that is an open-and-scan per lookup,
+   and on a host wired to LDAP or SSSD it can be a network round trip. A
+   directory is almost always owned by one or two accounts, so a tiny memo
+   collapses thousands of lookups into a handful.
+
+   Thread-local because DirectGate_Files_CreateEntryJson runs on both the main
+   loop and the async search worker. The whole memo is dropped once it ages
+   out, so a renamed account is picked up on the next listing rather than at
+   the next restart. */
+#define DIRECTGATE_FILES_ID_CACHE_SIZE   8
+#define DIRECTGATE_FILES_ID_CACHE_TTL_MS 60000ULL
+#define DIRECTGATE_FILES_ID_NAME_SIZE    64
+
+#if defined(__GNUC__) || defined(__clang__)
+#define DIRECTGATE_FILES_TLS __thread
+#else
+#define DIRECTGATE_FILES_TLS _Thread_local
+#endif
+
+typedef struct directgate_files_id_cache_ {
+    struct {
+        char sName[DIRECTGATE_FILES_ID_NAME_SIZE];
+        uint32_t nId;
+        xbool_t bUsed;
+    } entries[DIRECTGATE_FILES_ID_CACHE_SIZE];
+
+    unsigned int nNextSlot;
+    uint64_t nStampMs;
+    xbool_t bStamped;
+} directgate_files_id_cache_t;
+
+static void DirectGate_Files_ExpireIdCache(directgate_files_id_cache_t *pCache)
+{
+    uint64_t nNowMs = XTime_GetMs();
+
+    if (pCache->bStamped &&
+        nNowMs - pCache->nStampMs < DIRECTGATE_FILES_ID_CACHE_TTL_MS) return;
+
+    memset(pCache->entries, 0, sizeof(pCache->entries));
+    pCache->nNextSlot = 0;
+    pCache->nStampMs = nNowMs;
+    pCache->bStamped = XTRUE;
+}
+
+static const char* DirectGate_Files_FindCachedId(const directgate_files_id_cache_t *pCache, uint32_t nId)
+{
+    unsigned int i;
+
+    for (i = 0; i < DIRECTGATE_FILES_ID_CACHE_SIZE; i++)
+    {
+        if (pCache->entries[i].bUsed && pCache->entries[i].nId == nId)
+            return pCache->entries[i].sName;
+    }
+
+    return NULL;
+}
+
+static void DirectGate_Files_StoreCachedId(directgate_files_id_cache_t *pCache, uint32_t nId, const char *pName)
+{
+    /* A name that does not fit is not cached at all, so a hit can never answer
+       with a shorter string than the miss that filled it. */
+    if (strlen(pName) >= sizeof(pCache->entries[0].sName)) return;
+
+    /* Round-robin eviction: the working set of a listing is one or two ids,
+       so anything smarter would only cost more than it saves. */
+    unsigned int nSlot = pCache->nNextSlot % DIRECTGATE_FILES_ID_CACHE_SIZE;
+
+    xstrncpy(pCache->entries[nSlot].sName, sizeof(pCache->entries[nSlot].sName), pName);
+    pCache->entries[nSlot].nId = nId;
+    pCache->entries[nSlot].bUsed = XTRUE;
+    pCache->nNextSlot = nSlot + 1;
+}
+
+static const char* DirectGate_Files_UserName(uid_t nUid, char *pOutput, size_t nSize)
+{
+    static DIRECTGATE_FILES_TLS directgate_files_id_cache_t cache;
+    DirectGate_Files_ExpireIdCache(&cache);
+
+    const char *pCached = DirectGate_Files_FindCachedId(&cache, (uint32_t)nUid);
+    if (pCached != NULL) return pCached;
+
+    struct passwd pwd, *pw = NULL;
+    char sBuf[XSTR_MID];
+
+    if (getpwuid_r(nUid, &pwd, sBuf, sizeof(sBuf), &pw) != 0) pw = NULL;
+    const char *pName = (pw != NULL && xstrused(pw->pw_name)) ? pw->pw_name : "unknown";
+
+    /* Copied out before caching: pw points into sBuf, which dies with this
+       frame, and the caller's buffer keeps a name too long for the memo. */
+    xstrncpy(pOutput, nSize, pName);
+    DirectGate_Files_StoreCachedId(&cache, (uint32_t)nUid, pName);
+
+    return pOutput;
+}
+
+static const char* DirectGate_Files_GroupName(gid_t nGid, char *pOutput, size_t nSize)
+{
+    static DIRECTGATE_FILES_TLS directgate_files_id_cache_t cache;
+    DirectGate_Files_ExpireIdCache(&cache);
+
+    const char *pCached = DirectGate_Files_FindCachedId(&cache, (uint32_t)nGid);
+    if (pCached != NULL) return pCached;
+
+    struct group grp, *gr = NULL;
+    char sBuf[XSTR_MID];
+
+    if (getgrgid_r(nGid, &grp, sBuf, sizeof(sBuf), &gr) != 0) gr = NULL;
+    const char *pName = (gr != NULL && xstrused(gr->gr_name)) ? gr->gr_name : "unknown";
+
+    xstrncpy(pOutput, nSize, pName);
+    DirectGate_Files_StoreCachedId(&cache, (uint32_t)nGid, pName);
+
+    return pOutput;
+}
+#endif /* !_WIN32 */
+
 static const char* DirectGate_Files_LastError(void)
 {
     if (errno == 0) return "operation failed";
@@ -199,17 +325,12 @@ xjson_obj_t* DirectGate_Files_CreateEntryJson(const char *pName, const char *pDi
 #else
     /* Reentrant lookups: this runs on both the main thread and the async
        search worker thread, so the static buffers behind getpwuid/getgrgid/
-       localtime would race. Use the _r variants. */
-    struct passwd pwd, *pw = NULL;
-    struct group grp, *gr = NULL;
-    char sPwBuf[XSTR_MID];
-    char sGrBuf[XSTR_MID];
+       localtime would race. Use the _r variants, memoised per thread. */
+    char sOwner[XSTR_MID];
+    char sGroup[XSTR_MID];
 
-    if (getpwuid_r(pStat->st_uid, &pwd, sPwBuf, sizeof(sPwBuf), &pw) != 0) pw = NULL;
-    if (getgrgid_r(pStat->st_gid, &grp, sGrBuf, sizeof(sGrBuf), &gr) != 0) gr = NULL;
-
-    XJSON_AddString(pEntry, "owner", (pw != NULL) ? pw->pw_name : "unknown");
-    XJSON_AddString(pEntry, "group", (gr != NULL) ? gr->gr_name : "unknown");
+    XJSON_AddString(pEntry, "owner", DirectGate_Files_UserName(pStat->st_uid, sOwner, sizeof(sOwner)));
+    XJSON_AddString(pEntry, "group", DirectGate_Files_GroupName(pStat->st_gid, sGroup, sizeof(sGroup)));
 #endif
     XJSON_AddU64(pEntry, "sizeBytes", (uint64_t)pStat->st_size);
 
@@ -449,7 +570,11 @@ xjson_obj_t* DirectGate_Files_ListDir(const char *pPath)
     while (XDir_Read(&dir, sName, sizeof(sName)) > 0)
     {
         xstat_t st;
-        snprintf(sFullPath, sizeof(sFullPath), "%s/%s", pPath, sName);
+
+        /* A truncated join names a different, shorter path - one that can exist and
+           would then be reported with another file's stat. Skip the entry instead. */
+        int nPathLen = snprintf(sFullPath, sizeof(sFullPath), "%s/%s", pPath, sName);
+        if (nPathLen <= 0 || (size_t)nPathLen >= sizeof(sFullPath)) continue;
         if (xstat(sFullPath, &st) < 0) continue;
 
         xjson_obj_t *pEntry = DirectGate_Files_CreateEntryJson(sName, pPath, &st);
@@ -533,7 +658,106 @@ XSTATUS DirectGate_Files_CreateDir(const char *pPath)
     return XSTDOK;
 }
 
-static XSTATUS DirectGate_Files_CopyPath(const char *pPath, const char *pTargetPath)
+/* Applies the source mode to a path this copy just created. Best effort: a
+   copy whose bytes are in place is not failed over a mode that would not set. */
+static void DirectGate_Files_ApplyMode(const char *pPath, xmode_t nMode)
+{
+    char sPerm[XPERM_LEN + 1];
+    int nSavedErrno = errno;
+
+    if (XPath_ModeToPerm(sPerm, sizeof(sPerm), nMode) == XPERM_LEN &&
+        XPath_SetPerm(pPath, sPerm) != XSTDOK)
+    {
+        xlogw("Failed to apply source permissions to copy: path(%s), perm(%s), errno(%d)",
+            pPath, sPerm, errno);
+    }
+
+    errno = nSavedErrno;
+}
+
+/* Whether a directory entry has anything a copy can reproduce. Real
+   directories are walked; everything else has to resolve to a regular file,
+   which is what a symlink copied by content needs to point at. Sockets,
+   FIFOs, device nodes, dangling links and links aimed at a directory do not
+   qualify - and failing a whole tree over one of them would make a home
+   directory impossible to copy. */
+static xbool_t DirectGate_Files_IsCopyableEntry(const char *pPath, const xstat_t *pLinkStat)
+{
+    if (S_ISDIR(pLinkStat->st_mode) || S_ISREG(pLinkStat->st_mode)) return XTRUE;
+
+#ifdef S_ISLNK
+    if (!S_ISLNK(pLinkStat->st_mode)) return XFALSE;
+
+    /* The only case that needs a second look, and stat() rather than xstat()
+       because this one has to follow the link. */
+    xstat_t targetSt;
+    if (stat(pPath, &targetSt) != 0) return XFALSE;
+
+    return S_ISREG(targetSt.st_mode) ? XTRUE : XFALSE;
+#else
+    /* The Windows CRT reports nothing as a link, so there is nothing to
+       follow and the path is not needed. */
+    (void)pPath;
+    return XFALSE;
+#endif
+}
+
+/* Copies one regular file. The library does the reading, the writing and the
+   permissions; what is added here is an exclusive create, so the destination
+   this session already checked was absent cannot be swapped for a symlink or
+   another file between that check and the write. */
+static XSTATUS DirectGate_Files_CopyRegularFile(const char *pPath, const char *pTargetPath)
+{
+    /* Non-blocking: a FIFO would otherwise park the whole agent loop inside
+       open() until someone writes to it. The type is then checked through the
+       descriptor, so the check and the reads apply to the same object. */
+    xfile_t srcFile;
+    if (XFile_Open(&srcFile, pPath, "rni", NULL) < 0) return XSTDERR;
+
+    if (XFile_GetStats(&srcFile) < 0 || !S_ISREG(srcFile.nMode))
+    {
+        int nSavedErrno = S_ISREG(srcFile.nMode) ? errno : EINVAL;
+        XFile_Close(&srcFile);
+        errno = nSavedErrno;
+        return XSTDERR;
+    }
+
+    /* Created 0600 and exclusive: the bytes land before anyone but this
+       account can read them, and the source mode is applied once they have. */
+    xfile_t dstFile;
+    if (XFile_OpenM(&dstFile, pTargetPath, "cwtei", 0600) < 0)
+    {
+        int nSavedErrno = errno;
+        XFile_Close(&srcFile);
+        errno = nSavedErrno;
+        return XSTDERR;
+    }
+
+    int nCopied = XFile_Copy(&srcFile, &dstFile);
+    int nSavedErrno = errno;
+
+    XFile_Close(&dstFile);
+    XFile_Close(&srcFile);
+
+    if (nCopied < 0)
+    {
+        xunlink(pTargetPath);
+        errno = nSavedErrno;
+        return XSTDERR;
+    }
+
+    /* The mode of the object behind the descriptor, so a symlinked source
+       copies the permissions of the file it points at rather than the 0777
+       the link itself reports. */
+    DirectGate_Files_ApplyMode(pTargetPath, srcFile.nMode);
+    return XSTDOK;
+}
+
+/* Takes the source stat the caller already has: the recursive walk below has
+   to classify every entry anyway, and re-reading it here would put a second
+   lstat on the path of every file in the tree. */
+static XSTATUS DirectGate_Files_CopyEntry(const char *pPath, const char *pTargetPath,
+                                          const xstat_t *pSrcStat)
 {
     XCHECK(xstrused(pPath), xthrowr(XSTDERR, "Source path is empty"));
     XCHECK(xstrused(pTargetPath), xthrowr(XSTDERR, "Target path is empty"));
@@ -544,9 +768,7 @@ static XSTATUS DirectGate_Files_CopyPath(const char *pPath, const char *pTargetP
         return XSTDERR;
     }
 
-    xstat_t st;
-    if (xstat(pPath, &st) < 0) return XSTDERR;
-
+    const xstat_t st = *pSrcStat;
     xstat_t dstSt;
     if (xstat(pTargetPath, &dstSt) == XSTDOK)
     {
@@ -562,11 +784,22 @@ static XSTATUS DirectGate_Files_CopyPath(const char *pPath, const char *pTargetP
             return XSTDERR;
         }
 
-        if (XDir_Create(pTargetPath, st.st_mode & 0777) <= 0)
+        /* Created writable and traversable for us first: a source directory
+           without the owner write bit (say r-xr-xr-x) would otherwise refuse
+           the children about to be copied into it. mkdir is also subject to
+           the umask, so the source mode is applied by hand once the directory
+           is populated. */
+        if (XDir_Create(pTargetPath, (st.st_mode & 0777) | 0700) <= 0)
             return XSTDERR;
 
         xdir_t dir;
-        if (XDir_Open(&dir, pPath) < 0) return XSTDERR;
+        if (XDir_Open(&dir, pPath) < 0)
+        {
+            int nSavedErrno = errno;
+            XPath_Remove(pTargetPath);
+            errno = nSavedErrno;
+            return XSTDERR;
+        }
 
         char sName[XNAME_MAX];
         char sSrcChild[XFILE_PATH_SIZE];
@@ -574,22 +807,55 @@ static XSTATUS DirectGate_Files_CopyPath(const char *pPath, const char *pTargetP
 
         while (XDir_Read(&dir, sName, sizeof(sName)) > 0)
         {
-            snprintf(sSrcChild, sizeof(sSrcChild), "%s/%s", pPath, sName);
-            snprintf(sDstChild, sizeof(sDstChild), "%s/%s", pTargetPath, sName);
+            int nSrcLen = snprintf(sSrcChild, sizeof(sSrcChild), "%s/%s", pPath, sName);
+            int nDstLen = snprintf(sDstChild, sizeof(sDstChild), "%s/%s", pTargetPath, sName);
+            int nTruncated = (nSrcLen <= 0 || (size_t)nSrcLen >= sizeof(sSrcChild) ||
+                              nDstLen <= 0 || (size_t)nDstLen >= sizeof(sDstChild));
 
-            if (DirectGate_Files_CopyPath(sSrcChild, sDstChild) < 0)
+            /* A truncated child path names something else entirely, so it is
+               a failure rather than an entry to skip over. */
+            if (nTruncated) errno = ENAMETOOLONG;
+
+            /* One lstat per entry, shared by the classification and the copy
+               that follows it. */
+            xstat_t childSt;
+            if (!nTruncated && (xstat(sSrcChild, &childSt) != XSTDOK ||
+                !DirectGate_Files_IsCopyableEntry(sSrcChild, &childSt)))
             {
+                xlogw("Skipping entry with no copyable content: path(%s)", sSrcChild);
+                continue;
+            }
+
+            if (nTruncated || DirectGate_Files_CopyEntry(sSrcChild, sDstChild, &childSt) < 0)
+            {
+                int nSavedErrno = errno;
                 XDir_Close(&dir);
-                XDir_Remove(pTargetPath);
+
+                /* Recursive: the target was created by this copy and nothing
+                   else has written to it, and the plain rmdir left every
+                   half-copied tree behind. */
+                XPath_Remove(pTargetPath);
+                errno = nSavedErrno;
                 return XSTDERR;
             }
         }
 
         XDir_Close(&dir);
+        DirectGate_Files_ApplyMode(pTargetPath, st.st_mode);
         return XSTDOK;
     }
 
-    return XPath_CopyFile(pPath, pTargetPath) >= 0 ? XSTDOK : XSTDERR;
+    return DirectGate_Files_CopyRegularFile(pPath, pTargetPath);
+}
+
+static XSTATUS DirectGate_Files_CopyPath(const char *pPath, const char *pTargetPath)
+{
+    XCHECK(xstrused(pPath), xthrowr(XSTDERR, "Source path is empty"));
+
+    xstat_t st;
+    if (xstat(pPath, &st) < 0) return XSTDERR;
+
+    return DirectGate_Files_CopyEntry(pPath, pTargetPath, &st);
 }
 
 XSTATUS DirectGate_Files_Rename(const char *pPath, const char *pTargetPath)
@@ -673,7 +939,12 @@ static int DirectGate_Files_BuildTempPath(char *pOutput, size_t nSize, const cha
     xstrncpy(sDir, sizeof(sDir), pPath);
 
     char *pSlash = strrchr(sDir, '/');
-    const char *pName = pSlash ? pSlash + 1 : pPath;
+
+    /* Taken before sDir is cut down to the parent directory: the name lives
+       inside that same buffer, and truncating a target directly under "/"
+       used to leave it empty. */
+    char sName[DIRECTGATE_UPLOAD_TEMP_NAME_MAX + 1];
+    xstrncpy(sName, sizeof(sName), pSlash ? pSlash + 1 : pPath);
 
     if (pSlash == NULL) xstrncpy(sDir, sizeof(sDir), ".");
     else if (pSlash == sDir) pSlash[1] = '\0';
@@ -691,7 +962,7 @@ static int DirectGate_Files_BuildTempPath(char *pOutput, size_t nSize, const cha
             snprintf(&sRandomHex[j * 2], sizeof(sRandomHex) - (j * 2), "%02x", sRandom[j]);
 
         int nWritten = snprintf(pOutput, nSize, "%s/.directgate-upload-%s-%s.part",
-            sDir, sRandomHex, pName);
+            sDir, sRandomHex, sName);
 
         if (nWritten <= 0 || (size_t)nWritten >= nSize)
             return XSTDERR;
@@ -705,8 +976,7 @@ static int DirectGate_Files_BuildTempPath(char *pOutput, size_t nSize, const cha
 }
 
 /* File transfer send callback: header comes from transfer.c, we handle cc/build/encrypt/route */
-int DirectGate_Files_TransferSendCb(xjson_obj_t *pHeader, const uint8_t *pPayload,
-                                size_t nLen, void *pCtx)
+int DirectGate_Files_TransferSendCb(xjson_obj_t *pHeader, const uint8_t *pPayload, size_t nLen, void *pCtx)
 {
     directgate_session_t *pSession = (directgate_session_t*)pCtx;
     XCHECK((pSession != NULL), xthrowr(XSTDERR, "Invalid session data"));
@@ -1072,15 +1342,26 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
     }
     else if (xstrcmp(pFilePkg->pAction, "end"))
     {
+        /* Captured before the call, because the cleanup below is only ever
+           right for a transfer that was still running. A duplicate or replayed
+           file/end finds the transfer already finished, and sPath then names
+           the committed destination - removing it would delete the file the
+           first end had just saved. */
+        xbool_t bReceiving = (pFT->eState == XTRANSFER_STATE_RECEIVING);
+
         if (DirectGate_Transfer_HandleEnd(pFT, pPkg, NULL, NULL) < 0)
         {
             int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
-            xloge("Failed to finalize inbound file transfer: sid(%u), wsfd(%d), transferId(%s)",
-                pSession->nSessionId, nWsFd, pFilePkg->transfer.pTransferId);
+            xloge("Failed to finalize inbound file transfer: sid(%u), wsfd(%d), transferId(%s), receiving(%s)",
+                pSession->nSessionId, nWsFd, pFilePkg->transfer.pTransferId, bReceiving ? "true" : "false");
 
             DirectGate_Files_SendTransferCancel(pSession, pFilePkg->transfer.pTransferId, DirectGate_Files_LastError());
-            if (xstrused(pFT->sPath)) remove(pFT->sPath);
-            DirectGate_Files_ClearPendingSave(pSession);
+
+            if (bReceiving)
+            {
+                if (xstrused(pFT->sPath)) remove(pFT->sPath);
+                DirectGate_Files_ClearPendingSave(pSession);
+            }
         }
         else if (xstrused(pSession->sSaveTempPath) && xstrused(pSession->sSavePath))
         {

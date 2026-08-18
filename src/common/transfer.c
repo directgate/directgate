@@ -529,8 +529,32 @@ XSTATUS DirectGate_Transfer_HandleStart(directgate_transfer_t *pFT, const direct
     XCHECK((xstrused(pTransfer->pFileName)), XSTDERR);
     const char *pDir = xstrused(pDestDir) ? pDestDir : ".";
 
+    /* The name is peer-supplied and gets joined to a directory this side
+       chose, so it must not be able to steer the write out of that directory:
+       keep the last component only, and refuse the two that still walk.
+       Callers that already know the full destination use HandleStartPath. */
+    const char *pName = pTransfer->pFileName;
+    const char *pSlash = strrchr(pName, '/');
+    if (pSlash != NULL) pName = pSlash + 1;
+
+#ifdef _WIN32
+    /* Backslash is a separator here, and "C:name" is drive-relative. */
+    const char *pBackSlash = strrchr(pName, '\\');
+    if (pBackSlash != NULL) pName = pBackSlash + 1;
+    if (strchr(pName, ':') != NULL) pName = "";
+#endif
+
+    if (!xstrused(pName) || !strcmp(pName, ".") || !strcmp(pName, ".."))
+    {
+        xloge("Inbound transfer start has an unusable file name: id(%s), name(%s)",
+            xstrused(pTransfer->pTransferId) ? pTransfer->pTransferId : "N/A",
+            pTransfer->pFileName);
+
+        return XSTDERR;
+    }
+
     char sPath[XFILE_PATH_SIZE];
-    snprintf(sPath, sizeof(sPath), "%s/%s", pDir, pTransfer->pFileName);
+    snprintf(sPath, sizeof(sPath), "%s/%s", pDir, pName);
 
     return DirectGate_Transfer_HandleStartPath(pFT, pPkg, sPath);
 }
@@ -563,6 +587,19 @@ XSTATUS DirectGate_Transfer_HandleChunk(directgate_transfer_t *pFT, const direct
     {
         xloge("Inbound transfer chunk index mismatch: id(%s), expected(%u), got(%u)",
             DirectGate_Transfer_GetId(pFT), pFT->nCurrentChunk, pFilePkg->transfer.nChunkIndex);
+
+        pFT->eState = XTRANSFER_STATE_ERROR;
+        return XSTDERR;
+    }
+
+    /* Receiving without an open destination is not reachable today - the state
+       is only set once the file is open - but a chunk is peer-driven and the
+       write below would dereference the NULL rather than fail. */
+    if (pFT->pFile == NULL)
+    {
+        xloge("Inbound transfer chunk has no open destination: id(%s), path(%s), chunk(%u/%u)",
+            DirectGate_Transfer_GetId(pFT), DirectGate_Transfer_GetPath(pFT),
+            pFT->nCurrentChunk, pFT->nTotalChunks);
 
         pFT->eState = XTRANSFER_STATE_ERROR;
         return XSTDERR;
@@ -606,8 +643,23 @@ XSTATUS DirectGate_Transfer_HandleEnd(directgate_transfer_t *pFT, const directga
         return XSTDERR;
     }
 
-    fclose(pFT->pFile);
-    pFT->pFile = NULL;
+    if (pFT->pFile != NULL)
+    {
+        /* Buffered bytes reach the file here, so a full disk surfaces as a
+           close error rather than as a silently short file that then fails
+           its hash check with a misleading reason. */
+        int nClosed = fclose(pFT->pFile);
+        pFT->pFile = NULL;
+
+        if (nClosed != 0)
+        {
+            xloge("Failed to close inbound transfer destination: id(%s), path(%s), errno(%d)",
+                DirectGate_Transfer_GetId(pFT), DirectGate_Transfer_GetPath(pFT), errno);
+
+            pFT->eState = XTRANSFER_STATE_ERROR;
+            return XSTDERR;
+        }
+    }
 
     /* Verify SHA-256 */
     char sRecvHex[XSHA256_HEX_LENGTH];

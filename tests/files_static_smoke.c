@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "src/agent/files.c"
@@ -201,6 +202,137 @@ int main(void)
         "copy directory into itself should fail");
     CHECK(errno == EINVAL, "copy directory into itself should report EINVAL");
 
+    /* An empty file is a valid thing to copy. The library used to treat "no
+       bytes" as a failed stat and refuse it, leaving an empty destination
+       behind and reporting an error. */
+    {
+        char sEmptySrc[512], sEmptyDst[512];
+        snprintf(sEmptySrc, sizeof(sEmptySrc), "%s/empty.txt", sRoot);
+        snprintf(sEmptyDst, sizeof(sEmptyDst), "%s/empty-copy.txt", sRoot);
+
+        FILE *pEmpty = fopen(sEmptySrc, "wb");
+        CHECK(pEmpty != NULL, "create an empty source");
+        fclose(pEmpty);
+
+        CHECK(DirectGate_Files_CopyPath(sEmptySrc, sEmptyDst) == XSTDOK,
+            "copy an empty file");
+        CHECK(XPath_Exists(sEmptyDst), "the empty copy exists");
+        CHECK(XPath_GetSize(sEmptyDst) == 0, "the empty copy is empty");
+    }
+
+    /* A write that cannot complete has to fail the copy. /dev/full accepts an
+       open and refuses every write, which is the full-disk case the library
+       used to report as success after counting the bytes it had managed. */
+    {
+        const char *pFull = "/dev/full";
+
+        if (XPath_Exists(pFull))
+        {
+            xfile_t srcFile, dstFile;
+            CHECK(XFile_Open(&srcFile, sFile, "r", NULL) >= 0, "open the copy source");
+            CHECK(XFile_Open(&dstFile, pFull, "cw", NULL) >= 0, "open /dev/full");
+
+            CHECK(XFile_Copy(&srcFile, &dstFile) == XSTDERR,
+                "a copy onto a full device fails instead of reporting bytes");
+
+            XFile_Close(&dstFile);
+            XFile_Close(&srcFile);
+        }
+    }
+
+#ifndef _WIN32
+    /* POSIX-only: Windows has no executable bit to lose and no FIFOs to walk
+       into, and its chmod only moves the read-only flag. */
+
+    /* Copies carry the source mode. A same-device copy used to land on the
+       library's default 0644, so an executable stopped being executable and a
+       private file became world-readable. */
+    {
+        char sModeSrc[512], sModeDst[512], sModeDirSrc[512], sModeDirDst[512], sModeDirChild[512];
+        snprintf(sModeSrc, sizeof(sModeSrc), "%s/script.sh", sRoot);
+        snprintf(sModeDst, sizeof(sModeDst), "%s/script-copy.sh", sRoot);
+        snprintf(sModeDirSrc, sizeof(sModeDirSrc), "%s/locked", sRoot);
+        snprintf(sModeDirDst, sizeof(sModeDirDst), "%s/locked-copy", sRoot);
+        snprintf(sModeDirChild, sizeof(sModeDirChild), "%s/locked/inside.txt", sRoot);
+
+        CHECK(write_file(sModeSrc, "#!/bin/sh\n"), "write executable source");
+        CHECK(chmod(sModeSrc, 0700) == 0, "make the source executable");
+        CHECK(DirectGate_Files_CopyPath(sModeSrc, sModeDst) == XSTDOK,
+            "copy an executable file");
+
+        xstat_t modeSt;
+        CHECK(xstat(sModeDst, &modeSt) == XSTDOK, "stat the copied executable");
+        CHECK((modeSt.st_mode & 0777) == 0700, "the copy keeps the source mode");
+        CHECK(read_file(sModeDst, sRead, sizeof(sRead)), "read the copied executable");
+        CHECK(strcmp(sRead, "#!/bin/sh\n") == 0, "the copied executable keeps its bytes");
+
+        /* A read-only source directory still has to accept the children the
+           copy puts inside it before its own mode is applied. */
+        CHECK(XDir_Create(sModeDirSrc, 0755) > 0, "create the read-only source dir");
+        CHECK(write_file(sModeDirChild, "inside"), "write a child into it");
+        CHECK(chmod(sModeDirSrc, 0555) == 0, "drop the write bit on the source dir");
+
+        CHECK(DirectGate_Files_CopyPath(sModeDirSrc, sModeDirDst) == XSTDOK,
+            "copy a directory that is not writable");
+        CHECK(xstat(sModeDirDst, &modeSt) == XSTDOK, "stat the copied directory");
+        CHECK((modeSt.st_mode & 0777) == 0555, "the copied directory keeps its mode");
+
+        char sCopiedChild[600];
+        snprintf(sCopiedChild, sizeof(sCopiedChild), "%s/inside.txt", sModeDirDst);
+        CHECK(read_file(sCopiedChild, sRead, sizeof(sRead)), "read the copied child");
+        CHECK(strcmp(sRead, "inside") == 0, "the copied child keeps its bytes");
+
+        CHECK(chmod(sModeDirSrc, 0755) == 0, "restore the source dir mode");
+        CHECK(chmod(sModeDirDst, 0755) == 0, "restore the copied dir mode");
+    }
+
+    /* A FIFO has no content to copy; it must not stall the loop inside open()
+       and must not fail the tree it happens to sit in. */
+    {
+        char sFifoDir[512], sFifoDst[512], sFifoChild[512], sFifoRegular[512], sFifoCopiedRegular[600];
+        snprintf(sFifoDir, sizeof(sFifoDir), "%s/with-fifo", sRoot);
+        snprintf(sFifoDst, sizeof(sFifoDst), "%s/with-fifo-copy", sRoot);
+        snprintf(sFifoChild, sizeof(sFifoChild), "%s/with-fifo/pipe", sRoot);
+        snprintf(sFifoRegular, sizeof(sFifoRegular), "%s/with-fifo/plain.txt", sRoot);
+
+        CHECK(XDir_Create(sFifoDir, 0755) > 0, "create the fifo directory");
+        CHECK(write_file(sFifoRegular, "plain"), "write a regular sibling");
+        CHECK(mkfifo(sFifoChild, 0600) == 0, "create a fifo");
+
+        CHECK(DirectGate_Files_CopyPath(sFifoDir, sFifoDst) == XSTDOK,
+            "a fifo does not fail the directory around it");
+
+        snprintf(sFifoCopiedRegular, sizeof(sFifoCopiedRegular), "%s/plain.txt", sFifoDst);
+        CHECK(read_file(sFifoCopiedRegular, sRead, sizeof(sRead)), "read the copied sibling");
+        CHECK(strcmp(sRead, "plain") == 0, "the regular sibling was copied");
+
+        char sFifoCopied[600];
+        snprintf(sFifoCopied, sizeof(sFifoCopied), "%s/pipe", sFifoDst);
+        CHECK(!XPath_Exists(sFifoCopied), "the fifo itself is skipped");
+
+        /* A symlink aimed at a directory is copied by content like any other
+           link, and a directory has none - skipped, not walked into and not
+           turned into an empty file. */
+        char sLinkDir[600], sLinkCopied[700];
+        snprintf(sLinkDir, sizeof(sLinkDir), "%s/dirlink", sFifoDir);
+        CHECK(symlink(sFifoDir, sLinkDir) == 0, "create a link to a directory");
+        CHECK(DirectGate_Files_Delete(sFifoDst, XTRUE) == XSTDOK, "drop the earlier copy");
+        CHECK(DirectGate_Files_CopyPath(sFifoDir, sFifoDst) == XSTDOK,
+            "a link to a directory does not fail the copy");
+        snprintf(sLinkCopied, sizeof(sLinkCopied), "%s/dirlink", sFifoDst);
+        CHECK(!XPath_Exists(sLinkCopied), "the link to a directory is skipped");
+        CHECK(read_file(sFifoCopiedRegular, sRead, sizeof(sRead)),
+            "the regular sibling is still copied");
+
+        errno = 0;
+        char sFifoDirect[600];
+        snprintf(sFifoDirect, sizeof(sFifoDirect), "%s/pipe-copy", sRoot);
+        CHECK(DirectGate_Files_CopyPath(sFifoChild, sFifoDirect) == XSTDERR,
+            "copying a fifo directly is refused");
+        CHECK(!XPath_Exists(sFifoDirect), "a refused fifo copy leaves nothing behind");
+    }
+#endif /* !_WIN32 */
+
     CHECK(DirectGate_Files_BuildTempPath(sTempPath, sizeof(sTempPath), sFile) == XSTDOK,
         "build upload temp path");
     CHECK(strstr(sTempPath, "/.directgate-upload-") != NULL,
@@ -213,6 +345,35 @@ int main(void)
         "build second upload temp path");
     CHECK(strcmp(sTempPath, sTempPath2) != 0,
         "upload temp path should include random material");
+
+    /* A long target name has to stay inside one filesystem component once the
+       prefix, the random material and the suffix are added, or the upload
+       fails at file/start with ENAMETOOLONG. */
+    {
+        char sLongName[300];
+        char sLongTarget[1024];
+        char sLongTemp[1024];
+
+        memset(sLongName, 'a', sizeof(sLongName) - 1);
+        sLongName[sizeof(sLongName) - 1] = '\0';
+        snprintf(sLongTarget, sizeof(sLongTarget), "%s/%s.txt", sRoot, sLongName);
+
+        CHECK(DirectGate_Files_BuildTempPath(sLongTemp, sizeof(sLongTemp), sLongTarget) == XSTDOK,
+            "build a temp path for a long target name");
+
+        const char *pTempName = strrchr(sLongTemp, '/');
+        CHECK(pTempName != NULL, "the temp path has a parent directory");
+        CHECK(strlen(pTempName + 1) <= 255,
+            "the temp name fits one filesystem component");
+
+        /* The name is only bounded, not dropped, and the file still opens. */
+        CHECK(strstr(sLongTemp, "/.directgate-upload-") != NULL,
+            "the bounded temp name keeps the upload prefix");
+        FILE *pProbe = fopen(sLongTemp, "wb");
+        CHECK(pProbe != NULL, "the bounded temp path is creatable");
+        fclose(pProbe);
+        CHECK(remove(sLongTemp) == 0, "clean up the probe file");
+    }
 
     CHECK(write_file(sCommitTemp, "new-data"), "write no-replace commit source");
     CHECK(write_file(sCommitTarget, "old-data"), "write no-replace commit target");
