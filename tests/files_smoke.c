@@ -170,6 +170,51 @@ int main(void)
         "entry size");
     XJSON_FreeObject(pEntry);
 
+    /* A symlink stays a symlink, but the entry says what it resolves to so the
+       client can enter a linked directory and download a linked file. */
+    {
+        xstat_t linkSt;
+        CHECK(xstat(sDirLink, &linkSt) == XSTDOK, "lstat the directory link");
+
+        xjson_obj_t *pLink = DirectGate_Files_CreateEntryJson("dir-link", sRoot, &linkSt);
+        CHECK(pLink != NULL, "create link entry JSON");
+        CHECK(strcmp(XJSON_GetString(XJSON_GetObject(pLink, "type")), "symlink") == 0,
+            "link entry keeps the symlink type");
+        CHECK(strcmp(XJSON_GetString(XJSON_GetObject(pLink, "targetType")), "directory") == 0,
+            "link entry reports the target type");
+        CHECK(strcmp(XJSON_GetString(XJSON_GetObject(pLink, "target")), sExternal) == 0,
+            "link entry reports the target path");
+        XJSON_FreeObject(pLink);
+
+        char sFileLink[512];
+        snprintf(sFileLink, sizeof(sFileLink), "%s/file-link", sRoot);
+        CHECK(symlink(sExternalFile, sFileLink) == 0, "symlink external file");
+        CHECK(xstat(sFileLink, &linkSt) == XSTDOK, "lstat the file link");
+
+        pLink = DirectGate_Files_CreateEntryJson("file-link", sRoot, &linkSt);
+        CHECK(pLink != NULL, "create file link entry JSON");
+        CHECK(strcmp(XJSON_GetString(XJSON_GetObject(pLink, "targetType")), "file") == 0,
+            "file link reports a file target");
+        CHECK(XJSON_GetU64(XJSON_GetObject(pLink, "targetSizeBytes")) == strlen("external"),
+            "file link reports the target size, not the length of the link");
+        XJSON_FreeObject(pLink);
+
+        /* A dangling link carries no target type at all rather than a wrong one. */
+        char sDangling[512];
+        snprintf(sDangling, sizeof(sDangling), "%s/dangling", sRoot);
+        CHECK(symlink("/nonexistent-directgate-target", sDangling) == 0, "dangling symlink");
+        CHECK(xstat(sDangling, &linkSt) == XSTDOK, "lstat the dangling link");
+
+        pLink = DirectGate_Files_CreateEntryJson("dangling", sRoot, &linkSt);
+        CHECK(pLink != NULL, "create dangling entry JSON");
+        CHECK(XJSON_GetObject(pLink, "targetType") == NULL,
+            "a dangling link reports no target type");
+        XJSON_FreeObject(pLink);
+
+        CHECK(unlink(sFileLink) == 0, "cleanup file link");
+        CHECK(unlink(sDangling) == 0, "cleanup dangling link");
+    }
+
     xjson_obj_t *pList = DirectGate_Files_ListDir(sRoot);
     CHECK(pList != NULL, "list directory");
     CHECK(strcmp(XJSON_GetString(XJSON_GetObject(pList, "path")), sRoot) == 0,

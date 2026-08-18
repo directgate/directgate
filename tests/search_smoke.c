@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "src/agent/files.h"
@@ -146,6 +147,14 @@ int main(void)
     CHECK(write_file(sBeta, "no match here\n"), "write beta");
     CHECK(write_file(sGamma, "another needle\n"), "write gamma");
 
+    /* A link inside the tree pointing back at its own root. A recursive search
+       that followed it would report every file again under a path leading
+       through it, and would keep doing so until the path stopped growing -
+       then never stop. */
+    char sLoop[512];
+    snprintf(sLoop, sizeof(sLoop), "%s/loop", sNested);
+    CHECK(symlink(sRoot, sLoop) == 0, "link back to the search root");
+
     directgate_session_t session;
     memset(&session, 0, sizeof(session));
     session.nSessionId = 7;
@@ -191,6 +200,12 @@ int main(void)
         "filename search should include insensitive nested match");
     CHECK(strstr(g_capture.sPayload, "beta.log") == NULL,
         "filename search should exclude beta");
+
+    /* A search that walked into the link back to the root would report the same
+       files again under a path leading through it - and would keep doing so
+       until the path stopped growing, then never stop. */
+    CHECK(strstr(g_capture.sPayload, "/loop/") == NULL,
+        "the search never descended into the link back to its own root");
 
     reset_capture();
     memset(&mgr, 0, sizeof(mgr));

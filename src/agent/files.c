@@ -154,6 +154,20 @@ static const char* DirectGate_Files_GroupName(gid_t nGid, char *pOutput, size_t 
 }
 #endif /* !_WIN32 */
 
+/* Whether anything sits at this path, a link with a missing target included.
+   XPath_Exists() stats through a link and answers "no" for one of those, which
+   would have a caller pick a name that is already taken and then fail on the
+   exclusive create that follows. */
+static xbool_t DirectGate_Files_EntryExists(const char *pPath)
+{
+    xstat_t st;
+    if (xstat(pPath, &st) == XSTDOK) return XTRUE;
+
+    /* xstat() is an lstat on POSIX and has already answered; on Windows
+       it followed the link, so a dangling one needs the attribute. */
+    return XPath_IsLink(pPath);
+}
+
 static const char* DirectGate_Files_LastError(void)
 {
     if (errno == 0) return "operation failed";
@@ -187,7 +201,7 @@ static int DirectGate_Files_ResolvePasteTarget(char *pOutput, size_t nSize, cons
     XCHECK((nSize > 0), XSTDERR);
     XCHECK((xstrused(pTargetPath)), XSTDERR);
 
-    if (!XPath_Exists(pTargetPath))
+    if (!DirectGate_Files_EntryExists(pTargetPath))
     {
         xstrncpy(pOutput, nSize, pTargetPath);
         return XSTDOK;
@@ -229,7 +243,7 @@ static int DirectGate_Files_ResolvePasteTarget(char *pOutput, size_t nSize, cons
             nWritten = snprintf(pOutput, nSize, "%s/%s(%u)%s", sDir, sStem, i, sExt);
 
         if (nWritten <= 0 || (size_t)nWritten >= nSize) return XSTDERR;
-        if (!XPath_Exists(pOutput)) return XSTDOK;
+        if (!DirectGate_Files_EntryExists(pOutput)) return XSTDOK;
     }
 
     errno = EEXIST;
@@ -285,6 +299,67 @@ static int DirectGate_Files_BuildFullPath(char *pOutput, size_t nSize, const cha
     return (nWritten > 0 && (size_t)nWritten < nSize) ? XSTDOK : XSTDERR;
 }
 
+#ifndef _WIN32
+/* A symlink stays a symlink in the listing, but the client cannot act on one
+   without knowing what it resolves to: a link to a directory has to be
+   enterable and a link to a file downloadable, and the lstat behind the entry
+   cannot say which it is. A dangling link simply carries no target fields.
+
+   Windows needs none of this - xstat() there is a stat() that already follows,
+   so a link is reported as whatever it points at. */
+static void DirectGate_Files_AddLinkTarget(xjson_obj_t *pEntry, const char *pFullPath)
+{
+    char sTarget[XFILE_PATH_SIZE];
+    ssize_t nLength = readlink(pFullPath, sTarget, sizeof(sTarget) - 1);
+
+    if (nLength > 0)
+    {
+        sTarget[nLength] = XSTR_NUL;
+        XJSON_AddString(pEntry, "target", sTarget);
+    }
+
+    /* stat() rather than xstat(), which is an lstat: this one has to follow. */
+    xstat_t targetSt;
+    if (stat(pFullPath, &targetSt) != 0) return;
+
+    xfile_type_t eTargetType = XFile_GetType((xmode_t)targetSt.st_mode);
+    XJSON_AddString(pEntry, "targetType", DirectGate_Files_TypeStr(eTargetType));
+    XJSON_AddU64(pEntry, "targetSizeBytes", (uint64_t)targetSt.st_size);
+
+    char sPerm[16], sFullPerm[32];
+    XPath_ModeToPerm(sPerm, sizeof(sPerm), (xmode_t)targetSt.st_mode);
+    snprintf(sFullPerm, sizeof(sFullPerm), "%c%s", XFile_GetTypeChar(eTargetType), sPerm);
+
+    XJSON_AddString(pEntry, "targetPermissions", sFullPerm);
+}
+#endif
+
+/* Resolves a symlink to the real path behind it, or NULL when the path is not
+   a link and can be used as it stands. The caller frees the result. */
+static char* DirectGate_Files_ResolveLink(const char *pPath)
+{
+#ifdef _WIN32
+    /* xstat() is a stat() here and the CRT opens through a reparse point, so
+       there is nothing to resolve by hand. */
+    (void)pPath;
+    return NULL;
+#else
+    xstat_t linkSt;
+    if (xstat(pPath, &linkSt) != XSTDOK || !S_ISLNK(linkSt.st_mode)) return NULL;
+
+    /* realpath() allocates its own buffer here rather than writing into one
+       sized against PATH_MAX, which is not a bound this code can assume. */
+    char *pResolved = realpath(pPath, NULL);
+    if (pResolved == NULL)
+    {
+        xlogw("Failed to resolve symlink: path(%s), errno(%d)", pPath, errno);
+        return NULL;
+    }
+
+    return pResolved;
+#endif
+}
+
 xjson_obj_t* DirectGate_Files_CreateEntryJson(const char *pName, const char *pDirPath, const xstat_t *pStat)
 {
     XCHECK((xstrused(pName)), NULL);
@@ -305,6 +380,10 @@ xjson_obj_t* DirectGate_Files_CreateEntryJson(const char *pName, const char *pDi
 
     xfile_type_t eType = XFile_GetType((xmode_t)pStat->st_mode);
     XJSON_AddString(pEntry, "type", DirectGate_Files_TypeStr(eType));
+
+#ifndef _WIN32
+    if (eType & XF_SYMLINK) DirectGate_Files_AddLinkTarget(pEntry, sFullPath);
+#endif
 
     char sPerm[16], sFullPerm[32];
     char cTypeChar = XFile_GetTypeChar(eType);
@@ -623,7 +702,7 @@ XSTATUS DirectGate_Files_Delete(const char *pPath, xbool_t bForce)
             errno = nDeleteErrno;
         }
 
-        if (bForce && !XPath_Exists(pPath))
+        if (bForce && !DirectGate_Files_EntryExists(pPath))
         {
             xlogi("File manager target deleted: path(%s), recursive(%s)", pPath, "true");
             return XSTDOK;
@@ -641,7 +720,7 @@ XSTATUS DirectGate_Files_CreateDir(const char *pPath)
 {
     XCHECK(xstrused(pPath), xthrowr(XSTDERR, "Path is empty"));
 
-    if (XPath_Exists(pPath))
+    if (DirectGate_Files_EntryExists(pPath))
     {
         errno = EEXIST;
         xloge("Directory create target already exists: path(%s)", pPath);
@@ -675,32 +754,51 @@ static void DirectGate_Files_ApplyMode(const char *pPath, xmode_t nMode)
     errno = nSavedErrno;
 }
 
-/* Whether a directory entry has anything a copy can reproduce. Real
-   directories are walked; everything else has to resolve to a regular file,
-   which is what a symlink copied by content needs to point at. Sockets,
-   FIFOs, device nodes, dangling links and links aimed at a directory do not
-   qualify - and failing a whole tree over one of them would make a home
-   directory impossible to copy. */
+/* Whether a directory entry has anything a copy can reproduce: directories are
+   walked, regular files are read, and a link is recreated as a link - so where
+   it points, or whether it points anywhere at all, does not matter. Sockets,
+   FIFOs and device nodes have no content and no equivalent to recreate. */
 static xbool_t DirectGate_Files_IsCopyableEntry(const char *pPath, const xstat_t *pLinkStat)
 {
-    if (S_ISDIR(pLinkStat->st_mode) || S_ISREG(pLinkStat->st_mode)) return XTRUE;
+#ifdef S_ISLNK
+    (void)pPath;
+    if (S_ISLNK(pLinkStat->st_mode)) return XTRUE;
+#else
+    /* Windows stats through a reparse point, so a junction looks like the
+       directory it points at, and there is no symlink() to reproduce it with.
+       Skipped rather than walked into: copying it would pull a whole tree in
+       from outside the folder being copied. */
+    if (XPath_IsLink(pPath)) return XFALSE;
+#endif
+
+    return (S_ISDIR(pLinkStat->st_mode) || S_ISREG(pLinkStat->st_mode))
+        ? XTRUE : XFALSE;
+}
 
 #ifdef S_ISLNK
-    if (!S_ISLNK(pLinkStat->st_mode)) return XFALSE;
+/* Recreates a symlink at the destination, pointing exactly where the source
+   one points. Copying the content instead would turn one entry into a whole
+   tree, and a link back up the tree into an endless one. Defined only where
+   links exist: the Windows CRT reports nothing as one, so nothing calls it. */
+static XSTATUS DirectGate_Files_CopyLink(const char *pPath, const char *pTargetPath)
+{
+    char sTarget[XFILE_PATH_SIZE];
+    ssize_t nLength = readlink(pPath, sTarget, sizeof(sTarget) - 1);
 
-    /* The only case that needs a second look, and stat() rather than xstat()
-       because this one has to follow the link. */
-    xstat_t targetSt;
-    if (stat(pPath, &targetSt) != 0) return XFALSE;
+    if (nLength <= 0) return XSTDERR;
 
-    return S_ISREG(targetSt.st_mode) ? XTRUE : XFALSE;
-#else
-    /* The Windows CRT reports nothing as a link, so there is nothing to
-       follow and the path is not needed. */
-    (void)pPath;
-    return XFALSE;
-#endif
+    /* A target that filled the buffer may have been cut short, and a link to
+       half a path is worse than no link at all. */
+    if ((size_t)nLength >= sizeof(sTarget) - 1)
+    {
+        errno = ENAMETOOLONG;
+        return XSTDERR;
+    }
+
+    sTarget[nLength] = XSTR_NUL;
+    return symlink(sTarget, pTargetPath) == 0 ? XSTDOK : XSTDERR;
 }
+#endif /* S_ISLNK */
 
 /* Copies one regular file. The library does the reading, the writing and the
    permissions; what is added here is an exclusive create, so the destination
@@ -776,6 +874,20 @@ static XSTATUS DirectGate_Files_CopyEntry(const char *pPath, const char *pTarget
         return XSTDERR;
     }
 
+#ifdef S_ISLNK
+    /* Before the directory branch on purpose: a link to a directory is a link,
+       not a directory to walk into. */
+    if (S_ISLNK(st.st_mode)) return DirectGate_Files_CopyLink(pPath, pTargetPath);
+#else
+    /* No symlink() to reproduce one with, and following it would copy a tree
+       from outside the source. */
+    if (XPath_IsLink(pPath))
+    {
+        errno = ENOSYS;
+        return XSTDERR;
+    }
+#endif
+
     if (S_ISDIR(st.st_mode))
     {
         if (DirectGate_Files_IsNestedTarget(pPath, pTargetPath))
@@ -846,6 +958,38 @@ static XSTATUS DirectGate_Files_CopyEntry(const char *pPath, const char *pTarget
     }
 
     return DirectGate_Files_CopyRegularFile(pPath, pTargetPath);
+}
+
+XSTATUS DirectGate_Files_CreateSymlink(const char *pPath, const char *pTargetPath)
+{
+    XCHECK(xstrused(pPath), xthrowr(XSTDERR, "Link path is empty"));
+    XCHECK(xstrused(pTargetPath), xthrowr(XSTDERR, "Link target is empty"));
+
+#ifdef S_ISLNK
+    /* A link is created, never replaced: an existing entry here is the
+       caller's to resolve, exactly like mkdir. */
+    if (DirectGate_Files_EntryExists(pPath))
+    {
+        errno = EEXIST;
+        xloge("Symlink target already exists: path(%s)", pPath);
+        return XSTDERR;
+    }
+
+    if (symlink(pTargetPath, pPath) != 0)
+    {
+        xloge("Failed to create symlink: path(%s), target(%s), errno(%d)",
+            pPath, pTargetPath, errno);
+
+        return XSTDERR;
+    }
+
+    xlogi("File manager symlink created: path(%s), target(%s)", pPath, pTargetPath);
+    return XSTDOK;
+#else
+    errno = ENOSYS;
+    xloge("Symlink creation is not supported on this platform: path(%s)", pPath);
+    return XSTDERR;
+#endif
 }
 
 static XSTATUS DirectGate_Files_CopyPath(const char *pPath, const char *pTargetPath)
@@ -967,7 +1111,7 @@ static int DirectGate_Files_BuildTempPath(char *pOutput, size_t nSize, const cha
         if (nWritten <= 0 || (size_t)nWritten >= nSize)
             return XSTDERR;
 
-        if (!XPath_Exists(pOutput))
+        if (!DirectGate_Files_EntryExists(pOutput))
             return XSTDOK;
     }
 
@@ -1111,8 +1255,10 @@ int DirectGate_Files_HandleManager(xapi_session_t *pApiSession, directgate_pkg_t
 
     if (xstrcmp(pMgrPkg->pAction, "open"))
     {
-        xstat_t st;
-        if (xstat(pMgrPkg->pPath, &st) < 0 || !S_ISREG(st.st_mode))
+        /* stat() rather than xstat(), which is an lstat: opening a link the
+           user picked means opening what it points at. */
+        struct stat st;
+        if (stat(pMgrPkg->pPath, &st) != 0 || !S_ISREG(st.st_mode))
         {
             return DirectGate_Session_SendManagerResp(pSession, "open",
                 "failed", "file not found or not a regular file", pMgrPkg->pPath);
@@ -1124,7 +1270,18 @@ int DirectGate_Files_HandleManager(xapi_session_t *pApiSession, directgate_pkg_t
                 "failed", "transfer already in progress", pMgrPkg->pPath);
         }
 
-        if (DirectGate_Transfer_Send(&pSession->transfer, pMgrPkg->pPath, DirectGate_Files_TransferSendCb, pSession) < 0)
+        /* The transfer opens its source with O_NOFOLLOW so a link planted
+           between the check above and the read cannot redirect it, which also
+           means it will not open a link the user asked for on purpose. The
+           link is resolved here instead, so the transfer still sees a real
+           file and keeps that guarantee. */
+        char *pResolved = DirectGate_Files_ResolveLink(pMgrPkg->pPath);
+        const char *pSource = pResolved != NULL ? pResolved : pMgrPkg->pPath;
+
+        int nStarted = DirectGate_Transfer_Send(&pSession->transfer, pSource, DirectGate_Files_TransferSendCb, pSession);
+        free(pResolved);
+
+        if (nStarted < 0)
         {
             DirectGate_Transfer_Destroy(&pSession->transfer);
             return DirectGate_Session_SendManagerResp(pSession, "open",
@@ -1191,6 +1348,23 @@ int DirectGate_Files_HandleManager(xapi_session_t *pApiSession, directgate_pkg_t
         }
 
         return DirectGate_Session_SendManagerResp(pSession, "mkdir", "ok", NULL, pMgrPkg->pPath);
+    }
+
+    if (xstrcmp(pMgrPkg->pAction, "symlink"))
+    {
+        if (!xstrused(pMgrPkg->pTargetPath))
+        {
+            return DirectGate_Session_SendManagerResp(pSession, "symlink",
+                "failed", "missing target path", pMgrPkg->pPath);
+        }
+
+        if (DirectGate_Files_CreateSymlink(pMgrPkg->pPath, pMgrPkg->pTargetPath) < 0)
+        {
+            return DirectGate_Session_SendManagerResp(pSession, "symlink",
+                "failed", DirectGate_Files_LastError(), pMgrPkg->pPath);
+        }
+
+        return DirectGate_Session_SendManagerResp(pSession, "symlink", "ok", NULL, pMgrPkg->pPath);
     }
 
     if (xstrcmp(pMgrPkg->pAction, "rename"))
@@ -1365,14 +1539,34 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
         }
         else if (xstrused(pSession->sSaveTempPath) && xstrused(pSession->sSavePath))
         {
+            /* A save aimed at a symlink writes through it. The link is what the
+               user picked and expects to still be there afterwards, and the
+               bytes belong in the file it points at - renaming onto the link
+               would replace it with a regular file and leave the real one
+               untouched. Resolving here also means the permissions restored
+               below are the target's rather than the 0777 every link reports
+               for itself. Only for an overwrite: a new file is a new file. */
+            char sCommitPath[XFILE_PATH_SIZE];
+            xstrncpy(sCommitPath, sizeof(sCommitPath), pSession->sSavePath);
+
+            if (pSession->bSaveForce)
+            {
+                char *pResolved = DirectGate_Files_ResolveLink(pSession->sSavePath);
+                if (pResolved != NULL)
+                {
+                    xstrncpy(sCommitPath, sizeof(sCommitPath), pResolved);
+                    free(pResolved);
+                }
+            }
+
             xstat_t st;
-            xbool_t bHasOrigPerms = (xstat(pSession->sSavePath, &st) == XSTDOK);
+            xbool_t bHasOrigPerms = (xstat(sCommitPath, &st) == XSTDOK);
 
             if (bHasOrigPerms && !pSession->bSaveForce)
             {
                 errno = EEXIST;
                 int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
-                xloge("Save target appeared during upload: sid(%u), wsfd(%d), path(%s)", pSession->nSessionId, nWsFd, pSession->sSavePath);
+                xloge("Save target appeared during upload: sid(%u), wsfd(%d), path(%s)", pSession->nSessionId, nWsFd, sCommitPath);
 
                 DirectGate_Files_SendTransferCancel(pSession, pFilePkg->transfer.pTransferId, DirectGate_Files_LastError());
                 remove(pSession->sSaveTempPath);
@@ -1385,14 +1579,14 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
                this rename cannot be silently overwritten (TOCTOU). Force
                saves intentionally replace the existing target. */
             int nCommit = pSession->bSaveForce
-                ? DirectGate_Files_RenameReplace(pSession->sSaveTempPath, pSession->sSavePath)
-                : DirectGate_Files_RenameNoReplace(pSession->sSaveTempPath, pSession->sSavePath);
+                ? DirectGate_Files_RenameReplace(pSession->sSaveTempPath, sCommitPath)
+                : DirectGate_Files_RenameNoReplace(pSession->sSaveTempPath, sCommitPath);
 
             if (nCommit != XSTDOK)
             {
                 int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
                 xloge("Failed to commit uploaded file: sid(%u), wsfd(%d), tmp(%s), dst(%s), errno(%d)",
-                    pSession->nSessionId, nWsFd, pSession->sSaveTempPath, pSession->sSavePath, errno);
+                    pSession->nSessionId, nWsFd, pSession->sSaveTempPath, sCommitPath, errno);
 
                 DirectGate_Files_SendTransferCancel(pSession, pFilePkg->transfer.pTransferId, DirectGate_Files_LastError());
                 remove(pSession->sSaveTempPath);
@@ -1405,32 +1599,32 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
                 char sPerm[XPERM_LEN + 1];
                 XPath_ModeToPerm(sPerm, sizeof(sPerm), st.st_mode);
 
-                if (XPath_SetPerm(pSession->sSavePath, sPerm) == XSTDOK)
+                if (XPath_SetPerm(sCommitPath, sPerm) == XSTDOK)
                 {
                     xlogd("Restored original file permissions: path(%s), perm(%s)",
-                        pSession->sSavePath, sPerm);
+                        sCommitPath, sPerm);
                 }
                 else
                 {
                     xloge("Failed to restore original file permissions: path(%s), perm(%s), errno(%d)",
-                        pSession->sSavePath, sPerm, errno);
+                        sCommitPath, sPerm, errno);
                 }
             }
             else if (xstrused(pSession->sSavePermissions))
             {
-                if (XPath_SetPerm(pSession->sSavePath, pSession->sSavePermissions) == XSTDOK)
+                if (XPath_SetPerm(sCommitPath, pSession->sSavePermissions) == XSTDOK)
                 {
                     xlogd("Applied source permissions to uploaded file: path(%s), perm(%s)",
-                        pSession->sSavePath, pSession->sSavePermissions);
+                        sCommitPath, pSession->sSavePermissions);
                 }
                 else
                 {
                     xloge("Failed to apply source permissions to uploaded file: path(%s), perm(%s), errno(%d)",
-                        pSession->sSavePath, pSession->sSavePermissions, errno);
+                        sCommitPath, pSession->sSavePermissions, errno);
                 }
             }
 
-            xstrncpy(pFT->sPath, sizeof(pFT->sPath), pSession->sSavePath);
+            xstrncpy(pFT->sPath, sizeof(pFT->sPath), sCommitPath);
             DirectGate_Files_SendTransferAck(pSession, pFilePkg->transfer.pTransferId, pFT->nCurrentChunk);
             DirectGate_Files_ClearPendingSave(pSession);
         }

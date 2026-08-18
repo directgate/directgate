@@ -286,6 +286,107 @@ int main(void)
         CHECK(chmod(sModeDirDst, 0755) == 0, "restore the copied dir mode");
     }
 
+    /* A link is copied as a link, whether it points at a file or a directory
+       and whether it points anywhere at all. Taking the content instead would
+       turn one entry into a whole tree, and a link back up the tree into an
+       endless one. */
+    {
+        char sLinkedDirSrc[512], sLinkedDirLink[512], sLinkedDirDst[512];
+        char sLinkedChild[600], sLinkedCopiedChild[700];
+        char sFileLink[512], sFileLinkDst[512];
+        char sDangling[512], sDanglingDst[512];
+        char sReadTarget[XFILE_PATH_SIZE];
+
+        snprintf(sLinkedDirSrc, sizeof(sLinkedDirSrc), "%s/link-src", sRoot);
+        snprintf(sLinkedDirLink, sizeof(sLinkedDirLink), "%s/link-to-dir", sRoot);
+        snprintf(sLinkedDirDst, sizeof(sLinkedDirDst), "%s/link-to-dir-copy", sRoot);
+        snprintf(sLinkedChild, sizeof(sLinkedChild), "%s/inside.txt", sLinkedDirSrc);
+        snprintf(sFileLink, sizeof(sFileLink), "%s/link-to-file", sRoot);
+        snprintf(sFileLinkDst, sizeof(sFileLinkDst), "%s/link-to-file-copy", sRoot);
+        snprintf(sDangling, sizeof(sDangling), "%s/link-to-nowhere", sRoot);
+        snprintf(sDanglingDst, sizeof(sDanglingDst), "%s/link-to-nowhere-copy", sRoot);
+
+        CHECK(XDir_Create(sLinkedDirSrc, 0755) > 0, "create the link target dir");
+        CHECK(write_file(sLinkedChild, "linked"), "write a child in it");
+        CHECK(symlink(sLinkedDirSrc, sLinkedDirLink) == 0, "link to the directory");
+
+        CHECK(DirectGate_Files_CopyPath(sLinkedDirLink, sLinkedDirDst) == XSTDOK,
+            "copy a link to a directory");
+
+        xstat_t copySt;
+        CHECK(xstat(sLinkedDirDst, &copySt) == XSTDOK, "lstat the copied link");
+        CHECK(S_ISLNK(copySt.st_mode), "the copy is a link, not a directory");
+
+        ssize_t nLen = readlink(sLinkedDirDst, sReadTarget, sizeof(sReadTarget) - 1);
+        CHECK(nLen > 0, "read the copied link");
+        sReadTarget[nLen] = '\0';
+        CHECK(strcmp(sReadTarget, sLinkedDirSrc) == 0,
+            "the copied link points where the original does");
+
+        snprintf(sLinkedCopiedChild, sizeof(sLinkedCopiedChild), "%s/inside.txt", sLinkedDirDst);
+        CHECK(read_file(sLinkedCopiedChild, sRead, sizeof(sRead)),
+            "the copied link still reaches the target's content");
+        CHECK(strcmp(sRead, "linked") == 0, "through the link, the content is the target's");
+
+        CHECK(symlink(sFile, sFileLink) == 0, "link to a file");
+        CHECK(DirectGate_Files_CopyPath(sFileLink, sFileLinkDst) == XSTDOK,
+            "copy a link to a file");
+        CHECK(xstat(sFileLinkDst, &copySt) == XSTDOK, "lstat the copied file link");
+        CHECK(S_ISLNK(copySt.st_mode), "a link to a file is copied as a link too");
+
+        /* A dangling link has no content to take, and is still a link to copy. */
+        CHECK(symlink("/nowhere-directgate", sDangling) == 0, "dangling link");
+        CHECK(DirectGate_Files_CopyPath(sDangling, sDanglingDst) == XSTDOK,
+            "copy a dangling link");
+        CHECK(xstat(sDanglingDst, &copySt) == XSTDOK, "lstat the copied dangling link");
+        CHECK(S_ISLNK(copySt.st_mode), "the dangling link is copied as a link");
+
+        /* Inside a tree the same rule holds, which is what keeps a link
+           pointing back up it from making the walk recurse forever. */
+        char sTreeSrc[512], sTreeDst[512], sTreeLoop[600], sCopiedLoop[700];
+        snprintf(sTreeSrc, sizeof(sTreeSrc), "%s/loop-tree", sRoot);
+        snprintf(sTreeDst, sizeof(sTreeDst), "%s/loop-tree-copy", sRoot);
+        snprintf(sTreeLoop, sizeof(sTreeLoop), "%s/up", sTreeSrc);
+
+        CHECK(XDir_Create(sTreeSrc, 0755) > 0, "create a tree");
+        CHECK(symlink(sTreeSrc, sTreeLoop) == 0, "link inside it back to itself");
+        CHECK(DirectGate_Files_CopyPath(sTreeSrc, sTreeDst) == XSTDOK,
+            "copy a tree containing a link to itself");
+
+        snprintf(sCopiedLoop, sizeof(sCopiedLoop), "%s/up", sTreeDst);
+        CHECK(xstat(sCopiedLoop, &copySt) == XSTDOK, "lstat the copied loop link");
+        CHECK(S_ISLNK(copySt.st_mode), "the self-referencing link is copied as a link");
+    }
+
+    /* The same link, created on request rather than by a copy: this is what a
+       cross-device copy uses to reproduce one on the far side. */
+    {
+        char sMadeLink[512], sReadTarget[XFILE_PATH_SIZE];
+        snprintf(sMadeLink, sizeof(sMadeLink), "%s/made-link", sRoot);
+
+        CHECK(DirectGate_Files_CreateSymlink(sMadeLink, "../elsewhere/file.txt") == XSTDOK,
+            "create a symlink");
+
+        xstat_t linkSt;
+        CHECK(xstat(sMadeLink, &linkSt) == XSTDOK, "lstat the created link");
+        CHECK(S_ISLNK(linkSt.st_mode), "the created entry is a link");
+
+        ssize_t nLen = readlink(sMadeLink, sReadTarget, sizeof(sReadTarget) - 1);
+        CHECK(nLen > 0, "read the created link");
+        sReadTarget[nLen] = '\0';
+        CHECK(strcmp(sReadTarget, "../elsewhere/file.txt") == 0,
+            "a relative target is stored exactly as given");
+
+        /* Dangling on purpose: the far side of a copy may not have the target,
+           and a link that points nowhere is still the faithful copy. */
+        CHECK(!XPath_Exists(sReadTarget), "the target does not have to exist");
+
+        errno = 0;
+        CHECK(DirectGate_Files_CreateSymlink(sMadeLink, "/other") == XSTDERR,
+            "an existing entry is never replaced");
+        CHECK(errno == EEXIST, "creating over an existing entry reports EEXIST");
+    }
+
     /* A FIFO has no content to copy; it must not stall the loop inside open()
        and must not fail the tree it happens to sit in. */
     {
@@ -310,17 +411,20 @@ int main(void)
         snprintf(sFifoCopied, sizeof(sFifoCopied), "%s/pipe", sFifoDst);
         CHECK(!XPath_Exists(sFifoCopied), "the fifo itself is skipped");
 
-        /* A symlink aimed at a directory is copied by content like any other
-           link, and a directory has none - skipped, not walked into and not
-           turned into an empty file. */
+        /* A link to a directory next to a FIFO: the link is reproduced, the
+           FIFO is not, and neither stops the entries around them. */
         char sLinkDir[600], sLinkCopied[700];
         snprintf(sLinkDir, sizeof(sLinkDir), "%s/dirlink", sFifoDir);
         CHECK(symlink(sFifoDir, sLinkDir) == 0, "create a link to a directory");
         CHECK(DirectGate_Files_Delete(sFifoDst, XTRUE) == XSTDOK, "drop the earlier copy");
         CHECK(DirectGate_Files_CopyPath(sFifoDir, sFifoDst) == XSTDOK,
             "a link to a directory does not fail the copy");
+
         snprintf(sLinkCopied, sizeof(sLinkCopied), "%s/dirlink", sFifoDst);
-        CHECK(!XPath_Exists(sLinkCopied), "the link to a directory is skipped");
+        xstat_t linkCopySt;
+        CHECK(xstat(sLinkCopied, &linkCopySt) == XSTDOK, "lstat the copied link");
+        CHECK(S_ISLNK(linkCopySt.st_mode),
+            "the link to a directory is copied as a link, not walked into");
         CHECK(read_file(sFifoCopiedRegular, sRead, sizeof(sRead)),
             "the regular sibling is still copied");
 

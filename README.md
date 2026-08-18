@@ -14,17 +14,17 @@
 
 </div>
 
-DirectGate gives you a full terminal, file manager, and code editor on your own machines from any browser - over connections that are end-to-end encrypted and, whenever possible, peer-to-peer. Nothing listens on the public internet. No static IP required, no VPN to run and no port to forward.
+DirectGate gives you the ultra-low-latency remote desktop, full terminal and file manager experience, and code editor on your own machines from any browser - over connections that are end-to-end encrypted and, whenever possible, peer-to-peer. Nothing listens on the public internet. No static IP required, no VPN to run and no port to forward.
 
 This repository is the **agent**: the program you install on a machine you want to reach. It is the only part of DirectGate that runs on your hardware and touches your shell, so it is open source. You can read every line, audit the cryptography, and build it yourself to confirm that the binary you run is exactly this code.
 
 **What it does:**
 
+- Ultra-low-latency remote desktop over WebRTC, with P2P when possible and TURN fallback
 - Works behind NAT - no port forwarding, no firewall changes, no static IP
 - End-to-end encrypted (AES-256-SIV) at the application layer, independent of transport
 - Peer-to-peer over WebRTC whenever possible; the relay never sees plaintext
 - Terminal, file manager, and a browser-based code editor over a single connection
-- Ultra-low-latency remote desktop over WebRTC, with P2P when possible and TURN fallback <sup>beta</sup>
 - Full file manager experience with upload/download, rename, copy, move, and delete
 - Advanced file search, image/video playback, and drag-and-drop between devices
 - Multiple concurrent sessions multiplexed over one link
@@ -103,7 +103,7 @@ After authentication, the client and agent negotiate a WebRTC peer-to-peer data 
        ^                                                              ^
        |               WebRTC Data Channel (direct P2P)               |
        +--------------------------------------------------------------+
-          (DTLS transport + AES-256-SIV application-layer encryption)
+         (DTLS transport + AES-256-SIV application-layer encryption)
 ```
 
 If a direct path can't be established, the connection degrades gracefully - TURN, then the WebSocket relay - and stays end-to-end encrypted throughout. The client always shows which path is active.

@@ -38,6 +38,10 @@ xjson_obj_t* DirectGate_Files_CreateEntryJson(const char *pName, const char *pDi
 /* Delete a file or empty directory, or recursively if forced. Returns XSTDOK or XSTDERR. */
 XSTATUS DirectGate_Files_Delete(const char *pPath, xbool_t bForce);
 XSTATUS DirectGate_Files_CreateDir(const char *pPath);
+
+/* Create a symlink at pPath pointing at pTargetPath. Never replaces an
+   existing entry. Returns XSTDOK or XSTDERR. */
+XSTATUS DirectGate_Files_CreateSymlink(const char *pPath, const char *pTargetPath);
 XSTATUS DirectGate_Files_Rename(const char *pPath, const char *pTargetPath);
 
 /* File transfer send callback for transfer.c */

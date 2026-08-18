@@ -561,6 +561,44 @@ int main(void)
         CHECK(fix.api.txBuffer.nUsed == 0, "a finished transfer sends nothing further");
     }
 
+    /* A link the user picked opens what it points at. The transfer itself
+       refuses to follow a link, so the handler has to resolve it first - the
+       download used to be refused as "not a regular file". */
+    {
+        char sLinkTarget[512], sLink[512];
+        snprintf(sLinkTarget, sizeof(sLinkTarget), "%s/link-target.txt", sRoot);
+        snprintf(sLink, sizeof(sLink), "%s/link.txt", sRoot);
+
+        CHECK(write_file(sLinkTarget, "behind the link"), "seed a link target");
+        CHECK(symlink(sLinkTarget, sLink) == 0, "create the link");
+
+        CHECK(deliver(&fix, manager_header("open", sLink, NULL, 11, XFALSE)) == XAPI_CONTINUE,
+            "deliver an open of a symlink");
+        CHECK(fix.pSession->transfer.eState == XTRANSFER_STATE_SENDING,
+            "opening a symlink starts a transfer");
+        drain(&fix);
+
+        for (int i = 0; i < 8 && fix.pSession->transfer.eState == XTRANSFER_STATE_SENDING; i++)
+        {
+            DirectGate_Files_ProcessTransfer(fix.pSession);
+            drain(&fix);
+        }
+
+        CHECK(fix.pSession->transfer.eState == XTRANSFER_STATE_DONE,
+            "the symlinked download completes");
+        CHECK(fix.pSession->transfer.nBytesXferred == strlen("behind the link"),
+            "the bytes come from the link target");
+
+        /* A link to a directory is still not a download. */
+        char sDirLink[512];
+        snprintf(sDirLink, sizeof(sDirLink), "%s/dir-link", sRoot);
+        CHECK(symlink(sRoot, sDirLink) == 0, "create a link to a directory");
+        CHECK(deliver(&fix, manager_header("open", sDirLink, NULL, 11, XFALSE)) == XAPI_CONTINUE,
+            "deliver an open of a directory link");
+        CHECK(expect_manager(&fix, "open", "failed"),
+            "opening a link to a directory is refused");
+    }
+
     /* ---- inbound transfer ----------------------------------------------- */
 
     {
@@ -766,6 +804,100 @@ int main(void)
         CHECK(pHeader != NULL, "build an action-less file header");
         CHECK(deliver(&fix, pHeader) == XAPI_CONTINUE, "deliver an action-less file message");
         CHECK(fix.api.txBuffer.nUsed == 0, "an action-less file message is not answered");
+    }
+
+    /* Saving onto a link writes through it: the link stays, its target gets the
+       bytes, and the target's permissions survive - not the 0777 the link
+       reports for itself. */
+    {
+        char sSaveTarget[512], sSaveLink[512];
+        snprintf(sSaveTarget, sizeof(sSaveTarget), "%s/save-target.txt", sRoot);
+        snprintf(sSaveLink, sizeof(sSaveLink), "%s/save-link.txt", sRoot);
+
+        CHECK(write_file(sSaveTarget, "old"), "seed the save target");
+        CHECK(chmod(sSaveTarget, 0640) == 0, "give the target a distinct mode");
+        CHECK(symlink(sSaveTarget, sSaveLink) == 0, "link to it");
+
+        const char *pBody = "written through";
+        size_t nBody = strlen(pBody);
+
+        char sSha[XSHA256_DIGEST_SIZE * 2 + 1];
+        uint8_t digest[XSHA256_DIGEST_SIZE];
+        XSHA256_Compute(digest, sizeof(digest), (const uint8_t*)pBody, nBody);
+        for (size_t i = 0; i < sizeof(digest); i++)
+            snprintf(sSha + (i * 2), sizeof(sSha) - (i * 2), "%02x", digest[i]);
+
+        CHECK(deliver(&fix, manager_header("save", sSaveLink, NULL, 11, XTRUE)) == XAPI_CONTINUE,
+            "deliver a forced save onto the link");
+        CHECK(expect_manager(&fix, "save", "ok"), "the save is accepted");
+
+        xjson_obj_t *pStart = DirectGate_Proto_BuildFileStart("link-1", "save-link.txt",
+            nBody, 1, 65536);
+        CHECK(pStart != NULL, "build file/start");
+        XJSON_AddU32(pStart, "sessionId", 11);
+        CHECK(deliver(&fix, pStart) == XAPI_CONTINUE, "deliver file/start");
+        drain(&fix);
+
+        {
+            xjson_obj_t *pChunk = DirectGate_Proto_BuildFileChunk("link-1", 0);
+            CHECK(pChunk != NULL, "build file/chunk");
+            XJSON_AddU32(pChunk, "sessionId", 11);
+            CHECK(deliver_payload(&fix, pChunk, (const uint8_t*)pBody, nBody) ==
+                XAPI_CONTINUE, "deliver file/chunk");
+        }
+        drain(&fix);
+
+        xjson_obj_t *pEnd = DirectGate_Proto_BuildFileEnd("link-1", sSha);
+        CHECK(pEnd != NULL, "build file/end");
+        XJSON_AddU32(pEnd, "sessionId", 11);
+        CHECK(deliver(&fix, pEnd) == XAPI_CONTINUE, "deliver file/end");
+        drain(&fix);
+
+        xstat_t linkSt;
+        CHECK(xstat(sSaveLink, &linkSt) == XSTDOK, "lstat the save path");
+        CHECK(S_ISLNK(linkSt.st_mode), "the link survived the save");
+
+        char sBody[64] = {0};
+        FILE *pFile = fopen(sSaveTarget, "rb");
+        CHECK(pFile != NULL, "reopen the link target");
+        size_t nRead = fread(sBody, 1, sizeof(sBody) - 1, pFile);
+        fclose(pFile);
+        CHECK(nRead == nBody && strcmp(sBody, pBody) == 0,
+            "the bytes landed in the file the link points at");
+
+        xstat_t targetSt;
+        CHECK(xstat(sSaveTarget, &targetSt) == XSTDOK, "stat the link target");
+        CHECK((targetSt.st_mode & 0777) == 0640,
+            "the target keeps its own permissions, not the link's 0777");
+    }
+
+    /* A cross-device copy reproduces a link by asking for one, since it has no
+       bytes to stream. */
+    {
+        char sMadeLink[512];
+        snprintf(sMadeLink, sizeof(sMadeLink), "%s/made-link", sRoot);
+
+        xjson_obj_t *pHeader = manager_header("symlink", sMadeLink, "/elsewhere/file.txt",
+            11, XFALSE);
+        CHECK(pHeader != NULL, "build a symlink request");
+        CHECK(deliver(&fix, pHeader) == XAPI_CONTINUE, "deliver the symlink request");
+        CHECK(expect_manager(&fix, "symlink", "ok"), "the link is created");
+
+        xstat_t linkSt;
+        CHECK(xstat(sMadeLink, &linkSt) == XSTDOK, "lstat the created link");
+        CHECK(S_ISLNK(linkSt.st_mode), "the created entry is a link");
+
+        /* A second one over the same path is refused rather than replacing it. */
+        pHeader = manager_header("symlink", sMadeLink, "/other", 11, XFALSE);
+        CHECK(pHeader != NULL, "build a duplicate symlink request");
+        CHECK(deliver(&fix, pHeader) == XAPI_CONTINUE, "deliver the duplicate");
+        CHECK(expect_manager(&fix, "symlink", "failed"), "an existing entry is kept");
+
+        /* Without a target there is nothing to point at. */
+        pHeader = manager_header("symlink", sMadeLink, NULL, 11, XFALSE);
+        CHECK(pHeader != NULL, "build a targetless symlink request");
+        CHECK(deliver(&fix, pHeader) == XAPI_CONTINUE, "deliver the targetless request");
+        CHECK(expect_manager(&fix, "symlink", "failed"), "a targetless request is refused");
     }
 
     /* A message for a session that does not exist is dropped, not fatal. */
