@@ -175,15 +175,66 @@ xbool_t DirectGate_IsAPIEndpointAllowed(const char *pUrl)
     Directories add OICI so files created inside them inherit the
     same private ACL even when written by other tooling.
 */
+
+/* SID of the extra grantee, in SDDL string form, or empty for none. Resolved
+   once at set time so the DACL builder cannot fail on a name lookup. */
+static char g_sPrivateGranteeSid[XSTR_TINY] = { 0 };
+
+void DirectGate_SetPrivateFileGrantee(const char *pAccount)
+{
+    g_sPrivateGranteeSid[0] = XSTR_NUL;
+    if (!xstrused(pAccount)) return;
+
+    uint8_t sSid[SECURITY_MAX_SID_SIZE];
+    DWORD nSidLen = (DWORD)sizeof(sSid);
+    char sDomain[XSTR_TINY];
+    DWORD nDomLen = (DWORD)sizeof(sDomain);
+    SID_NAME_USE eUse;
+
+    if (!LookupAccountNameA(NULL, pAccount, sSid, &nSidLen, sDomain, &nDomLen, &eUse))
+    {
+        xloge("Failed to resolve the private-file grantee, its files will stay "
+              "inaccessible to it: account(%s), error(%lu)", pAccount, GetLastError());
+
+        return;
+    }
+
+    LPSTR pSidStr = NULL;
+    if (!ConvertSidToStringSidA(sSid, &pSidStr) || pSidStr == NULL)
+    {
+        xloge("Failed to stringify the private-file grantee SID: account(%s), error(%lu)",
+            pAccount, GetLastError());
+
+        return;
+    }
+
+    xstrncpy(g_sPrivateGranteeSid, sizeof(g_sPrivateGranteeSid), pSidStr);
+    LocalFree(pSidStr);
+
+    xlogn("Private files will also grant access to: account(%s), sid(%s)",
+        pAccount, g_sPrivateGranteeSid);
+}
+
 static xbool_t DirectGate_BuildPrivateSecAttrs(SECURITY_ATTRIBUTES *pSecAttrs,
                                                PSECURITY_DESCRIPTOR *ppDescriptor,
                                                xbool_t bDirectory)
 {
     XCHECK_NL((pSecAttrs != NULL && ppDescriptor != NULL), XFALSE);
 
-    const char *pSDDL = bDirectory ?
+    const char *pBaseSDDL = bDirectory ?
         "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)" :
         "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)";
+
+    char sSDDL[XSTR_MID];
+
+    if (xstrused(g_sPrivateGranteeSid))
+    {
+        xstrncpyf(sSDDL, sizeof(sSDDL), "%s(A;%s;FA;;;%s)", pBaseSDDL,
+            bDirectory ? "OICI" : "", g_sPrivateGranteeSid);
+    }
+    else xstrncpy(sSDDL, sizeof(sSDDL), pBaseSDDL);
+
+    const char *pSDDL = sSDDL;
 
     *ppDescriptor = NULL;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
@@ -381,6 +432,13 @@ xbool_t DirectGate_WritePrivateFile(const char *pPath, const uint8_t *pData, siz
     return XTRUE;
 }
 #else
+/* POSIX has no equivalent problem: the agent setuid()s to shell.user before it
+   writes anything, and DirectGate_ChownToUser hands over what it wrote first. */
+void DirectGate_SetPrivateFileGrantee(const char *pAccount)
+{
+    (void)pAccount;
+}
+
 xbool_t DirectGate_EnsurePrivateFileParent(const char *pPath)
 {
     XCHECK((xstrused(pPath)), XFALSE);

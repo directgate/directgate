@@ -37,6 +37,23 @@ xbool_t DirectGate_IsAPIEndpointAllowed(const char *pUrl);
 xbool_t DirectGate_EnsurePrivateFileParent(const char *pPath);
 xbool_t DirectGate_WritePrivateFile(const char *pPath, const uint8_t *pData, size_t nSize);
 
+/*
+ * Grant one extra account full access to every private file this process
+ * writes from now on (Windows only, no-op elsewhere). Pass NULL or "" to clear.
+ *
+ * The private DACL is protected and names only SYSTEM, Administrators and the
+ * file's owner, which is normally exactly right: the agent runs as shell.user,
+ * so shell.user owns everything it writes. The Windows pre-logon agent breaks
+ * that assumption - it runs as SYSTEM, so a config it rewrote would come back
+ * owned by SYSTEM with shell.user locked out of their own agent.json, and the
+ * device would stop working at the moment somebody finally logged on.
+ *
+ * This is the Windows counterpart of DirectGate_ChownToUser on POSIX, which
+ * hands the config to shell.user for the same reason. It self-heals: once the
+ * normal agent writes the file again it is owned by shell.user outright.
+ */
+void DirectGate_SetPrivateFileGrantee(const char *pAccount);
+
 /* Convert backslash separators to forward slashes in place (Windows
    only, no-op elsewhere). Every Windows API accepts forward slashes,
    while raw backslashes inside generated JSON configs are invalid

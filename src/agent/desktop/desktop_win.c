@@ -116,6 +116,12 @@ typedef struct directgate_winenc_ {
      * of this thread's own capture. */
     xbool_t bElevAttached;
     xbool_t bBridged;
+
+    /* Set when this pipeline never had a capture of its own to begin with -
+     * started on the secure desktop, where duplication will not initialise and
+     * GDI reads a desktop this process does not own. The helper is then not a
+     * fallback but the only source there is, and the bridge is never left. */
+    xbool_t bNoLocalCapture;
     uint64_t nDesktopProbeUs;
     uint64_t nLastFrameUs;              /* last capture that actually produced pixels */
 
@@ -620,6 +626,12 @@ static void DirectGate_Desktop_WinEnc_LeaveBridge(directgate_winenc_t *pEnc)
 {
     if (!pEnc->bBridged) return;
 
+    /* Nothing to go back to. A pipeline that started with no capture of its
+     * own would trade a working picture for a stream of capture failures, and
+     * the helper serves an ordinary desktop just as well as a secure one - so
+     * it simply keeps serving. */
+    if (pEnc->bNoLocalCapture) return;
+
     DirectGate_Elevated_StopCapture();
     pEnc->bBridged = XFALSE;
     pEnc->bHavePrev = XFALSE;
@@ -812,16 +824,52 @@ static int DirectGate_Desktop_WinEnc_InitPipeline(directgate_winenc_t *pEnc)
      * first frame: duplication only delivers frames on screen updates, and
      * an idle desktop would otherwise leave the viewer black until
      * something repaints. */
-    if (DirectGate_Desktop_WinEnc_InitGdi(pEnc) != XSTDOK)
-    {
-        DirectGate_Desktop_WinEnc_SetError(pEnc, "GDI screen capture initialization failed.");
-        return XSTDERR;
-    }
+    xbool_t bLocalCapture = XTRUE;
 
-    if (DirectGate_Desktop_WinEnc_CaptureGdi(pEnc, XTRUE) == XSTDERR)
+    if (DirectGate_Desktop_WinEnc_InitGdi(pEnc) != XSTDOK ||
+        DirectGate_Desktop_WinEnc_CaptureGdi(pEnc, XTRUE) == XSTDERR)
+        bLocalCapture = XFALSE;
+
+    /*
+        Neither duplication nor GDI is a requirement when the helper is here.
+        
+        On the secure desktop - a logon screen, the lock screen, a UAC prompt
+        that was already up before this pipeline started - this process can
+        capture nothing at all: duplication will not initialise and GDI reads
+        an empty desktop it does not own. That is not a broken pipeline, it is
+        precisely the situation the SYSTEM helper exists for, and it is already
+        attached by the time this runs.
+
+        Treating it as fatal is what made a device on the logon screen useless:
+        the pipeline refused to start, the caller fell back to raw RGBA, the
+        fallback released the helper - and the raw path has no bridge to it, so
+        the operator got a display list, no picture, and no error. Only the
+        already-running case worked, because there the bridge is entered on a
+        *lost* duplication rather than on one that never existed.
+    */
+    if (!bLocalCapture)
     {
-        DirectGate_Desktop_WinEnc_SetError(pEnc, "GDI screen capture probe failed.");
-        return XSTDERR;
+        if (!pEnc->bElevAttached)
+        {
+            DirectGate_Desktop_WinEnc_SetError(pEnc, "GDI screen capture probe failed.");
+            return XSTDERR;
+        }
+
+        /* Entered here rather than left to the capture loop's probe, so the
+           pipeline starts with a frame source instead of a window in which it
+           has none and would report failures for a screen it cannot read. */
+        if (!DirectGate_Desktop_WinEnc_EnterBridge(pEnc))
+        {
+            DirectGate_Desktop_WinEnc_SetError(pEnc,
+                "Screen capture is unavailable and the elevated desktop helper could not take over.");
+
+            return XSTDERR;
+        }
+
+        pEnc->bNoLocalCapture = XTRUE;
+
+        xlogn("Local screen capture is unavailable, starting on the elevated helper: sid(%u), encode(%ux%u)",
+              pEnc->pDesktop->nSessionId, pEnc->nEncodeWidth, pEnc->nEncodeHeight);
     }
 
     return XSTDOK;

@@ -426,7 +426,18 @@ static int DirectGate_Elev_RequestHelper(uint32_t nCaptureWidth, uint32_t nCaptu
  */
 int DirectGate_Elevated_Attach(void)
 {
-    if (!DirectGate_Elevated_Supported()) return XSTDNON;
+    /* Both early returns below used to be silent, which made the one failure
+       that matters invisible: with no helper the capture path never probes for
+       the secure desktop at all (see bElevAttached in desktop_win.c), so a
+       session on the logon screen produces no frames, reports no error, and
+       leaves the viewer sitting on "choose a display" with nothing in the log
+       to say why. */
+    if (!DirectGate_Elevated_Supported())
+    {
+        xlogw("Elevated desktop helper unavailable: %s", DirectGate_Elevated_Reason());
+        return XSTDNON;
+    }
+
     EnterCriticalSection(&g_elev.ctlLock);
 
     if (g_elev.bReady)
@@ -446,6 +457,14 @@ int DirectGate_Elevated_Attach(void)
     if (nVirtualWidth <= 0 || nVirtualHeight <= 0)
     {
         LeaveCriticalSection(&g_elev.ctlLock);
+
+        /* Zero here means this process cannot see a desktop at all - which a
+           SYSTEM process can hit in a session whose window station it never
+           reached. Worth naming: it looks nothing like a helper problem from
+           the outside, and every symptom downstream is identical to one. */
+        xlogw("Elevated desktop helper unavailable: this process reports no virtual "
+              "screen (%dx%d), so it has no desktop to capture", nVirtualWidth, nVirtualHeight);
+
         return XSTDNON;
     }
 
@@ -1326,6 +1345,7 @@ XSTATUS DirectGate_Elevated_HelperMain(int argc, char *argv[])
     }
 
     xlog_defaults();
+    xlog_indent(XTRUE);
     xlog_coloring(XFALSE);
     xlog_timing(XLOG_DATE);
     DirectGate_LogApply(&log);

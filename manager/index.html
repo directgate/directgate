@@ -112,6 +112,24 @@
 
         <p id="service-msg" class="msg" role="status" aria-live="polite"></p>
       </section>
+
+      <!--
+        Version and updates. A footer rather than a third card on purpose: it
+        reports on the app itself rather than on anything the user came here to
+        do, and giving it the same weight as Pair Device and Service would say
+        it matters as much as they do.
+      -->
+      <footer class="appfoot" role="status" aria-live="polite">
+        <span id="ver-dot" class="appfoot__dot" aria-hidden="true"></span>
+        <span class="appfoot__text">
+          <span id="ver-installed" class="appfoot__version"></span>
+          <span id="ver-state" class="appfoot__state"></span>
+          <a id="ver-download" class="link appfoot__link"
+             href="https://directgate.io/update" hidden></a>
+        </span>
+        <button id="ver-check-btn" class="btn btn--ghost btn--small appfoot__check"
+                type="button" title="Check for updates" hidden>Check</button>
+      </footer>
     </main>
 
     <script type="module" src="/src/main.ts"></script>

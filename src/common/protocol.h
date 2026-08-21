@@ -83,6 +83,7 @@ typedef struct directgate_pkg_auth_ {
     const char *pAgentSig;       /* Ed25519 signature from agent, base64 */
     const char *pClientSig;      /* Ed25519 signature from client, base64 */
     const char *pDesktopShareId; /* Ephemeral desktop-only SRP credential. */
+    xbool_t bPreLogon;           /* Agent result: only "desktop" mode is available. */
 } directgate_pkg_auth_t;
 
 typedef struct directgate_pkg_verify_ {
@@ -215,8 +216,14 @@ xjson_obj_t* DirectGate_Proto_BuildAuthChallenge(const char *pSalt, const char *
                                                  const char *pNonce, uint32_t nSuite,
                                                  uint32_t nSessionId);
 
+/* bPreLogon marks an agent that is only reachable because nobody is logged on
+ * yet (Windows pre-logon; see desktop.preLogon). It is carried on the auth
+ * result rather than discovered later so a client knows before it picks a mode
+ * that only "desktop" will be accepted. Absent means false: older agents never
+ * enter that state, so a missing field and a false one mean the same thing. */
 xjson_obj_t* DirectGate_Proto_BuildAuthResult(const char *pStatus, const char *pM2,
-                                              const char *pReason, uint32_t nSessionId);
+                                              const char *pReason, uint32_t nSessionId,
+                                              xbool_t bPreLogon);
 
 /* ---- Public-key auth variants (method="key") ----
  *
@@ -267,8 +274,7 @@ xjson_obj_t* DirectGate_Proto_BuildFileCancel(const char *pTransferId, const cha
 
 xbool_t DirectGate_Proto_EncryptPackage(xbyte_buffer_t *pPkg, directgate_e2e_t *pE2E, uint32_t nSessionId);
 xbool_t DirectGate_Proto_DecryptPackage(xbyte_buffer_t *pOut, const directgate_pkg_t *pPkg, directgate_e2e_t *pE2E);
-xbool_t DirectGate_Proto_AddCC(xjson_obj_t *pHeader, directgate_e2e_t *pE2E,
-                              uint32_t nSessionEpoch);
+xbool_t DirectGate_Proto_AddCC(xjson_obj_t *pHeader, directgate_e2e_t *pE2E, uint32_t nSessionEpoch);
 xbool_t DirectGate_Proto_CheckCC(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E);
 xbool_t DirectGate_Proto_BindInnerSessionId(uint32_t nOuterSessionId, directgate_pkg_t *pInnerPkg);
 

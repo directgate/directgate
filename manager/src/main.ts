@@ -43,6 +43,34 @@ function changeSrpPassword(authPassword: string): Promise<string> {
   return invoke<string>("change_srp_password", { authPassword });
 }
 
+/*
+ * Version / update state, as reported by the Rust side.
+ *
+ * `state` is the whole vocabulary of the footer:
+ *   current     - the installed agent matches the published release
+ *   outdated    - something newer is published; `url` is where to get it
+ *   ahead       - installed is newer than published (a local or CI build)
+ *   unknown     - the check could not complete; `detail` says why
+ *   unsupported - a platform where a package manager owns the agent
+ */
+interface UpdateInfo {
+  installed: string | null;
+  latest: string | null;
+  state: "current" | "outdated" | "ahead" | "unknown" | "unsupported";
+  url: string | null;
+  md5: string | null;
+  supported: boolean;
+  detail: string | null;
+}
+
+function getAgentVersion(): Promise<string> {
+  return invoke<string>("get_agent_version");
+}
+
+function checkForUpdate(): Promise<UpdateInfo> {
+  return invoke<UpdateInfo>("check_for_update");
+}
+
 const NOT_INSTALLED_MSG =
   "DirectGate service is not installed. Please install DirectGate Agent first.";
 
@@ -125,6 +153,12 @@ const srpConfirmEl = $<HTMLInputElement>("srp-confirm");
 const srpSubmitBtn = $<HTMLButtonElement>("srp-submit-btn");
 const srpCancelBtn = $<HTMLButtonElement>("srp-cancel-btn");
 
+const verDot = $<HTMLSpanElement>("ver-dot");
+const verInstalled = $<HTMLSpanElement>("ver-installed");
+const verState = $<HTMLSpanElement>("ver-state");
+const verDownload = $<HTMLAnchorElement>("ver-download");
+const verCheckBtn = $<HTMLButtonElement>("ver-check-btn");
+
 const statusValue = $<HTMLSpanElement>("status-value");
 const actionBtn = $<HTMLButtonElement>("action-btn");
 const stopBtn = $<HTMLButtonElement>("stop-btn");
@@ -186,6 +220,121 @@ async function refreshPairing(): Promise<void> {
     // If we can't tell, default to showing the form.
     showPairForm();
   }
+}
+
+// --- version / updates -------------------------------------------------------
+/*
+ * The footer has one job: answer "am I running the current version?" without
+ * ever getting in the way of the two things the window is actually for. So it
+ * only ever paints three elements - a dot, a version, and one short phrase -
+ * and the phrase becomes a link exactly when there is somewhere to go.
+ */
+type VerTone = "idle" | "busy" | "ok" | "update" | "err";
+
+/** Latest successful check, so the update link knows where to point. */
+let updateUrl: string | null = null;
+
+function paintVersion(
+  tone: VerTone,
+  version: string,
+  state: string,
+  detail?: string,
+): void {
+  verDot.className =
+    tone === "idle" ? "appfoot__dot" : `appfoot__dot appfoot__dot--${tone}`;
+  verInstalled.textContent = version;
+  verState.textContent = state;
+  // The reason a check failed belongs on hover, not in a 420px-wide line.
+  verState.title = detail ?? "";
+  verDownload.hidden = true;
+}
+
+function paintUpdateAvailable(info: UpdateInfo): void {
+  verDot.className = "appfoot__dot appfoot__dot--update";
+  verInstalled.textContent = info.installed ? `v${info.installed}` : "";
+  // Left empty so the line carries one separator, not two: the link says
+  // everything the state text would have.
+  verState.textContent = "";
+  verState.title = "";
+
+  updateUrl = info.url;
+  verDownload.textContent = `Update to ${info.latest}`;
+  // Opens the update page, not the installer: upgrading stops the service and
+  // drops whatever remote session the user is in, which is worth reading
+  // before it happens rather than after a download has already started.
+  verDownload.title = info.md5
+    ? `Opens directgate.io/update\nInstaller MD5: ${info.md5}`
+    : "Opens directgate.io/update";
+  verDownload.hidden = false;
+}
+
+function applyUpdateInfo(info: UpdateInfo): void {
+  const version = info.installed ? `v${info.installed}` : "";
+
+  // Only offer the button where checking means anything; on Linux and macOS
+  // the package manager owns the agent and this window has no business
+  // second-guessing it.
+  verCheckBtn.hidden = !info.supported;
+
+  switch (info.state) {
+    case "outdated":
+      paintUpdateAvailable(info);
+      break;
+    case "current":
+      paintVersion("ok", version, "Latest version");
+      break;
+    case "ahead":
+      // A local or CI build, which is a fact worth stating plainly rather than
+      // dressing up as either "current" or "out of date".
+      paintVersion("idle", version, `Newer than the published ${info.latest}`);
+      break;
+    case "unsupported":
+      paintVersion("idle", version, "");
+      break;
+    default:
+      paintVersion(
+        "err",
+        version,
+        "Update check unavailable",
+        info.detail ?? undefined,
+      );
+      break;
+  }
+}
+
+async function runUpdateCheck(): Promise<void> {
+  verCheckBtn.disabled = true;
+  verDot.className = "appfoot__dot appfoot__dot--busy";
+  verState.textContent = "Checking\u2026";
+  verState.title = "";
+  verDownload.hidden = true;
+
+  try {
+    applyUpdateInfo(await checkForUpdate());
+  } catch (err) {
+    // check_for_update reports trouble in its result rather than by failing,
+    // so reaching here means the command itself did not run.
+    paintVersion("err", verInstalled.textContent ?? "", "Update check unavailable", String(err));
+  } finally {
+    verCheckBtn.disabled = false;
+  }
+}
+
+/*
+ * Two probes, in this order on purpose: the local one answers instantly and
+ * fills the line, so the footer never starts as a blank strip waiting on the
+ * network. The remote one then upgrades it in place.
+ */
+async function initVersionFooter(): Promise<void> {
+  try {
+    paintVersion("idle", `v${await getAgentVersion()}`, "");
+  } catch {
+    paintVersion("idle", "", "Agent not installed");
+    // Nothing to compare against, so there is nothing to check either.
+    return;
+  }
+
+  await runUpdateCheck();
 }
 
 // --- service status ----------------------------------------------------------
@@ -412,6 +561,18 @@ function wireExternalLink(link: HTMLAnchorElement): void {
 wireExternalLink(workspaceLink);
 wireExternalLink(pairedWorkspaceLink);
 
+verCheckBtn.addEventListener("click", runUpdateCheck);
+
+// The update link points at whatever the last check resolved, falling back to
+// the update page baked into the markup.
+verDownload.addEventListener("click", (e) => {
+  e.preventDefault();
+  openUrl(updateUrl ?? verDownload.href).catch((err) => {
+    verState.textContent = "Could not open the browser";
+    verState.title = String(err);
+  });
+});
+
 refreshBtn.addEventListener("click", refreshStatus);
 
 actionBtn.addEventListener("click", () => {
@@ -433,3 +594,4 @@ confirmEl.addEventListener("keydown", (e) => {
 // Initial probes.
 refreshPairing();
 refreshStatus();
+initVersionFooter();

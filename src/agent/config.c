@@ -569,6 +569,7 @@ void DirectGate_InitConfig(directgate_cfg_t *pCfg)
 
     pCfg->desktop.bElevatedInput = XTRUE;
     pCfg->desktop.bLockScreen = XTRUE;
+    pCfg->desktop.bPreLogon = XTRUE;
 
     pCfg->nKAInterval = DIRECTGATE_KA_INTERVAL_SEC;
     pCfg->bRotateAgentKey = XFALSE;
@@ -676,6 +677,9 @@ xbool_t DirectGate_LoadConfig(directgate_cfg_t *pCfg, const char *pPath)
 
         xjson_obj_t *pLockScreen = XJSON_GetObject(pDesktop, "lockScreen");
         if (pLockScreen != NULL) pCfg->desktop.bLockScreen = XJSON_GetBool(pLockScreen);
+
+        xjson_obj_t *pPreLogon = XJSON_GetObject(pDesktop, "preLogon");
+        if (pPreLogon != NULL) pCfg->desktop.bPreLogon = XJSON_GetBool(pPreLogon);
     }
 
     xjson_obj_t *pEnroll = XJSON_GetObject(pRoot, "enrollment");
@@ -821,6 +825,7 @@ xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
     {
         XJSON_AddBool(pDesktop, "elevatedInput", pCfg->desktop.bElevatedInput);
         XJSON_AddBool(pDesktop, "lockScreen", pCfg->desktop.bLockScreen);
+        XJSON_AddBool(pDesktop, "preLogon", pCfg->desktop.bPreLogon);
     }
 
     if (xstrused(pCfg->enroll.sApiUrl) ||

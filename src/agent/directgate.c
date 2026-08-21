@@ -2806,9 +2806,77 @@ static void DirectGate_RunService(xapi_t *pApi, xapi_endpoint_t *pEndpt, directg
 }
 
 #ifdef _WIN32
+/* True only for a process whose token user is LocalSystem. */
+static xbool_t DirectGate_IsLocalSystem(void)
+{
+    uint8_t sSystemSid[SECURITY_MAX_SID_SIZE];
+    DWORD nSidLen = (DWORD)sizeof(sSystemSid);
+
+    if (!CreateWellKnownSid(WinLocalSystemSid, NULL, sSystemSid, &nSidLen))
+    {
+        xloge("Failed to build the LocalSystem SID: error(%lu)", GetLastError());
+        return XFALSE;
+    }
+
+    HANDLE hToken = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
+    {
+        xloge("Failed to open the process token: error(%lu)", GetLastError());
+        return XFALSE;
+    }
+
+    uint8_t sUserBuf[XSTR_TINY];
+    DWORD nLen = 0;
+    xbool_t bIsSystem = XFALSE;
+
+    if (GetTokenInformation(hToken, TokenUser, sUserBuf, (DWORD)sizeof(sUserBuf), &nLen))
+        bIsSystem = EqualSid(((TOKEN_USER*)sUserBuf)->User.Sid, sSystemSid) ? XTRUE : XFALSE;
+    else xloge("Failed to read the process token user: error(%lu)", GetLastError());
+
+    CloseHandle(hToken);
+    return bIsSystem;
+}
+
 static xbool_t DirectGate_DropPrivileges(const directgate_cfg_t *pCfg)
 {
     XCHECK((pCfg != NULL), XFALSE);
+
+    /*
+        Pre-logon is the one sanctioned way for the agent not to be shell.user:
+        the launcher started it as SYSTEM because nobody was logged on (see
+        desktop.preLogon). The identity check below would refuse that, so it is
+        replaced - not skipped - by the check that actually applies here.
+
+        Being told "you are pre-logon" is not taken on trust. The flag arrives
+        on a command line, and a command line is something any local user can
+        write; without this, running the agent by hand with it would turn the
+        identity check into an opt-out. Only a process that really is SYSTEM
+        can have been started the way the launcher starts this one.
+    */
+    if (DirectGate_Session_IsPreLogon())
+    {
+        if (!DirectGate_IsLocalSystem())
+        {
+            xloge("Pre-logon mode was requested by a process that is not LocalSystem, "
+                  "refusing to start: it is set by the launcher alone");
+
+            return XFALSE;
+        }
+
+        /*
+            Everything this agent persists - a refreshed enrollment token above
+            all - would otherwise come back owned by SYSTEM, with shell.user
+            shut out of their own agent.json. The device would then work
+            perfectly right up until somebody logged on, which is the one
+            moment it must not fail.
+        */
+        DirectGate_SetPrivateFileGrantee(pCfg->sShellUser);
+
+        xlogn("Running as the pre-logon agent: nobody is logged on, so only desktop "
+              "sessions will start until someone signs in: shell.user(%s)", pCfg->sShellUser);
+
+        return XTRUE;
+    }
 
     if (!xstrused(pCfg->sShellUser))
     {

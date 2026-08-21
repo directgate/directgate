@@ -632,6 +632,18 @@ static int DirectGate_Client_HandleKeyAuthMsg(directgate_ctx_t *pCli, directgate
             if (pCli->bAddKeyMode)
                 return DirectGate_Client_SendAddKey(pCli);
 
+            /* A pre-logon agent serves desktop sessions only, and dgcli has
+               no desktop client - say so plainly instead of letting the shell
+               request come back as a generic mode error. */
+            if (pAuth->bPreLogon)
+            {
+                xloge("Nobody is logged on to this device yet, so only a remote desktop "
+                      "session is available; sign in there first");
+
+                g_bFinish = XTRUE;
+                return XAPI_DISCONNECT;
+            }
+
             if (DirectGate_Client_SendCmdStart(pCli, "terminal") < 0)
                 return XAPI_DISCONNECT;
 
@@ -735,6 +747,18 @@ static int DirectGate_Client_HandleAuthMsg(directgate_ctx_t *pCli, directgate_pk
         /* Authorizes a key and stops; it never opens a shell. */
         if (pCli->bAddKeyMode)
             return DirectGate_Client_SendAddKey(pCli);
+
+        /* A pre-logon agent serves desktop sessions only, and dgcli has
+           no desktop client - say so plainly instead of letting the shell
+           request come back as a generic mode error. */
+        if (pAuth->bPreLogon)
+        {
+            xloge("Nobody is logged on to this device yet, so only a remote desktop "
+                  "session is available; sign in there first");
+
+            g_bFinish = XTRUE;
+            return XAPI_DISCONNECT;
+        }
 
         if (DirectGate_Client_SendCmdStart(pCli, "terminal") < 0)
             return XAPI_DISCONNECT;

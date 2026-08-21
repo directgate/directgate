@@ -602,6 +602,25 @@ static xjson_obj_t* DirectGate_Files_ListDrives(void)
 }
 #endif
 
+/*
+    Why this is not just errno.
+
+    libxutils opens a directory with opendir() on POSIX but with
+    FindFirstFile() on Windows, and a failing Win32 call records its reason in
+    GetLastError() while leaving errno alone. Reading errno there reports
+    whatever happened last in this thread, which is usually nothing - which is
+    how a plain access denial reached the log as errno(0), saying nothing at
+    all about the directory the agent could not open.
+*/
+static int DirectGate_Files_DirError(void)
+{
+#ifdef _WIN32
+    DWORD nError = GetLastError();
+    if (nError != 0) return (int)nError;
+#endif
+    return errno;
+}
+
 xjson_obj_t* DirectGate_Files_ListDir(const char *pPath)
 {
     XCHECK(xstrused(pPath), xthrowp(NULL, "Path is empty"));
@@ -622,7 +641,9 @@ xjson_obj_t* DirectGate_Files_ListDir(const char *pPath)
     xdir_t dir;
     if (XDir_Open(&dir, pPath) < 0)
     {
-        xloge("Failed to open directory listing target: path(%s), errno(%d)", pPath, errno);
+        xloge("Failed to open directory listing target: path(%s), error(%d)",
+            pPath, DirectGate_Files_DirError());
+
         return NULL;
     }
 

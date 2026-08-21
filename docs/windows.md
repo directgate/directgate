@@ -99,7 +99,7 @@ The binaries land in `build/`. The MinGW runtime is linked statically and `OPENS
 
 The project's Windows CI builds a Windows x64 MSI with the [WiX Toolset](https://wixtoolset.org/) - the `build-msi` job in `.github/workflows/windows.yml`. WiX runs only on Windows, so the installer is produced in CI rather than the Linux release pipeline. The rest of this section covers installing and configuring that MSI.
 
-Installing `directgate-<version>-x64.msi` (double-click, or `msiexec /i directgate-<version>-x64.msi`, add `/qn` for silent):
+Installing `directgate-<release>_x64.msi` (double-click, or `msiexec /i directgate-<release>_x64.msi`, add `/qn` for silent):
 
 - requests elevation once for the per-machine installation;
 - installs the `DirectGate P2P UDP` inbound Windows Firewall rule for `directgate.exe` on every profile, with edge traversal enabled;
@@ -115,7 +115,7 @@ Nothing here needs a reboot, and the installer does not ask for one. It stops th
 
 An interactive install shows the normal Windows UAC prompt. A silent `/qn` install cannot display UAC, so it must be launched from an already elevated process or deployment service.
 
-**Operational disclosure.** The service runs only the privilege-separation *launcher* (see [As a Windows service](#as-a-windows-service)): a tiny LocalSystem supervisor that acquires `shell.user`'s logon token and runs the actual agent as `shell.user`. Terminal sessions, file-manager operations, protocol parsing and network session handling run as `shell.user`, not as LocalSystem. Remote access is unavailable until the device is explicitly paired and the client authenticates; the installed service does not grant anonymous remote access. No Windows password is ever stored or prompted.
+**Operational disclosure.** The service runs only the privilege-separation *launcher* (see [As a Windows service](#as-a-windows-service)): a tiny LocalSystem supervisor that acquires `shell.user`'s logon token and runs the actual agent as `shell.user`. Terminal sessions, file-manager operations, protocol parsing and network session handling run as `shell.user`, not as LocalSystem. The one exception is the logon screen, where no user exists to be: see [Reaching a machine before anyone logs on](#reaching-a-machine-before-anyone-logs-on). Remote access is unavailable until the device is explicitly paired and the client authenticates; the installed service does not grant anonymous remote access. No Windows password is ever stored or prompted.
 
 Finish setup after installing:
 
@@ -129,7 +129,7 @@ Finish setup after installing:
 
 There is no third step: the service is already running and picks the configuration up on its own within a couple of seconds. It does not need to be started by hand and the machine does not need a reboot. Until a config with a `shell.user` exists the launcher simply waits, which is also why a fresh install never reports a failed service start.
 
-The launcher serves sessions only while `shell.user` is logged on (console/RDP); when they are not it waits and starts the agent on the next logon. There is no headless mode - that is the deliberate cost of never storing a password.
+The launcher serves full sessions only while `shell.user` is logged on (console/RDP). When nobody is logged on at all it keeps the device reachable on the logon screen instead of going dark - see [Reaching a machine before anyone logs on](#reaching-a-machine-before-anyone-logs-on). When somebody *else* is logged on it waits, and starts the agent on the next `shell.user` logon.
 
 Uninstalling stops and removes the service, deletes the files, and removes the `PATH` entry.
 
@@ -146,7 +146,7 @@ Safe ways to start it:
 
   ```bat
   schtasks /create /tn DirectGateUpgrade /ru SYSTEM /sc once /st 00:00 /f ^
-      /tr "msiexec /i C:\path\directgate-<version>-x64.msi /qn /norestart"
+      /tr "msiexec /i C:\path\directgate-<release>_x64.msi /qn /norestart"
   schtasks /run /tn DirectGateUpgrade
   ```
 
@@ -190,7 +190,7 @@ or `"C:\\Users\\Kala"`. Forward slashes are the recommended form: every Windows 
 The [MSI installer](#installer-msi) registers this service for you; the manual
 `sc.exe` route below is for source builds and custom setups.
 
-DirectGate uses **privilege separation** on Windows. A single service runs a small **launcher** as LocalSystem; the launcher acquires `shell.user`'s logon token (passwordless, via `WTSQueryUserToken`) and spawns the agent inside that user's session, so the agent - including all protocol parsing, the PTY and the file manager - runs as `shell.user`, never as SYSTEM. This mirrors the POSIX model where the agent `setuid`s to `shell.user`: the untrusted parser is never SYSTEM. Remote access is available only after explicit pairing and client authentication; installing or starting the service alone does not expose an anonymous remote shell or file manager.
+DirectGate uses **privilege separation** on Windows. A single service runs a small **launcher** as LocalSystem; the launcher acquires `shell.user`'s logon token (passwordless, via `WTSQueryUserToken`) and spawns the agent inside that user's session, so the agent - including all protocol parsing, the PTY and the file manager - runs as `shell.user`, never as SYSTEM. This mirrors the POSIX model where the agent `setuid`s to `shell.user`: the untrusted parser is never SYSTEM. The single, bounded exception is the pre-logon agent described [below](#reaching-a-machine-before-anyone-logs-on), which exists only while nobody is logged on and serves nothing but a desktop session. Remote access is available only after explicit pairing and client authentication; installing or starting the service alone does not expose an anonymous remote shell or file manager.
 From an **administrator** prompt:
 
 ```bat
@@ -205,10 +205,66 @@ sc.exe start directgate-agent
 
 Notes:
 
-- **No password.** The service is LocalSystem; only the launcher (which holds   `SeTcbPrivilege`) can mint `shell.user`'s token. `shell.user` must be set in the config and **logged on** for sessions to run - the launcher waits for both rather than exiting, so it can be installed and started before the machine has ever been paired. The identity is still pinned once: the first configuration carrying a `shell.user` is the one it commits to, and nothing re-reads it afterwards.
+- **No password.** The service is LocalSystem; only the launcher (which holds   `SeTcbPrivilege`) can mint `shell.user`'s token. `shell.user` must be set in the config and **logged on** for terminal and file-manager sessions to run - the launcher waits for both rather than exiting, so it can be installed and started before the machine has ever been paired. The identity is still pinned once: the first configuration carrying a `shell.user` is the one it commits to, and nothing re-reads it afterwards.
 - The launcher pins the spawn identity to the configured `shell.user` and never takes it from anything else, so terminal and file-manager sessions can never run under an unexpected identity - the Windows counterpart of the POSIX privilege-drop policy.
 - A service stop (`sc.exe stop directgate-agent`) stops the launcher, which terminates the supervised agent.
 - Logs go to the file configured under `log` in `agent.json`; there is no Windows Event Log integration.
+
+### Reaching a machine before anyone logs on
+
+A Windows machine that reboots with nobody at the keyboard used to be unreachable until somebody walked up to it: there is no logon session, so there is no `shell.user` token, so the launcher had nothing to start the agent with. That is precisely the situation remote access exists for - a power cut on a machine three time zones away - so the launcher covers it with an agent run under the one identity that exists before any user does: its own.
+
+When `shell.user` is not logged on **and nobody else is either**, the launcher duplicates its own LocalSystem token, retargets it at the console session with `SetTokenInformation(TokenSessionId)` - the same mint the [desktop helper](#elevated-ui-and-the-secure-desktop) uses - and starts the agent there with `--win-prelogon`. The result is a device that stays online at the logon screen: connect a desktop session, drive `LogonUI` through the helper, sign in normally.
+
+What that agent may do is deliberately narrow, because it is SYSTEM:
+
+- **Desktop sessions only.** `DirectGate_Session_StartMode` refuses `terminal`
+  and `file-manager` outright, so the pre-logon window never yields a SYSTEM
+  shell or a SYSTEM file manager. Clients are told before they pick a mode: the
+  auth result carries `preLogon: true`.
+- **A session that is being torn down is not spawned into twice.** For a second
+  or two after a sign-out, the dying session still answers `WTSQueryUserToken`,
+  so the supervisor would start an agent straight back into it and watch that
+  one die within milliseconds. An agent that exits in under three seconds is
+  taken as evidence about its session rather than about itself: that session is
+  then left alone for six seconds, which also caps what used to be an unbounded
+  two-second retry loop against a session that keeps killing whatever starts in
+  it.
+- **Signing out brings it back.** The supervisor re-checks a running agent on
+  every tick, not only when its process exits, because a Windows session can be
+  destroyed out from under a process that keeps running: an agent left in a
+  session that no longer exists holds its relay connection open and looks
+  perfectly healthy while every session it could serve is already impossible.
+  The question it asks is deliberately narrow - *is the agent's own session
+  still `shell.user`'s?* - resolved against the session the OS says the process
+  is in (`ProcessIdToSessionId` at spawn). Asking the broad "is `shell.user`
+  logged on anywhere" instead cannot settle it: the agent is itself a process
+  in the session being torn down, so the broad answer can stay "yes" for as
+  long as the stale agent lives. After six seconds of the narrow answer being
+  "no", the agent is stopped and the logon screen is back on the air.
+- **It ends at the first logon.** The launcher retires it the moment the console
+  session gains a user. If that user is `shell.user`, the normal unprivileged
+  agent replaces it and everything works as documented above; if it is anyone
+  else, no agent runs at all - a SYSTEM capture left running in a session that
+  now belongs to somebody else would be streaming their desktop.
+- **The flag is not a switch a user can flip.** `--win-prelogon` is refused by
+  any agent that is not actually running as LocalSystem, so passing it by hand
+  cannot turn the `shell.user` identity check into an opt-out.
+- **It hands its files back.** Private files (`agent.json` above all) normally
+  carry a protected DACL naming SYSTEM, Administrators and the owner - which is
+  right when the writer is `shell.user`, and wrong when it is SYSTEM. A
+  pre-logon agent adds `shell.user` to that DACL explicitly, so a token refresh
+  it performs cannot lock the real agent out of its own configuration. This is
+  the Windows counterpart of the POSIX `chown` to `shell.user`, and it heals on
+  the next normal write.
+
+It is on by default (`desktop.preLogon`) and needs `desktop.elevatedInput`, since the logon screen lives on `winsta0\Winlogon` and only the helper can reach it; with elevated input off, the launcher logs why and disables pre-logon rather than serving a connected session that shows nothing. Deployments that would rather stay dark than run a restricted SYSTEM agent set:
+
+```json
+"desktop": { "preLogon": false }
+```
+
+and get exactly the previous behaviour - the launcher waits for a logon, and a machine that reboots unattended waits for someone to walk up to it.
 
 ### Terminal sessions
 
@@ -245,6 +301,7 @@ This is a fallback, never the normal path. The agent keeps its own duplication a
 - **Secure desktop.** `SendInput` returns zero, because the calling thread's desktop is not the one receiving input. The direct call therefore goes first exactly as before and only what it rejected is re-sent through the helper - which costs nothing but reading a return value the call already produced.
 - **Elevated window.** UIPI drops the event and reports nothing: MSDN states plainly that `SendInput` "fails when it is blocked by UIPI" and that "neither `GetLastError` nor the return value will indicate the failure". This one has to be decided *before* the call, so the agent checks whether the foreground window outranks its own integrity level and, if so, skips the direct `SendInput` entirely - sending both would double every event on windows that do accept input. The check is one `GetForegroundWindow` per event; the token lookup behind it is cached against that window and only redone when focus moves.
 - **Capture:** a lost duplication that `OpenInputDesktop` confirms is the secure desktop hands capture to the helper, which delivers BGRA at the pipeline's own encode size through a shared section. The same encoder, the same stream - only a keyframe is forced on each transition, which the screen change warrants anyway.
+- **Capture that was never there.** A pipeline can also *start* on the secure desktop - the logon screen, or a lock screen that was already up - and then there is no duplication to lose: it will not initialise, and the GDI probe reads a desktop this process does not own. That is not a broken pipeline, it is the case the helper exists for, so the pipeline starts bridged instead of failing. Treating it as fatal is what once made a device on the logon screen useless: the H.264 pipeline refused to start, the caller fell back to raw RGBA, the fallback released the helper, and the raw path has no bridge - so the operator got a display list, no picture and no error. A pipeline that started this way never leaves the bridge either; there is nothing to go back to, and the helper serves an ordinary desktop just as well.
 
 The helper never encodes. It is a capture and injection surface only, and the frames it hands over go through the agent's existing Media Foundation encoder - the same hardware MFT instance, chosen once at pipeline start and never rebuilt - so a UAC prompt or the lock screen is encoded on the GPU exactly like the rest of the session. Giving the helper its own encoder would mean two MFTs, two bitstreams and a discontinuity for the viewer at every transition, which is why the split is where it is.
 

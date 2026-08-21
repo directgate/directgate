@@ -132,12 +132,22 @@ int main(void)
     DirectGate_Package_Clear(&pkg);
 
     CHECK(roundtrip(&pkg, &wire,
-        DirectGate_Proto_BuildAuthResult("ok", "m2-proof", NULL, 5), NULL, 0) == 0,
+        DirectGate_Proto_BuildAuthResult("ok", "m2-proof", NULL, 5, XFALSE), NULL, 0) == 0,
         "auth result");
     {
         directgate_pkg_auth_t *pAuth = (directgate_pkg_auth_t*)pkg.pPackage;
         CHECK(pAuth != NULL && STREQ(pAuth->pStatus, "ok"), "result status");
         CHECK(STREQ(pAuth->pM2, "m2-proof"), "result M2");
+        CHECK(pAuth->bPreLogon == XFALSE, "result preLogon absent");
+    }
+    DirectGate_Package_Clear(&pkg);
+
+    CHECK(roundtrip(&pkg, &wire,
+        DirectGate_Proto_BuildAuthResult("ok", "m2-proof", NULL, 5, XTRUE), NULL, 0) == 0,
+        "auth result pre-logon");
+    {
+        directgate_pkg_auth_t *pAuth = (directgate_pkg_auth_t*)pkg.pPackage;
+        CHECK(pAuth != NULL && pAuth->bPreLogon == XTRUE, "result preLogon set");
     }
     DirectGate_Package_Clear(&pkg);
 

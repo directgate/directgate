@@ -129,6 +129,9 @@ int DirectGate_Session_SendErrorMsg(directgate_session_t *pSession, const char *
 directgate_session_mode_t DirectGate_SessionMode_FromString(const char *pMode);
 const char* DirectGate_SessionMode_ToString(directgate_session_mode_t eMode);
 
+void DirectGate_Session_SetPreLogon(xbool_t bPreLogon);
+xbool_t DirectGate_Session_IsPreLogon(void);
+
 int DirectGate_Session_EnsureMode(directgate_session_t *pSession, directgate_session_mode_t eMode, const char *pReason);
 int DirectGate_Session_StartMode(directgate_session_t *pSession, directgate_session_mode_t eMode);
 int DirectGate_Session_StartTerminal(directgate_session_t *pSession);
