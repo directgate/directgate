@@ -20,6 +20,7 @@
 #include "includes.h"
 #include "config.h"
 #include "launcher.h"
+#include "session.h"
 #include "elevated.h"
 
 #include <windows.h>   /* HANDLE, DWORD, etc. */
@@ -51,6 +52,10 @@
 #define DIRECTGATE_WIN_SERVICE_NAME "directgate-agent"
 #define DIRECTGATE_WIN_SERVICE_FLAG "--win-service"
 #define DIRECTGATE_WIN_LAUNCHER_FLAG "--win-launcher"
+
+/* Launcher -> agent: "you are the pre-logon stand-in". Never passed by hand;
+   the agent additionally refuses it unless it really is running as SYSTEM. */
+#define DIRECTGATE_WIN_PRELOGON_FLAG "--win-prelogon"
 
 static SERVICE_STATUS_HANDLE g_hSvcStatusHandle = NULL;
 static char **g_pSvcArgv = NULL;
@@ -164,7 +169,10 @@ static xbool_t DirectGate_WinLauncher_TokenMatchesUser(HANDLE hToken, PSID pWant
     return EqualSid(((TOKEN_USER*)sUserBuf)->User.Sid, pWantSid) ? XTRUE : XFALSE;
 }
 
-static XSTATUS DirectGate_WinLauncher_AcquireTokenForUser(const char *pShellUser, HANDLE *phToken)
+/* bQuiet suppresses the "not logged on" warning: the supervisor also uses this
+   as a plain predicate while a pre-logon agent is running, and that must not
+   turn a normal state of affairs into a log line every couple of seconds. */
+static XSTATUS DirectGate_WinLauncher_AcquireTokenForUser(const char *pShellUser, HANDLE *phToken, xbool_t bQuiet)
 {
     XCHECK((xstrused(pShellUser) && phToken != NULL), XSTDINV);
     *phToken = NULL;
@@ -203,10 +211,125 @@ static XSTATUS DirectGate_WinLauncher_AcquireTokenForUser(const char *pShellUser
 
     WTSFreeMemory(pSessions);
 
-    if (nStatus != XSTDOK)
+    if (nStatus != XSTDOK && !bQuiet)
         xlogw("token: shell.user is not logged on, cannot start session: user(%s)", pShellUser);
 
     return nStatus;
+}
+
+/* Whether shell.user has a logon session anywhere - console or RDP. */
+static xbool_t DirectGate_WinLauncher_UserIsLoggedOn(const char *pShellUser)
+{
+    HANDLE hToken = NULL;
+    if (DirectGate_WinLauncher_AcquireTokenForUser(pShellUser, &hToken, XTRUE) != XSTDOK)
+        return XFALSE;
+
+    CloseHandle(hToken);
+    return XTRUE;
+}
+
+/*
+    Pre-logon reachability (see desktop.preLogon in config.h).
+
+    A machine that reboots unattended has nobody logged on, so there is no
+    shell.user token to be had and the model above simply waits - which is
+    exactly the state an operator cannot recover from remotely, because
+    recovering means logging on and logging on means being at the keyboard.
+
+    The way out is the one identity that exists before any user does: the
+    launcher's own. A copy of its LocalSystem token retargeted at the console
+    session runs an agent that can see and drive the logon screen, and nothing
+    else - DirectGate_Session_SetPreLogon refuses every session mode but
+    "desktop", so the pre-logon window never yields a SYSTEM shell.
+
+    It is strictly a stand-in. The supervisor retires it the instant anyone
+    logs on: shell.user gets the normal unprivileged agent, and any other
+    account gets none, because a SYSTEM agent left running in a session that
+    now belongs to someone else would be streaming their desktop.
+*/
+
+static xbool_t g_bPreLogon = XTRUE;
+
+/* Whether the agent currently supervised is the pre-logon stand-in. Read by
+   SpawnHelper, which has to answer the lock-screen question differently for
+   it, so it cannot live as a local in the supervision loop. */
+static xbool_t g_bAgentPreLogon = XFALSE;
+
+/* True when nSessionId has an interactive user. Anything other than a clean
+   "no token" answer counts as occupied: guessing wrong in that direction only
+   withholds a pre-logon agent, while guessing wrong the other way would put a
+   SYSTEM capture into a session we could not account for. */
+static xbool_t DirectGate_WinLauncher_SessionHasUser(DWORD nSessionId)
+{
+    HANDLE hToken = NULL;
+
+    if (WTSQueryUserToken(nSessionId, &hToken))
+    {
+        CloseHandle(hToken);
+        return XTRUE;
+    }
+
+    DWORD nError = GetLastError();
+    if (nError == ERROR_NO_TOKEN) return XFALSE;
+
+    xlogw("token: could not tell whether session %lu is occupied, assuming it is: error(%lu)",
+        (unsigned long)nSessionId, nError);
+
+    return XTRUE;
+}
+
+/* A primary LocalSystem token aimed at nSessionId. Setting TokenSessionId
+   needs SeTcbPrivilege, which is why only the launcher can do this. */
+static HANDLE DirectGate_WinLauncher_SystemTokenForSession(DWORD nSessionId, const char *pWhat)
+{
+    HANDLE hSelfToken = NULL, hToken = NULL;
+
+    if (!OpenProcessToken(GetCurrentProcess(),
+        TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &hSelfToken) ||
+        !DuplicateTokenEx(hSelfToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &hToken))
+    {
+        xloge("launcher: failed to duplicate the system token for the %s: error(%lu)",
+            pWhat, GetLastError());
+
+        if (hSelfToken != NULL) CloseHandle(hSelfToken);
+        return NULL;
+    }
+
+    CloseHandle(hSelfToken);
+
+    if (!SetTokenInformation(hToken, TokenSessionId, &nSessionId, (DWORD)sizeof(nSessionId)))
+    {
+        xloge("launcher: failed to move the %s token into session %lu: error(%lu)",
+            pWhat, (unsigned long)nSessionId, GetLastError());
+
+        CloseHandle(hToken);
+        return NULL;
+    }
+
+    return hToken;
+}
+
+/* The token a pre-logon agent should run under, or NULL when this is not a
+   moment for one. On success *pnSessionId is the console session it belongs
+   to, which the supervisor watches for the logon that ends its life. */
+static HANDLE DirectGate_WinLauncher_AcquirePreLogonToken(DWORD *pnSessionId)
+{
+    *pnSessionId = 0;
+    if (!g_bPreLogon) return NULL;
+
+    /* 0 is the services session (no desktop of its own) and 0xFFFFFFFF means
+       there is no console session at all; both also show up transiently while
+       one session is handing the console to another. */
+    DWORD nSession = WTSGetActiveConsoleSessionId();
+    if (nSession == 0 || nSession == 0xFFFFFFFF) return NULL;
+
+    if (DirectGate_WinLauncher_SessionHasUser(nSession)) return NULL;
+
+    HANDLE hToken = DirectGate_WinLauncher_SystemTokenForSession(nSession, "pre-logon agent");
+    if (hToken == NULL) return NULL;
+
+    *pnSessionId = nSession;
+    return hToken;
 }
 
 /*
@@ -334,7 +457,7 @@ static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid
     HANDLE hCmdRead = NULL, hCmdWrite = NULL, hSection = NULL;
     HANDLE hReady = NULL, hTaken = NULL, hAgentInherit = NULL;
     LPPROC_THREAD_ATTRIBUTE_LIST pAttrs = NULL;
-    HANDLE hToken = NULL, hSelfToken = NULL;
+    HANDLE hToken = NULL;
     XSTATUS nStatus = XSTDERR;
 
     /* Single-pass block: every failure below breaks out to the one teardown
@@ -414,7 +537,7 @@ static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid
             (unsigned long long)(uintptr_t)hTaken,
             (unsigned long long)(uintptr_t)hAgentInherit,
             (unsigned long)nAgentPid,
-            g_bElevLockScreen ? 1 : 0,
+            (g_bAgentPreLogon || g_bElevLockScreen) ? 1 : 0,
             g_sElevCfgPath);
 
         HANDLE sHandles[5] = { hCmdRead, hSection, hReady, hTaken, hAgentInherit };
@@ -426,22 +549,9 @@ static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid
         }
 
         /* A copy of this process's own LocalSystem token, retargeted at the
-           interactive session. Setting TokenSessionId needs SeTcbPrivilege,
-           which is exactly why this cannot be done from the agent. */
-        if (!OpenProcessToken(GetCurrentProcess(),
-            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &hSelfToken) ||
-            !DuplicateTokenEx(hSelfToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &hToken))
-        {
-            xloge("launcher: failed to duplicate the system token for the helper: error(%lu)", GetLastError());
-            break;
-        }
-
-        if (!SetTokenInformation(hToken, TokenSessionId, &nSessionId, (DWORD)sizeof(nSessionId)))
-        {
-            xloge("launcher: failed to move the helper token into session %lu: error(%lu)",
-                (unsigned long)nSessionId, GetLastError());
-            break;
-        }
+           interactive session - the same mint the pre-logon agent uses. */
+        hToken = DirectGate_WinLauncher_SystemTokenForSession(nSessionId, "helper");
+        if (hToken == NULL) break;
 
         STARTUPINFOEXA si;
         memset(&si, 0, sizeof(si));
@@ -495,7 +605,6 @@ static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid
 
     DirectGate_WinLauncher_FreeHandleList(pAttrs);
     DirectGate_WinLauncher_CloseHandle(&hToken);
-    DirectGate_WinLauncher_CloseHandle(&hSelfToken);
     DirectGate_WinLauncher_CloseHandle(&hAgentInherit);
     DirectGate_WinLauncher_CloseHandle(&hCmdRead);
     DirectGate_WinLauncher_CloseHandle(&hCmdWrite);
@@ -666,7 +775,7 @@ static void DirectGate_WinLauncher_Stop(void)
  * shell.user. The identity comes only from the token the launcher minted for the
  * configured shell.user.
  */
-static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfgPath, HANDLE *phProcess)
+static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfgPath, xbool_t bPreLogon, HANDLE *phProcess)
 {
     *phProcess = NULL;
     char sSelf[XPATH_MAX];
@@ -711,16 +820,23 @@ static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfg
 
     char sCmd[XPATH_MAX * 2 + 256];
 
+    /* The child cannot work out for itself that it is the pre-logon stand-in:
+       being SYSTEM is a symptom of it, not proof of it. The launcher decided,
+       so the launcher says so. */
+    const char *pPreLogonArg = bPreLogon ? " " DIRECTGATE_WIN_PRELOGON_FLAG : "";
+
     if (pAttrs != NULL)
     {
-        xstrncpyf(sCmd, sizeof(sCmd), "\"%s\" -c \"%s\" --win-ctl-write %llu --win-ctl-read %llu",
+        xstrncpyf(sCmd, sizeof(sCmd), "\"%s\" -c \"%s\" --win-ctl-write %llu --win-ctl-read %llu%s",
             sSelf, pCfgPath, (unsigned long long)(uintptr_t)hReqWrite,
-            (unsigned long long)(uintptr_t)hRspRead);
+            (unsigned long long)(uintptr_t)hRspRead, pPreLogonArg);
     }
-    else xstrncpyf(sCmd, sizeof(sCmd), "\"%s\" -c \"%s\"", sSelf, pCfgPath);
+    else xstrncpyf(sCmd, sizeof(sCmd), "\"%s\" -c \"%s\"%s", sSelf, pCfgPath, pPreLogonArg);
 
     /* Run with the user's environment so HOME/USERPROFILE/APPDATA
-       resolve to shell.user, not the launcher's SYSTEM profile. */
+       resolve to shell.user, not the launcher's SYSTEM profile. In pre-logon
+       mode there is no user, and this resolves to the SYSTEM profile - which
+       is correct, because that is whose process it is. */
     LPVOID pEnv = NULL;
     CreateEnvironmentBlock(&pEnv, hToken, FALSE);
 
@@ -780,8 +896,27 @@ static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfg
         }
     }
 
-    xlogn("launcher: started agent in shell.user session: pid(%lu)", pi.dwProcessId);
+    if (bPreLogon) xlogn("launcher: started pre-logon agent as SYSTEM, desktop sessions only: pid(%lu)", pi.dwProcessId);
+    else xlogn("launcher: started agent in shell.user session: pid(%lu)", pi.dwProcessId);
+
     return XSTDOK;
+}
+
+/* Kill the supervised agent and tear the elevated-UI bridge down with it: no
+   agent means no reason for a SYSTEM process to still be injecting input. */
+static void DirectGate_WinLauncher_StopAgent(HANDLE *phAgent)
+{
+    if (phAgent == NULL || *phAgent == NULL) return;
+
+    /* TODO: graceful stop (console ctrl / signal) instead of kill;
+       sessions already tolerate an abrupt agent exit like a logoff. */
+    TerminateProcess(*phAgent, 0);
+    WaitForSingleObject(*phAgent, 5000);
+
+    /* After the agent is gone, so the servicing thread's read has ended. */
+    DirectGate_WinLauncher_StopElevChannel();
+    CloseHandle(*phAgent);
+    *phAgent = NULL;
 }
 
 static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
@@ -851,6 +986,18 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
                the decision. */
             g_bElevEnabled = cfg.desktop.bElevatedInput;
             g_bElevLockScreen = cfg.desktop.bLockScreen;
+            g_bPreLogon = cfg.desktop.bPreLogon;
+
+            /* Pre-logon capture lands on the Winlogon desktop, which only the
+               elevated helper can reach. Without it the operator would get a
+               connected session showing nothing, so say why instead. */
+            if (g_bPreLogon && !g_bElevEnabled)
+            {
+                xlogw("launcher: desktop.preLogon needs desktop.elevatedInput, disabling it: "
+                      "the logon screen is only reachable through the elevated helper");
+
+                g_bPreLogon = XFALSE;
+            }
 
             xstrncpy(cfg.log.sIdent, sizeof(cfg.log.sIdent), "directgate-launcher");
             DirectGate_LogApply(&cfg.log);
@@ -872,15 +1019,45 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
         return XSTDOK;
     }
 
-    xlogn("launcher: supervising agent for shell.user(%s), elevatedInput(%s), lockScreen(%s)",
-        sShellUser, g_bElevEnabled ? "on" : "off", g_bElevLockScreen ? "on" : "off");
+    xlogn("launcher: supervising agent for shell.user(%s), elevatedInput(%s), lockScreen(%s), preLogon(%s)",
+        sShellUser, g_bElevEnabled ? "on" : "off", g_bElevLockScreen ? "on" : "off", g_bPreLogon ? "on" : "off");
 
     HANDLE hAgent = NULL;
     uint64_t nLastSpawnMs = 0;
     xbool_t bWaitingForLogon = XFALSE;
+    xbool_t bAgentPreLogon = XFALSE;
+    DWORD nAgentSession = 0;
 
     while (!DirectGate_WinLauncher_Stopping())
     {
+        /* A pre-logon agent is a stand-in for an empty console, so it stops
+           being legitimate the moment that console is no longer empty - or is
+           no longer the console. Checked before the spawn block so the logon
+           that ends one agent can start the next on the very same tick. */
+        if (hAgent != NULL && bAgentPreLogon)
+        {
+            DWORD nConsole = WTSGetActiveConsoleSessionId();
+            const char *pWhy = NULL;
+
+            /* shell.user is checked separately from the console: an RDP logon
+               gives them a session of their own and leaves the console sitting
+               at the logon screen, so watching the console alone would keep a
+               SYSTEM agent running when the real one could have taken over. */
+            if (DirectGate_WinLauncher_UserIsLoggedOn(sShellUser)) pWhy = "shell.user logged on";
+            else if (nConsole != nAgentSession) pWhy = "the console moved to another session";
+            else if (DirectGate_WinLauncher_SessionHasUser(nAgentSession)) pWhy = "someone logged on at the console";
+
+            if (pWhy != NULL)
+            {
+                xlogn("launcher: retiring the pre-logon agent in session %lu: %s",
+                    (unsigned long)nAgentSession, pWhy);
+
+                DirectGate_WinLauncher_StopAgent(&hAgent);
+                bAgentPreLogon = XFALSE;
+                g_bAgentPreLogon = XFALSE;
+            }
+        }
+
         if (hAgent == NULL)
         {
             uint64_t nNow = XTime_GetMs();
@@ -891,26 +1068,49 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
             }
 
             HANDLE hToken = NULL;
-            if (DirectGate_WinLauncher_AcquireTokenForUser(sShellUser, &hToken) != XSTDOK)
+            xbool_t bPreLogon = XFALSE;
+            DWORD nSession = 0;
+
+            if (DirectGate_WinLauncher_AcquireTokenForUser(sShellUser, &hToken, XFALSE) == XSTDOK)
             {
-                /* shell.user not logged on: passwordless model waits for a logon. */
-                if (!bWaitingForLogon)
+                bWaitingForLogon = XFALSE;
+            }
+            else
+            {
+                /* shell.user not logged on. Either nobody is - and the machine
+                   can still be reached on the logon screen - or somebody else
+                   is, and the passwordless model has nothing to offer but the
+                   wait it always did. */
+                hToken = DirectGate_WinLauncher_AcquirePreLogonToken(&nSession);
+
+                if (hToken == NULL)
                 {
-                    xlogn("launcher: shell.user not logged on; waiting for logon: user(%s)", sShellUser);
-                    bWaitingForLogon = XTRUE;
+                    if (!bWaitingForLogon)
+                    {
+                        xlogn("launcher: shell.user not logged on; waiting for logon: user(%s)", sShellUser);
+                        bWaitingForLogon = XTRUE;
+                    }
+
+                    Sleep(DIRECTGATE_WIN_LAUNCHER_POLL_MS);
+                    continue;
                 }
 
-                Sleep(DIRECTGATE_WIN_LAUNCHER_POLL_MS);
-                continue;
+                bWaitingForLogon = XFALSE;
+                bPreLogon = XTRUE;
             }
 
-            bWaitingForLogon = XFALSE;
             nLastSpawnMs = nNow;
+            g_bAgentPreLogon = bPreLogon;
 
-            if (DirectGate_WinLauncher_SpawnAgent(hToken, pCfgPath, &hAgent) != XSTDOK)
+            if (DirectGate_WinLauncher_SpawnAgent(hToken, pCfgPath, bPreLogon, &hAgent) != XSTDOK)
                 hAgent = NULL;
 
             CloseHandle(hToken);
+
+            bAgentPreLogon = (hAgent != NULL) ? bPreLogon : XFALSE;
+            g_bAgentPreLogon = bAgentPreLogon;
+            nAgentSession = nSession;
+
             if (hAgent == NULL)
             {
                 Sleep(DIRECTGATE_WIN_LAUNCHER_POLL_MS);
@@ -919,7 +1119,7 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
         }
 
         /* Agent running: wake on its exit, on stop (POLL_MS cap), then respawn
-           on the next shell.user logon. */
+           on the next shell.user logon - or straight away on the logon screen. */
         DWORD nWait = WaitForSingleObject(hAgent, DIRECTGATE_WIN_LAUNCHER_POLL_MS);
         if (nWait == WAIT_OBJECT_0)
         {
@@ -928,22 +1128,14 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
             DirectGate_WinLauncher_StopElevChannel();
             CloseHandle(hAgent);
             hAgent = NULL;
+            bAgentPreLogon = XFALSE;
+            g_bAgentPreLogon = XFALSE;
 
-            xlogn("launcher: agent exited; will restart when shell.user is logged on");
+            xlogn("launcher: agent exited; will restart when a session is available");
         }
     }
 
-    if (hAgent != NULL)
-    {
-        /* TODO: graceful stop (console ctrl / signal) instead of kill;
-           sessions already tolerate an abrupt agent exit like a logoff. */
-        TerminateProcess(hAgent, 0);
-        WaitForSingleObject(hAgent, 5000);
-
-        /* After the agent is gone, so the servicing thread's read has ended. */
-        DirectGate_WinLauncher_StopElevChannel();
-        CloseHandle(hAgent);
-    }
+    DirectGate_WinLauncher_StopAgent(&hAgent);
 
     xlogn("launcher: stopped");
     return XSTDOK;
@@ -1026,6 +1218,16 @@ XSTATUS DirectGate_WinLauncher_Main(int argc, char* argv[])
     {
         if (strcmp(argv[i], DIRECTGATE_WIN_LAUNCHER_FLAG) == 0) { bWinLauncher = XTRUE; continue; }
         if (strcmp(argv[i], DIRECTGATE_WIN_SERVICE_FLAG) == 0) { bWinService = XTRUE; continue; }
+
+        /* Set before any of the agent's start-up runs, so no code path can
+           observe an agent that is briefly unrestricted. Stripped like the
+           control handles, for the same reason: the agent's own option parser
+           has no business knowing about the launcher's private arguments. */
+        if (strcmp(argv[i], DIRECTGATE_WIN_PRELOGON_FLAG) == 0)
+        {
+            DirectGate_Session_SetPreLogon(XTRUE);
+            continue;
+        }
 
         /* Control-channel handles the launcher inherited into this process.
            Stripped here so no other option parser has to know about them. */

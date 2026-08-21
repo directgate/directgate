@@ -507,6 +507,19 @@ directgate_session_mode_t DirectGate_SessionMode_FromString(const char *pMode)
     return DIRECTGATE_SESSION_MODE_NONE;
 }
 
+/* See DirectGate_Session_SetPreLogon in session.h for what this gates. */
+static xbool_t g_bPreLogon = XFALSE;
+
+void DirectGate_Session_SetPreLogon(xbool_t bPreLogon)
+{
+    g_bPreLogon = bPreLogon;
+}
+
+xbool_t DirectGate_Session_IsPreLogon(void)
+{
+    return g_bPreLogon;
+}
+
 const char* DirectGate_SessionMode_ToString(directgate_session_mode_t eMode)
 {
     if (eMode == DIRECTGATE_SESSION_MODE_TERMINAL) return "terminal";
@@ -560,7 +573,7 @@ int DirectGate_Session_SendAuthResp(directgate_session_t *pSession, const char *
 {
     XCHECK((pSession != NULL), XAPI_DISCONNECT);
 
-    xjson_obj_t *pHeader = DirectGate_Proto_BuildAuthResult(pStatus, pM2, pReason, pSession->nSessionId);
+    xjson_obj_t *pHeader = DirectGate_Proto_BuildAuthResult(pStatus, pM2, pReason, pSession->nSessionId, g_bPreLogon);
     XCHECK((pHeader != NULL), xthrowr(XAPI_DISCONNECT, "Proto: Failed to build auth result header"));
 
     int nStatus = DirectGate_Session_Send(pSession, pHeader, NULL, XSTDNON);
@@ -788,6 +801,17 @@ int DirectGate_Session_StartMode(directgate_session_t *pSession, directgate_sess
 
     if (eMode == DIRECTGATE_SESSION_MODE_NONE)
         return XAPI_CONTINUE;
+
+    /* The single choke point every mode passes through, which is why the
+       pre-logon restriction lives here and not in each mode's own start-up. */
+    if (g_bPreLogon && eMode != DIRECTGATE_SESSION_MODE_DESKTOP)
+    {
+        xlogw("Pre-logon agent rejected a non-desktop mode: sid(%u), requested(%s)",
+            pSession->nSessionId, DirectGate_SessionMode_ToString(eMode));
+
+        return DirectGate_Session_SendErrorMsg(pSession,
+            "nobody is logged on: sign in over the desktop session first");
+    }
 
     if (pSession->eActiveMode == eMode)
         return XAPI_CONTINUE;

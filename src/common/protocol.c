@@ -197,6 +197,10 @@ static void DirectGate_Package_ParseAuthPkg(directgate_pkg_auth_t *pPkg, xjson_o
     pPkg->pAgentSig = XJSON_GetString(XJSON_GetObject(pHdr, "agentSig"));
     pPkg->pClientSig = XJSON_GetString(XJSON_GetObject(pHdr, "clientSig"));
     pPkg->pDesktopShareId = XJSON_GetString(XJSON_GetObject(pHdr, "desktopShareId"));
+
+    /* Missing means false: agents that predate pre-logon never enter it. */
+    xjson_obj_t *pPreLogon = XJSON_GetObject(pHdr, "preLogon");
+    pPkg->bPreLogon = (pPreLogon != NULL && XJSON_GetBool(pPreLogon)) ? XTRUE : XFALSE;
 }
 
 static void DirectGate_Package_ParseCmdPkg(directgate_pkg_cmd_t *pPkg, xjson_obj_t *pHdr)
@@ -568,7 +572,8 @@ xjson_obj_t* DirectGate_Proto_BuildAuthChallenge(const char *pSalt, const char *
 }
 
 xjson_obj_t* DirectGate_Proto_BuildAuthResult(const char *pStatus, const char *pM2,
-                                              const char *pReason, uint32_t nSessionId)
+                                              const char *pReason, uint32_t nSessionId,
+                                              xbool_t bPreLogon)
 {
     xjson_obj_t *pHeader = DirectGate_Proto_NewHeader("auth", nSessionId);
     XCHECK(pHeader, xthrowp(NULL, "Failed to create json header"));
@@ -577,6 +582,7 @@ xjson_obj_t* DirectGate_Proto_BuildAuthResult(const char *pStatus, const char *p
     XJSON_AddStrIfUsed(pHeader, "status", pStatus);
     XJSON_AddStrIfUsed(pHeader, "reason", pReason);
     XJSON_AddStrIfUsed(pHeader, "M2", pM2);
+    if (bPreLogon) XJSON_AddBool(pHeader, "preLogon", XTRUE);
 
     return pHeader;
 }

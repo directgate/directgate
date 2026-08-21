@@ -278,6 +278,36 @@ int main(void)
         "expired pre-auth session slot should be cleared");
     DirectGate_SessionMgr_Destroy(&noAuthMgr);
 
+    /* Pre-logon: the Windows launcher runs the agent as SYSTEM when nobody is
+       logged on, so the only mode it may serve is the one that lets an
+       operator log on. Everything else has to be refused at StartMode, which
+       is the single door every mode goes through. */
+    CHECK(!DirectGate_Session_IsPreLogon(), "pre-logon should be off by default");
+
+    directgate_session_mgr_t preLogonMgr;
+    DirectGate_SessionMgr_Init(&preLogonMgr, &cfg);
+
+    directgate_session_t *pPreLogon =
+        DirectGate_SessionMgr_GetOrCreate(&preLogonMgr, &apiSession, 300);
+    CHECK(pPreLogon != NULL, "create pre-logon session");
+
+    DirectGate_Session_SetPreLogon(XTRUE);
+    CHECK(DirectGate_Session_IsPreLogon(), "pre-logon should report as on");
+
+    CHECK(DirectGate_Session_StartMode(pPreLogon, DIRECTGATE_SESSION_MODE_TERMINAL) == XAPI_CONTINUE,
+        "pre-logon should refuse a terminal without dropping the session");
+    CHECK(pPreLogon->eActiveMode == DIRECTGATE_SESSION_MODE_NONE,
+        "refused terminal should leave the session mode unset");
+
+    CHECK(DirectGate_Session_StartMode(pPreLogon, DIRECTGATE_SESSION_MODE_FILE_MANAGER) == XAPI_CONTINUE,
+        "pre-logon should refuse the file manager without dropping the session");
+    CHECK(pPreLogon->eActiveMode == DIRECTGATE_SESSION_MODE_NONE,
+        "refused file manager should leave the session mode unset");
+
+    DirectGate_Session_SetPreLogon(XFALSE);
+    CHECK(!DirectGate_Session_IsPreLogon(), "pre-logon should be clearable");
+    DirectGate_SessionMgr_Destroy(&preLogonMgr);
+
     directgate_session_mgr_t rateMgr;
     DirectGate_SessionMgr_Init(&rateMgr, &cfg);
     for (uint32_t i = 0; i < DIRECTGATE_AUTH_RATE_MAX_ATTEMPTS; i++)

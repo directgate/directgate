@@ -12,7 +12,7 @@ DirectGate uses a custom binary framing over WebSocket frames and the WebRTC dat
 
 | Type        | Direction                | Purpose                                            |
 |-------------|--------------------------|----------------------------------------------------|
-| `role`      | Agent/Client → Server    | Register with the device ID                        |
+| `role`      | Agent/Client -> Server   | Register with the device ID                        |
 | `auth`      | Client <-> Agent         | SRP-6a authentication                              |
 | `cmd`       | Client -> Agent          | Control commands (start, stop)                     |
 | `data`      | Bidirectional            | Terminal I/O (E2E encrypted)                       |

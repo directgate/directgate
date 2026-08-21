@@ -46,7 +46,8 @@ The default log directory is platform-specific: `/var/log/directgate` on Linux a
   },
   "desktop": {
     "elevatedInput": true,
-    "lockScreen": true
+    "lockScreen": true,
+    "preLogon": true
   },
   "auth": {
     "srp": {
@@ -75,6 +76,7 @@ The default log directory is platform-specific: `/var/log/directgate` on Linux a
 | `shell.home`                  | string   | Working directory for the shell            |
 | `desktop.elevatedInput`       | bool     | **Windows only**, default `true`. Lets a desktop session drive privileged UI - UAC prompts, Task Manager, elevated windows - through the service's SYSTEM helper. Setting it to `false` leaves those visible but frozen. Read [Elevated UI and the secure desktop](windows.md#elevated-ui-and-the-secure-desktop) before changing it: with it on, a remote operator who approves a UAC prompt is effectively an administrator on the host |
 | `desktop.lockScreen`          | bool     | **Windows only**, default `true`. Also allows the lock screen and the Ctrl+Alt+Del security screen. Ignored when `desktop.elevatedInput` is `false` |
+| `desktop.preLogon`            | bool     | **Windows only**, default `true`. Keeps the device reachable while nobody is logged on, by running the agent as SYSTEM in the console session so the logon screen can be driven remotely - the only way back into a machine that rebooted unattended. Such an agent serves desktop sessions and nothing else, and is retired at the first logon. Ignored when `desktop.elevatedInput` is `false`. See [Reaching a machine before anyone logs on](windows.md#reaching-a-machine-before-anyone-logs-on) |
 | `auth.srp.salt`               | string   | SRP salt in hex (32 bytes / 64 hex chars)  |
 | `auth.srp.verifier`           | string   | SRP verifier in hex                        |
 | `auth.srp.suite`              | number   | SRP credential suite advertised at auth (managed by the agent; older records are upgraded in place on load) |

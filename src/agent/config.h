@@ -83,6 +83,7 @@ typedef struct directgate_keyauth_cfg_ {
 typedef struct directgate_desktop_cfg_ {
     xbool_t bElevatedInput;
     xbool_t bLockScreen;
+    xbool_t bPreLogon;
 } directgate_desktop_cfg_t;
 
 typedef struct directgate_cfg_ {
