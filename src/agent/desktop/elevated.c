@@ -1345,6 +1345,7 @@ XSTATUS DirectGate_Elevated_HelperMain(int argc, char *argv[])
     }
 
     xlog_defaults();
+    xlog_indent(XTRUE);
     xlog_coloring(XFALSE);
     xlog_timing(XLOG_DATE);
     DirectGate_LogApply(&log);
