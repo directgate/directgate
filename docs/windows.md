@@ -222,6 +222,14 @@ What that agent may do is deliberately narrow, because it is SYSTEM:
   and `file-manager` outright, so the pre-logon window never yields a SYSTEM
   shell or a SYSTEM file manager. Clients are told before they pick a mode: the
   auth result carries `preLogon: true`.
+- **A session that is being torn down is not spawned into twice.** For a second
+  or two after a sign-out, the dying session still answers `WTSQueryUserToken`,
+  so the supervisor would start an agent straight back into it and watch that
+  one die within milliseconds. An agent that exits in under three seconds is
+  taken as evidence about its session rather than about itself: that session is
+  then left alone for six seconds, which also caps what used to be an unbounded
+  two-second retry loop against a session that keeps killing whatever starts in
+  it.
 - **Signing out brings it back.** The supervisor re-checks a running agent on
   every tick, not only when its process exits, because a Windows session can be
   destroyed out from under a process that keeps running: an agent left in a
@@ -293,6 +301,7 @@ This is a fallback, never the normal path. The agent keeps its own duplication a
 - **Secure desktop.** `SendInput` returns zero, because the calling thread's desktop is not the one receiving input. The direct call therefore goes first exactly as before and only what it rejected is re-sent through the helper - which costs nothing but reading a return value the call already produced.
 - **Elevated window.** UIPI drops the event and reports nothing: MSDN states plainly that `SendInput` "fails when it is blocked by UIPI" and that "neither `GetLastError` nor the return value will indicate the failure". This one has to be decided *before* the call, so the agent checks whether the foreground window outranks its own integrity level and, if so, skips the direct `SendInput` entirely - sending both would double every event on windows that do accept input. The check is one `GetForegroundWindow` per event; the token lookup behind it is cached against that window and only redone when focus moves.
 - **Capture:** a lost duplication that `OpenInputDesktop` confirms is the secure desktop hands capture to the helper, which delivers BGRA at the pipeline's own encode size through a shared section. The same encoder, the same stream - only a keyframe is forced on each transition, which the screen change warrants anyway.
+- **Capture that was never there.** A pipeline can also *start* on the secure desktop - the logon screen, or a lock screen that was already up - and then there is no duplication to lose: it will not initialise, and the GDI probe reads a desktop this process does not own. That is not a broken pipeline, it is the case the helper exists for, so the pipeline starts bridged instead of failing. Treating it as fatal is what once made a device on the logon screen useless: the H.264 pipeline refused to start, the caller fell back to raw RGBA, the fallback released the helper, and the raw path has no bridge - so the operator got a display list, no picture and no error. A pipeline that started this way never leaves the bridge either; there is nothing to go back to, and the helper serves an ordinary desktop just as well.
 
 The helper never encodes. It is a capture and injection surface only, and the frames it hands over go through the agent's existing Media Foundation encoder - the same hardware MFT instance, chosen once at pipeline start and never rebuilt - so a UAC prompt or the lock screen is encoded on the GPU exactly like the rest of the session. Giving the helper its own encoder would mean two MFTs, two bitstreams and a discontinuity for the viewer at every transition, which is why the split is where it is.
 

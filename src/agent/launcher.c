@@ -36,6 +36,15 @@
    the logon screen back on the air while the operator is still watching. */
 #define DIRECTGATE_WIN_LAUNCHER_LOGOFF_MS  6000
 
+/* An agent that dies this quickly never got going: the usual cause is a
+   session that still hands out a token while it is being torn down, which is
+   exactly what a sign-out looks like for a second or two. */
+#define DIRECTGATE_WIN_LAUNCHER_INFANT_MS  3000
+
+/* How long such a session is left alone afterwards. Long enough to outlast a
+   logoff, short enough that a genuine crash loop still recovers promptly. */
+#define DIRECTGATE_WIN_LAUNCHER_SETTLE_MS  6000
+
 /* Page-aligned so the pixel slot that follows starts on a page boundary. */
 #define DIRECTGATE_WIN_ELEV_HEADER_BYTES   4096U
 
@@ -178,10 +187,12 @@ static xbool_t DirectGate_WinLauncher_TokenMatchesUser(HANDLE hToken, PSID pWant
 /* bQuiet suppresses the "not logged on" warning: the supervisor also uses this
    as a plain predicate while a pre-logon agent is running, and that must not
    turn a normal state of affairs into a log line every couple of seconds. */
-static XSTATUS DirectGate_WinLauncher_AcquireTokenForUser(const char *pShellUser, HANDLE *phToken, xbool_t bQuiet)
+static XSTATUS DirectGate_WinLauncher_AcquireTokenForUser(const char *pShellUser, HANDLE *phToken,
+                                                          DWORD *pnSessionId, xbool_t bQuiet)
 {
     XCHECK((xstrused(pShellUser) && phToken != NULL), XSTDINV);
     *phToken = NULL;
+    if (pnSessionId != NULL) *pnSessionId = 0;
 
     uint8_t sWantSid[SECURITY_MAX_SID_SIZE];
     if (DirectGate_WinLauncher_LookupSid(pShellUser, sWantSid) != XSTDOK) return XSTDERR;
@@ -208,6 +219,8 @@ static XSTATUS DirectGate_WinLauncher_AcquireTokenForUser(const char *pShellUser
         if (DirectGate_WinLauncher_TokenMatchesUser(hToken, sWantSid))
         {
             *phToken = hToken;
+            if (pnSessionId != NULL) *pnSessionId = pSessions[i].SessionId;
+
             nStatus = XSTDOK;
             break;
         }
@@ -307,7 +320,7 @@ static xbool_t DirectGate_WinLauncher_SessionOwnedBy(DWORD nSessionId, const cha
 static xbool_t DirectGate_WinLauncher_UserIsLoggedOn(const char *pShellUser)
 {
     HANDLE hToken = NULL;
-    if (DirectGate_WinLauncher_AcquireTokenForUser(pShellUser, &hToken, XTRUE) != XSTDOK)
+    if (DirectGate_WinLauncher_AcquireTokenForUser(pShellUser, &hToken, NULL, XTRUE) != XSTDOK)
         return XFALSE;
 
     CloseHandle(hToken);
@@ -1139,6 +1152,9 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
     /* When shell.user was first seen to be gone while their agent was still
        running; 0 whenever they are present. See the retire check below. */
     uint64_t nUserGoneSinceMs = 0;
+    uint64_t nSuspectUntilMs = 0;
+    uint64_t nAgentStartedMs = 0;
+    DWORD nSuspectSession = 0;
 
     while (!DirectGate_WinLauncher_Stopping())
     {
@@ -1246,8 +1262,19 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
             xbool_t bPreLogon = XFALSE;
             DWORD nSession = 0;
 
-            if (DirectGate_WinLauncher_AcquireTokenForUser(sShellUser, &hToken, XFALSE) == XSTDOK)
+            if (DirectGate_WinLauncher_AcquireTokenForUser(sShellUser, &hToken, &nSession, XFALSE) == XSTDOK)
             {
+                /* A session that just killed a newborn agent is left alone for
+                   a moment rather than spawned into again. Without this a
+                   sign-out costs two doomed agents before the session finally
+                   stops answering, which is what a real machine did. */
+                if (nSession == nSuspectSession && nNow < nSuspectUntilMs)
+                {
+                    CloseHandle(hToken);
+                    Sleep(DIRECTGATE_WIN_LAUNCHER_POLL_MS);
+                    continue;
+                }
+
                 bWaitingForLogon = XFALSE;
             }
             else
@@ -1290,6 +1317,7 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
                pre-logon path those agree; for shell.user only the OS knows. */
             nAgentSession = (nSpawnedSession != 0) ? nSpawnedSession : nSession;
             nUserGoneSinceMs = 0;
+            nAgentStartedMs = (hAgent != NULL) ? nNow : 0;
 
             if (hAgent == NULL)
             {
@@ -1307,10 +1335,25 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
                reason for a SYSTEM process to be injecting input. */
             DirectGate_WinLauncher_StopElevChannel();
             CloseHandle(hAgent);
+            uint64_t nNow = XTime_GetMs();
+            uint64_t nLived = (nAgentStartedMs != 0 && nNow > nAgentStartedMs) ? nNow - nAgentStartedMs : 0;
+
+            /* An agent that barely lived says more about its session than about
+               itself, so the session - not the agent - is what gets held back. */
+            if (nAgentStartedMs != 0 && nLived < DIRECTGATE_WIN_LAUNCHER_INFANT_MS && nAgentSession != 0)
+            {
+                nSuspectSession = nAgentSession;
+                nSuspectUntilMs = nNow + DIRECTGATE_WIN_LAUNCHER_SETTLE_MS;
+
+                xlogw("launcher: agent in session %lu exited after %llu ms; leaving that session alone for %u ms",
+                      (unsigned long)nAgentSession, (unsigned long long)nLived, (unsigned)DIRECTGATE_WIN_LAUNCHER_SETTLE_MS);
+            }
+
             hAgent = NULL;
             bAgentPreLogon = XFALSE;
             g_bAgentPreLogon = XFALSE;
             nUserGoneSinceMs = 0;
+            nAgentStartedMs = 0;
 
             xlogn("launcher: agent exited; will restart when a session is available");
         }
