@@ -223,6 +223,86 @@ static XSTATUS DirectGate_WinLauncher_AcquireTokenForUser(const char *pShellUser
     return nStatus;
 }
 
+/* Connect-state of nSessionId, or NULL when it no longer has one. Purely for
+   the log: when an agent has to be retired, the first question is always what
+   Windows thought its session was doing at the time. */
+static const char* DirectGate_WinLauncher_SessionState(DWORD nSessionId)
+{
+    PWTS_SESSION_INFOA pSessions = NULL;
+    const char *pState = NULL;
+    DWORD nCount = 0;
+
+    if (!WTSEnumerateSessionsA(WTS_CURRENT_SERVER_HANDLE, 0, 1, &pSessions, &nCount))
+        return "unreadable";
+
+    for (DWORD i = 0; i < nCount; i++)
+    {
+        if (pSessions[i].SessionId != nSessionId) continue;
+
+        switch (pSessions[i].State)
+        {
+            case WTSActive:       pState = "active"; break;
+            case WTSConnected:    pState = "connected"; break;
+            case WTSConnectQuery: pState = "connect-query"; break;
+            case WTSShadow:       pState = "shadow"; break;
+            case WTSDisconnected: pState = "disconnected"; break;
+            case WTSIdle:         pState = "idle"; break;
+            case WTSListen:       pState = "listen"; break;
+            case WTSReset:        pState = "reset"; break;
+            case WTSDown:         pState = "down"; break;
+            case WTSInit:         pState = "init"; break;
+            default:              pState = "other"; break;
+        }
+
+        break;
+    }
+
+    WTSFreeMemory(pSessions);
+    return (pState != NULL) ? pState : "gone";
+}
+
+/*
+    Whether nSessionId is still a live session belonging to pShellUser.
+
+    This is the question that actually decides whether a running agent can do
+    anything, and it is not the same as "is shell.user logged on somewhere".
+    An agent whose session was destroyed keeps running and keeps its relay
+    connection; if shell.user then signs in again they get a brand new session
+    that the old process is not in, and asking the broad question would answer
+    "yes" about a session the agent has nothing to do with.
+
+    An unreadable answer counts as "still theirs": the cost of being wrong that
+    way is a stale agent for one more tick, and the cost of being wrong the
+    other way is killing the live session of someone sitting at the machine.
+*/
+static xbool_t DirectGate_WinLauncher_SessionOwnedBy(DWORD nSessionId, const char *pShellUser)
+{
+    uint8_t sWantSid[SECURITY_MAX_SID_SIZE];
+    if (DirectGate_WinLauncher_LookupSid(pShellUser, sWantSid) != XSTDOK) return XTRUE;
+
+    HANDLE hToken = NULL;
+    if (!WTSQueryUserToken(nSessionId, &hToken))
+    {
+        DWORD nError = GetLastError();
+
+        /* The session is gone, or is sitting at the logon screen with nobody
+           in it. Either way it is not shell.user's any more. */
+        if (nError == ERROR_NO_TOKEN ||
+            nError == ERROR_CTX_WINSTATION_NOT_FOUND ||
+            nError == ERROR_INVALID_PARAMETER)
+            return XFALSE;
+
+        xlogw("token: could not tell who owns session %lu, leaving the agent alone: error(%lu)",
+            (unsigned long)nSessionId, nError);
+
+        return XTRUE;
+    }
+
+    xbool_t bMatch = DirectGate_WinLauncher_TokenMatchesUser(hToken, sWantSid);
+    CloseHandle(hToken);
+    return bMatch;
+}
+
 /* Whether shell.user has a logon session anywhere - console or RDP. */
 static xbool_t DirectGate_WinLauncher_UserIsLoggedOn(const char *pShellUser)
 {
@@ -781,9 +861,12 @@ static void DirectGate_WinLauncher_Stop(void)
  * shell.user. The identity comes only from the token the launcher minted for the
  * configured shell.user.
  */
-static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfgPath, xbool_t bPreLogon, HANDLE *phProcess)
+static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfgPath,
+                                                xbool_t bPreLogon, HANDLE *phProcess,
+                                                DWORD *pnSession)
 {
     *phProcess = NULL;
+    *pnSession = 0;
     char sSelf[XPATH_MAX];
 
     DWORD nSelfLen = GetModuleFileNameA(NULL, sSelf, (DWORD)sizeof(sSelf));
@@ -880,6 +963,17 @@ static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfg
     CloseHandle(pi.hThread);
     *phProcess = pi.hProcess;
 
+    /* Asked of the OS rather than assumed from the token: this is the session
+       the supervisor watches for the rest of the agent's life, and a session
+       the agent is not actually in would make every check below meaningless. */
+    if (!ProcessIdToSessionId(pi.dwProcessId, pnSession))
+    {
+        xlogw("launcher: could not resolve the agent's session: pid(%lu), error(%lu)",
+            (unsigned long)pi.dwProcessId, GetLastError());
+
+        *pnSession = 0;
+    }
+
     if (hReqRead != NULL && hRspWrite != NULL)
     {
         directgate_win_elev_ctx_t *pCtx = (directgate_win_elev_ctx_t*)calloc(1, sizeof(*pCtx));
@@ -902,8 +996,16 @@ static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfg
         }
     }
 
-    if (bPreLogon) xlogn("launcher: started pre-logon agent as SYSTEM, desktop sessions only: pid(%lu)", pi.dwProcessId);
-    else xlogn("launcher: started agent in shell.user session: pid(%lu)", pi.dwProcessId);
+    if (bPreLogon)
+    {
+        xlogn("launcher: started pre-logon agent as SYSTEM, desktop sessions only: pid(%lu), session(%lu)",
+            (unsigned long)pi.dwProcessId, (unsigned long)*pnSession);
+    }
+    else
+    {
+        xlogn("launcher: started agent in shell.user session: pid(%lu), session(%lu)",
+            (unsigned long)pi.dwProcessId, (unsigned long)*pnSession);
+    }
 
     return XSTDOK;
 }
@@ -1055,7 +1157,6 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
         */
         if (hAgent != NULL)
         {
-            xbool_t bUserLoggedOn = DirectGate_WinLauncher_UserIsLoggedOn(sShellUser);
             const char *pWhy = NULL;
 
             if (bAgentPreLogon)
@@ -1067,40 +1168,63 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
                    could have taken over. */
                 DWORD nConsole = WTSGetActiveConsoleSessionId();
 
-                if (bUserLoggedOn) pWhy = "shell.user logged on";
+                if (DirectGate_WinLauncher_UserIsLoggedOn(sShellUser)) pWhy = "shell.user logged on";
                 else if (nConsole != nAgentSession) pWhy = "the console moved to another session";
                 else if (DirectGate_WinLauncher_SessionHasUser(nAgentSession)) pWhy = "someone logged on at the console";
 
                 nUserGoneSinceMs = 0;
             }
-            else if (!bUserLoggedOn)
+            else if (!DirectGate_WinLauncher_SessionOwnedBy(nAgentSession, sShellUser))
             {
-                /* Signing out is the case this exists for: the agent's session
-                   is gone, so it can serve nothing, and without this the
-                   launcher would wait forever on a process that will never
-                   exit and never work again - the device online and useless,
-                   recoverable only by walking to it. Confirmed over a window
-                   rather than acted on at once, because the price of a single
-                   spurious reading is a live session killed under a user who
-                   is still sitting in front of it. */
+                /*
+                    Signing out is the case this exists for, and the question
+                    has to be about the agent's OWN session.
+
+                    Asking the broad "is shell.user logged on anywhere" cannot
+                    settle it, because the answer feeds back into itself: the
+                    agent is a process inside the session being torn down, so
+                    while it lives the session lives, its token still resolves,
+                    the broad question keeps answering "yes", and the supervisor
+                    keeps a stale agent alive forever - which is exactly what a
+                    real machine did after a sign-out. The device stays online,
+                    holding a relay connection from a session where nothing can
+                    be captured or started.
+
+                    Confirmed over a window rather than acted on at once,
+                    because the price of one spurious reading is a live session
+                    killed under someone sitting at the machine.
+                */
                 uint64_t nNow = XTime_GetMs();
 
-                if (nUserGoneSinceMs == 0) nUserGoneSinceMs = nNow;
-                else if (nNow - nUserGoneSinceMs >= DIRECTGATE_WIN_LAUNCHER_LOGOFF_MS) pWhy = "shell.user signed out";
+                if (nUserGoneSinceMs == 0)
+                {
+                    nUserGoneSinceMs = nNow;
+
+                    xlogn("launcher: session %lu is no longer shell.user's (state: %s); "
+                          "retiring the agent in %u ms unless it comes back",
+                           (unsigned long)nAgentSession,
+                           DirectGate_WinLauncher_SessionState(nAgentSession),
+                           (unsigned)DIRECTGATE_WIN_LAUNCHER_LOGOFF_MS);
+                }
+                else if (nNow - nUserGoneSinceMs >= DIRECTGATE_WIN_LAUNCHER_LOGOFF_MS)
+                {
+                    pWhy = "its session is no longer shell.user's";
+                }
             }
-            else nUserGoneSinceMs = 0;
+            else if (nUserGoneSinceMs != 0)
+            {
+                xlogn("launcher: session %lu is shell.user's again, keeping the agent",
+                    (unsigned long)nAgentSession);
+
+                nUserGoneSinceMs = 0;
+            }
 
             if (pWhy != NULL)
             {
-                /* Only the pre-logon agent has a session the launcher chose
-                   and tracked; the normal one lives in whatever session
-                   shell.user logged into, which is not ours to name. */
-                if (bAgentPreLogon)
-                {
-                    xlogn("launcher: retiring the pre-logon agent in session %lu: %s",
-                        (unsigned long)nAgentSession, pWhy);
-                }
-                else xlogn("launcher: retiring the shell.user agent: %s", pWhy);
+                xlogn("launcher: retiring the %s agent in session %lu (state: %s): %s",
+                      bAgentPreLogon ? "pre-logon" : "shell.user",
+                      (unsigned long)nAgentSession,
+                      DirectGate_WinLauncher_SessionState(nAgentSession), pWhy);
 
                 DirectGate_WinLauncher_StopAgent(&hAgent);
                 bAgentPreLogon = XFALSE;
@@ -1153,14 +1277,18 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
             nLastSpawnMs = nNow;
             g_bAgentPreLogon = bPreLogon;
 
-            if (DirectGate_WinLauncher_SpawnAgent(hToken, pCfgPath, bPreLogon, &hAgent) != XSTDOK)
-                hAgent = NULL;
+            DWORD nSpawnedSession = 0;
+            if (DirectGate_WinLauncher_SpawnAgent(hToken, pCfgPath, bPreLogon,
+                &hAgent, &nSpawnedSession) != XSTDOK) hAgent = NULL;
 
             CloseHandle(hToken);
 
             bAgentPreLogon = (hAgent != NULL) ? bPreLogon : XFALSE;
             g_bAgentPreLogon = bAgentPreLogon;
-            nAgentSession = nSession;
+
+            /* Where the agent actually is, not where it was aimed. For the
+               pre-logon path those agree; for shell.user only the OS knows. */
+            nAgentSession = (nSpawnedSession != 0) ? nSpawnedSession : nSession;
             nUserGoneSinceMs = 0;
 
             if (hAgent == NULL)

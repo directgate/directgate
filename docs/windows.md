@@ -227,9 +227,13 @@ What that agent may do is deliberately narrow, because it is SYSTEM:
   destroyed out from under a process that keeps running: an agent left in a
   session that no longer exists holds its relay connection open and looks
   perfectly healthy while every session it could serve is already impossible.
-  When `shell.user` has been gone for six seconds the launcher stops that agent
-  and the logon screen is back on the air - so signing out is recoverable
-  remotely instead of being the one action that strands the machine.
+  The question it asks is deliberately narrow - *is the agent's own session
+  still `shell.user`'s?* - resolved against the session the OS says the process
+  is in (`ProcessIdToSessionId` at spawn). Asking the broad "is `shell.user`
+  logged on anywhere" instead cannot settle it: the agent is itself a process
+  in the session being torn down, so the broad answer can stay "yes" for as
+  long as the stale agent lives. After six seconds of the narrow answer being
+  "no", the agent is stopped and the logon screen is back on the air.
 - **It ends at the first logon.** The launcher retires it the moment the console
   session gains a user. If that user is `shell.user`, the normal unprivileged
   agent replaces it and everything works as documented above; if it is anyone
