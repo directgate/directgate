@@ -231,7 +231,7 @@ async function refreshPairing(): Promise<void> {
  */
 type VerTone = "idle" | "busy" | "ok" | "update" | "err";
 
-/** Latest successful check, so the download link knows where to point. */
+/** Latest successful check, so the update link knows where to point. */
 let updateUrl: string | null = null;
 
 function paintVersion(
@@ -259,9 +259,12 @@ function paintUpdateAvailable(info: UpdateInfo): void {
 
   updateUrl = info.url;
   verDownload.textContent = `Update to ${info.latest}`;
+  // Opens the update page, not the installer: upgrading stops the service and
+  // drops whatever remote session the user is in, which is worth reading
+  // before it happens rather than after a download has already started.
   verDownload.title = info.md5
-    ? `Downloads directgate-latest-x64.msi\nMD5: ${info.md5}`
-    : "Downloads directgate-latest-x64.msi";
+    ? `Opens directgate.io/update\nInstaller MD5: ${info.md5}`
+    : "Opens directgate.io/update";
   verDownload.hidden = false;
 }
 
@@ -560,8 +563,8 @@ wireExternalLink(pairedWorkspaceLink);
 
 verCheckBtn.addEventListener("click", runUpdateCheck);
 
-// The download link points at whatever the last check resolved, falling back
-// to the stable "latest" URL baked into the markup.
+// The update link points at whatever the last check resolved, falling back to
+// the update page baked into the markup.
 verDownload.addEventListener("click", (e) => {
   e.preventDefault();
   openUrl(updateUrl ?? verDownload.href).catch((err) => {

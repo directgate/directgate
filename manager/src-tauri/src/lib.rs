@@ -426,11 +426,21 @@ fn restart_service() -> Result<String, String> {
  * user cannot apply from this window.
  */
 
-/// Where the published manifest and the installer live.
+/// Where the published manifest lives.
 #[cfg(windows)]
 const UPDATE_MANIFEST_URL: &str = "https://pkg.directgate.io/win/latest-version";
+
+/// Where an out-of-date user is sent.
+///
+/// The update page rather than the installer itself, and a constant rather
+/// than anything the manifest says. Two reasons, and the second is the one
+/// that matters: a page can explain what upgrading costs - it stops the
+/// service, which drops whatever remote session the user is in - where a file
+/// download just starts. And because the manifest arrives over the network, a
+/// link taken from it would be a network-controlled URL handed to the user's
+/// browser; a constant is one thing nobody can move.
 #[cfg(windows)]
-const UPDATE_DOWNLOAD_URL: &str = "https://pkg.directgate.io/win/directgate-latest-x64.msi";
+const UPDATE_PAGE_URL: &str = "https://directgate.io/update";
 
 /// A release, ordered the way releases are: numerically, field by field.
 ///
@@ -483,7 +493,7 @@ struct UpdateInfo {
     latest: Option<String>,
     /// `current` | `outdated` | `ahead` | `unknown` | `unsupported`
     state: String,
-    /// Download link, only set when there is something newer to download.
+    /// Where to go about it, only set when there is something newer.
     url: Option<String>,
     /// MD5 of the published installer, for a user who wants to verify it.
     md5: Option<String>,
@@ -668,14 +678,6 @@ fn check_for_update() -> Result<UpdateInfo, String> {
         }
     };
 
-    // Only ever hand the frontend a link to our own package host. The manifest
-    // arrives over the network and its url is the one field in it that turns
-    // into something the user is invited to click.
-    let url = match manifest_value(&manifest, "url") {
-        Some(value) if value.starts_with("https://pkg.directgate.io/") => value,
-        _ => UPDATE_DOWNLOAD_URL.to_string(),
-    };
-
     // "ahead" is a normal state on a development machine, and saying so is more
     // use than claiming a local build is out of date.
     let outdated = installed_version < latest_version;
@@ -691,7 +693,11 @@ fn check_for_update() -> Result<UpdateInfo, String> {
         installed,
         latest: Some(latest_text),
         state: state.into(),
-        url: if outdated { Some(url) } else { None },
+        url: if outdated {
+            Some(UPDATE_PAGE_URL.to_string())
+        } else {
+            None
+        },
         md5: if outdated {
             manifest_value(&manifest, "md5")
         } else {

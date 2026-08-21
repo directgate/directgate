@@ -212,7 +212,7 @@ start/stop/restart do:
 The line under the two cards answers one question - "am I running the current
 version?" - and stays out of the way otherwise. It shows the release reported
 by the installed agent (`directgate -v`), a dot for the state, and, only when
-there is somewhere to go, a link to the newer installer.
+there is something newer, a link to <https://directgate.io/update>.
 
 **Windows only.** Nothing else has a package manager problem to solve here: on
 Linux and macOS the agent came from apt, dnf or brew, those already know about
@@ -243,9 +243,13 @@ How the check works:
 
 Three things it deliberately does not do:
 
-- **It never downloads or installs.** Replacing the agent stops the service,
-  which drops whatever remote session the user is sitting in. The link opens
-  the system browser and the rest is their decision.
+- **It never downloads or installs, and does not even link the installer.** The
+  link goes to the update page, in the system browser. Replacing the agent
+  stops the service, which drops whatever remote session the user is sitting
+  in - a page can say so before anything happens, where a file download just
+  starts. The page URL is a constant in the manager, not a field from the
+  manifest: the manifest arrives over the network, and a link taken from it
+  would be a network-controlled URL handed to the user's browser.
 - **It never fails loudly.** A check that cannot reach the network paints
   "Update check unavailable" and puts the reason in the tooltip. This runs on
   every launch; it is not something to make anyone dismiss.
@@ -253,8 +257,7 @@ Three things it deliberately does not do:
   which has shipped in Windows since 1803. One plain GET of a few dozen bytes
   does not justify a TLS library and an async runtime inside a remote-access
   program. The path is absolute because `CreateProcess` searches the calling
-  program's own directory first, and only our own package host is ever accepted
-  as a download link.
+  program's own directory first.
 
 ## Troubleshooting
 
