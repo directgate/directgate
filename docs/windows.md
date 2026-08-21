@@ -222,6 +222,14 @@ What that agent may do is deliberately narrow, because it is SYSTEM:
   and `file-manager` outright, so the pre-logon window never yields a SYSTEM
   shell or a SYSTEM file manager. Clients are told before they pick a mode: the
   auth result carries `preLogon: true`.
+- **Signing out brings it back.** The supervisor re-checks a running agent on
+  every tick, not only when its process exits, because a Windows session can be
+  destroyed out from under a process that keeps running: an agent left in a
+  session that no longer exists holds its relay connection open and looks
+  perfectly healthy while every session it could serve is already impossible.
+  When `shell.user` has been gone for six seconds the launcher stops that agent
+  and the logon screen is back on the air - so signing out is recoverable
+  remotely instead of being the one action that strands the machine.
 - **It ends at the first logon.** The launcher retires it the moment the console
   session gains a user. If that user is `shell.user`, the normal unprivileged
   agent replaces it and everything works as documented above; if it is anyone

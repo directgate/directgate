@@ -30,6 +30,12 @@
 #define DIRECTGATE_WIN_LAUNCHER_POLL_MS    2000  /* supervisor tick */
 #define DIRECTGATE_WIN_LAUNCHER_RESPAWN_MS 2000  /* min gap between spawn attempts */
 
+/* How long shell.user must stay absent before a running agent started for them
+   is torn down. Long enough that one failed session enumeration cannot cost a
+   healthy agent the session it is serving, short enough that signing out gets
+   the logon screen back on the air while the operator is still watching. */
+#define DIRECTGATE_WIN_LAUNCHER_LOGOFF_MS  6000
+
 /* Page-aligned so the pixel slot that follows starts on a page boundary. */
 #define DIRECTGATE_WIN_ELEV_HEADER_BYTES   4096U
 
@@ -1028,33 +1034,78 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
     xbool_t bAgentPreLogon = XFALSE;
     DWORD nAgentSession = 0;
 
+    /* When shell.user was first seen to be gone while their agent was still
+       running; 0 whenever they are present. See the retire check below. */
+    uint64_t nUserGoneSinceMs = 0;
+
     while (!DirectGate_WinLauncher_Stopping())
     {
-        /* A pre-logon agent is a stand-in for an empty console, so it stops
-           being legitimate the moment that console is no longer empty - or is
-           no longer the console. Checked before the spawn block so the logon
-           that ends one agent can start the next on the very same tick. */
-        if (hAgent != NULL && bAgentPreLogon)
+        /*
+            Whichever agent is running, it stays legitimate only while the
+            state it was started for still holds: a normal agent needs
+            shell.user logged on, a pre-logon agent needs the console still
+            empty. Neither can report losing that itself - a Windows session
+            can be destroyed out from under a process that keeps running, and
+            an agent in that position holds its relay connection open and looks
+            perfectly healthy while every session it could serve is already
+            impossible. Only the supervisor can see it, so it checks both.
+
+            Checked before the spawn block, so the logon or logoff that ends
+            one agent can start its replacement on the very same tick.
+        */
+        if (hAgent != NULL)
         {
-            DWORD nConsole = WTSGetActiveConsoleSessionId();
+            xbool_t bUserLoggedOn = DirectGate_WinLauncher_UserIsLoggedOn(sShellUser);
             const char *pWhy = NULL;
 
-            /* shell.user is checked separately from the console: an RDP logon
-               gives them a session of their own and leaves the console sitting
-               at the logon screen, so watching the console alone would keep a
-               SYSTEM agent running when the real one could have taken over. */
-            if (DirectGate_WinLauncher_UserIsLoggedOn(sShellUser)) pWhy = "shell.user logged on";
-            else if (nConsole != nAgentSession) pWhy = "the console moved to another session";
-            else if (DirectGate_WinLauncher_SessionHasUser(nAgentSession)) pWhy = "someone logged on at the console";
+            if (bAgentPreLogon)
+            {
+                /* shell.user is checked separately from the console: an RDP
+                   logon gives them a session of their own and leaves the
+                   console sitting at the logon screen, so watching the console
+                   alone would keep a SYSTEM agent running when the real one
+                   could have taken over. */
+                DWORD nConsole = WTSGetActiveConsoleSessionId();
+
+                if (bUserLoggedOn) pWhy = "shell.user logged on";
+                else if (nConsole != nAgentSession) pWhy = "the console moved to another session";
+                else if (DirectGate_WinLauncher_SessionHasUser(nAgentSession)) pWhy = "someone logged on at the console";
+
+                nUserGoneSinceMs = 0;
+            }
+            else if (!bUserLoggedOn)
+            {
+                /* Signing out is the case this exists for: the agent's session
+                   is gone, so it can serve nothing, and without this the
+                   launcher would wait forever on a process that will never
+                   exit and never work again - the device online and useless,
+                   recoverable only by walking to it. Confirmed over a window
+                   rather than acted on at once, because the price of a single
+                   spurious reading is a live session killed under a user who
+                   is still sitting in front of it. */
+                uint64_t nNow = XTime_GetMs();
+
+                if (nUserGoneSinceMs == 0) nUserGoneSinceMs = nNow;
+                else if (nNow - nUserGoneSinceMs >= DIRECTGATE_WIN_LAUNCHER_LOGOFF_MS) pWhy = "shell.user signed out";
+            }
+            else nUserGoneSinceMs = 0;
 
             if (pWhy != NULL)
             {
-                xlogn("launcher: retiring the pre-logon agent in session %lu: %s",
-                    (unsigned long)nAgentSession, pWhy);
+                /* Only the pre-logon agent has a session the launcher chose
+                   and tracked; the normal one lives in whatever session
+                   shell.user logged into, which is not ours to name. */
+                if (bAgentPreLogon)
+                {
+                    xlogn("launcher: retiring the pre-logon agent in session %lu: %s",
+                        (unsigned long)nAgentSession, pWhy);
+                }
+                else xlogn("launcher: retiring the shell.user agent: %s", pWhy);
 
                 DirectGate_WinLauncher_StopAgent(&hAgent);
                 bAgentPreLogon = XFALSE;
                 g_bAgentPreLogon = XFALSE;
+                nUserGoneSinceMs = 0;
             }
         }
 
@@ -1110,6 +1161,7 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
             bAgentPreLogon = (hAgent != NULL) ? bPreLogon : XFALSE;
             g_bAgentPreLogon = bAgentPreLogon;
             nAgentSession = nSession;
+            nUserGoneSinceMs = 0;
 
             if (hAgent == NULL)
             {
@@ -1130,6 +1182,7 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
             hAgent = NULL;
             bAgentPreLogon = XFALSE;
             g_bAgentPreLogon = XFALSE;
+            nUserGoneSinceMs = 0;
 
             xlogn("launcher: agent exited; will restart when a session is available");
         }
