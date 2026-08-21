@@ -212,12 +212,24 @@ jobs:
       id: ver
       shell: pwsh
       run: |
+        # Two values, and they are not interchangeable:
+        #   version - MAJOR.MINOR.BUILD, the MSI ProductVersion. Windows
+        #             Installer compares only the first three fields, so the
+        #             package revision must not be smuggled into a fourth.
+        #             Rebuilds of the same version still upgrade cleanly
+        #             because the package sets AllowSameVersionUpgrades.
+        #   release - version plus DIRECTGATE_VERSION_PKG, the full package
+        #             release the rest of the pipeline names artifacts by
+        #             (pkg/release.sh looks for directgate-<release>_x64.msi).
         $h = Get-Content src/common/version.h -Raw
         $maj = [regex]::Match($h, 'DIRECTGATE_VERSION_MAJOR\s+(\d+)').Groups[1].Value
         $min = [regex]::Match($h, 'DIRECTGATE_VERSION_MINOR\s+(\d+)').Groups[1].Value
         $bld = [regex]::Match($h, 'DIRECTGATE_VERSION_BUILD\s+(\d+)').Groups[1].Value
+        $pkg = [regex]::Match($h, 'DIRECTGATE_VERSION_PKG\s+(\d+)').Groups[1].Value
         if (-not ($maj -and $min -and $bld)) { throw "Could not parse version from src/common/version.h" }
+        if (-not $pkg) { throw "Could not parse DIRECTGATE_VERSION_PKG from src/common/version.h" }
         "version=$maj.$min.$bld" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        "release=$maj.$min.$bld-$pkg" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
     - name: Install WiX Toolset
       shell: pwsh
@@ -246,7 +258,7 @@ jobs:
       shell: pwsh
       run: |
         $ver = "${{ steps.ver.outputs.version }}"
-        $msi = "directgate-$ver-x64.msi"
+        $msi = "directgate-${{ steps.ver.outputs.release }}_x64.msi"
         wix build -arch x64 `
           -d Version=$ver `
           -d StageDir=stage `

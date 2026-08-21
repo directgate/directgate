@@ -28,6 +28,8 @@
 //!   - `start_service`      -> starts the existing service (elevated if needed)
 //!   - `stop_service`       -> stops the existing service (elevated if needed)
 //!   - `restart_service`    -> restarts the existing service (elevated if needed)
+//!   - `get_agent_version`  -> the installed agent's release, from `directgate -v`
+//!   - `check_for_update`   -> compares that release against the published one
 //!
 //! The app never installs the service and never requests admin privileges for
 //! pairing; elevation is requested only for service start/stop/restart.
@@ -408,6 +410,314 @@ fn restart_service() -> Result<String, String> {
     service::restart()
 }
 
+/*
+ * Update checking.
+ *
+ * Windows has no package manager to notice a new release, so the manager has
+ * to ask. It reads a small manifest published next to the installer by
+ * pkg/release.sh, compares it with the agent actually installed here, and - at
+ * most - offers a download link. It never downloads or installs anything on
+ * its own: replacing the agent stops the service, which drops whatever remote
+ * session the user is sitting in, so that has to stay their decision.
+ *
+ * Linux and macOS deliberately do not check. There the agent came from apt,
+ * dnf or brew, and those know about updates already; a second opinion here
+ * could only ever contradict the package manager or nag about an update the
+ * user cannot apply from this window.
+ */
+
+/// Where the published manifest and the installer live.
+#[cfg(windows)]
+const UPDATE_MANIFEST_URL: &str = "https://pkg.directgate.io/win/latest-version";
+#[cfg(windows)]
+const UPDATE_DOWNLOAD_URL: &str = "https://pkg.directgate.io/win/directgate-latest-x64.msi";
+
+/// A release, ordered the way releases are: numerically, field by field.
+///
+/// The build-channel tag (`-x64_msi`, `-amd64_deb`, `-brew_silicon`) is not
+/// part of the ordering. It records where a build came from, not how new it
+/// is, and comparing it as text would make `1.0.21-3-x64_msi` and the plain
+/// `1.0.21-3` in the manifest look like different releases.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ReleaseVersion {
+    major: u32,
+    minor: u32,
+    build: u32,
+    pkg: u32,
+}
+
+/// Parses `MAJOR.MINOR.BUILD[-PKG][-tag]`, e.g. `1.0.21-3-x64_msi`.
+///
+/// A missing package revision reads as 0, which orders a bare `1.0.21` before
+/// `1.0.21-1` - the same order the packaging uses.
+fn parse_release_version(text: &str) -> Option<ReleaseVersion> {
+    let text = text.trim().trim_start_matches('v');
+
+    // Split the numeric head off any build tag: the revision is numeric, the
+    // tag never is, so a field that does not parse simply leaves pkg at 0.
+    let mut fields = text.split('-');
+    let mut dotted = fields.next()?.split('.');
+
+    let major = dotted.next()?.trim().parse().ok()?;
+    let minor = dotted.next()?.trim().parse().ok()?;
+    let build = dotted.next()?.trim().parse().ok()?;
+    let pkg = fields
+        .next()
+        .and_then(|f| f.trim().parse().ok())
+        .unwrap_or(0);
+
+    Some(ReleaseVersion {
+        major,
+        minor,
+        build,
+        pkg,
+    })
+}
+
+/// What the version line in the footer should say.
+#[derive(serde::Serialize)]
+struct UpdateInfo {
+    /// Release of the agent installed here, `None` when it could not be read.
+    installed: Option<String>,
+    /// Release currently published, `None` when the check did not get that far.
+    latest: Option<String>,
+    /// `current` | `outdated` | `ahead` | `unknown` | `unsupported`
+    state: String,
+    /// Download link, only set when there is something newer to download.
+    url: Option<String>,
+    /// MD5 of the published installer, for a user who wants to verify it.
+    md5: Option<String>,
+    /// Whether checking is possible at all on this platform.
+    supported: bool,
+    /// Why a check could not be completed; shown as-is when state is `unknown`.
+    detail: Option<String>,
+}
+
+/// Reads the installed agent's release string by running `directgate -v`,
+/// whose output is `DirectGate agent: v<release>`.
+fn installed_release() -> Result<String, String> {
+    use std::process::Stdio;
+
+    let agent = find_agent().ok_or_else(|| "DirectGate agent binary was not found.".to_string())?;
+
+    let output = hidden_command(&agent)
+        .arg("-v")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run the DirectGate agent: {e}"))?;
+
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    // Take the last whitespace-separated token of the first non-empty line and
+    // drop its leading "v", rather than matching the whole sentence - the
+    // banner's wording is not something this has to stay in step with.
+    let token = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .and_then(|line| line.split_whitespace().last())
+        .map(|token| token.trim_start_matches('v').to_string())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| "The DirectGate agent did not report a version.".to_string())?;
+
+    if parse_release_version(&token).is_none() {
+        return Err(format!("Unrecognised agent version: {token}"));
+    }
+
+    Ok(token)
+}
+
+/// The installed agent's release, for the version line in the footer.
+#[tauri::command(async)]
+fn get_agent_version() -> Result<String, String> {
+    installed_release()
+}
+
+/// Fetches a small text document over HTTPS.
+///
+/// Shells out to the system `curl` rather than linking an HTTP stack: this is
+/// one plain GET of a few dozen bytes on a user-initiated action, and curl has
+/// shipped in Windows since 1803 - well below anything the agent itself runs
+/// on. It buys no TLS library, no async runtime, and nothing new to keep
+/// patched in a program whose whole job is remote access.
+///
+/// The path is absolute on purpose. CreateProcess searches the calling
+/// program's own directory before the system one, so a bare "curl" would let
+/// anything that can drop a file next to the manager decide what runs here.
+#[cfg(windows)]
+fn http_get_text(url: &str) -> Result<String, String> {
+    use std::process::Stdio;
+
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let curl = PathBuf::from(system_root).join(r"System32\curl.exe");
+
+    if !curl.is_file() {
+        return Err("curl.exe was not found in System32.".to_string());
+    }
+
+    let output = hidden_command(&curl)
+        .arg("--fail")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--location")
+        .arg("--max-time")
+        .arg("10")
+        .arg("--")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Could not run curl: {e}"))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            "Could not reach the update server.".to_string()
+        } else {
+            err
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Reads one key from the flat `key=value` manifest. Unknown keys and blank or
+/// commented lines are ignored, so the manifest can gain fields without
+/// breaking managers already installed.
+#[cfg(windows)]
+fn manifest_value(manifest: &str, key: &str) -> Option<String> {
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some((name, value)) = line.split_once('=') {
+            if name.trim() == key {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// A result that says "could not tell", which is a normal outcome for a check
+/// that runs unprompted on every launch.
+#[cfg(windows)]
+fn update_unknown(installed: Option<String>, detail: &str) -> UpdateInfo {
+    UpdateInfo {
+        installed,
+        latest: None,
+        state: "unknown".into(),
+        url: None,
+        md5: None,
+        supported: true,
+        detail: Some(detail.to_string()),
+    }
+}
+
+/// Compares the installed agent against the published manifest.
+///
+/// Never returns Err: this runs on every launch, and a version footer that
+/// could not reach the network is a footer that says so, not an error the user
+/// has to dismiss before using the rest of the window.
+#[cfg(windows)]
+#[tauri::command(async)]
+fn check_for_update() -> Result<UpdateInfo, String> {
+    let installed = installed_release().ok();
+
+    let manifest = match http_get_text(UPDATE_MANIFEST_URL) {
+        Ok(text) => text,
+        Err(err) => return Ok(update_unknown(installed, &err)),
+    };
+
+    let latest_text = match manifest_value(&manifest, "version") {
+        Some(value) => value,
+        None => {
+            return Ok(update_unknown(
+                installed,
+                "The update server returned an unreadable manifest.",
+            ))
+        }
+    };
+
+    let latest_version = match parse_release_version(&latest_text) {
+        Some(value) => value,
+        None => {
+            return Ok(update_unknown(
+                installed,
+                "The update server returned an unreadable version.",
+            ))
+        }
+    };
+
+    let installed_version = match installed.as_deref().and_then(parse_release_version) {
+        Some(value) => value,
+        None => {
+            return Ok(update_unknown(
+                installed,
+                "Could not read the installed agent version.",
+            ))
+        }
+    };
+
+    // Only ever hand the frontend a link to our own package host. The manifest
+    // arrives over the network and its url is the one field in it that turns
+    // into something the user is invited to click.
+    let url = match manifest_value(&manifest, "url") {
+        Some(value) if value.starts_with("https://pkg.directgate.io/") => value,
+        _ => UPDATE_DOWNLOAD_URL.to_string(),
+    };
+
+    // "ahead" is a normal state on a development machine, and saying so is more
+    // use than claiming a local build is out of date.
+    let outdated = installed_version < latest_version;
+    let state = if outdated {
+        "outdated"
+    } else if installed_version > latest_version {
+        "ahead"
+    } else {
+        "current"
+    };
+
+    Ok(UpdateInfo {
+        installed,
+        latest: Some(latest_text),
+        state: state.into(),
+        url: if outdated { Some(url) } else { None },
+        md5: if outdated {
+            manifest_value(&manifest, "md5")
+        } else {
+            None
+        },
+        supported: true,
+        detail: None,
+    })
+}
+
+/// Nothing to check where a package manager owns the agent; the footer shows
+/// the installed version and no update controls.
+#[cfg(not(windows))]
+#[tauri::command(async)]
+fn check_for_update() -> Result<UpdateInfo, String> {
+    Ok(UpdateInfo {
+        installed: installed_release().ok(),
+        latest: None,
+        state: "unsupported".into(),
+        url: None,
+        md5: None,
+        supported: false,
+        detail: None,
+    })
+}
+
 /// Opens an external URL in the user's default browser. Used by the "add a
 /// device" link in the pairing form so the in-app webview never navigates away
 /// from the manager UI.
@@ -583,6 +893,8 @@ pub fn run() {
             start_service,
             stop_service,
             restart_service,
+            get_agent_version,
+            check_for_update,
             open_url
         ])
         .run(tauri::generate_context!())

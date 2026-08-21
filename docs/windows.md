@@ -99,7 +99,7 @@ The binaries land in `build/`. The MinGW runtime is linked statically and `OPENS
 
 The project's Windows CI builds a Windows x64 MSI with the [WiX Toolset](https://wixtoolset.org/) - the `build-msi` job in `.github/workflows/windows.yml`. WiX runs only on Windows, so the installer is produced in CI rather than the Linux release pipeline. The rest of this section covers installing and configuring that MSI.
 
-Installing `directgate-<version>-x64.msi` (double-click, or `msiexec /i directgate-<version>-x64.msi`, add `/qn` for silent):
+Installing `directgate-<release>_x64.msi` (double-click, or `msiexec /i directgate-<release>_x64.msi`, add `/qn` for silent):
 
 - requests elevation once for the per-machine installation;
 - installs the `DirectGate P2P UDP` inbound Windows Firewall rule for `directgate.exe` on every profile, with edge traversal enabled;
@@ -146,7 +146,7 @@ Safe ways to start it:
 
   ```bat
   schtasks /create /tn DirectGateUpgrade /ru SYSTEM /sc once /st 00:00 /f ^
-      /tr "msiexec /i C:\path\directgate-<version>-x64.msi /qn /norestart"
+      /tr "msiexec /i C:\path\directgate-<release>_x64.msi /qn /norestart"
   schtasks /run /tn DirectGateUpgrade
   ```
 

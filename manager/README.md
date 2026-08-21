@@ -207,6 +207,55 @@ start/stop/restart do:
   controlled through `osascript ... with administrator privileges`, which
   shows the macOS authentication dialog.
 
+## Version and updates (footer)
+
+The line under the two cards answers one question - "am I running the current
+version?" - and stays out of the way otherwise. It shows the release reported
+by the installed agent (`directgate -v`), a dot for the state, and, only when
+there is somewhere to go, a link to the newer installer.
+
+**Windows only.** Nothing else has a package manager problem to solve here: on
+Linux and macOS the agent came from apt, dnf or brew, those already know about
+updates, and a second opinion in this window could only contradict them or nag
+about something the user cannot apply from here. On those platforms the footer
+shows the version and nothing more.
+
+How the check works:
+
+1. `get_agent_version` runs `directgate -v` and reads the release out of it.
+2. `check_for_update` fetches `https://pkg.directgate.io/win/latest-version`, a
+   flat `key=value` manifest published by `pkg/release.sh` alongside the
+   installer:
+
+   ```
+   version=1.0.21-3
+   md5=<md5 of the installer>
+   sha256=<sha256 of the installer>
+   file=directgate-latest-x64.msi
+   url=https://pkg.directgate.io/win/directgate-latest-x64.msi
+   ```
+
+   Unknown keys are ignored, so the manifest can gain fields without breaking
+   managers already installed.
+3. Both releases are compared **numerically** on `MAJOR.MINOR.BUILD-PKG`. The
+   build-channel tag (`-x64_msi`, `-amd64_deb`, …) records where a build came
+   from, not how new it is, and is left out of the comparison.
+
+Three things it deliberately does not do:
+
+- **It never downloads or installs.** Replacing the agent stops the service,
+  which drops whatever remote session the user is sitting in. The link opens
+  the system browser and the rest is their decision.
+- **It never fails loudly.** A check that cannot reach the network paints
+  "Update check unavailable" and puts the reason in the tooltip. This runs on
+  every launch; it is not something to make anyone dismiss.
+- **It adds no HTTP stack.** The fetch shells out to `%SystemRoot%\System32\curl.exe`,
+  which has shipped in Windows since 1803. One plain GET of a few dozen bytes
+  does not justify a TLS library and an async runtime inside a remote-access
+  program. The path is absolute because `CreateProcess` searches the calling
+  program's own directory first, and only our own package host is ever accepted
+  as a download link.
+
 ## Troubleshooting
 
 **Blank/gray window on Linux, log shows `Failed to create GBM buffer ...
