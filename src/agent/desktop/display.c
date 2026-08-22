@@ -529,7 +529,7 @@ static int DirectGate_Desktop_OpenWayland(directgate_session_t *pSession)
 
     if (g_pPendingWayland == NULL)
     {
-        char sTokenPath[XPATH_MAX];
+        char sTokenPath[XPATH_MAX + 64];
         DirectGate_Desktop_WaylandTokenPath(sTokenPath, sizeof(sTokenPath));
 
         g_pPendingWayland = DirectGate_WL_SourceCreate(sTokenPath);
