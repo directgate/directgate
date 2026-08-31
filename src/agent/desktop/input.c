@@ -932,6 +932,11 @@ static int DirectGate_Desktop_WaylandHandleInput(directgate_session_t *pSession,
             uint32_t nStreamH = nCaptureH;
             DirectGate_WL_SourceSize((directgate_wl_source_t*)pDesktop->pWayland, &nStreamW, &nStreamH);
 
+            /* A stream that reported no size would divide by zero below and
+             * turn every coordinate into a NaN the compositor cannot use. */
+            if (!nStreamW) nStreamW = nCaptureW;
+            if (!nStreamH) nStreamH = nCaptureH;
+
             /* The portal stack does not agree with itself about which of the
              * two sizes an absolute coordinate is in, and under a display
              * scale that costs the screen its far edges.

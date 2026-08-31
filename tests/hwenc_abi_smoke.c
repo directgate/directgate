@@ -24,6 +24,32 @@
 
 #include <dirent.h>
 
+#if defined(__SANITIZE_ADDRESS__)
+#define DIRECTGATE_HWENC_SMOKE_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define DIRECTGATE_HWENC_SMOKE_ASAN 1
+#endif
+#endif
+
+#ifdef DIRECTGATE_HWENC_SMOKE_ASAN
+/* Opening a GPU device leaves allocations behind that this process does not
+ * own. A VA driver that fails to initialise - the ordinary case on a hybrid
+ * box, where the first render node is not the one that encodes - does not
+ * give libavutil back everything it took, and the device handles this agent
+ * caches for the process lifetime are deliberate besides (see the cache in
+ * hwenc.c). Both are bounded and neither is what this test is for.
+ *
+ * Deliberately narrow: only the device open is excused. A leak in the import
+ * chain itself - the frames contexts, the conversion graph, the descriptor
+ * wrappers - allocates through other entry points and still fails the run. */
+const char* __lsan_default_suppressions(void);
+const char* __lsan_default_suppressions(void)
+{
+    return "leak:av_hwdevice_ctx_create\n";
+}
+#endif
+
 /* True when any libavcodec.so.<major> exists in the usual library paths, so
  * the difference between "nothing installed" and "installed but not selected"
  * can be told apart. */

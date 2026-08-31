@@ -702,6 +702,12 @@ static int DirectGate_Desktop_X11Enc_Encode(directgate_x11enc_t *pEnc,
     }
 #endif
 
+    /* The zero-copy fallback can leave a pipeline with no encoder at all
+     * when neither a replacement GPU encoder nor the software one would
+     * open. Failing every frame from here is what stops the pipeline; going
+     * on would convert into a buffer that was never allocated. */
+    if (pEnc->pEncoder == NULL || pEnc->pI420 == NULL) return XSTDERR;
+
     DirectGate_YUV_BGRAToI420(pEnc->pI420,
         pEnc->pI420 + (size_t)nWidth * nHeight,
         pEnc->pI420 + (size_t)nWidth * nHeight * 5U / 4U,
