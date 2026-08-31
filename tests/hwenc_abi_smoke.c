@@ -33,20 +33,25 @@
 #endif
 
 #ifdef DIRECTGATE_HWENC_SMOKE_ASAN
-/* Opening a GPU device leaves allocations behind that this process does not
- * own. A VA driver that fails to initialise - the ordinary case on a hybrid
- * box, where the first render node is not the one that encodes - does not
- * give libavutil back everything it took, and the device handles this agent
- * caches for the process lifetime are deliberate besides (see the cache in
- * hwenc.c). Both are bounded and neither is what this test is for.
+/* Loading a GPU driver leaves allocations behind that this process does not
+ * own and cannot free. Opening a VAAPI device makes libva dlopen the vendor's
+ * driver and call into it, and a driver that fails to initialise - the
+ * ordinary case on a hybrid box, where the first render node is not the one
+ * that encodes - keeps what it allocated on the way. The stack is entirely
+ * inside libva and the driver:
  *
- * Deliberately narrow: only the device open is excused. A leak in the import
- * chain itself - the frames contexts, the conversion graph, the descriptor
- * wrappers - allocates through other entry points and still fails the run. */
+ *     malloc <- iHD_drv_video.so <- __vaDriverInit <- vaInitialize
+ *
+ * so vaInitialize is what is excused here, and nothing above it. That matters:
+ * every allocation this agent is responsible for - the frames contexts, the
+ * conversion graph, the descriptor wrappers, the device references themselves
+ * - reaches malloc without passing through libva's driver load, and still
+ * fails the run. Excusing the libavutil entry point above it would have
+ * covered the agent's own device references too. */
 const char* __lsan_default_suppressions(void);
 const char* __lsan_default_suppressions(void)
 {
-    return "leak:av_hwdevice_ctx_create\n";
+    return "leak:vaInitialize\n";
 }
 #endif
 
