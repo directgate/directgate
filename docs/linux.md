@@ -24,6 +24,8 @@ Configure prints which one it took:
 -- Wayland desktop streaming: enabled (PipeWire 1.4.11 headers, runtime dlopen)
 ```
 
+Any PipeWire from 0.3.6 onwards will do. The build images are older than the SPA headers that name the DMA-BUF negotiation constants and report a buffer layout through the parsed format struct, so the two flags are defined here when the header does not carry them - their values are part of the pod wire format and have never moved - and the layout is read from the format itself, where it has always been.
+
 If it says `disabled`, the agent reports *"This agent was built without Wayland desktop streaming"* at run time. Install the packages and **re-run cmake** - a plain `cmake --build` will not re-check. If configure still says disabled afterwards, delete `CMakeCache.txt` and configure again.
 
 ## Wayland sessions

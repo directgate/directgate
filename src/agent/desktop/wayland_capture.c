@@ -111,6 +111,19 @@ static const char *g_pPipeWireNames[] = {
 #define DIRECTGATE_WL_DRM_MOD_INVALID 0x00ffffffffffffffULL
 #define DIRECTGATE_WL_DRM_MOD_LINEAR  0ULL
 
+/* Two POD property flags this file needs by name. They are part of the pod
+ * wire format and their values have never moved, but SPA only gave them
+ * names in 0.3.30 and 0.3.36 - and the header on a build image is whatever
+ * that distribution froze years ago. Naming them here when they are absent
+ * costs nothing and lets one source build against every SPA in the field. */
+#ifndef SPA_POD_PROP_FLAG_MANDATORY
+#define SPA_POD_PROP_FLAG_MANDATORY    (1u << 3)
+#endif
+
+#ifndef SPA_POD_PROP_FLAG_DONT_FIXATE
+#define SPA_POD_PROP_FLAG_DONT_FIXATE  (1u << 4)
+#endif
+
 /* The layouts this agent offers to import.
  *
  * INVALID means "whatever the driver would have chosen on its own", which is
@@ -389,6 +402,39 @@ static uint32_t DirectGate_WL_BuildFormats(directgate_wl_capture_t *pCap,
     return nCount;
 }
 
+/* The layout the stream negotiated, read out of the format itself.
+ *
+ * Not out of the parsed struct: spa_video_info_raw only grew the fields that
+ * report a layout in PipeWire 0.3.65, while the property they report has been
+ * in the format all along - so asking the format works on every version and
+ * asking the struct does not build on half of them.
+ *
+ * Returns XFALSE when there is no layout at all, which is the memory path.
+ * @p pbFixate comes back true when the producer has narrowed the list down
+ * but not chosen yet, and is waiting to be told which one it may use. */
+static xbool_t DirectGate_WL_FormatModifier(const struct spa_pod *pFormat,
+                                            uint64_t *pModifier, xbool_t *pbFixate)
+{
+    if (pbFixate != NULL) *pbFixate = XFALSE;
+
+    const struct spa_pod_prop *pProp = spa_pod_find_prop(pFormat, NULL, SPA_FORMAT_VIDEO_modifier);
+    if (pProp == NULL) return XFALSE;
+
+    if (pbFixate != NULL) *pbFixate = ((pProp->flags & SPA_POD_PROP_FLAG_DONT_FIXATE) != 0) ? XTRUE : XFALSE;
+
+    /* A choice while the producer is still deciding and a plain value once it
+     * has decided. The first entry of a choice is its default, which is the
+     * one the producer would rather have out of what it was offered. */
+    const struct spa_pod *pValue = &pProp->value;
+    if (SPA_POD_TYPE(pValue) == SPA_TYPE_Choice) pValue = SPA_POD_CHOICE_CHILD(pValue);
+
+    int64_t nValue = 0;
+    if (spa_pod_get_long(pValue, &nValue) < 0) return XFALSE;
+
+    if (pModifier != NULL) *pModifier = (uint64_t)nValue;
+    return XTRUE;
+}
+
 /* Whether a layout is one of the two this agent said it could import. The
  * producer can only choose from what was offered, so this should always be
  * true - but a compositor that ignored the offer would have the agent promise
@@ -444,25 +490,28 @@ static void DirectGate_WL_OnParamChanged(void *pCtx, uint32_t nId, const struct 
     if (nMediaType != SPA_MEDIA_TYPE_video || nMediaSubtype != SPA_MEDIA_SUBTYPE_raw) return;
     if (spa_format_video_raw_parse(pParam, &pCap->format) < 0) return;
 
-    /* The producer has chosen a layout from the list and is asking which one
-     * it may use. Nothing is allocated until that is answered with a single
+    uint64_t nModifier = 0;
+    xbool_t bFixate = XFALSE;
+    xbool_t bExported = DirectGate_WL_FormatModifier(pParam, &nModifier, &bFixate);
+
+    /* Every value the producer can pick came from ours, because it can only
+     * choose from what was offered - but one that ignored that would have
+     * this agent promise the GPU something it never agreed to take. */
+    if (bExported && !DirectGate_WL_ModifierOffered(nModifier))
+    {
+        DirectGate_WL_CaptureFallbackLocked(pCap, "the compositor picked a buffer layout that was not offered");
+        return;
+    }
+
+    /* The producer has narrowed the list down and is asking which layout it
+     * may use. Nothing is allocated until that is answered with a single
      * value, so this round of negotiation ends here and the next one carries
      * the format the buffers are actually made in. */
-    if ((pCap->format.flags & SPA_VIDEO_FLAG_MODIFIER_FIXATION_REQUIRED) != 0)
+    if (bExported && bFixate)
     {
         uint8_t fixate[4096];
         struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(fixate, sizeof(fixate));
         const struct spa_pod *params[4];
-
-        /* The parser hands back the first value of the choice, which is the
-         * producer's own preference out of the list it was given. */
-        uint64_t nModifier = pCap->format.modifier;
-
-        if (!DirectGate_WL_ModifierOffered(nModifier))
-        {
-            DirectGate_WL_CaptureFallbackLocked(pCap, "the compositor picked a buffer layout that was not offered");
-            return;
-        }
 
         uint32_t nCount = DirectGate_WL_BuildFormats(pCap, &builder, params, 4, &nModifier, 1);
         if (nCount > 0) g_pw.streamUpdateParams(pCap->pStream, params, nCount);
@@ -470,13 +519,12 @@ static void DirectGate_WL_OnParamChanged(void *pCtx, uint32_t nId, const struct 
         return;
     }
 
-    xbool_t bExported = ((pCap->format.flags & SPA_VIDEO_FLAG_MODIFIER) != 0) ? XTRUE : XFALSE;
     uint32_t nFourCC = bExported ? DirectGate_WL_FourCCFromFormat(pCap->format.format) : 0;
 
     /* Agreed to export something that cannot be described to the encoder:
      * better to say so now, while a renegotiation costs nothing, than to
      * discover it one frame at a time. */
-    if (bExported && (nFourCC == 0 || !DirectGate_WL_ModifierOffered(pCap->format.modifier)))
+    if (bExported && nFourCC == 0)
     {
         DirectGate_WL_CaptureFallbackLocked(pCap, "the exported buffer is not in a format this agent imports");
         return;
@@ -517,7 +565,7 @@ static void DirectGate_WL_OnParamChanged(void *pCtx, uint32_t nId, const struct 
 
     pCap->bDmaBuf = bExported;
     pCap->nFourCC = nFourCC;
-    pCap->nModifier = bExported ? pCap->format.modifier : 0;
+    pCap->nModifier = bExported ? nModifier : 0;
     pCap->bHaveFormat = XTRUE;
 
     xlogi("Wayland capture negotiated a format: size(%ux%u), rate(%u/%u), frames(%s)",

@@ -932,13 +932,77 @@ static int DirectGate_Desktop_WaylandHandleInput(directgate_session_t *pSession,
             uint32_t nStreamH = nCaptureH;
             DirectGate_WL_SourceSize((directgate_wl_source_t*)pDesktop->pWayland, &nStreamW, &nStreamH);
 
+            /* The portal stack does not agree with itself about which of the
+             * two sizes an absolute coordinate is in, and under a display
+             * scale that costs the screen its far edges.
+             *
+             * xdg-desktop-portal's check_position accepts a coordinate only
+             * while it is inside the size the *portal* advertised for the
+             * stream - the compositor's logical pixels, 1536x864 on a 1920
+             * panel at 125% - and refuses anything else as "Invalid
+             * position". The compositor then reads that same number as
+             * *stream* pixels and divides it by the scale to get back to
+             * logical. So the largest coordinate that survives the first
+             * step lands at 1/scale of the way across the screen, and no
+             * absolute coordinate exists that reaches the bottom-right
+             * corner at all.
+             *
+             * The absolute call therefore carries as much as it can, and the
+             * rest is added as one relative motion, which has no position to
+             * check. A virtual pointer is not accelerated - mutter passes the
+             * delta through as its own unaccelerated value - so the two
+             * together land on the requested pixel exactly. Without display
+             * scaling the two sizes are equal, the residual is zero, and this
+             * is the plain absolute call it has always been. */
             double nStreamX = (pDesktop->nWlPointerX * (double)nStreamW) / (double)nCaptureW;
             double nStreamY = (pDesktop->nWlPointerY * (double)nStreamH) / (double)nCaptureH;
+
+            /* The check is exclusive, so the far edge is refused as well. */
+            if (nStreamX > (double)(nCaptureW - 1U)) nStreamX = (double)(nCaptureW - 1U);
+            if (nStreamY > (double)(nCaptureH - 1U)) nStreamY = (double)(nCaptureH - 1U);
+
+            /* Where that puts the pointer by the compositor's own arithmetic,
+             * and how far short of the target it leaves it. Never negative:
+             * the clamp above only ever lowers the coordinate. */
+            double nResidualX = pDesktop->nWlPointerX - (nStreamX * (double)nCaptureW) / (double)nStreamW;
+            double nResidualY = pDesktop->nWlPointerY - (nStreamY * (double)nCaptureH) / (double)nStreamH;
+
+            /* Says what the three frames of reference actually were, at the
+             * one moment it matters: the pointer pushed into the far edge.
+             * A display scale makes the encoded picture, the rectangle the
+             * portal described and the stream PipeWire negotiated three
+             * different sizes, and when the pointer stops short of an edge
+             * the only question is which of them the arithmetic used. Once
+             * every two seconds, and only at the edge, so an ordinary
+             * session never prints it at all. */
+            xbool_t bAtEdge = ((pDesktop->nWlPointerX >= (double)(nCaptureW - 2U)) ||
+                               (pDesktop->nWlPointerY >= (double)(nCaptureH - 2U))) ? XTRUE : XFALSE;
+
+            if (bAtEdge)
+            {
+                uint64_t nNowMs = XTime_GetMs();
+                if (nNowMs - pDesktop->nWlPointerLogMs >= 2000ULL)
+                {
+                    pDesktop->nWlPointerLogMs = nNowMs;
+                    xlogi("Wayland pointer reached an edge: sid(%u), frame(%ux%u), capture(%ux%u), "
+                        "stream(%ux%u), pointer(%.1f,%.1f), sent(%.1f,%.1f), residual(%.1f,%.1f)",
+                        pDesktop->nSessionId, pDesktop->nFrameWidth, pDesktop->nFrameHeight,
+                        nCaptureW, nCaptureH, nStreamW, nStreamH,
+                        pDesktop->nWlPointerX, pDesktop->nWlPointerY, nStreamX, nStreamY,
+                        nResidualX, nResidualY);
+                }
+            }
 
             /* Addressed to the screen actually being watched, not to whichever
              * one the portal happened to list first. */
             DirectGate_WL_PortalPointerMotion(pPortal,
                 DirectGate_WL_SourceActiveNode((directgate_wl_source_t*)pDesktop->pWayland), nStreamX, nStreamY);
+
+            /* Whatever the absolute call could not express. Half a pixel is
+             * the threshold because anything smaller cannot move the pointer
+             * anyway, and sending it every frame would be noise on the bus. */
+            if (nResidualX >= 0.5 || nResidualY >= 0.5)
+                DirectGate_WL_PortalPointerMotionRelative(pPortal, nResidualX, nResidualY);
         }
 
         if (xstrcmp(pEvent, "button"))

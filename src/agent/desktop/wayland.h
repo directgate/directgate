@@ -216,6 +216,12 @@ int DirectGate_WL_PortalOpenPipeWire(directgate_wl_portal_t *pPortal, char *pErr
  * given. Keysyms are XKB keysyms, the same values the X11 path resolves. */
 int DirectGate_WL_PortalPointerMotion(directgate_wl_portal_t *pPortal, uint32_t nStream, double nX, double nY);
 int DirectGate_WL_PortalPointerButton(directgate_wl_portal_t *pPortal, int32_t nButton, xbool_t bPressed);
+
+/* Relative motion, in the compositor's own pixels. Unlike the absolute call
+ * this one carries no position, so xdg-desktop-portal does not range-check
+ * it - which is what makes it the only way to reach a part of the screen the
+ * absolute call cannot address. See the caller for why one exists. */
+int DirectGate_WL_PortalPointerMotionRelative(directgate_wl_portal_t *pPortal, double nDx, double nDy);
 int DirectGate_WL_PortalPointerAxis(directgate_wl_portal_t *pPortal, double nDx, double nDy);
 int DirectGate_WL_PortalKeysym(directgate_wl_portal_t *pPortal, int32_t nKeysym, xbool_t bPressed);
 

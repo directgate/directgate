@@ -469,7 +469,13 @@ elseif(UNIX)
             ${AGENT_DIR}/desktop/wayland_portal.c
             ${AGENT_DIR}/desktop/desktop_wayland.c)
         target_compile_definitions(directgate PRIVATE DIRECTGATE_DESKTOP_HAS_WAYLAND=1)
-        target_include_directories(directgate PRIVATE ${PIPEWIRE_INCLUDE_DIRS} ${DBUS_INCLUDE_DIRS})
+        # SYSTEM, so the warning settings this project builds itself with do
+        # not apply to somebody else's headers. SPA is header-only and full of
+        # designated-initializer macros that -Wmissing-field-initializers
+        # objects to; those warnings are reported against the macro, which
+        # lives in their header, so nothing this agent writes can silence them
+        # and nothing it writes is what they are about.
+        target_include_directories(directgate SYSTEM PRIVATE ${PIPEWIRE_INCLUDE_DIRS} ${DBUS_INCLUDE_DIRS})
     else()
         # Name what is missing and what installs it. "Headers not found" on its
         # own sends people looking at their Wayland session, which is working

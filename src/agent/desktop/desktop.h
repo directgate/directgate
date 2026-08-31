@@ -202,6 +202,7 @@ typedef struct directgate_desktop_ {
     double nWlPointerX;
     double nWlPointerY;
     xbool_t bWlPointerValid;
+    uint64_t nWlPointerLogMs;
     /* Double/triple click tracking for platforms where the injected event
      * must carry an explicit click count (macOS kCGMouseEventClickState). */
     uint64_t nLastClickMs;
