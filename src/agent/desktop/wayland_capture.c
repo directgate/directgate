@@ -99,6 +99,33 @@ static const char *g_pPipeWireNames[] = {
     NULL
 };
 
+/* DRM format codes and layout modifiers, spelled out rather than taken from
+ * libdrm: four constants are not worth a build dependency on every
+ * distribution, and these are ABI - what a compositor and a GPU driver agree
+ * on between themselves - so they cannot change. */
+#define DIRECTGATE_WL_FOURCC(a, b, c, d) \
+    ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+
+#define DIRECTGATE_WL_DRM_XRGB8888   DIRECTGATE_WL_FOURCC('X', 'R', '2', '4')
+#define DIRECTGATE_WL_DRM_ARGB8888   DIRECTGATE_WL_FOURCC('A', 'R', '2', '4')
+#define DIRECTGATE_WL_DRM_MOD_INVALID 0x00ffffffffffffffULL
+#define DIRECTGATE_WL_DRM_MOD_LINEAR  0ULL
+
+/* The layouts this agent offers to import.
+ *
+ * INVALID means "whatever the driver would have chosen on its own", which is
+ * the one layout a GPU can always import back on the device that produced it;
+ * LINEAR is the universal fallback any compositor can produce. Naming the
+ * tiled layouts a particular GPU supports would mean querying them through
+ * EGL, and linking a GL stack into an agent to save the compositor a detiling
+ * pass is not a trade worth making. A layout that is not on this list is not
+ * a failure: the offer simply does not match and the compositor keeps sending
+ * memory this process can read. */
+static const uint64_t g_wlModifiers[] = {
+    DIRECTGATE_WL_DRM_MOD_INVALID,
+    DIRECTGATE_WL_DRM_MOD_LINEAR,
+};
+
 struct directgate_wl_capture_ {
     struct pw_thread_loop *pLoop;
     struct pw_context *pContext;
@@ -113,6 +140,18 @@ struct directgate_wl_capture_ {
     xbool_t bHaveFormat;
     xbool_t bFailed;
     char sError[256];
+
+    /* Export state. bWantDmaBuf is what the caller asked for, bDmaBuf is what
+     * the compositor agreed to, and bDroppedDmaBuf is a door that only closes:
+     * once the export has proved unusable the offer is never made again on
+     * this stream, or a compositor that keeps agreeing to it would put the
+     * session in a renegotiation loop. */
+    xbool_t bWantDmaBuf;
+    xbool_t bDmaBuf;
+    xbool_t bDroppedDmaBuf;
+    uint32_t nFourCC;
+    uint64_t nModifier;
+    xbool_t bWarnedExport;
 
     /* Diagnostics that answer the two questions a black stream raises. */
     uint64_t nFrames;
@@ -258,6 +297,143 @@ static void DirectGate_WL_OnStreamState(void *pCtx, enum pw_stream_state eOld,
         g_pw.streamStateStr != NULL ? g_pw.streamStateStr(eState) : "?");
 }
 
+/* One EnumFormat entry. With no modifiers this is the memory offer that has
+ * always been made; with them it is the same picture as something the GPU
+ * keeps, and the two are offered together so the compositor picks whichever
+ * it can actually do. */
+static const struct spa_pod* DirectGate_WL_BuildFormat(struct spa_pod_builder *pBuilder,
+                                                       uint32_t nFormat,
+                                                       const uint64_t *pModifiers,
+                                                       uint32_t nModifiers)
+{
+    struct spa_pod_frame frames[2];
+
+    spa_pod_builder_push_object(pBuilder, &frames[0], SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+    spa_pod_builder_add(pBuilder,
+        SPA_FORMAT_mediaType,       SPA_POD_Id(SPA_MEDIA_TYPE_video),
+        SPA_FORMAT_mediaSubtype,    SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+        SPA_FORMAT_VIDEO_format,    SPA_POD_Id(nFormat), 0);
+
+    if (pModifiers != NULL && nModifiers > 0)
+    {
+        /* Mandatory, because a producer that ignored it would hand back
+         * memory this entry promised to import. Not fixated while there is
+         * still a choice to make: the producer picks from the list and then
+         * asks which one it may use, and answering that is what turns the
+         * offer into an export. */
+        uint32_t nFlags = SPA_POD_PROP_FLAG_MANDATORY;
+        if (nModifiers > 1) nFlags |= SPA_POD_PROP_FLAG_DONT_FIXATE;
+
+        spa_pod_builder_prop(pBuilder, SPA_FORMAT_VIDEO_modifier, nFlags);
+        spa_pod_builder_push_choice(pBuilder, &frames[1], SPA_CHOICE_Enum, 0);
+        spa_pod_builder_long(pBuilder, (int64_t)pModifiers[0]);
+
+        for (uint32_t i = 0; i < nModifiers; i++)
+            spa_pod_builder_long(pBuilder, (int64_t)pModifiers[i]);
+
+        spa_pod_builder_pop(pBuilder, &frames[1]);
+    }
+
+    spa_pod_builder_add(pBuilder,
+        SPA_FORMAT_VIDEO_size,      SPA_POD_CHOICE_RANGE_Rectangle(
+                                        &SPA_RECTANGLE(1920, 1080),
+                                        &SPA_RECTANGLE(1, 1),
+                                        &SPA_RECTANGLE(8192, 8192)),
+        /* The minimum must be 0/1. A screen is a variable-rate source and
+         * advertises exactly that; asking for 1/1 as the floor matches
+         * nothing and the stream reports that it has no more input formats. */
+        SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
+                                        &SPA_FRACTION(60, 1),
+                                        &SPA_FRACTION(0, 1),
+                                        &SPA_FRACTION(240, 1)), 0);
+
+    return (const struct spa_pod*)spa_pod_builder_pop(pBuilder, &frames[0]);
+}
+
+/* The whole offer, in the order it is preferred: exported entries first when
+ * there is an encoder that can take one, and the memory entry always last so
+ * that a compositor which will not export still has something to agree to.
+ *
+ * @p pModifiers is the list to offer (NULL when not exporting, and a single
+ * fixated value when answering the producer's choice). */
+static uint32_t DirectGate_WL_BuildFormats(directgate_wl_capture_t *pCap,
+                                           struct spa_pod_builder *pBuilder,
+                                           const struct spa_pod **pParams,
+                                           uint32_t nMax,
+                                           const uint64_t *pModifiers,
+                                           uint32_t nModifiers)
+{
+    uint32_t nCount = 0;
+
+    if (pCap->bWantDmaBuf && !pCap->bDroppedDmaBuf && pModifiers != NULL && nModifiers > 0)
+    {
+        /* One entry per format: a modifier list belongs to a single format,
+         * so the two cannot share a pod the way the memory offer does. */
+        if (nCount < nMax)
+            pParams[nCount++] = DirectGate_WL_BuildFormat(pBuilder, SPA_VIDEO_FORMAT_BGRx, pModifiers, nModifiers);
+
+        if (nCount < nMax)
+            pParams[nCount++] = DirectGate_WL_BuildFormat(pBuilder, SPA_VIDEO_FORMAT_BGRA, pModifiers, nModifiers);
+    }
+
+    /* BGRx/BGRA only: both are byte-order identical to what the X11 path
+     * produces, so the existing scale and I420 conversion are reused with no
+     * swizzle. A compositor offering only RGB-order formats would fail
+     * negotiation rather than stream wrong colours. */
+    if (nCount < nMax)
+        pParams[nCount++] = DirectGate_WL_BuildFormat(pBuilder, SPA_VIDEO_FORMAT_BGRx, NULL, 0);
+
+    if (nCount < nMax)
+        pParams[nCount++] = DirectGate_WL_BuildFormat(pBuilder, SPA_VIDEO_FORMAT_BGRA, NULL, 0);
+
+    return nCount;
+}
+
+/* Whether a layout is one of the two this agent said it could import. The
+ * producer can only choose from what was offered, so this should always be
+ * true - but a compositor that ignored the offer would have the agent promise
+ * the GPU something it never agreed to take. */
+static xbool_t DirectGate_WL_ModifierOffered(uint64_t nModifier)
+{
+    for (uint32_t i = 0; i < sizeof(g_wlModifiers) / sizeof(g_wlModifiers[0]); i++)
+    {
+        if (g_wlModifiers[i] == nModifier) return XTRUE;
+    }
+
+    return XFALSE;
+}
+
+/* DRM code for what the stream negotiated. Only the two formats offered above
+ * can appear here; anything else means the export cannot be described. */
+static uint32_t DirectGate_WL_FourCCFromFormat(uint32_t nFormat)
+{
+    if (nFormat == SPA_VIDEO_FORMAT_BGRx) return DIRECTGATE_WL_DRM_XRGB8888;
+    if (nFormat == SPA_VIDEO_FORMAT_BGRA) return DIRECTGATE_WL_DRM_ARGB8888;
+
+    return 0;
+}
+
+/* Re-offers without the exported entries, which makes the stream renegotiate
+ * for memory in place. The portal grant is not involved - only the format
+ * offer changes - so nobody is prompted again. Stream thread only. */
+static void DirectGate_WL_CaptureFallbackLocked(directgate_wl_capture_t *pCap, const char *pReason)
+{
+    if (pCap->bDroppedDmaBuf || pCap->pStream == NULL) return;
+
+    pCap->bDroppedDmaBuf = XTRUE;
+    pCap->bDmaBuf = XFALSE;
+
+    xlogw("Exported desktop frames cannot be used, asking the compositor for mapped memory: reason(%s)",
+        xstrused(pReason) ? pReason : "unknown");
+
+    uint8_t buffer[4096];
+    struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    const struct spa_pod *params[4];
+
+    uint32_t nCount = DirectGate_WL_BuildFormats(pCap, &builder, params, 4, NULL, 0);
+    if (nCount > 0) g_pw.streamUpdateParams(pCap->pStream, params, nCount);
+}
+
 static void DirectGate_WL_OnParamChanged(void *pCtx, uint32_t nId, const struct spa_pod *pParam)
 {
     directgate_wl_capture_t *pCap = (directgate_wl_capture_t*)pCtx;
@@ -268,28 +444,86 @@ static void DirectGate_WL_OnParamChanged(void *pCtx, uint32_t nId, const struct 
     if (nMediaType != SPA_MEDIA_TYPE_video || nMediaSubtype != SPA_MEDIA_SUBTYPE_raw) return;
     if (spa_format_video_raw_parse(pParam, &pCap->format) < 0) return;
 
+    /* The producer has chosen a layout from the list and is asking which one
+     * it may use. Nothing is allocated until that is answered with a single
+     * value, so this round of negotiation ends here and the next one carries
+     * the format the buffers are actually made in. */
+    if ((pCap->format.flags & SPA_VIDEO_FLAG_MODIFIER_FIXATION_REQUIRED) != 0)
+    {
+        uint8_t fixate[4096];
+        struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(fixate, sizeof(fixate));
+        const struct spa_pod *params[4];
+
+        /* The parser hands back the first value of the choice, which is the
+         * producer's own preference out of the list it was given. */
+        uint64_t nModifier = pCap->format.modifier;
+
+        if (!DirectGate_WL_ModifierOffered(nModifier))
+        {
+            DirectGate_WL_CaptureFallbackLocked(pCap, "the compositor picked a buffer layout that was not offered");
+            return;
+        }
+
+        uint32_t nCount = DirectGate_WL_BuildFormats(pCap, &builder, params, 4, &nModifier, 1);
+        if (nCount > 0) g_pw.streamUpdateParams(pCap->pStream, params, nCount);
+
+        return;
+    }
+
+    xbool_t bExported = ((pCap->format.flags & SPA_VIDEO_FLAG_MODIFIER) != 0) ? XTRUE : XFALSE;
+    uint32_t nFourCC = bExported ? DirectGate_WL_FourCCFromFormat(pCap->format.format) : 0;
+
+    /* Agreed to export something that cannot be described to the encoder:
+     * better to say so now, while a renegotiation costs nothing, than to
+     * discover it one frame at a time. */
+    if (bExported && (nFourCC == 0 || !DirectGate_WL_ModifierOffered(pCap->format.modifier)))
+    {
+        DirectGate_WL_CaptureFallbackLocked(pCap, "the exported buffer is not in a format this agent imports");
+        return;
+    }
+
     uint8_t buffer[512];
     struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
     const struct spa_pod *params[1];
 
-    /* The load-bearing constraint. A GPU compositor's natural answer is a
-     * DMA-BUF, which arrives with data == NULL in a process that has not
-     * imported it through EGL, so every frame is skipped and the viewer sees
-     * a black screen rather than an error. Excluding SPA_DATA_DmaBuf here
-     * makes the compositor do the GPU-to-CPU copy and hand back memory that
-     * can simply be mapped. Importing DMA-BUF directly would be faster and is
-     * the natural next step, but correct beats fast for the first frame. */
-    params[0] = spa_pod_builder_add_object(&builder,
-        SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-        SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(
-            (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr)));
+    if (bExported)
+    {
+        /* The encoder is handed the compositor's own buffer and holds it
+         * until the frame has been through the GPU, so one is out of
+         * circulation for as long as an encode takes. Asking for a few more
+         * than the default means the compositor never has to wait for one
+         * back, which is what a shortage would look like: dropped frames on
+         * a screen that is changing fast. */
+        params[0] = spa_pod_builder_add_object(&builder,
+            SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+            SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_DmaBuf),
+            SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 2, 16));
+    }
+    else
+    {
+        /* The load-bearing constraint on the memory path. A GPU compositor's
+         * natural answer is a DMA-BUF, which arrives with data == NULL in a
+         * process that has not imported it, so every frame would be skipped
+         * and the viewer would see a black screen rather than an error.
+         * Excluding SPA_DATA_DmaBuf makes the compositor do the GPU-to-CPU
+         * copy and hand back memory that can simply be mapped. */
+        params[0] = spa_pod_builder_add_object(&builder,
+            SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+            SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(
+                (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr)));
+    }
 
     g_pw.streamUpdateParams(pCap->pStream, params, 1);
+
+    pCap->bDmaBuf = bExported;
+    pCap->nFourCC = nFourCC;
+    pCap->nModifier = bExported ? pCap->format.modifier : 0;
     pCap->bHaveFormat = XTRUE;
 
-    xlogi("Wayland capture negotiated a format: size(%ux%u), rate(%u/%u)",
+    xlogi("Wayland capture negotiated a format: size(%ux%u), rate(%u/%u), frames(%s)",
         pCap->format.size.width, pCap->format.size.height,
-        pCap->format.framerate.num, pCap->format.framerate.denom);
+        pCap->format.framerate.num, pCap->format.framerate.denom,
+        bExported ? "exported by the GPU" : "mapped memory");
 
     g_pw.loopSignal(pCap->pLoop, false);
 }
@@ -378,10 +612,81 @@ static xbool_t DirectGate_WL_FrameFromBuffer(directgate_wl_capture_t *pCap,
         return XFALSE;
     }
 
+    pFrame->eKind = DIRECTGATE_WL_FRAME_MAPPED;
     pFrame->pPixels = (const uint8_t*)pData->data + nOffset;
     pFrame->nWidth = nWidth;
     pFrame->nHeight = nHeight;
     pFrame->nStride = nStride;
+
+    return XTRUE;
+}
+
+/* The exported equivalent: nothing in the buffer is read, only described.
+ * The same suspicion applies to every number, because they still cross a
+ * process boundary - but a bad one here means an import the GPU refuses
+ * rather than a read past the end of a mapping. */
+static xbool_t DirectGate_WL_FrameFromDmaBuf(directgate_wl_capture_t *pCap,
+                                             struct pw_buffer *pBuffer,
+                                             directgate_wl_frame_t *pFrame)
+{
+    struct spa_buffer *pBuf = pBuffer->buffer;
+    if (pBuf == NULL || pBuf->n_datas < 1) return XFALSE;
+
+    /* One object is what libavutil is able to map, and a packed RGB frame is
+     * one. A compositor that splits it across several is answered by going
+     * back to memory rather than by importing part of a picture. */
+    if (pBuf->n_datas != 1 || pBuf->datas[0].type != SPA_DATA_DmaBuf || pBuf->datas[0].fd < 0)
+    {
+        if (!pCap->bWarnedExport)
+        {
+            pCap->bWarnedExport = XTRUE;
+            xlogw("Wayland capture received an export it cannot describe: planes(%u), type(%u)",
+                pBuf->n_datas, pBuf->datas[0].type);
+        }
+
+        return XFALSE;
+    }
+
+    uint32_t nWidth = pCap->format.size.width;
+    uint32_t nHeight = pCap->format.size.height;
+    if (nWidth == 0 || nHeight == 0 || pCap->nFourCC == 0) return XFALSE;
+
+    struct spa_data *pData = &pBuf->datas[0];
+    uint32_t nOffset = 0, nStride = 0;
+
+    if (pData->chunk != NULL)
+    {
+        nOffset = (uint32_t)pData->chunk->offset;
+        nStride = (uint32_t)pData->chunk->stride;
+    }
+
+    /* A zero stride means packed rows, the same as on the memory path;
+     * anything shorter than a packed row describes a frame that does not
+     * fit in the object it claims to live in. */
+    if (nStride == 0) nStride = nWidth * 4U;
+    if (nStride < nWidth * 4U) return XFALSE;
+
+    /* Compositors do not always fill maxsize in for an exported buffer, and
+     * the driver needs a size for the import; the packed extent of what was
+     * announced is the honest answer when there is nothing better. */
+    uint64_t nSize = (uint64_t)pData->maxsize;
+    uint64_t nNeeded = (uint64_t)nOffset + (uint64_t)nStride * nHeight;
+    if (nSize < nNeeded) nSize = nNeeded;
+
+    memset(&pFrame->dmabuf, 0, sizeof(pFrame->dmabuf));
+    pFrame->dmabuf.nWidth = nWidth;
+    pFrame->dmabuf.nHeight = nHeight;
+    pFrame->dmabuf.nFourCC = pCap->nFourCC;
+    pFrame->dmabuf.nModifier = pCap->nModifier;
+    pFrame->dmabuf.nPlanes = 1;
+    pFrame->dmabuf.nSize = nSize;
+    pFrame->dmabuf.nFds[0] = (int)pData->fd;
+    pFrame->dmabuf.nOffsets[0] = nOffset;
+    pFrame->dmabuf.nStrides[0] = nStride;
+
+    pFrame->eKind = DIRECTGATE_WL_FRAME_EXPORTED;
+    pFrame->nWidth = nWidth;
+    pFrame->nHeight = nHeight;
 
     return XTRUE;
 }
@@ -410,9 +715,36 @@ static void DirectGate_WL_OnProcess(void *pCtx)
     if (pNewest == NULL) return;
 
     directgate_wl_frame_t frame;
+    memset(&frame, 0, sizeof(frame));
+
+    if (pCap->bDmaBuf)
+    {
+        if (!DirectGate_WL_FrameFromDmaBuf(pCap, pNewest, &frame))
+        {
+            /* Nothing can be done with this one, and nothing will be done
+             * with the next either: the export is refused as a whole rather
+             * than one silent frame at a time. */
+            g_pw.streamQueue(pCap->pStream, pNewest);
+            DirectGate_WL_CaptureFallbackLocked(pCap, "the exported buffer cannot be described");
+
+            return;
+        }
+
+        /* The buffer goes with the frame. It cannot be given back here: the
+         * compositor would be free to draw into it while the GPU is still
+         * reading, and a torn frame is exactly what that looks like. */
+        pCap->nFrames++;
+        frame.pHandle = pNewest;
+        frame.pCapture = pCap;
+        pCap->fnFrame(pCap->pUserCtx, &frame);
+
+        return;
+    }
+
     if (DirectGate_WL_FrameFromBuffer(pCap, pNewest, &frame))
     {
         pCap->nFrames++;
+        frame.pCapture = pCap;
         pCap->fnFrame(pCap->pUserCtx, &frame);
     }
 
@@ -430,6 +762,7 @@ directgate_wl_capture_t* DirectGate_WL_CaptureStart(int nPipeWireFd,
                                                     uint32_t nNodeId,
                                                     directgate_wl_frame_cb_t fnFrame,
                                                     void *pUserCtx,
+                                                    xbool_t bWantDmaBuf,
                                                     char *pErrBuf,
                                                     size_t nErrSize)
 {
@@ -449,6 +782,7 @@ directgate_wl_capture_t* DirectGate_WL_CaptureStart(int nPipeWireFd,
 
     pCap->fnFrame = fnFrame;
     pCap->pUserCtx = pUserCtx;
+    pCap->bWantDmaBuf = bWantDmaBuf;
 
     pCap->pLoop = g_pw.loopNew("directgate-capture", NULL);
     if (pCap->pLoop == NULL)
@@ -518,36 +852,18 @@ directgate_wl_capture_t* DirectGate_WL_CaptureStart(int nPipeWireFd,
 
     g_pw.streamAddListener(pCap->pStream, &pCap->streamHook, &g_streamEvents, pCap);
 
-    uint8_t buffer[1024];
+    uint8_t buffer[4096];
     struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-    const struct spa_pod *params[1];
+    const struct spa_pod *params[4];
 
-    params[0] = spa_pod_builder_add_object(&builder,
-        SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
-        SPA_FORMAT_mediaType,       SPA_POD_Id(SPA_MEDIA_TYPE_video),
-        SPA_FORMAT_mediaSubtype,    SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-        /* BGRx/BGRA only: both are byte-order identical to what the X11 path
-         * produces, so the existing scale and I420 conversion are reused with
-         * no swizzle. A compositor offering only RGB-order formats would fail
-         * negotiation rather than stream wrong colours. */
-        SPA_FORMAT_VIDEO_format,    SPA_POD_CHOICE_ENUM_Id(3,
-                                        SPA_VIDEO_FORMAT_BGRx,
-                                        SPA_VIDEO_FORMAT_BGRx,
-                                        SPA_VIDEO_FORMAT_BGRA),
-        SPA_FORMAT_VIDEO_size,      SPA_POD_CHOICE_RANGE_Rectangle(
-                                        &SPA_RECTANGLE(1920, 1080),
-                                        &SPA_RECTANGLE(1, 1),
-                                        &SPA_RECTANGLE(8192, 8192)),
-        /* The minimum must be 0/1. A screen is a variable-rate source and
-         * advertises exactly that; asking for 1/1 as the floor matches
-         * nothing and the stream reports that it has no more input formats. */
-        SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
-                                        &SPA_FRACTION(60, 1),
-                                        &SPA_FRACTION(0, 1),
-                                        &SPA_FRACTION(240, 1)));
+    uint32_t nParams = DirectGate_WL_BuildFormats(pCap, &builder, params, 4,
+        bWantDmaBuf ? g_wlModifiers : NULL,
+        bWantDmaBuf ? (uint32_t)(sizeof(g_wlModifiers) / sizeof(g_wlModifiers[0])) : 0);
 
+    /* MAP_BUFFERS stays on for the memory entries; it does nothing to an
+     * exported buffer, which is not mappable and is never read here. */
     int nStatus = g_pw.streamConnect(pCap->pStream, PW_DIRECTION_INPUT, nNodeId,
-        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, 1);
+        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, nParams);
 
     g_pw.loopUnlock(pCap->pLoop);
 
@@ -572,6 +888,23 @@ int DirectGate_WL_CaptureWaitFormat(directgate_wl_capture_t *pCapture, uint32_t 
     while (!pCapture->bHaveFormat && !pCapture->bFailed)
     {
         if (g_pw.loopTimedWait(pCapture->pLoop, (int)((nTimeoutMs + 999U) / 1000U)) != 0) break;
+    }
+
+    /* An offer to export is the only thing here that has ever been new, so it
+     * is also the only thing a silence like this is likely to be about: a
+     * compositor that answers the modifier question with nothing at all would
+     * otherwise cost the session, when withdrawing the offer costs a second.
+     * Once only - bDroppedDmaBuf sees to that - and never on a stream that
+     * was not offered one. */
+    if (!pCapture->bHaveFormat && !pCapture->bFailed &&
+        pCapture->bWantDmaBuf && !pCapture->bDroppedDmaBuf)
+    {
+        DirectGate_WL_CaptureFallbackLocked(pCapture, "the compositor did not answer the export offer");
+
+        while (!pCapture->bHaveFormat && !pCapture->bFailed)
+        {
+            if (g_pw.loopTimedWait(pCapture->pLoop, (int)((nTimeoutMs + 999U) / 1000U)) != 0) break;
+        }
     }
 
     xbool_t bReady = pCapture->bHaveFormat;
@@ -610,6 +943,55 @@ xbool_t DirectGate_WL_CaptureSize(directgate_wl_capture_t *pCapture,
 
     g_pw.loopUnlock(pCapture->pLoop);
     return bReady;
+}
+
+xbool_t DirectGate_WL_CaptureIsDmaBuf(directgate_wl_capture_t *pCapture,
+                                      uint32_t *pFourCC, uint64_t *pModifier)
+{
+    XCHECK_NL((pCapture != NULL), XFALSE);
+
+    g_pw.loopLock(pCapture->pLoop);
+    xbool_t bDmaBuf = pCapture->bDmaBuf;
+
+    if (bDmaBuf)
+    {
+        if (pFourCC != NULL) *pFourCC = pCapture->nFourCC;
+        if (pModifier != NULL) *pModifier = pCapture->nModifier;
+    }
+
+    g_pw.loopUnlock(pCapture->pLoop);
+    return bDmaBuf;
+}
+
+void DirectGate_WL_CaptureRelease(directgate_wl_capture_t *pCapture, void *pHandle)
+{
+    XCHECK_VOID_NL((pCapture != NULL && pHandle != NULL));
+
+    /* Locking the loop is how another thread reaches a stream safely. The
+     * caller must therefore not be holding anything DirectGate_WL_OnProcess
+     * takes on its way in, or the two threads wait for each other; the frame
+     * slot is handed over before the encode starts for exactly that reason. */
+    g_pw.loopLock(pCapture->pLoop);
+    if (pCapture->pStream != NULL) g_pw.streamQueue(pCapture->pStream, (struct pw_buffer*)pHandle);
+    g_pw.loopUnlock(pCapture->pLoop);
+}
+
+void DirectGate_WL_CaptureDrop(directgate_wl_capture_t *pCapture, void *pHandle)
+{
+    XCHECK_VOID_NL((pCapture != NULL && pHandle != NULL));
+
+    /* Already on the loop thread: taking its lock here would be a thread
+     * waiting for itself. */
+    if (pCapture->pStream != NULL) g_pw.streamQueue(pCapture->pStream, (struct pw_buffer*)pHandle);
+}
+
+void DirectGate_WL_CaptureDisableDmaBuf(directgate_wl_capture_t *pCapture)
+{
+    XCHECK_VOID_NL((pCapture != NULL));
+
+    g_pw.loopLock(pCapture->pLoop);
+    DirectGate_WL_CaptureFallbackLocked(pCapture, "the GPU could not take the exported frames");
+    g_pw.loopUnlock(pCapture->pLoop);
 }
 
 void DirectGate_WL_CaptureStop(directgate_wl_capture_t *pCapture)

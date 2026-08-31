@@ -100,6 +100,62 @@ int DirectGate_HWEnc_Encode(directgate_hwenc_t *pEncoder,
                             xbyte_buffer_t *pOut,
                             xbool_t *pKeyframe);
 
+/* --- Zero-copy import (Wayland/PipeWire DMA-BUF -> GPU encoder) ----------
+ *
+ * The frames the pipeline normally hands over have made a round trip nobody
+ * wanted: the compositor read them back out of the GPU, the CPU turned BGRA
+ * into NV12, and the encoder uploaded them again. When the compositor is
+ * willing to export the frame as a DMA-BUF instead, none of that has to
+ * happen - the buffer is already a GPU image, and the encoder is on the same
+ * GPU.
+ *
+ * The import is VAAPI only. It is the one backend that can take a DRM object
+ * as an encode surface through libavcodec (av_hwframe_map), and the colour
+ * conversion and the resize are then done by the driver's video
+ * post-processor through libavfilter's scale_vaapi. NVENC and AMF have no
+ * equivalent path here, so a host that encodes on those keeps the existing
+ * pipeline - which is why the caller must be prepared for this to decline. */
+
+/* Whether this build and this host can import at all: libavfilter present,
+ * loadable, with a scale_vaapi filter in it. Says nothing about whether a
+ * VAAPI encoder will open - CreateImport answers that - and nothing about
+ * whether the compositor will offer DMA-BUF. DIRECTGATE_HWENC_ZEROCOPY=0
+ * turns it off. Cached, safe to call often. */
+xbool_t DirectGate_HWEnc_ImportAvailable(char *pErrBuf, size_t nErrSize);
+
+/* Opens a VAAPI encoder that takes DMA-BUF handles of @a nSrcWidth x
+ * @a nSrcHeight in DRM format @a nFourCC / @a nModifier and emits
+ * @a nWidth x @a nHeight H.264 - the scale is part of the GPU pass, so the
+ * two sizes may differ freely.
+ *
+ * Returns NULL (with the reason) when anything in that chain will not build,
+ * which is not a failure of the session: the caller opens an ordinary
+ * encoder instead and asks the capture for mapped frames. */
+directgate_hwenc_t* DirectGate_HWEnc_CreateImport(uint32_t nSrcWidth, uint32_t nSrcHeight,
+                                                  uint32_t nFourCC, uint64_t nModifier,
+                                                  uint32_t nWidth, uint32_t nHeight,
+                                                  const directgate_desktop_quality_t *pQuality,
+                                                  char *pErrBuf, size_t nErrSize);
+
+/* Encodes one exported frame. The descriptors in @p pFrame are borrowed for
+ * the duration of the call and are not stored: when this returns, the buffer
+ * they came from can go back to the compositor.
+ *
+ * @p pFrame may be NULL to re-encode the last picture, which is how a
+ * keyframe is answered on a screen that has stopped changing - there is no
+ * CPU copy of it to fall back on. XSTDNON then means there is no last
+ * picture yet.
+ *
+ * Return values match DirectGate_HWEnc_Encode. XSTDERR means the import
+ * chain itself failed: the caller should stop asking the compositor for
+ * DMA-BUF and rebuild on the ordinary encoder. */
+int DirectGate_HWEnc_EncodeImport(directgate_hwenc_t *pEncoder,
+                                  const directgate_desktop_dmabuf_t *pFrame,
+                                  uint64_t nPtsUs,
+                                  xbool_t bForceKeyframe,
+                                  xbyte_buffer_t *pOut,
+                                  xbool_t *pKeyframe);
+
 /* Applies bitrate/fps/GOP updates that do not change the encode dimensions. */
 int DirectGate_HWEnc_ApplyQuality(directgate_hwenc_t *pEncoder,
                                   const directgate_desktop_quality_t *pQuality);

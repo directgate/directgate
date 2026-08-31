@@ -10,6 +10,14 @@
  * Skips (77) when the host has no libavcodec at all, which is the legitimate
  * software-only case; a host that does have one and still fails to select an
  * ABI is a genuine failure of the dispatch.
+ *
+ * Then builds the Wayland zero-copy chain, which is the part with the most
+ * that can go wrong on a given host: libavfilter, a scale_vaapi filter inside
+ * it, a VAAPI device, a mapping frames context, the conversion graph, and an
+ * encoder opened on that graph's own frame pool. All of it is optional - a
+ * machine with no usable VAAPI keeps the copied path and the agent is none
+ * the worse - so not having it is reported rather than failed. What is failed
+ * is a chain that builds and then behaves wrongly.
  */
 
 #include "src/agent/desktop/hwenc.h"
@@ -74,6 +82,64 @@ int main(void)
         }
 
         printf("hwenc_abi_smoke: selected %s\n", pVersion);
+
+        char sImport[DIRECTGATE_DESKTOP_REASON_LEN] = {0};
+        if (!DirectGate_HWEnc_ImportAvailable(sImport, sizeof(sImport)))
+        {
+            printf("hwenc_abi_smoke: zero-copy unavailable here: %s\n",
+                sImport[0] ? sImport : "no reason reported");
+
+            return 0;
+        }
+
+        directgate_desktop_quality_t quality;
+        memset(&quality, 0, sizeof(quality));
+        quality.nFps = 30U;
+        quality.nBitrateKbps = 4000U;
+        quality.nKeyframeFrames = 300U;
+
+        /* XR24 is DRM_FORMAT_XRGB8888 and the modifier is the "whatever the
+         * driver would have picked" one, which is exactly what the capture
+         * side offers a compositor. The two sizes differ on purpose, so the
+         * GPU has to scale as well as convert. */
+        sImport[0] = '\0';
+        directgate_hwenc_t *pEncoder = DirectGate_HWEnc_CreateImport(2560, 1440,
+            0x34325258u, 0x00ffffffffffffffULL, 1920, 1080, &quality, sImport, sizeof(sImport));
+
+        if (pEncoder == NULL)
+        {
+            /* A VAAPI device that decodes but does not encode ends up here,
+             * and so does one whose driver will not scale to NV12. Both are
+             * hosts the agent still works on. */
+            printf("hwenc_abi_smoke: zero-copy could not be built here: %s\n",
+                sImport[0] ? sImport : "no reason reported");
+
+            return 0;
+        }
+
+        printf("hwenc_abi_smoke: zero-copy encoder is %s\n", DirectGate_HWEnc_Describe(pEncoder));
+
+        /* Nothing has been imported yet, so this has no picture to re-encode
+         * and must say so - rather than encode whatever the surface it was
+         * given happens to contain. */
+        xbyte_buffer_t encoded;
+        xbool_t bKeyframe = XFALSE;
+        XByteBuffer_Init(&encoded, XSTDNON, XFALSE);
+
+        int nEncoded = DirectGate_HWEnc_EncodeImport(pEncoder, NULL, 0, XTRUE, &encoded, &bKeyframe);
+        size_t nProduced = encoded.nUsed;
+
+        XByteBuffer_Clear(&encoded);
+        DirectGate_HWEnc_Destroy(pEncoder);
+
+        if (nEncoded != XSTDNON || nProduced != 0)
+        {
+            fprintf(stderr, "hwenc_abi_smoke: zero-copy encoder produced %zu bytes before any frame (%d)\n",
+                nProduced, nEncoded);
+
+            return 1;
+        }
+
         return 0;
     }
 

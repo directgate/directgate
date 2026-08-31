@@ -43,6 +43,9 @@
 #define DirectGate_HWEnc_Encode       DIRECTGATE_HWENC_ABI_SYM(DirectGate_HWEnc_Encode)
 #define DirectGate_HWEnc_ApplyQuality DIRECTGATE_HWENC_ABI_SYM(DirectGate_HWEnc_ApplyQuality)
 #define DirectGate_HWEnc_SetBitrate   DIRECTGATE_HWENC_ABI_SYM(DirectGate_HWEnc_SetBitrate)
+#define DirectGate_HWEnc_ImportAvailable DIRECTGATE_HWENC_ABI_SYM(DirectGate_HWEnc_ImportAvailable)
+#define DirectGate_HWEnc_CreateImport DIRECTGATE_HWENC_ABI_SYM(DirectGate_HWEnc_CreateImport)
+#define DirectGate_HWEnc_EncodeImport DIRECTGATE_HWENC_ABI_SYM(DirectGate_HWEnc_EncodeImport)
 #endif
 
 #include "hwenc.h"
@@ -66,7 +69,19 @@
 #include <libavutil/dict.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_drm.h>
 #include <libavutil/opt.h>
+
+/* libavfilter is what turns an imported DMA-BUF into something an H.264
+ * encoder will take: scale_vaapi drives the GPU's post-processor for the
+ * colour conversion and the resize. It is optional at build time - a build
+ * image without the headers simply has no zero-copy path, and every other
+ * part of this file is unchanged. */
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersrc.h>
+#include <libavfilter/buffersink.h>
+#endif
 
 /* Reconfiguration policy for adaptive bitrate. NVENC can apply AVCodecContext
  * rate-control changes to its live session; the other hardware backends need
@@ -118,6 +133,68 @@ typedef struct directgate_hwenc_lib_ {
 } directgate_hwenc_lib_t;
 
 static directgate_hwenc_lib_t g_hwenc;
+
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
+
+/* DRM format codes, spelled out rather than taken from libdrm: this file
+ * needs four constants from it and nothing else, and adding drm.h to the
+ * build would make a header package mandatory for every agent build on
+ * every distribution. The codes are ABI, not API - they are what crosses
+ * the wire between a compositor and a GPU driver, so they cannot change. */
+#define DIRECTGATE_DRM_FOURCC(a, b, c, d) \
+    ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+
+#define DIRECTGATE_DRM_FORMAT_XRGB8888  DIRECTGATE_DRM_FOURCC('X', 'R', '2', '4')
+#define DIRECTGATE_DRM_FORMAT_ARGB8888  DIRECTGATE_DRM_FOURCC('A', 'R', '2', '4')
+
+/* av_buffer_create took an int length until libavutil 57 (FFmpeg 5.0) and a
+ * size_t after it. Each variant of this file is compiled against the headers
+ * of the major it talks to, so the pointer type simply follows them. */
+#if LIBAVUTIL_VERSION_MAJOR >= 57
+#define DIRECTGATE_HWENC_BUFSIZE size_t
+#else
+#define DIRECTGATE_HWENC_BUFSIZE int
+#endif
+
+/* Loaded separately from libavcodec and allowed to be absent: a host with no
+ * libavfilter, or one whose FFmpeg was built without VAAPI filters, keeps
+ * every other GPU path. Nothing here is ever required for a session to run. */
+typedef struct directgate_hwenc_filter_lib_ {
+    void *pHandle;
+    xbool_t bLoadAttempted;
+    xbool_t bLoaded;
+    char sError[192];
+
+    /* libavfilter */
+    unsigned (*avfilter_version)(void);
+    const AVFilter* (*avfilter_get_by_name)(const char*);
+    AVFilterGraph* (*avfilter_graph_alloc)(void);
+    void (*avfilter_graph_free)(AVFilterGraph**);
+    AVFilterContext* (*avfilter_graph_alloc_filter)(AVFilterGraph*, const AVFilter*, const char*);
+    int (*avfilter_graph_create_filter)(AVFilterContext**, const AVFilter*, const char*,
+                                        const char*, void*, AVFilterGraph*);
+    int (*avfilter_init_str)(AVFilterContext*, const char*);
+    int (*avfilter_link)(AVFilterContext*, unsigned, AVFilterContext*, unsigned);
+    int (*avfilter_graph_config)(AVFilterGraph*, void*);
+    AVBufferSrcParameters* (*av_buffersrc_parameters_alloc)(void);
+    int (*av_buffersrc_parameters_set)(AVFilterContext*, AVBufferSrcParameters*);
+    int (*av_buffersrc_add_frame_flags)(AVFilterContext*, AVFrame*, int);
+    int (*av_buffersink_get_frame)(AVFilterContext*, AVFrame*);
+    AVBufferRef* (*av_buffersink_get_hw_frames_ctx)(const AVFilterContext*);
+
+    /* libavutil, but only the import path needs them - keeping them here
+     * means a libavutil without one of them costs the zero-copy path and
+     * not GPU encoding as a whole. */
+    int (*av_hwframe_map)(AVFrame*, const AVFrame*, int);
+    int (*av_frame_ref)(AVFrame*, const AVFrame*);
+    AVBufferRef* (*av_buffer_create)(uint8_t*, DIRECTGATE_HWENC_BUFSIZE,
+                                     void (*)(void*, uint8_t*), void*, int);
+    void (*av_free)(void*);
+} directgate_hwenc_filter_lib_t;
+
+static directgate_hwenc_filter_lib_t g_hwfilter;
+
+#endif /* DIRECTGATE_HWENC_HAS_FILTER */
 
 /* Process-wide GPU device cache.
  *
@@ -204,6 +281,16 @@ static const directgate_hwenc_candidate_t g_hwencCandidates[] = {
     { "h264_v4l2m2m",  AV_HWDEVICE_TYPE_NONE },  /* ARM SBC / Raspberry Pi */
 };
 
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
+/* The zero-copy probe order, which is a list of one. VAAPI is the only
+ * backend libavcodec will hand a DRM object to, so an import encoder is a
+ * VAAPI encoder or it is nothing - and when it is nothing the caller opens
+ * an ordinary one from the list above and asks for mapped frames instead. */
+static const directgate_hwenc_candidate_t g_hwencImportCandidates[] = {
+    { "h264_vaapi",    AV_HWDEVICE_TYPE_VAAPI },
+};
+#endif
+
 struct directgate_hwenc_ {
     const AVCodec *pCodec;
     AVCodecContext *pCtx;
@@ -213,6 +300,32 @@ struct directgate_hwenc_ {
     AVBufferRef *pHwDevice;
     AVBufferRef *pHwFrames;
     enum AVHWDeviceType eDevice;
+
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
+    /* The zero-copy chain, present only on an encoder opened by CreateImport.
+     * pMapFrames is what the compositor's DRM object becomes - a VAAPI
+     * surface over memory nobody copied - and the graph is the driver's
+     * post-processor doing the colour conversion and the resize that the CPU
+     * does on the ordinary path. pSinkFrames is the NV12 pool the graph
+     * produces into, and it is the encoder's input pool too: opening the
+     * encoder on the filter's own pool is what keeps the frame on the GPU
+     * from one end to the other. */
+    xbool_t bImport;
+    AVBufferRef *pMapFrames;
+    AVBufferRef *pSinkFrames;
+    AVFilterGraph *pGraph;
+    AVFilterContext *pSrcFilter;
+    AVFilterContext *pSinkFilter;
+    AVFrame *pDrmFrame;       /* the descriptor, wrapped as an AVFrame */
+    AVFrame *pMapped;         /* the DRM object as a VAAPI surface */
+    AVFrame *pFiltered;       /* NV12 out of the post-processor */
+    AVFrame *pLastFiltered;   /* kept so a keyframe on a still screen has one */
+    uint32_t nSrcWidth;
+    uint32_t nSrcHeight;
+    uint32_t nSrcFourCC;
+    uint64_t nSrcModifier;
+    xbool_t bDriverMatrix;    /* colour options refused; driver default used */
+#endif
 
     uint32_t nWidth;
     uint32_t nHeight;
@@ -387,6 +500,192 @@ const char* DirectGate_HWEnc_Version(void)
     return g_hwenc.bLoaded ? g_hwenc.sVersion : "unloaded";
 }
 
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
+
+#define DIRECTGATE_HWFILTER_SYM(pHandle, pField, pName)          \
+    do {                                                         \
+        *(void**)(&pLib->pField) = dlsym((pHandle), (pName));    \
+        if (pLib->pField == NULL) pMissing = (pName);            \
+    } while (0)
+
+/* Same contract as DirectGate_HWEnc_Load, one library later: the soname is
+ * pinned to the major this variant was compiled against, and a miss is a
+ * feature that is unavailable rather than an error anybody has to act on. */
+static int DirectGate_HWEnc_LoadFilter(void)
+{
+    directgate_hwenc_filter_lib_t *pLib = &g_hwfilter;
+    if (pLib->bLoadAttempted) return pLib->bLoaded ? XSTDOK : XSTDERR;
+
+    pLib->bLoadAttempted = XTRUE;
+    if (!g_hwenc.bLoaded)
+    {
+        xstrncpy(pLib->sError, sizeof(pLib->sError), "libavcodec is not loaded");
+        return XSTDERR;
+    }
+
+    char sName[64];
+    snprintf(sName, sizeof(sName), "libavfilter.so.%d", LIBAVFILTER_VERSION_MAJOR);
+
+    dlerror();
+    void *pHandle = dlopen(sName, RTLD_NOW | RTLD_LOCAL);
+    if (pHandle == NULL)
+    {
+        const char *pError = dlerror();
+        snprintf(pLib->sError, sizeof(pLib->sError), "%s could not be loaded: %s",
+            sName, (pError != NULL) ? pError : "no reason reported");
+
+        return XSTDERR;
+    }
+
+    const char *pMissing = NULL;
+    DIRECTGATE_HWFILTER_SYM(pHandle, avfilter_version, "avfilter_version");
+    DIRECTGATE_HWFILTER_SYM(pHandle, avfilter_get_by_name, "avfilter_get_by_name");
+    DIRECTGATE_HWFILTER_SYM(pHandle, avfilter_graph_alloc, "avfilter_graph_alloc");
+    DIRECTGATE_HWFILTER_SYM(pHandle, avfilter_graph_free, "avfilter_graph_free");
+    DIRECTGATE_HWFILTER_SYM(pHandle, avfilter_graph_alloc_filter, "avfilter_graph_alloc_filter");
+    DIRECTGATE_HWFILTER_SYM(pHandle, avfilter_graph_create_filter, "avfilter_graph_create_filter");
+    DIRECTGATE_HWFILTER_SYM(pHandle, avfilter_init_str, "avfilter_init_str");
+    DIRECTGATE_HWFILTER_SYM(pHandle, avfilter_link, "avfilter_link");
+    DIRECTGATE_HWFILTER_SYM(pHandle, avfilter_graph_config, "avfilter_graph_config");
+    DIRECTGATE_HWFILTER_SYM(pHandle, av_buffersrc_parameters_alloc, "av_buffersrc_parameters_alloc");
+    DIRECTGATE_HWFILTER_SYM(pHandle, av_buffersrc_parameters_set, "av_buffersrc_parameters_set");
+    DIRECTGATE_HWFILTER_SYM(pHandle, av_buffersrc_add_frame_flags, "av_buffersrc_add_frame_flags");
+    DIRECTGATE_HWFILTER_SYM(pHandle, av_buffersink_get_frame, "av_buffersink_get_frame");
+    DIRECTGATE_HWFILTER_SYM(pHandle, av_buffersink_get_hw_frames_ctx, "av_buffersink_get_hw_frames_ctx");
+
+    DIRECTGATE_HWFILTER_SYM(g_hwenc.pUtilHandle, av_hwframe_map, "av_hwframe_map");
+    DIRECTGATE_HWFILTER_SYM(g_hwenc.pUtilHandle, av_frame_ref, "av_frame_ref");
+    DIRECTGATE_HWFILTER_SYM(g_hwenc.pUtilHandle, av_buffer_create, "av_buffer_create");
+    DIRECTGATE_HWFILTER_SYM(g_hwenc.pUtilHandle, av_free, "av_free");
+
+    unsigned nVersion = (pLib->avfilter_version != NULL) ? pLib->avfilter_version() : 0;
+
+    if (pMissing != NULL || (nVersion >> 16) != LIBAVFILTER_VERSION_MAJOR)
+    {
+        if (pMissing != NULL)
+        {
+            snprintf(pLib->sError, sizeof(pLib->sError),
+                "%s is missing the %s entry point", sName, pMissing);
+        }
+        else
+        {
+            snprintf(pLib->sError, sizeof(pLib->sError),
+                "libavfilter %u does not match the %d this build expects",
+                nVersion >> 16, LIBAVFILTER_VERSION_MAJOR);
+        }
+
+        dlclose(pHandle);
+        memset(pLib, 0, sizeof(*pLib));
+        pLib->bLoadAttempted = XTRUE;
+
+        return XSTDERR;
+    }
+
+    pLib->pHandle = pHandle;
+    pLib->bLoaded = XTRUE;
+
+    return XSTDOK;
+}
+
+/* AVPixelFormat the DRM code has to be presented as. FFmpeg maps a DRM
+ * fourcc to a VA one and then to a pixel format, and the frames context has
+ * to already say the same thing or the import is refused - so these two pairs
+ * are exactly the ones its own tables spell out, not a guess about byte
+ * order. */
+static enum AVPixelFormat DirectGate_HWEnc_PixelFromFourCC(uint32_t nFourCC)
+{
+    if (nFourCC == DIRECTGATE_DRM_FORMAT_XRGB8888) return AV_PIX_FMT_BGR0;
+    if (nFourCC == DIRECTGATE_DRM_FORMAT_ARGB8888) return AV_PIX_FMT_BGRA;
+
+    return AV_PIX_FMT_NONE;
+}
+
+#endif /* DIRECTGATE_HWENC_HAS_FILTER */
+
+xbool_t DirectGate_HWEnc_ImportAvailable(char *pErrBuf, size_t nErrSize)
+{
+#ifndef DIRECTGATE_HWENC_HAS_FILTER
+    DirectGate_HWEnc_SetError(pErrBuf, nErrSize,
+        "this agent was built without the libavfilter headers zero-copy needs.");
+
+    return XFALSE;
+#else
+    const char *pDisable = getenv("DIRECTGATE_HWENC_ZEROCOPY");
+    if (xstrused(pDisable) && pDisable[0] == '0')
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize,
+            "zero-copy disabled by DIRECTGATE_HWENC_ZEROCOPY=0.");
+
+        return XFALSE;
+    }
+
+    const char *pOff = getenv("DIRECTGATE_HWENC");
+    if (xstrused(pOff) && pOff[0] == '0')
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "GPU encoding disabled by DIRECTGATE_HWENC=0.");
+        return XFALSE;
+    }
+
+    /* A pinned encoder is a deliberate choice and this path is VAAPI only, so
+     * honouring the pin means not asking the compositor for an export the
+     * encoder that was asked for could not take. */
+    const char *pForced = getenv("DIRECTGATE_HWENC_ENCODER");
+    if (xstrused(pForced) && !xstrcmp(pForced, "h264_vaapi"))
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize,
+            "DIRECTGATE_HWENC_ENCODER pins %s, and only h264_vaapi can import.", pForced);
+
+        return XFALSE;
+    }
+
+    if (DirectGate_HWEnc_Load(pErrBuf, nErrSize) != XSTDOK) return XFALSE;
+
+    if (DirectGate_HWEnc_LoadFilter() != XSTDOK)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "%s.", g_hwfilter.sError);
+        return XFALSE;
+    }
+
+    /* An FFmpeg built without VAAPI has the library and not the filter. */
+    if (g_hwfilter.avfilter_get_by_name("scale_vaapi") == NULL)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize,
+            "this FFmpeg has no scale_vaapi filter, so an imported frame "
+            "could not be converted on the GPU.");
+
+        return XFALSE;
+    }
+
+    /* Asked here rather than left to the encoder, because the answer decides
+     * what the compositor is asked to export. A machine with no VAAPI device
+     * at all - an NVIDIA-only box, most often - would otherwise negotiate an
+     * export nothing can take and pay a renegotiation to find out, once per
+     * session. The device cache makes this free after the first call. */
+    int nError = 0;
+    AVBufferRef *pDevice = DirectGate_HWEnc_AcquireDevice(AV_HWDEVICE_TYPE_VAAPI, NULL, &nError);
+
+    for (uint32_t n = 0; pDevice == NULL && n < DIRECTGATE_HWENC_MAX_RENDER_NODES; n++)
+    {
+        char sNode[32];
+        snprintf(sNode, sizeof(sNode), "/dev/dri/renderD%u", 128U + n);
+        if (access(sNode, R_OK | W_OK) != 0) continue;
+
+        pDevice = DirectGate_HWEnc_AcquireDevice(AV_HWDEVICE_TYPE_VAAPI, sNode, &nError);
+    }
+
+    if (pDevice == NULL)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize,
+            "no VAAPI device on this machine can take an exported frame.");
+
+        return XFALSE;
+    }
+
+    g_hwenc.av_buffer_unref(&pDevice);
+    return XTRUE;
+#endif
+}
+
 /* True when the access unit already carries an SPS NAL before the first
  * slice (both 3- and 4-byte Annex-B start codes). Same guarantee the
  * OpenH264 and Media Foundation paths give: every keyframe is decodable on
@@ -485,6 +784,189 @@ static void DirectGate_HWEnc_ApplyLatencyOptions(directgate_hwenc_t *pEnc, const
     }
 }
 
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
+
+/* Survives a context rebuild: an adaptive-bitrate step re-opens the encoder,
+ * and the frames it will be fed have to keep coming from the same pool. */
+static void DirectGate_HWEnc_FreeImport(directgate_hwenc_t *pEnc)
+{
+    if (pEnc->pGraph != NULL) g_hwfilter.avfilter_graph_free(&pEnc->pGraph);
+    pEnc->pSrcFilter = NULL;
+    pEnc->pSinkFilter = NULL;
+
+    if (pEnc->pSinkFrames != NULL) g_hwenc.av_buffer_unref(&pEnc->pSinkFrames);
+    if (pEnc->pMapFrames != NULL) g_hwenc.av_buffer_unref(&pEnc->pMapFrames);
+    if (pEnc->pDrmFrame != NULL) g_hwenc.av_frame_free(&pEnc->pDrmFrame);
+    if (pEnc->pMapped != NULL) g_hwenc.av_frame_free(&pEnc->pMapped);
+    if (pEnc->pFiltered != NULL) g_hwenc.av_frame_free(&pEnc->pFiltered);
+    if (pEnc->pLastFiltered != NULL) g_hwenc.av_frame_free(&pEnc->pLastFiltered);
+}
+
+/* Builds DRM object -> VAAPI surface -> post-processor -> NV12 surface.
+ * @p pScaleArgs is the post-processor's option string; the caller tries a
+ * rich one and then a plain one, because the colour options are newer than
+ * some of the libavfilters this agent supports. Cleans up after itself, so a
+ * failure leaves nothing to unwind. */
+static int DirectGate_HWEnc_BuildImport(directgate_hwenc_t *pEnc, const char *pScaleArgs,
+                                        char *pErrBuf, size_t nErrSize)
+{
+    enum AVPixelFormat eSwFormat = DirectGate_HWEnc_PixelFromFourCC(pEnc->nSrcFourCC);
+    if (eSwFormat == AV_PIX_FMT_NONE)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize,
+            "the compositor exports a frame format this agent cannot import (%c%c%c%c).",
+            (char)(pEnc->nSrcFourCC & 0xFFU), (char)((pEnc->nSrcFourCC >> 8) & 0xFFU),
+            (char)((pEnc->nSrcFourCC >> 16) & 0xFFU), (char)((pEnc->nSrcFourCC >> 24) & 0xFFU));
+
+        return XSTDERR;
+    }
+
+    /* A frames context that allocates nothing of its own: every surface in it
+     * is one the compositor already owns, which is what a zero pool size
+     * means to libavutil and what the DRM mapping requires. */
+    pEnc->pMapFrames = g_hwenc.av_hwframe_ctx_alloc(pEnc->pHwDevice);
+    if (pEnc->pMapFrames == NULL)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "failed to allocate the import frame context.");
+        return XSTDERR;
+    }
+
+    AVHWFramesContext *pMapCtx = (AVHWFramesContext*)pEnc->pMapFrames->data;
+    pMapCtx->format = AV_PIX_FMT_VAAPI;
+    pMapCtx->sw_format = eSwFormat;
+    pMapCtx->width = (int)pEnc->nSrcWidth;
+    pMapCtx->height = (int)pEnc->nSrcHeight;
+    pMapCtx->initial_pool_size = 0;
+
+    int nRet = g_hwenc.av_hwframe_ctx_init(pEnc->pMapFrames);
+    if (nRet < 0)
+    {
+        char sErr[128];
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "the GPU refused an import frame context: %s.",
+            DirectGate_HWEnc_ErrStr(nRet, sErr, sizeof(sErr)));
+
+        DirectGate_HWEnc_FreeImport(pEnc);
+        return XSTDERR;
+    }
+
+    const AVFilter *pSourceFilter = g_hwfilter.avfilter_get_by_name("buffer");
+    const AVFilter *pScaleFilter = g_hwfilter.avfilter_get_by_name("scale_vaapi");
+    const AVFilter *pSinkFilter = g_hwfilter.avfilter_get_by_name("buffersink");
+
+    pEnc->pGraph = g_hwfilter.avfilter_graph_alloc();
+
+    if (pSourceFilter == NULL || pScaleFilter == NULL || pSinkFilter == NULL || pEnc->pGraph == NULL)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "this FFmpeg cannot build a GPU conversion graph.");
+        DirectGate_HWEnc_FreeImport(pEnc);
+        return XSTDERR;
+    }
+
+    /* Microseconds, matching the encoder: the capture cadence is irregular
+     * and a synthetic frame counter would misreport it to rate control. */
+    char sArgs[192];
+    snprintf(sArgs, sizeof(sArgs),
+        "video_size=%ux%u:pix_fmt=%d:time_base=1/1000000:pixel_aspect=1/1",
+        pEnc->nSrcWidth, pEnc->nSrcHeight, (int)AV_PIX_FMT_VAAPI);
+
+    if (g_hwfilter.avfilter_graph_create_filter(&pEnc->pSrcFilter, pSourceFilter, "in", sArgs, NULL, pEnc->pGraph) < 0)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "failed to open the GPU graph input.");
+        DirectGate_HWEnc_FreeImport(pEnc);
+        return XSTDERR;
+    }
+
+    /* The option string above can only say "a GPU surface"; which GPU, and
+     * which layout on it, comes from the frames context. */
+    AVBufferSrcParameters *pParams = g_hwfilter.av_buffersrc_parameters_alloc();
+    if (pParams == NULL)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "failed to allocate GPU graph parameters.");
+        DirectGate_HWEnc_FreeImport(pEnc);
+        return XSTDERR;
+    }
+
+    pParams->format = AV_PIX_FMT_VAAPI;
+    pParams->width = (int)pEnc->nSrcWidth;
+    pParams->height = (int)pEnc->nSrcHeight;
+    pParams->time_base.num = 1;
+    pParams->time_base.den = 1000000;
+    pParams->hw_frames_ctx = pEnc->pMapFrames;   /* the setter takes its own reference */
+
+    nRet = g_hwfilter.av_buffersrc_parameters_set(pEnc->pSrcFilter, pParams);
+    g_hwfilter.av_free(pParams);
+
+    if (nRet < 0)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "the GPU graph refused the imported frame format.");
+        DirectGate_HWEnc_FreeImport(pEnc);
+        return XSTDERR;
+    }
+
+    /* Allocated and initialised in two steps, unlike the others: the device
+     * has to be attached before the filter initialises on it. */
+    AVFilterContext *pScaleCtx = g_hwfilter.avfilter_graph_alloc_filter(pEnc->pGraph, pScaleFilter, "csc");
+    if (pScaleCtx == NULL)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "failed to allocate the GPU post-processor.");
+        DirectGate_HWEnc_FreeImport(pEnc);
+        return XSTDERR;
+    }
+
+    pScaleCtx->hw_device_ctx = g_hwenc.av_buffer_ref(pEnc->pHwDevice);
+
+    if (g_hwfilter.avfilter_init_str(pScaleCtx, pScaleArgs) < 0)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize,
+            "the GPU post-processor rejected its options (%s).", pScaleArgs);
+
+        DirectGate_HWEnc_FreeImport(pEnc);
+        return XSTDERR;
+    }
+
+    if (g_hwfilter.avfilter_graph_create_filter(&pEnc->pSinkFilter, pSinkFilter, "out", NULL, NULL, pEnc->pGraph) < 0)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "failed to open the GPU graph output.");
+        DirectGate_HWEnc_FreeImport(pEnc);
+        return XSTDERR;
+    }
+
+    if (g_hwfilter.avfilter_link(pEnc->pSrcFilter, 0, pScaleCtx, 0) < 0 ||
+        g_hwfilter.avfilter_link(pScaleCtx, 0, pEnc->pSinkFilter, 0) < 0 ||
+        g_hwfilter.avfilter_graph_config(pEnc->pGraph, NULL) < 0)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize,
+            "the GPU could not be configured to convert %ux%u into %ux%u NV12.",
+            pEnc->nSrcWidth, pEnc->nSrcHeight, pEnc->nWidth, pEnc->nHeight);
+
+        DirectGate_HWEnc_FreeImport(pEnc);
+        return XSTDERR;
+    }
+
+    /* Borrowed from the link, so it is referenced rather than kept: this pool
+     * is what the encoder is opened on, and it has to outlive the frame that
+     * happens to be in flight. */
+    AVBufferRef *pSinkFrames = g_hwfilter.av_buffersink_get_hw_frames_ctx(pEnc->pSinkFilter);
+    if (pSinkFrames != NULL) pEnc->pSinkFrames = g_hwenc.av_buffer_ref(pSinkFrames);
+
+    pEnc->pDrmFrame = g_hwenc.av_frame_alloc();
+    pEnc->pMapped = g_hwenc.av_frame_alloc();
+    pEnc->pFiltered = g_hwenc.av_frame_alloc();
+    pEnc->pLastFiltered = g_hwenc.av_frame_alloc();
+
+    if (pEnc->pSinkFrames == NULL || pEnc->pDrmFrame == NULL || pEnc->pMapped == NULL ||
+        pEnc->pFiltered == NULL || pEnc->pLastFiltered == NULL)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "the GPU graph produced no usable frame pool.");
+        DirectGate_HWEnc_FreeImport(pEnc);
+        return XSTDERR;
+    }
+
+    return XSTDOK;
+}
+
+#endif /* DIRECTGATE_HWENC_HAS_FILTER */
+
 static void DirectGate_HWEnc_CloseContext(directgate_hwenc_t *pEnc)
 {
     /* Deliberately no drain-flush here. Sending the end-of-stream NULL frame
@@ -576,12 +1058,39 @@ static int DirectGate_HWEnc_OpenContext(directgate_hwenc_t *pEnc, const char *pE
 
     DirectGate_HWEnc_ApplyLatencyOptions(pEnc, pEncoderName);
 
-    if (pEnc->eDevice != AV_HWDEVICE_TYPE_NONE &&
-        DirectGate_HWEnc_InitHwFrames(pEnc) != XSTDOK)
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
+    if (pEnc->bImport)
     {
-        DirectGate_HWEnc_SetError(pErrBuf, nErrSize,
-            "%s: GPU frame pool initialization failed.", pEncoderName);
+        /* Opened on the post-processor's own output pool rather than a pool
+         * of its own: the surface the GPU conversion writes is then the exact
+         * surface the encoder reads, which is the last place a copy could
+         * still have crept back in.
+         *
+         * The colour description is written here too. The CPU converter is
+         * BT.709 limited and declares nothing, because that is what a viewer
+         * assumes for a stream this size anyway; the GPU is asked for the
+         * same and, unlike the CPU path, can say so in the bitstream. */
+        pCtx->pix_fmt = AV_PIX_FMT_VAAPI;
+        pCtx->hw_frames_ctx = g_hwenc.av_buffer_ref(pEnc->pSinkFrames);
+        pCtx->colorspace = AVCOL_SPC_BT709;
+        pCtx->color_primaries = AVCOL_PRI_BT709;
+        pCtx->color_trc = AVCOL_TRC_BT709;
+        pCtx->color_range = AVCOL_RANGE_MPEG;
 
+        if (pCtx->hw_frames_ctx == NULL)
+        {
+            DirectGate_HWEnc_SetError(pErrBuf, nErrSize,
+                "%s: the GPU conversion pool could not be attached.", pEncoderName);
+
+            DirectGate_HWEnc_CloseContext(pEnc);
+            return XSTDERR;
+        }
+    }
+    else
+#endif
+    if (pEnc->eDevice != AV_HWDEVICE_TYPE_NONE && DirectGate_HWEnc_InitHwFrames(pEnc) != XSTDOK)
+    {
+        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "%s: GPU frame pool initialization failed.", pEncoderName);
         DirectGate_HWEnc_CloseContext(pEnc);
         return XSTDERR;
     }
@@ -628,8 +1137,43 @@ static int DirectGate_HWEnc_TryOpen(directgate_hwenc_t *pEnc,
         }
     }
 
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
+    if (pEnc->bImport)
+    {
+        /* Asked for the colour handling first. These options are newer than
+         * some of the libavfilters this agent supports, and losing them costs
+         * the declared matrix rather than the picture - worth one retry
+         * before this device is given up on entirely. */
+        char sScale[192];
+        snprintf(sScale, sizeof(sScale),
+            "w=%u:h=%u:format=nv12:out_range=tv:out_color_matrix=bt709",
+            pEnc->nWidth, pEnc->nHeight);
+
+        if (DirectGate_HWEnc_BuildImport(pEnc, sScale, pErrBuf, nErrSize) != XSTDOK)
+        {
+            snprintf(sScale, sizeof(sScale), "w=%u:h=%u:format=nv12", pEnc->nWidth, pEnc->nHeight);
+            pEnc->bDriverMatrix = XTRUE;
+
+            if (DirectGate_HWEnc_BuildImport(pEnc, sScale, pErrBuf, nErrSize) != XSTDOK)
+            {
+                pEnc->bDriverMatrix = XFALSE;
+                if (pEnc->pHwDevice != NULL) g_hwenc.av_buffer_unref(&pEnc->pHwDevice);
+
+                return XSTDERR;
+            }
+        }
+    }
+#endif
+
     if (DirectGate_HWEnc_OpenContext(pEnc, pCandidate->pName, pErrBuf, nErrSize) != XSTDOK)
     {
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
+        if (pEnc->bImport)
+        {
+            DirectGate_HWEnc_FreeImport(pEnc);
+            pEnc->bDriverMatrix = XFALSE;
+        }
+#endif
         if (pEnc->pHwDevice != NULL) g_hwenc.av_buffer_unref(&pEnc->pHwDevice);
         return XSTDERR;
     }
@@ -644,12 +1188,21 @@ static int DirectGate_HWEnc_TryOpen(directgate_hwenc_t *pEnc,
 static int DirectGate_HWEnc_Probe(directgate_hwenc_t *pEnc, const char *pForced,
                                   char *pErrBuf, size_t nErrSize)
 {
+    const directgate_hwenc_candidate_t *pCandidates = g_hwencCandidates;
     size_t nCount = sizeof(g_hwencCandidates) / sizeof(g_hwencCandidates[0]);
     xbool_t bAnyCodec = XFALSE;
 
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
+    if (pEnc->bImport)
+    {
+        pCandidates = g_hwencImportCandidates;
+        nCount = sizeof(g_hwencImportCandidates) / sizeof(g_hwencImportCandidates[0]);
+    }
+#endif
+
     for (size_t i = 0; i < nCount; i++)
     {
-        const directgate_hwenc_candidate_t *pCandidate = &g_hwencCandidates[i];
+        const directgate_hwenc_candidate_t *pCandidate = &pCandidates[i];
         if (xstrused(pForced) && !xstrcmp(pForced, pCandidate->pName)) continue;
 
         pEnc->pCodec = g_hwenc.avcodec_find_encoder_by_name(pCandidate->pName);
@@ -684,14 +1237,19 @@ static int DirectGate_HWEnc_Probe(directgate_hwenc_t *pEnc, const char *pForced,
     return XSTDERR;
 }
 
-directgate_hwenc_t* DirectGate_HWEnc_Create(uint32_t nWidth, uint32_t nHeight,
-                                            const directgate_desktop_quality_t *pQuality,
-                                            char *pErrBuf, size_t nErrSize)
+/* Both entry points, which differ only in what the encoder is fed: an
+ * ordinary one takes NV12 out of system memory, an import one takes handles
+ * to frames that never left the GPU. Everything else - the probe, the render
+ * node walk, the packet plumbing - is the same, and keeping it in one place
+ * is what stops the zero-copy path from quietly drifting away from the one
+ * that has to work everywhere. */
+static directgate_hwenc_t* DirectGate_HWEnc_Open(uint32_t nSrcWidth, uint32_t nSrcHeight,
+                                                 uint32_t nFourCC, uint64_t nModifier,
+                                                 uint32_t nWidth, uint32_t nHeight,
+                                                 const directgate_desktop_quality_t *pQuality,
+                                                 xbool_t bImport,
+                                                 char *pErrBuf, size_t nErrSize)
 {
-    XCHECK_NL((pQuality != NULL), NULL);
-    XCHECK_NL((nWidth >= 16 && nHeight >= 16), NULL);
-    XCHECK_NL(((nWidth & 1U) == 0 && (nHeight & 1U) == 0), NULL);
-
     const char *pDisable = getenv("DIRECTGATE_HWENC");
     if (xstrused(pDisable) && pDisable[0] == '0')
     {
@@ -716,33 +1274,65 @@ directgate_hwenc_t* DirectGate_HWEnc_Create(uint32_t nWidth, uint32_t nHeight,
     pEnc->nBitrateKbps = pQuality->nBitrateKbps ? pQuality->nBitrateKbps : 4000U;
     pEnc->nTargetKbps = pEnc->nBitrateKbps;
 
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
+    /* Set before the probe: the candidate list, and the chain each candidate
+     * has to build before its context can be opened, both follow this. */
+    pEnc->bImport = bImport;
+    pEnc->nSrcWidth = nSrcWidth;
+    pEnc->nSrcHeight = nSrcHeight;
+    pEnc->nSrcFourCC = nFourCC;
+    pEnc->nSrcModifier = nModifier;
+#else
+    (void)nSrcWidth; (void)nSrcHeight; (void)nFourCC; (void)nModifier; (void)bImport;
+#endif
+
     if (DirectGate_HWEnc_Probe(pEnc, getenv("DIRECTGATE_HWENC_ENCODER"), pErrBuf, nErrSize) != XSTDOK)
     {
         free(pEnc);
         return NULL;
     }
 
-    pEnc->pSwFrame = g_hwenc.av_frame_alloc();
     pEnc->pPacket = g_hwenc.av_packet_alloc();
-
-    if (pEnc->pSwFrame == NULL || pEnc->pPacket == NULL)
+    if (pEnc->pPacket == NULL)
     {
         DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "Failed to allocate GPU encoder frame buffers.");
         DirectGate_HWEnc_Destroy(pEnc);
         return NULL;
     }
 
-    pEnc->pSwFrame->format = AV_PIX_FMT_NV12;
-    pEnc->pSwFrame->width = (int)nWidth;
-    pEnc->pSwFrame->height = (int)nHeight;
-
-    if (g_hwenc.av_frame_get_buffer(pEnc->pSwFrame, 0) < 0)
+    /* The staging frame is where a CPU frame is laid out before it is
+     * uploaded, so an import encoder - which is handed a GPU surface - has no
+     * use for one and does not pay for it. */
+    if (!bImport)
     {
-        DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "Failed to allocate the NV12 staging frame.");
-        DirectGate_HWEnc_Destroy(pEnc);
-        return NULL;
+        pEnc->pSwFrame = g_hwenc.av_frame_alloc();
+        if (pEnc->pSwFrame == NULL)
+        {
+            DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "Failed to allocate GPU encoder frame buffers.");
+            DirectGate_HWEnc_Destroy(pEnc);
+            return NULL;
+        }
+
+        pEnc->pSwFrame->format = AV_PIX_FMT_NV12;
+        pEnc->pSwFrame->width = (int)nWidth;
+        pEnc->pSwFrame->height = (int)nHeight;
+
+        if (g_hwenc.av_frame_get_buffer(pEnc->pSwFrame, 0) < 0)
+        {
+            DirectGate_HWEnc_SetError(pErrBuf, nErrSize, "Failed to allocate the NV12 staging frame.");
+            DirectGate_HWEnc_Destroy(pEnc);
+            return NULL;
+        }
     }
 
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
+    if (pEnc->bImport)
+    {
+        snprintf(pEnc->sName, sizeof(pEnc->sName), "%s, zero-copy DMA-BUF%s",
+            pEnc->pCodec->name, pEnc->bDriverMatrix ? " (driver colour matrix)" : "");
+    }
+    else
+#endif
     snprintf(pEnc->sName, sizeof(pEnc->sName), "%s (%s)",
         pEnc->pCodec->name,
         xstrused(pEnc->pCodec->long_name) ? pEnc->pCodec->long_name : "GPU H.264 encoder");
@@ -750,11 +1340,44 @@ directgate_hwenc_t* DirectGate_HWEnc_Create(uint32_t nWidth, uint32_t nHeight,
     return pEnc;
 }
 
+directgate_hwenc_t* DirectGate_HWEnc_Create(uint32_t nWidth, uint32_t nHeight,
+                                            const directgate_desktop_quality_t *pQuality,
+                                            char *pErrBuf, size_t nErrSize)
+{
+    XCHECK_NL((pQuality != NULL), NULL);
+    XCHECK_NL((nWidth >= 16 && nHeight >= 16), NULL);
+    XCHECK_NL(((nWidth & 1U) == 0 && (nHeight & 1U) == 0), NULL);
+
+    return DirectGate_HWEnc_Open(0, 0, 0, 0, nWidth, nHeight, pQuality, XFALSE, pErrBuf, nErrSize);
+}
+
+directgate_hwenc_t* DirectGate_HWEnc_CreateImport(uint32_t nSrcWidth, uint32_t nSrcHeight,
+                                                  uint32_t nFourCC, uint64_t nModifier,
+                                                  uint32_t nWidth, uint32_t nHeight,
+                                                  const directgate_desktop_quality_t *pQuality,
+                                                  char *pErrBuf, size_t nErrSize)
+{
+    XCHECK_NL((pQuality != NULL), NULL);
+    XCHECK_NL((nWidth >= 16 && nHeight >= 16), NULL);
+    XCHECK_NL(((nWidth & 1U) == 0 && (nHeight & 1U) == 0), NULL);
+    XCHECK_NL((nSrcWidth >= 16 && nSrcHeight >= 16), NULL);
+
+    if (!DirectGate_HWEnc_ImportAvailable(pErrBuf, nErrSize)) return NULL;
+
+    return DirectGate_HWEnc_Open(nSrcWidth, nSrcHeight, nFourCC, nModifier,
+        nWidth, nHeight, pQuality, XTRUE, pErrBuf, nErrSize);
+}
+
 void DirectGate_HWEnc_Destroy(directgate_hwenc_t *pEncoder)
 {
     if (pEncoder == NULL) return;
 
     DirectGate_HWEnc_CloseContext(pEncoder);
+
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
+    DirectGate_HWEnc_FreeImport(pEncoder);
+#endif
+
     if (pEncoder->pSwFrame != NULL) g_hwenc.av_frame_free(&pEncoder->pSwFrame);
     if (pEncoder->pPacket != NULL) g_hwenc.av_packet_free(&pEncoder->pPacket);
     if (pEncoder->pHwDevice != NULL) g_hwenc.av_buffer_unref(&pEncoder->pHwDevice);
@@ -837,6 +1460,72 @@ static int DirectGate_HWEnc_MaybeReconfigure(directgate_hwenc_t *pEnc)
     return DirectGate_HWEnc_Reconfigure(pEnc, nWanted);
 }
 
+/* Everything a frame goes through once it is a surface the encoder accepts,
+ * whichever way it got there: the CPU path uploads into it, the zero-copy
+ * path had it handed over by the compositor. @p bReleaseInput drops the
+ * caller's reference once send_frame has taken its own, which is what returns
+ * a pooled surface for reuse - the persistent staging frame must not be. */
+static int DirectGate_HWEnc_Submit(directgate_hwenc_t *pEncoder, AVFrame *pInput,
+                                   xbool_t bForceKeyframe, xbool_t bReleaseInput,
+                                   xbyte_buffer_t *pOut, xbool_t *pKeyframe)
+{
+    /* pict_type is how libavcodec spells "force an IDR here" for every
+     * hardware encoder; a fresh context already starts with one. */
+    xbool_t bWantKey = (bForceKeyframe || pEncoder->bForceNextKeyframe) ? XTRUE : XFALSE;
+    pInput->pict_type = bWantKey ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+
+    int nRet = g_hwenc.avcodec_send_frame(pEncoder->pCtx, pInput);
+
+    /* pict_type must not leak into the pooled surface's next use. */
+    pInput->pict_type = AV_PICTURE_TYPE_NONE;
+
+    /* send_frame took its own reference to whatever it needs; ours goes back
+     * to the pool now rather than being held until the next frame. */
+    if (bReleaseInput) g_hwenc.av_frame_unref(pInput);
+
+    if (nRet < 0)
+    {
+        char sErr[128];
+        xloge("GPU encoder rejected a frame: encoder(%s), reason(%s)", pEncoder->sName,
+            DirectGate_HWEnc_ErrStr(nRet, sErr, sizeof(sErr)));
+
+        return XSTDERR;
+    }
+
+    pEncoder->bForceNextKeyframe = XFALSE;
+
+    nRet = g_hwenc.avcodec_receive_packet(pEncoder->pCtx, pEncoder->pPacket);
+    if (nRet == AVERROR(EAGAIN)) return XSTDNON; /* pipelined: no output yet */
+
+    if (nRet < 0)
+    {
+        char sErr[128];
+        xloge("GPU encoder output failed: encoder(%s), reason(%s)", pEncoder->sName,
+            DirectGate_HWEnc_ErrStr(nRet, sErr, sizeof(sErr)));
+
+        return XSTDERR;
+    }
+
+    int nResult = XSTDOK;
+    xbool_t bKey = (pEncoder->pPacket->flags & AV_PKT_FLAG_KEY) ? XTRUE : XFALSE;
+
+    if (pEncoder->pPacket->data != NULL && pEncoder->pPacket->size > 0)
+    {
+        if (bKey && pEncoder->pSeqHeader != NULL &&
+            !DirectGate_HWEnc_HasParameterSets(pEncoder->pPacket->data, (size_t)pEncoder->pPacket->size))
+            XByteBuffer_Add(pOut, pEncoder->pSeqHeader, pEncoder->nSeqHeaderSize);
+
+        if (XByteBuffer_Add(pOut, pEncoder->pPacket->data, (size_t)pEncoder->pPacket->size) <= 0)
+            nResult = XSTDERR;
+    }
+    else nResult = XSTDNON;
+
+    g_hwenc.av_packet_unref(pEncoder->pPacket);
+    if (pKeyframe != NULL) *pKeyframe = bKey;
+
+    return (nResult == XSTDOK && pOut->nUsed > 0) ? XSTDOK : nResult;
+}
+
 int DirectGate_HWEnc_Encode(directgate_hwenc_t *pEncoder,
                             const uint8_t *pNV12,
                             uint64_t nPtsUs,
@@ -846,6 +1535,9 @@ int DirectGate_HWEnc_Encode(directgate_hwenc_t *pEncoder,
 {
     XCHECK((pEncoder != NULL && pEncoder->pCtx != NULL), XSTDERR);
     XCHECK((pNV12 != NULL && pOut != NULL), XSTDERR);
+
+    /* An import encoder has no staging frame and takes handles, not pixels. */
+    XCHECK((pEncoder->pSwFrame != NULL), XSTDERR);
 
     if (pKeyframe != NULL) *pKeyframe = XFALSE;
     pOut->nUsed = 0;
@@ -912,61 +1604,189 @@ int DirectGate_HWEnc_Encode(directgate_hwenc_t *pEncoder,
         pInput = pEncoder->pHwFrame;
     }
 
-    /* pict_type is how libavcodec spells "force an IDR here" for every
-     * hardware encoder; a fresh context already starts with one. */
-    xbool_t bWantKey = (bForceKeyframe || pEncoder->bForceNextKeyframe) ? XTRUE : XFALSE;
-    pInput->pict_type = bWantKey ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+    return DirectGate_HWEnc_Submit(pEncoder, pInput, bForceKeyframe,
+        (pInput == pEncoder->pHwFrame) ? XTRUE : XFALSE, pOut, pKeyframe);
+}
 
-    int nRet = g_hwenc.avcodec_send_frame(pEncoder->pCtx, pInput);
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
 
-    /* pict_type must not leak into the pooled surface's next use. */
-    pInput->pict_type = AV_PICTURE_TYPE_NONE;
+/* The descriptor crosses into libavutil as an AVFrame, and the mapping takes
+ * a reference to that frame for as long as it lives - which it can only do
+ * if the frame owns refcounted memory. Hence this wrapper: it owns the
+ * descriptor and nothing else. The file descriptors inside it belong to the
+ * compositor's buffer and are handed back with it, so they are never closed
+ * here. */
+static void DirectGate_HWEnc_FreeDescriptor(void *pOpaque, uint8_t *pData)
+{
+    (void)pOpaque;
+    free(pData);
+}
 
-    /* send_frame took its own reference to whatever it needs; ours goes back
-     * to the pool now rather than being held until the next frame. */
-    if (pInput == pEncoder->pHwFrame) g_hwenc.av_frame_unref(pEncoder->pHwFrame);
-
-    if (nRet < 0)
+/* Compositor frame -> VAAPI surface -> post-processor -> NV12 in pFiltered.
+ * XSTDNON when the graph has taken the frame but has nothing out yet. */
+static int DirectGate_HWEnc_ImportFrame(directgate_hwenc_t *pEnc,
+                                        const directgate_desktop_dmabuf_t *pFrame,
+                                        uint64_t nPtsUs)
+{
+    /* One object is what libavutil is able to map, and a packed RGB screen
+     * cast is exactly one. Anything else is a compositor doing something this
+     * path was not built for, and the answer is to stop asking it to export. */
+    if (pFrame->nPlanes != 1 || pFrame->nFds[0] < 0)
     {
-        char sErr[128];
-        xloge("GPU encoder rejected a frame: encoder(%s), reason(%s)", pEncoder->sName,
-            DirectGate_HWEnc_ErrStr(nRet, sErr, sizeof(sErr)));
+        xlogw("The compositor exported a frame in %u planes, which cannot be imported: encoder(%s)",
+            pFrame->nPlanes, pEnc->sName);
 
         return XSTDERR;
     }
 
-    pEncoder->bForceNextKeyframe = XFALSE;
+    /* The whole chain was built for one shape, and the encoder was opened on
+     * its output. A frame of another shape is a renegotiation nobody told the
+     * pipeline about, so it is refused rather than mapped into the wrong
+     * surface. */
+    if (pFrame->nWidth != pEnc->nSrcWidth || pFrame->nHeight != pEnc->nSrcHeight ||
+        pFrame->nFourCC != pEnc->nSrcFourCC)
+    {
+        xlogw("The exported frame no longer matches the imported format: encoder(%s)", pEnc->sName);
+        return XSTDERR;
+    }
 
-    nRet = g_hwenc.avcodec_receive_packet(pEncoder->pCtx, pEncoder->pPacket);
-    if (nRet == AVERROR(EAGAIN)) return XSTDNON; /* pipelined: no output yet */
+    AVDRMFrameDescriptor *pDesc = (AVDRMFrameDescriptor*)calloc(1, sizeof(*pDesc));
+    if (pDesc == NULL) return XSTDERR;
+
+    pDesc->nb_objects = 1;
+    pDesc->objects[0].fd = pFrame->nFds[0];
+    pDesc->objects[0].size = (size_t)pFrame->nSize;
+    pDesc->objects[0].format_modifier = pFrame->nModifier;
+
+    pDesc->nb_layers = 1;
+    pDesc->layers[0].format = pFrame->nFourCC;
+    pDesc->layers[0].nb_planes = 1;
+    pDesc->layers[0].planes[0].object_index = 0;
+    pDesc->layers[0].planes[0].offset = (ptrdiff_t)pFrame->nOffsets[0];
+    pDesc->layers[0].planes[0].pitch = (ptrdiff_t)pFrame->nStrides[0];
+
+    g_hwenc.av_frame_unref(pEnc->pDrmFrame);
+    pEnc->pDrmFrame->buf[0] = g_hwfilter.av_buffer_create((uint8_t*)pDesc,
+        (DIRECTGATE_HWENC_BUFSIZE)sizeof(*pDesc), DirectGate_HWEnc_FreeDescriptor, NULL, 0);
+
+    if (pEnc->pDrmFrame->buf[0] == NULL)
+    {
+        free(pDesc);
+        return XSTDERR;
+    }
+
+    pEnc->pDrmFrame->data[0] = (uint8_t*)pDesc;
+    pEnc->pDrmFrame->format = AV_PIX_FMT_DRM_PRIME;
+    pEnc->pDrmFrame->width = (int)pFrame->nWidth;
+    pEnc->pDrmFrame->height = (int)pFrame->nHeight;
+
+    g_hwenc.av_frame_unref(pEnc->pMapped);
+    pEnc->pMapped->format = AV_PIX_FMT_VAAPI;
+    pEnc->pMapped->hw_frames_ctx = g_hwenc.av_buffer_ref(pEnc->pMapFrames);
+
+    if (pEnc->pMapped->hw_frames_ctx == NULL)
+    {
+        g_hwenc.av_frame_unref(pEnc->pDrmFrame);
+        return XSTDERR;
+    }
+
+    int nRet = g_hwfilter.av_hwframe_map(pEnc->pMapped, pEnc->pDrmFrame, AV_HWFRAME_MAP_READ);
+
+    /* The mapping holds its own reference to the descriptor from here on. */
+    g_hwenc.av_frame_unref(pEnc->pDrmFrame);
 
     if (nRet < 0)
     {
         char sErr[128];
-        xloge("GPU encoder output failed: encoder(%s), reason(%s)", pEncoder->sName,
-            DirectGate_HWEnc_ErrStr(nRet, sErr, sizeof(sErr)));
+        xlogw("The GPU could not take the compositor's frame: encoder(%s), reason(%s)",
+            pEnc->sName, DirectGate_HWEnc_ErrStr(nRet, sErr, sizeof(sErr)));
+
+        g_hwenc.av_frame_unref(pEnc->pMapped);
+        return XSTDERR;
+    }
+
+    pEnc->pMapped->pts = (int64_t)nPtsUs;
+
+    /* The graph takes the frame; what comes back is NV12 at the encode size,
+     * converted and resized by the driver rather than by a core of the
+     * machine somebody is trying to work on. */
+    nRet = g_hwfilter.av_buffersrc_add_frame_flags(pEnc->pSrcFilter, pEnc->pMapped, 0);
+    if (nRet < 0)
+    {
+        char sErr[128];
+        xlogw("The GPU conversion refused a frame: encoder(%s), reason(%s)",
+            pEnc->sName, DirectGate_HWEnc_ErrStr(nRet, sErr, sizeof(sErr)));
+
+        g_hwenc.av_frame_unref(pEnc->pMapped);
+        return XSTDERR;
+    }
+
+    g_hwenc.av_frame_unref(pEnc->pFiltered);
+    nRet = g_hwfilter.av_buffersink_get_frame(pEnc->pSinkFilter, pEnc->pFiltered);
+
+    if (nRet == AVERROR(EAGAIN)) return XSTDNON;
+
+    if (nRet < 0)
+    {
+        char sErr[128];
+        xlogw("The GPU conversion produced nothing: encoder(%s), reason(%s)",
+            pEnc->sName, DirectGate_HWEnc_ErrStr(nRet, sErr, sizeof(sErr)));
 
         return XSTDERR;
     }
 
-    int nResult = XSTDOK;
-    xbool_t bKey = (pEncoder->pPacket->flags & AV_PKT_FLAG_KEY) ? XTRUE : XFALSE;
+    return XSTDOK;
+}
 
-    if (pEncoder->pPacket->data != NULL && pEncoder->pPacket->size > 0)
+#endif /* DIRECTGATE_HWENC_HAS_FILTER */
+
+int DirectGate_HWEnc_EncodeImport(directgate_hwenc_t *pEncoder,
+                                  const directgate_desktop_dmabuf_t *pFrame,
+                                  uint64_t nPtsUs,
+                                  xbool_t bForceKeyframe,
+                                  xbyte_buffer_t *pOut,
+                                  xbool_t *pKeyframe)
+{
+#ifndef DIRECTGATE_HWENC_HAS_FILTER
+    (void)pEncoder; (void)pFrame; (void)nPtsUs; (void)bForceKeyframe; (void)pOut; (void)pKeyframe;
+    return XSTDERR;
+#else
+    XCHECK((pEncoder != NULL && pEncoder->pCtx != NULL && pOut != NULL), XSTDERR);
+    XCHECK((pEncoder->bImport), XSTDERR);
+
+    if (pKeyframe != NULL) *pKeyframe = XFALSE;
+    pOut->nUsed = 0;
+
+    if (DirectGate_HWEnc_MaybeReconfigure(pEncoder) != XSTDOK) return XSTDERR;
+
+    AVFrame *pInput = NULL;
+    xbool_t bRelease = XFALSE;
+
+    if (pFrame != NULL)
     {
-        if (bKey && pEncoder->pSeqHeader != NULL &&
-            !DirectGate_HWEnc_HasParameterSets(pEncoder->pPacket->data, (size_t)pEncoder->pPacket->size))
-            XByteBuffer_Add(pOut, pEncoder->pSeqHeader, pEncoder->nSeqHeaderSize);
+        int nStatus = DirectGate_HWEnc_ImportFrame(pEncoder, pFrame, nPtsUs);
+        if (nStatus != XSTDOK) return nStatus;
 
-        if (XByteBuffer_Add(pOut, pEncoder->pPacket->data, (size_t)pEncoder->pPacket->size) <= 0)
-            nResult = XSTDERR;
+        /* Kept because a keyframe can be asked for on a screen that has
+         * stopped changing, and this path has no CPU copy of the picture to
+         * answer with - the compositor will not send it again. */
+        g_hwenc.av_frame_unref(pEncoder->pLastFiltered);
+        if (g_hwfilter.av_frame_ref(pEncoder->pLastFiltered, pEncoder->pFiltered) < 0)
+            g_hwenc.av_frame_unref(pEncoder->pLastFiltered);
+
+        pInput = pEncoder->pFiltered;
+        bRelease = XTRUE;
     }
-    else nResult = XSTDNON;
+    else
+    {
+        if (pEncoder->pLastFiltered == NULL || pEncoder->pLastFiltered->buf[0] == NULL) return XSTDNON;
 
-    g_hwenc.av_packet_unref(pEncoder->pPacket);
-    if (pKeyframe != NULL) *pKeyframe = bKey;
+        pInput = pEncoder->pLastFiltered;
+        pInput->pts = (int64_t)nPtsUs;
+    }
 
-    return (nResult == XSTDOK && pOut->nUsed > 0) ? XSTDOK : nResult;
+    return DirectGate_HWEnc_Submit(pEncoder, pInput, bForceKeyframe, bRelease, pOut, pKeyframe);
+#endif
 }
 
 int DirectGate_HWEnc_SetBitrate(directgate_hwenc_t *pEncoder, uint32_t nBitrateKbps)

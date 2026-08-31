@@ -23,6 +23,7 @@
 #define __DIRECTGATE_WAYLAND_H__
 
 #include "includes.h"
+#include "desktop.h"
 
 #ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
 
@@ -42,24 +43,52 @@ extern "C" {
  * as before, and a build with Wayland support still runs there - the feature
  * simply reports that it is unavailable. */
 
-/* One frame, borrowed for the duration of the callback only.
+typedef struct directgate_wl_capture_ directgate_wl_capture_t;
+
+/* How a frame arrived, which is the difference between a picture this
+ * process can read and one it can only point the GPU at. */
+typedef enum {
+    DIRECTGATE_WL_FRAME_MAPPED = 0,  /* pixels in memory, copied out and converted */
+    DIRECTGATE_WL_FRAME_EXPORTED     /* a GPU buffer: described, never read here */
+} directgate_wl_frame_kind_t;
+
+/* One frame.
  *
- * @a pPixels is BGRA in memory order, matching what the X11 path produces, so
- * the existing scale + I420 conversion applies unchanged. @a nStride is the
- * byte distance between rows and is routinely larger than nWidth * 4 -
- * treating the buffer as packed shears the image. */
+ * MAPPED: @a pPixels is BGRA in memory order, matching what the X11 path
+ * produces, so the existing scale + I420 conversion applies unchanged.
+ * @a nStride is the byte distance between rows and is routinely larger than
+ * nWidth * 4 - treating the buffer as packed shears the image. Borrowed for
+ * the duration of the callback only.
+ *
+ * EXPORTED: the compositor never read the frame back out of the GPU, and
+ * neither does this agent - @a dmabuf describes it well enough for the
+ * encoder to take it as it stands. The buffer it lives in is @a pHandle, and
+ * the callee owns it from the moment the callback returns: the compositor
+ * may overwrite the pixels the instant it is given back, so it is held until
+ * the frame has been encoded and then returned through CaptureRelease (from
+ * any other thread) or CaptureDrop (from the stream thread). */
 typedef struct directgate_wl_frame_ {
-    const uint8_t *pPixels;
+    directgate_wl_frame_kind_t eKind;
+
     uint32_t nWidth;
     uint32_t nHeight;
-    uint32_t nStride;
+
+    const uint8_t *pPixels;  /* MAPPED */
+    uint32_t nStride;        /* MAPPED */
+
+    directgate_desktop_dmabuf_t dmabuf;  /* EXPORTED */
+    void *pHandle;                       /* EXPORTED, and now the callee's */
+
+    /* EXPORTED: the stream pHandle has to go back to. Carried with the frame
+     * rather than looked up later, because a session that switches screens
+     * has already moved on to another one by the time it is given back. */
+    directgate_wl_capture_t *pCapture;
 } directgate_wl_frame_t;
 
 /* Called on the PipeWire stream thread, never on the agent's event loop.
- * The frame is invalid once it returns. */
+ * A MAPPED frame is invalid once it returns; an EXPORTED one hands the
+ * callee a buffer to give back later. */
 typedef void (*directgate_wl_frame_cb_t)(void *pUserCtx, const directgate_wl_frame_t *pFrame);
-
-typedef struct directgate_wl_capture_ directgate_wl_capture_t;
 
 /* Loads libpipewire-0.3 once per process (idempotent). Returns XSTDOK, or
  * XSTDERR with a human-readable reason in pErrBuf. */
@@ -68,6 +97,13 @@ int DirectGate_WL_PipeWireLoad(char *pErrBuf, size_t nErrSize);
 /* Connects to the PipeWire instance behind @p nPipeWireFd (the file
  * descriptor the portal handed back) and subscribes to stream @p nNodeId.
  *
+ * @p bWantDmaBuf asks the compositor to export its buffers instead of reading
+ * them back for us. It is an offer, not a demand: the memory formats are
+ * offered alongside, so a compositor that will not export - or one whose
+ * buffer layout this agent did not offer to import - simply negotiates the
+ * mapped path and nothing else changes. Ask for it only when there is an
+ * encoder that can take one.
+ *
  * Takes ownership of the descriptor either way. Returns NULL on failure with
  * the reason in pErrBuf. The stream is running when this returns, but the
  * format is negotiated asynchronously - see WaitFormat. */
@@ -75,8 +111,29 @@ directgate_wl_capture_t* DirectGate_WL_CaptureStart(int nPipeWireFd,
                                                     uint32_t nNodeId,
                                                     directgate_wl_frame_cb_t fnFrame,
                                                     void *pUserCtx,
+                                                    xbool_t bWantDmaBuf,
                                                     char *pErrBuf,
                                                     size_t nErrSize);
+
+/* Whether the negotiated stream exports its buffers, and in what DRM format
+ * and layout. Meaningful once WaitFormat has returned; the encoder is built
+ * around these, so they are read before it is opened. */
+xbool_t DirectGate_WL_CaptureIsDmaBuf(directgate_wl_capture_t *pCapture,
+                                      uint32_t *pFourCC, uint64_t *pModifier);
+
+/* Gives an exported buffer back. Release locks the stream loop and is for
+ * every other thread; Drop is the same thing from inside a stream callback,
+ * where the loop is this thread and locking it would deadlock. Neither may
+ * be called while holding a lock the frame callback also takes. */
+void DirectGate_WL_CaptureRelease(directgate_wl_capture_t *pCapture, void *pHandle);
+void DirectGate_WL_CaptureDrop(directgate_wl_capture_t *pCapture, void *pHandle);
+
+/* Stops asking for exported buffers and renegotiates the stream for mapped
+ * memory, in place. The portal grant is untouched - only the format offer
+ * changes - so nobody is prompted and the session keeps running; a few
+ * frames may be missed while the compositor answers. Called when the GPU
+ * turns out not to be able to take what it is being handed. */
+void DirectGate_WL_CaptureDisableDmaBuf(directgate_wl_capture_t *pCapture);
 
 /* Blocks until the stream has negotiated a video format or @p nTimeoutMs
  * passes. Must not be called from the agent's event loop. */
@@ -190,18 +247,61 @@ typedef enum {
     DIRECTGATE_WL_FAILED        /* refused or broken, see SourceError */
 } directgate_wl_state_t;
 
-/* Returns NULL only when the thread could not be started at all. */
-directgate_wl_source_t* DirectGate_WL_SourceCreate(const char *pTokenPath);
+/* @p bWantDmaBuf asks the compositor to export its frames rather than read
+ * them back, which is only worth asking for when there is an encoder that can
+ * take one - see DirectGate_HWEnc_ImportAvailable. It is an offer either way.
+ *
+ * Returns NULL only when the thread could not be started at all. */
+directgate_wl_source_t* DirectGate_WL_SourceCreate(const char *pTokenPath, xbool_t bWantDmaBuf);
 
 directgate_wl_state_t DirectGate_WL_SourceState(directgate_wl_source_t *pSource);
 const char* DirectGate_WL_SourceError(directgate_wl_source_t *pSource);
 xbool_t DirectGate_WL_SourceSize(directgate_wl_source_t *pSource, uint32_t *pWidth, uint32_t *pHeight);
 
-/* Scales the newest frame into @p pDst (BGRA, @p nWidth x @p nHeight packed).
+/* Blocks until a frame nobody has taken yet is waiting, or @p nTimeoutUs
+ * passes. Frames arrive on the compositor's clock rather than on the
+ * encoder's, so a tick that finds nothing is not an idle screen - it is just
+ * as likely to be a frame that lands a moment later and would then sit there
+ * for the rest of the frame period. Returns XSTDOK when there is one to
+ * take, XSTDNON on the timeout. Must not be called from the event loop. */
+int DirectGate_WL_SourceWaitFrame(directgate_wl_source_t *pSource, uint64_t nTimeoutUs);
+
+/* Takes the newest frame as BGRA at @p nWidth x @p nHeight packed.
+ *
+ * @p ppDst points at the caller's buffer and @p nDstSize is its size. When
+ * the frame is already that size the two buffers are *exchanged* - @p ppDst
+ * comes back holding the frame, and the buffer passed in becomes the one the
+ * capture thread writes next - so nothing is copied on the common path.
+ * Otherwise the frame is scaled into the buffer, which is left in place.
+ * Either way the caller owns whatever @p ppDst holds when this returns.
+ *
  * XSTDNON when nothing new has arrived since the last call, which lets the
  * caller skip a whole convert-encode-send pass on an idle desktop. */
-int DirectGate_WL_SourceTakeFrame(directgate_wl_source_t *pSource, uint8_t *pDst,
-                                  uint32_t nWidth, uint32_t nHeight);
+int DirectGate_WL_SourceTakeFrame(directgate_wl_source_t *pSource, uint8_t **ppDst,
+                                  size_t nDstSize, uint32_t nWidth, uint32_t nHeight);
+
+/* Whether the stream that was negotiated exports its frames, and in what DRM
+ * format and layout. Read before the encoder is built, because it decides
+ * which kind of encoder that is. */
+xbool_t DirectGate_WL_SourceIsDmaBuf(directgate_wl_source_t *pSource,
+                                     uint32_t *pFourCC, uint64_t *pModifier);
+
+/* Takes the newest exported frame. @p pFrame is filled with descriptors that
+ * are valid until the buffer is given back, and @p ppHandle is that buffer -
+ * the caller owns it until it passes it to SourceReleaseFrame, which must
+ * happen once the frame has been encoded and not before: the compositor is
+ * free to draw into it the moment it is back.
+ *
+ * XSTDNON when nothing new has arrived, exactly like SourceTakeFrame. */
+int DirectGate_WL_SourceTakeDmaBuf(directgate_wl_source_t *pSource,
+                                   directgate_desktop_dmabuf_t *pFrame, void **ppHandle);
+
+void DirectGate_WL_SourceReleaseFrame(directgate_wl_source_t *pSource, void *pHandle);
+
+/* Gives up on exporting and renegotiates the stream for mapped frames, in
+ * place and without a prompt. For the case the encoder can only discover by
+ * trying: the GPU will not take what the compositor produced. */
+void DirectGate_WL_SourceDisableDmaBuf(directgate_wl_source_t *pSource);
 
 /* Screens this grant covers, for the monitor list the viewer is offered. */
 uint32_t DirectGate_WL_SourceScreenCount(directgate_wl_source_t *pSource);

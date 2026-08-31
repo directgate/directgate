@@ -4,7 +4,7 @@ set -euo pipefail
 # Public FFmpeg headers for every libavcodec major the agent knows how to talk
 # to, laid out one tree per major:
 #
-#   <prefix>/58/libavcodec/*.h  <prefix>/58/libavutil/*.h
+#   <prefix>/58/libavcodec/*.h  <prefix>/58/libavutil/*.h  <prefix>/58/libavfilter/*.h
 #   <prefix>/59/...             <prefix>/60/...   <prefix>/61/...
 #
 # Why this exists: GPU encoding dlopen's libavcodec at runtime, but the struct
@@ -110,18 +110,22 @@ fetch_one() {
         attempt=$((attempt + 1))
     done
 
+    # libavfilter comes along because Wayland zero-copy needs the GPU
+    # post-processor (scale_vaapi), which is the only place FFmpeg exposes it.
     tar -xzf "$tmp/ffmpeg.tar.gz" -C "$tmp" \
-        "ffmpeg-$release/libavcodec" "ffmpeg-$release/libavutil" ||
+        "ffmpeg-$release/libavcodec" "ffmpeg-$release/libavutil" "ffmpeg-$release/libavfilter" ||
         die "archive does not contain the expected header directories: $url"
 
     rm -rf "$dest"
-    install -d "$dest/libavcodec" "$dest/libavutil"
+    install -d "$dest/libavcodec" "$dest/libavutil" "$dest/libavfilter"
     cp "$tmp/ffmpeg-$release/libavcodec/"*.h "$dest/libavcodec/"
     cp "$tmp/ffmpeg-$release/libavutil/"*.h "$dest/libavutil/"
+    cp "$tmp/ffmpeg-$release/libavfilter/"*.h "$dest/libavfilter/"
     write_avconfig "$dest"
 
     [ -f "$dest/libavcodec/avcodec.h" ] || die "libavcodec/avcodec.h missing from $url"
     [ -f "$dest/libavutil/avutil.h" ] || die "libavutil/avutil.h missing from $url"
+    [ -f "$dest/libavfilter/avfilter.h" ] || die "libavfilter/avfilter.h missing from $url"
 
     found="$(extracted_major "$dest")" || die "cannot read LIBAVCODEC_VERSION_MAJOR from $release"
     [ "$found" = "$major" ] ||

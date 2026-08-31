@@ -382,6 +382,11 @@ elseif(UNIX)
     find_package(PkgConfig QUIET)
     if(NOT DIRECTGATE_HWENC_ABIS AND PKG_CONFIG_FOUND)
         pkg_check_modules(LIBAV libavcodec libavutil)
+        # Zero-copy on Wayland needs the GPU post-processor, which only
+        # libavfilter exposes. Optional on purpose: without it the agent
+        # builds and runs exactly as before, and DMA-BUF frames are simply
+        # never asked for.
+        pkg_check_modules(LIBAVFILTER libavfilter)
     endif()
 
     if(DIRECTGATE_HWENC_ABIS)
@@ -402,6 +407,18 @@ elseif(UNIX)
             target_compile_definitions(directgate_hwenc_${_dg_abi} PRIVATE
                 DIRECTGATE_HAVE_HWENC=1
                 DIRECTGATE_HWENC_ABI=${_dg_abi})
+
+            # Per major, like everything else here: a header tree that
+            # predates the script's libavfilter support still builds, it
+            # just has no zero-copy path.
+            if(EXISTS "${DIRECTGATE_HWENC_HEADERS}/${_dg_abi}/libavfilter/avfilter.h")
+                target_compile_definitions(directgate_hwenc_${_dg_abi} PRIVATE
+                    DIRECTGATE_HWENC_HAS_FILTER=1)
+            else()
+                message(STATUS
+                    "GPU desktop encoding: libavcodec ${_dg_abi} has no libavfilter headers, "
+                    "Wayland zero-copy disabled for it (re-run misc/ffmpeg-headers.sh)")
+            endif()
             target_link_libraries(directgate_hwenc_${_dg_abi} PRIVATE xcommon)
 
             target_sources(directgate PRIVATE $<TARGET_OBJECTS:directgate_hwenc_${_dg_abi}>)
@@ -412,6 +429,14 @@ elseif(UNIX)
         target_sources(directgate PRIVATE ${AGENT_DIR}/desktop/hwenc.c)
         target_compile_definitions(directgate PRIVATE DIRECTGATE_HAVE_HWENC=1)
         target_include_directories(directgate PRIVATE ${LIBAV_INCLUDE_DIRS})
+
+        if(LIBAVFILTER_FOUND)
+            message(STATUS "Wayland zero-copy encoding: enabled (libavfilter ${LIBAVFILTER_VERSION} headers, runtime dlopen)")
+            target_compile_definitions(directgate PRIVATE DIRECTGATE_HWENC_HAS_FILTER=1)
+            target_include_directories(directgate PRIVATE ${LIBAVFILTER_INCLUDE_DIRS})
+        else()
+            message(STATUS "Wayland zero-copy encoding: disabled (libavfilter headers not found)")
+        endif()
     elseif(DIRECTGATE_REQUIRE_HWENC)
         message(FATAL_ERROR
             "GPU desktop encoding was required but no libavcodec/libavutil headers "

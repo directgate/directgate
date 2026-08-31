@@ -96,6 +96,14 @@ typedef struct directgate_x11enc_ {
     directgate_hwenc_t *pHwEncoder;
     xbool_t bHwDisabled;              /* GPU gave up for good; stay on the CPU */
     uint32_t nHwFailures;             /* consecutive GPU encode failures */
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    /* The compositor exports its frames and the encoder takes them as they
+     * are: nothing between the screen and the bitstream is read, converted or
+     * copied by this process. The buffers below stay allocated all the same,
+     * because the way back to the copied path is to rebuild the encoder in
+     * place rather than to restart the session. */
+    xbool_t bZeroCopy;
+#endif
 #endif
 
     /* Private X11 connection owned by the capture thread. */
@@ -124,6 +132,11 @@ typedef struct directgate_x11enc_ {
     uint8_t *pCaptureBGRA;  /* capture-size BGRA; only allocated when scaling */
     uint8_t *pFrameBGRA;    /* encode-size BGRA fed into the converter */
     uint8_t *pPrevBGRA;     /* previous encode-size BGRA for change detection */
+    /* A picture has gone out at least once, so a keyframe can be answered
+     * from what the encoder already holds instead of waiting for the screen
+     * to change. True on both paths; bHavePrev says the same thing about the
+     * BGRA buffers, which the zero-copy path never fills. */
+    xbool_t bSentFrame;
     /* OpenH264 takes planar I420, every GPU encoder takes NV12; only the
      * plane buffer for the active encoder is allocated. */
     uint8_t *pI420;
@@ -166,8 +179,9 @@ typedef struct directgate_x11enc_ {
     char sLastError[DIRECTGATE_DESKTOP_REASON_LEN];
 } directgate_x11enc_t;
 
-static void DirectGate_Desktop_X11Enc_EncodeAndPublish(directgate_x11enc_t *pEnc, 
-                                                       uint32_t nFps, uint64_t nCapturedUs);
+static void DirectGate_Desktop_X11Enc_EncodeAndPublish(directgate_x11enc_t *pEnc,
+                                                       uint32_t nFps, uint64_t nCapturedUs,
+                                                       const directgate_desktop_dmabuf_t *pDmaBuf);
 
 static directgate_x11enc_t* DirectGate_Desktop_X11Enc(const directgate_desktop_t *pDesktop)
 {
@@ -557,17 +571,100 @@ static int DirectGate_Desktop_X11Enc_FallBackToSoftware(directgate_x11enc_t *pEn
     DIRECTGATE_X11ENC_SET(&pEnc->bForceKeyframe, 1U);
     return XSTDOK;
 }
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+/* Gives up on zero-copy without giving up the session. The compositor is
+ * asked to go back to memory this process can read, and the encoder is
+ * rebuilt as the ordinary GPU one - or, failing that, the software one, by
+ * the same path a GPU failure already takes. Both ends change together, and
+ * nothing above this restarts: the pipeline, the video track and the viewer's
+ * session all carry on.
+ *
+ * Unlike a GPU hiccup this is not retried. The frames arrive in a shape the
+ * driver has refused, and it will go on refusing it. */
+static int DirectGate_Desktop_X11Enc_FallBackFromZeroCopy(directgate_x11enc_t *pEnc)
+{
+    xlogw("The GPU could not encode the compositor's own frames, falling back to copied ones: sid(%u)",
+        pEnc->pDesktop->nSessionId);
+
+    if (pEnc->pDesktop->pWayland != NULL)
+        DirectGate_WL_SourceDisableDmaBuf((directgate_wl_source_t*)pEnc->pDesktop->pWayland);
+
+    DirectGate_HWEnc_Destroy(pEnc->pHwEncoder);
+    pEnc->pHwEncoder = NULL;
+    pEnc->bZeroCopy = XFALSE;
+    pEnc->nHwFailures = 0;
+
+    /* Nothing was ever written into the frame buffers on this path, so the
+     * unchanged-frame check has nothing to compare against yet - and the new
+     * encoder holds no last picture to answer a keyframe from either. */
+    pEnc->bHavePrev = XFALSE;
+    pEnc->bSentFrame = XFALSE;
+
+    char sError[DIRECTGATE_DESKTOP_REASON_LEN] = { 0 };
+    pEnc->pHwEncoder = DirectGate_HWEnc_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
+        &pEnc->pDesktop->quality, sError, sizeof(sError));
+
+    if (pEnc->pHwEncoder == NULL)
+    {
+        xlogi("No GPU encoder after the zero-copy fallback, using the software encoder: sid(%u), reason(%s)",
+            pEnc->pDesktop->nSessionId, sError[0] ? sError : "unknown");
+
+        pEnc->pEncoder = DirectGate_OpenH264_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
+            &pEnc->pDesktop->quality, sError, sizeof(sError));
+
+        if (pEnc->pEncoder == NULL)
+        {
+            DirectGate_Desktop_X11Enc_SetError(pEnc, NULL,
+                sError[0] ? sError : "No encoder left after the zero-copy fallback.");
+
+            return XSTDERR;
+        }
+    }
+
+    if (DirectGate_Desktop_X11Enc_AllocPlanes(pEnc) != XSTDOK)
+    {
+        DirectGate_Desktop_X11Enc_SetError(pEnc, NULL, "Failed to allocate frame planes after the zero-copy fallback.");
+        return XSTDERR;
+    }
+
+    DIRECTGATE_X11ENC_SET(&pEnc->bForceKeyframe, 1U);
+    return XSTDOK;
+}
+#endif
 #endif
 
 /* Converts the captured BGRA into whatever the active encoder wants and
- * encodes it. Returns the encoder's XSTDOK/XSTDNON/XSTDERR verdict. */
+ * encodes it. Returns the encoder's XSTDOK/XSTDNON/XSTDERR verdict.
+ *
+ * @p pDmaBuf is the exported frame on the zero-copy path, where there is no
+ * BGRA to convert at all - and NULL there means "the last picture again",
+ * which is how a keyframe is answered on a screen that has stopped. */
 static int DirectGate_Desktop_X11Enc_Encode(directgate_x11enc_t *pEnc,
+                                            const directgate_desktop_dmabuf_t *pDmaBuf,
                                             uint64_t nPtsUs,
                                             xbool_t bForceKeyframe,
                                             xbool_t *pKeyframe)
 {
     uint32_t nWidth = pEnc->nEncodeWidth;
     uint32_t nHeight = pEnc->nEncodeHeight;
+
+#if defined(DIRECTGATE_HAVE_HWENC) && defined(DIRECTGATE_DESKTOP_HAS_WAYLAND)
+    if (pEnc->bZeroCopy)
+    {
+        int nStatus = DirectGate_HWEnc_EncodeImport(pEnc->pHwEncoder, pDmaBuf,
+            nPtsUs, bForceKeyframe, &pEnc->encoded, pKeyframe);
+
+        if (nStatus != XSTDERR) return nStatus;
+        if (DirectGate_Desktop_X11Enc_FallBackFromZeroCopy(pEnc) != XSTDOK) return XSTDERR;
+
+        /* This frame is gone with the encoder that could not take it; the
+         * keyframe the rebuild asked for brings the picture straight back. */
+        return XSTDNON;
+    }
+#else
+    (void)pDmaBuf;
+#endif
 
 #ifdef DIRECTGATE_HAVE_HWENC
     if (pEnc->pHwEncoder != NULL)
@@ -629,17 +726,60 @@ static void DirectGate_Desktop_X11Enc_CaptureFrame(directgate_x11enc_t *pEnc, ui
      * rather than giving Wayland a pipeline of its own. */
     if (pEnc->pDesktop != NULL && pEnc->pDesktop->pWayland != NULL)
     {
-        int nTaken = DirectGate_WL_SourceTakeFrame(
-            (directgate_wl_source_t*)pEnc->pDesktop->pWayland,
-            pEnc->pFrameBGRA, pEnc->nEncodeWidth, pEnc->nEncodeHeight);
+        directgate_wl_source_t *pSource = (directgate_wl_source_t*)pEnc->pDesktop->pWayland;
+        size_t nFrameBytes = (size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight * 4U;
+
+#ifdef DIRECTGATE_HAVE_HWENC
+        if (pEnc->bZeroCopy)
+        {
+            directgate_desktop_dmabuf_t dmabuf;
+            void *pHandle = NULL;
+
+            int nExported = DirectGate_WL_SourceTakeDmaBuf(pSource, &dmabuf, &pHandle);
+
+            /* Same rule as below, and the same reason: nothing new is an
+             * idle screen, and an owed keyframe is answered from the last
+             * picture the GPU converted rather than skipped. */
+            if (nExported != XSTDOK)
+            {
+                if (!DIRECTGATE_X11ENC_PEEK(&pEnc->bForceKeyframe)) return;
+
+                DirectGate_Desktop_X11Enc_EncodeAndPublish(pEnc, nFps,
+                    DirectGate_Desktop_X11Enc_MonotonicUs(), NULL);
+
+                return;
+            }
+
+            uint64_t nExportedUs = DirectGate_Desktop_X11Enc_MonotonicUs();
+            DirectGate_Desktop_X11Enc_EncodeAndPublish(pEnc, nFps, nExportedUs, &dmabuf);
+
+            /* Only now. The compositor is free to draw into this buffer the
+             * moment it is back, and the encode above is what the GPU had to
+             * finish reading it for. */
+            DirectGate_WL_SourceReleaseFrame(pSource, pHandle);
+            return;
+        }
+#endif
+
+        int nTaken = DirectGate_WL_SourceTakeFrame(pSource, &pEnc->pFrameBGRA,
+            nFrameBytes, pEnc->nEncodeWidth, pEnc->nEncodeHeight);
 
         /* No new frame is the idle desktop, not a failure: the compositor
          * sends nothing while nothing changes. A pending keyframe request
-         * still has to go out, so that case falls through to the encoder. */
-        if (nTaken != XSTDOK && !DIRECTGATE_X11ENC_PEEK(&pEnc->bForceKeyframe)) return;
+         * still has to go out - a viewer who joins a screen that is standing
+         * still would otherwise wait for it to move - and the only picture
+         * there is to answer it with is the last one that went out. The
+         * frame buffer itself does not hold it: the publish below exchanges
+         * that buffer for the previous one, so what it holds now is a frame
+         * older still, or nothing at all when none has been sent yet. */
+        if (nTaken != XSTDOK)
+        {
+            if (!DIRECTGATE_X11ENC_PEEK(&pEnc->bForceKeyframe) || !pEnc->bHavePrev) return;
+            memcpy(pEnc->pFrameBGRA, pEnc->pPrevBGRA, nFrameBytes);
+        }
 
         uint64_t nWlCapturedUs = DirectGate_Desktop_X11Enc_MonotonicUs();
-        DirectGate_Desktop_X11Enc_EncodeAndPublish(pEnc, nFps, nWlCapturedUs);
+        DirectGate_Desktop_X11Enc_EncodeAndPublish(pEnc, nFps, nWlCapturedUs, NULL);
         return;
     }
 #endif
@@ -681,24 +821,36 @@ static void DirectGate_Desktop_X11Enc_CaptureFrame(directgate_x11enc_t *pEnc, ui
 
     if (pImage != pEnc->pShmImage) XDestroyImage(pImage);
 
-    DirectGate_Desktop_X11Enc_EncodeAndPublish(pEnc, nFps, nCapturedUs);
+    DirectGate_Desktop_X11Enc_EncodeAndPublish(pEnc, nFps, nCapturedUs, NULL);
 }
 
 /* Everything a captured frame goes through once it is BGRA at the encode
  * size, regardless of where it came from. Runs on the worker. */
-static void DirectGate_Desktop_X11Enc_EncodeAndPublish(directgate_x11enc_t *pEnc, uint32_t nFps, uint64_t nCapturedUs)
+static void DirectGate_Desktop_X11Enc_EncodeAndPublish(directgate_x11enc_t *pEnc,
+                                                      uint32_t nFps, uint64_t nCapturedUs,
+                                                      const directgate_desktop_dmabuf_t *pDmaBuf)
 {
     /* Idle desktops are the common case for a remote-admin agent: skip the
      * whole convert+encode+send pass when nothing changed on screen. A
      * pending keyframe request always goes through (new viewer / PLI). */
     size_t nFrameBytes = (size_t)pEnc->nEncodeWidth * pEnc->nEncodeHeight * 4U;
 
+    /* On the zero-copy path there is no copy of the picture in this process
+     * to compare, and no need for one: the compositor sends a frame only when
+     * something changed, which is the question this check exists to answer. */
+    xbool_t bCompare = XTRUE;
+
+#if defined(DIRECTGATE_HAVE_HWENC) && defined(DIRECTGATE_DESKTOP_HAS_WAYLAND)
+    if (pEnc->bZeroCopy) bCompare = XFALSE;
+#else
+    (void)pDmaBuf;
+#endif
+
     /* Claim the pending request now: any request raised from here on is a
      * new one and stays pending for the next pass. */
     xbool_t bForceKeyframe = DIRECTGATE_X11ENC_TAKE(&pEnc->bForceKeyframe) ? XTRUE : XFALSE;
 
-    if (!bForceKeyframe && pEnc->bHavePrev &&
-        memcmp(pEnc->pFrameBGRA, pEnc->pPrevBGRA, nFrameBytes) == 0)
+    if (bCompare && !bForceKeyframe && pEnc->bHavePrev && memcmp(pEnc->pFrameBGRA, pEnc->pPrevBGRA, nFrameBytes) == 0)
     {
         /* Nothing changed. Normally that ends the pass - but not while a
          * keyframe is still settling (see nRefineLeft). */
@@ -709,8 +861,7 @@ static void DirectGate_Desktop_X11Enc_EncodeAndPublish(directgate_x11enc_t *pEnc
     uint64_t nPtsUs = nCapturedUs - pEnc->nStartUs;
     xbool_t bKeyframe = XFALSE;
 
-    int nStatus = DirectGate_Desktop_X11Enc_Encode(pEnc, nPtsUs, bForceKeyframe, &bKeyframe);
-
+    int nStatus = DirectGate_Desktop_X11Enc_Encode(pEnc, pDmaBuf, nPtsUs, bForceKeyframe, &bKeyframe);
     if (nStatus == XSTDERR)
     {
         __atomic_add_fetch(&pEnc->nFailures, 1U, __ATOMIC_ACQ_REL);
@@ -740,11 +891,15 @@ static void DirectGate_Desktop_X11Enc_EncodeAndPublish(directgate_x11enc_t *pEnc
         pEnc->nRefineLeft = nRefine ? nRefine : 1U;
     }
 
-    /* Remember what was sent for the next unchanged-frame check. */
-    uint8_t *pSwap = pEnc->pPrevBGRA;
-    pEnc->pPrevBGRA = pEnc->pFrameBGRA;
-    pEnc->pFrameBGRA = pSwap;
-    pEnc->bHavePrev = XTRUE;
+    /* Remember what was sent for the next unchanged-frame check. Nothing to
+     * remember when the picture was never in this process's memory. */
+    if (bCompare)
+    {
+        uint8_t *pSwap = pEnc->pPrevBGRA;
+        pEnc->pPrevBGRA = pEnc->pFrameBGRA;
+        pEnc->pFrameBGRA = pSwap;
+        pEnc->bHavePrev = XTRUE;
+    }
 
     /* Publish: swap the encoded scratch into the mailbox slot (no copy). */
     XSync_Lock(&pEnc->lock);
@@ -758,6 +913,7 @@ static void DirectGate_Desktop_X11Enc_EncodeAndPublish(directgate_x11enc_t *pEnc
     pEnc->nMailboxPtsUs = nPtsUs;
     pEnc->nMailboxCapturedUs = DirectGate_Desktop_X11Enc_MonotonicUs();
     pEnc->bMailboxHasFrame = XTRUE;
+    pEnc->bSentFrame = XTRUE;
     XSync_Unlock(&pEnc->lock);
 
     DirectGate_Desktop_X11Enc_WakeMainLoop(pEnc, nFps);
@@ -769,6 +925,12 @@ static void* DirectGate_Desktop_X11Enc_Worker(void *pArg)
     XCHECK((pEnc != NULL), NULL);
 
     uint64_t nNextDueUs = DirectGate_Desktop_X11Enc_MonotonicUs();
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    /* Fixed for the life of the pipeline: the source is built before the
+     * pipeline starts and destroyed after it is joined. */
+    xbool_t bWayland = (pEnc->pDesktop != NULL && pEnc->pDesktop->pWayland != NULL) ? XTRUE : XFALSE;
+#endif
 
     while (!DIRECTGATE_X11ENC_LOAD(&pEnc->bStop))
     {
@@ -805,6 +967,27 @@ static void* DirectGate_Desktop_X11Enc_Worker(void *pArg)
 
         nNextDueUs = (nNextDueUs + nIntervalUs > nNowUs) ?
             nNextDueUs + nIntervalUs : nNowUs + nIntervalUs;
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+        /* X11 is pulled: being due and capturing are the same instant, and
+         * what comes back is the screen as it is right now. PipeWire is
+         * pushed on the compositor's clock instead, so a tick that finds
+         * nothing has not proved the desktop is idle - the change may land a
+         * millisecond later and then wait out the whole frame period for the
+         * next tick to notice it. Waiting for it here costs no extra frames,
+         * because the tick that let us in has already spaced this encode a
+         * full period from the last one, and it is what makes a Wayland
+         * session answer a keystroke as promptly as an Xorg one.
+         *
+         * Skipped when a keyframe is owed and there is a picture to answer
+         * it with: that request must not wait on a screen that may never
+         * change again. */
+        if (bWayland && !(DIRECTGATE_X11ENC_PEEK(&pEnc->bForceKeyframe) && pEnc->bSentFrame))
+        {
+            DirectGate_WL_SourceWaitFrame((directgate_wl_source_t*)pEnc->pDesktop->pWayland, nIntervalUs);
+            if (DIRECTGATE_X11ENC_LOAD(&pEnc->bStop)) break;
+        }
+#endif
 
         DirectGate_Desktop_X11Enc_CaptureFrame(pEnc, nFps);
     }
@@ -922,12 +1105,50 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
 
 #ifdef DIRECTGATE_HAVE_HWENC
     char sHwError[DIRECTGATE_DESKTOP_REASON_LEN] = {0};
-    pEnc->pHwEncoder = DirectGate_HWEnc_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
-                                               &pDesktop->quality, sHwError, sizeof(sHwError));
+
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    /* A compositor that agreed to export its frames gets the encoder that can
+     * take them as they are. That encoder also does the colour conversion and
+     * the resize on the GPU, so nothing between the screen and the bitstream
+     * is read, converted or copied by this process - which is the whole point
+     * of asking. A refusal is not a failure of the session: the compositor is
+     * told to go back to memory and the ordinary encoder opens below. */
+    uint32_t nSrcFourCC = 0;
+    uint64_t nSrcModifier = 0;
+
+    if (bWayland && DirectGate_WL_SourceIsDmaBuf((directgate_wl_source_t*)pDesktop->pWayland, &nSrcFourCC, &nSrcModifier))
+    {
+        uint32_t nSrcWidth = 0;
+        uint32_t nSrcHeight = 0;
+
+        if (DirectGate_WL_SourceSize((directgate_wl_source_t*)pDesktop->pWayland, &nSrcWidth, &nSrcHeight))
+        {
+            pEnc->pHwEncoder = DirectGate_HWEnc_CreateImport(nSrcWidth, nSrcHeight,
+                nSrcFourCC, nSrcModifier, pEnc->nEncodeWidth, pEnc->nEncodeHeight,
+                &pDesktop->quality, sHwError, sizeof(sHwError));
+        }
+
+        if (pEnc->pHwEncoder != NULL) pEnc->bZeroCopy = XTRUE;
+        else
+        {
+            xlogi("The exported desktop frames cannot be encoded here, asking for copied ones: sid(%u), reason(%s)",
+                pSession->nSessionId, sHwError[0] ? sHwError : "unknown");
+
+            DirectGate_WL_SourceDisableDmaBuf((directgate_wl_source_t*)pDesktop->pWayland);
+            sHwError[0] = '\0';
+        }
+    }
+#endif
+
     if (pEnc->pHwEncoder == NULL)
     {
-        xlogi("No GPU H.264 encoder available, using the software encoder: sid(%u), reason(%s)",
-            pSession->nSessionId, sHwError[0] ? sHwError : "unknown");
+        pEnc->pHwEncoder = DirectGate_HWEnc_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
+                                                   &pDesktop->quality, sHwError, sizeof(sHwError));
+        if (pEnc->pHwEncoder == NULL)
+        {
+            xlogi("No GPU H.264 encoder available, using the software encoder: sid(%u), reason(%s)",
+                pSession->nSessionId, sHwError[0] ? sHwError : "unknown");
+        }
     }
 #endif
 
@@ -1041,11 +1262,15 @@ int DirectGate_Desktop_LinuxEncoder_Start(directgate_session_t *pSession,
     }
 #endif
 
-    xlogi("X11 H.264 pipeline started: sid(%u), capture(%d,%d %ux%u), encode(%ux%u), "
+    /* Named for the backend that produced the frames, because "X11" on a
+     * Wayland session is exactly the line someone reads when they are trying
+     * to work out which path a slow desktop took. */
+    xlogi("%s H.264 pipeline started: sid(%u), capture(%d,%d %ux%u), encode(%ux%u), "
         "shm(%s), encoder(%s: %s), preset(%s)",
+        bWayland ? "Wayland" : "X11",
         pSession->nSessionId, nX, nY, nWidth, nHeight,
         pEnc->nEncodeWidth, pEnc->nEncodeHeight,
-        pEnc->bShmAttached ? "yes" : "no",
+        pEnc->bShmAttached ? "yes" : (bWayland ? "n/a" : "no"),
         pEncoderKind, pEncoderName,
         DirectGate_Desktop_PresetName(pDesktop->quality.ePreset));
 
