@@ -181,10 +181,7 @@ brew install directgate
 
 Download the latest Windows installer from the [official install page](https://directgate.io/install).
 
-The Windows installer registers one auto-start service, `directgate-agent`.
-That service runs only a small LocalSystem launcher; the actual DirectGate agent
-is started in the configured logged-on user's session. Remote access is not
-available until the device is explicitly paired and the client authenticates.
+The Windows installer registers one auto-start service, `directgate-agent`. That service runs only a small LocalSystem launcher; the actual DirectGate agent is started in the configured logged-on user's session. Remote access is not available until the device is explicitly paired and the client authenticates.
 
 **From source**
 

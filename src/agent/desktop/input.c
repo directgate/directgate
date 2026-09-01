@@ -104,6 +104,22 @@ static int DirectGate_Desktop_WheelNotches(int32_t *pAccum, int nDelta)
 }
 #endif /* __linux__ || _WIN32 */
 
+static xbool_t DirectGate_Desktop_TrackPointerButton(directgate_desktop_t *pDesktop, uint32_t nButton, xbool_t bDown)
+{
+    if (nButton == 0 || nButton > 32) return XFALSE;
+    uint32_t nBit = 1U << (nButton - 1U);
+
+    if (bDown)
+    {
+        pDesktop->nPointerButtons |= nBit;
+        return XTRUE;
+    }
+
+    if (!(pDesktop->nPointerButtons & nBit)) return XFALSE;
+    pDesktop->nPointerButtons &= ~nBit;
+    return XTRUE;
+}
+
 #endif /* __linux__ || __APPLE__ || _WIN32 */
 
 #if defined(__linux__)
@@ -1013,11 +1029,11 @@ static int DirectGate_Desktop_WaylandHandleInput(directgate_session_t *pSession,
         if (xstrcmp(pEvent, "button"))
         {
             uint32_t nButton = XJSON_GetU32(XJSON_GetObject(pRoot, "button"));
+            xbool_t bDown = XJSON_GetBool(XJSON_GetObject(pRoot, "down")) ? XTRUE : XFALSE;
             int32_t nCode = DirectGate_WL_PortalButtonCode(nButton);
 
-            if (nCode != 0)
-                DirectGate_WL_PortalPointerButton(pPortal, nCode,
-                    XJSON_GetBool(XJSON_GetObject(pRoot, "down")) ? XTRUE : XFALSE);
+            if (nCode != 0 && DirectGate_Desktop_TrackPointerButton(pDesktop, nButton, bDown))
+                DirectGate_WL_PortalPointerButton(pPortal, nCode, bDown);
         }
         else if (xstrcmp(pEvent, "wheel"))
         {
@@ -1226,7 +1242,8 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
 
             /* 1-3 = left/middle/right, 8/9 = back/forward (X11 button ids;
              * 4-7 are reserved for wheel emulation below). */
-            if ((nButton >= 1 && nButton <= 3) || nButton == 8 || nButton == 9)
+            if (((nButton >= 1 && nButton <= 3) || nButton == 8 || nButton == 9) &&
+                DirectGate_Desktop_TrackPointerButton(pDesktop, nButton, bDown))
                 ((directgate_xtest_button_fn)pDesktop->pFakeButton)(pDisplay, nButton, bDown ? XTRUE : XFALSE, CurrentTime);
         }
         else if (xstrcmp(pEvent, "wheel"))
@@ -1643,11 +1660,9 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
             uint32_t nButton = XJSON_GetU32(XJSON_GetObject(pRoot, "button"));
             xbool_t bDown = XJSON_GetBool(XJSON_GetObject(pRoot, "down"));
 
-            if ((nButton >= 1 && nButton <= 3) || nButton == 8 || nButton == 9)
+            if (((nButton >= 1 && nButton <= 3) || nButton == 8 || nButton == 9) &&
+                DirectGate_Desktop_TrackPointerButton(pDesktop, nButton, bDown))
             {
-                if (bDown) pDesktop->nPointerButtons |= (1U << (nButton - 1U));
-                else pDesktop->nPointerButtons &= ~(1U << (nButton - 1U));
-
                 CGEventRef event = CGEventCreateMouseEvent(NULL,
                     DirectGate_Desktop_MacMouseEvent(nButton, bDown),
                     point, DirectGate_Desktop_MacMouseButton(nButton));
@@ -2062,7 +2077,8 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         {
             uint32_t nButton = XJSON_GetU32(XJSON_GetObject(pRoot, "button"));
             xbool_t bDown = XJSON_GetBool(XJSON_GetObject(pRoot, "down"));
-            if ((nButton >= 1 && nButton <= 3) || nButton == 8 || nButton == 9)
+            if (((nButton >= 1 && nButton <= 3) || nButton == 8 || nButton == 9) &&
+                DirectGate_Desktop_TrackPointerButton(pDesktop, nButton, bDown))
             {
                 DWORD nMouseData = 0;
                 DWORD nFlag = DirectGate_Desktop_MouseButtonFlag(nButton, bDown, &nMouseData);
