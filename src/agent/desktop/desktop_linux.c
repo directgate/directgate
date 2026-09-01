@@ -50,6 +50,12 @@
  * stuttered for a couple of frames. */
 #define DIRECTGATE_X11ENC_MAX_HW_FAILURES 30U
 
+/* The same idea for the zero-copy path, but a shorter fuse. What it falls
+ * back to is not a worse picture, only a busier CPU, so there is far less to
+ * lose by giving up early - and what it gives up is regained on the next
+ * pipeline rebuild. A quarter of a second at 30 fps. */
+#define DIRECTGATE_X11ENC_MAX_IMPORT_FAILURES 8U
+
 /* Poll interval while the mailbox is still occupied or the data channel is
  * backed up. Linux nanosleep honours this granularity, so it costs at most
  * half a millisecond of extra latency on a busy hand-off. */
@@ -655,7 +661,28 @@ static int DirectGate_Desktop_X11Enc_Encode(directgate_x11enc_t *pEnc,
         int nStatus = DirectGate_HWEnc_EncodeImport(pEnc->pHwEncoder, pDmaBuf,
             nPtsUs, bForceKeyframe, &pEnc->encoded, pKeyframe);
 
-        if (nStatus != XSTDERR) return nStatus;
+        if (nStatus != XSTDERR)
+        {
+            pEnc->nHwFailures = 0;
+            return nStatus;
+        }
+
+        /* A buffer layout the driver will not import fails on the very first
+         * frame and on every one after it, so there is nothing to wait for:
+         * fall back at once and let the session start on the copied path.
+         * Once frames have been going out, though, an error is far more
+         * likely to be the passing kind the GPU path already tolerates - a
+         * drained surface pool, a driver busy elsewhere - and answering that
+         * by giving up zero-copy for the rest of the session would cost more
+         * than it saves. */
+        if (pEnc->bSentFrame && ++pEnc->nHwFailures < DIRECTGATE_X11ENC_MAX_IMPORT_FAILURES)
+        {
+            xlogd("Zero-copy frame encode failed, retrying on the GPU: sid(%u), failures(%u)",
+                pEnc->pDesktop->nSessionId, pEnc->nHwFailures);
+
+            return XSTDNON;
+        }
+
         if (DirectGate_Desktop_X11Enc_FallBackFromZeroCopy(pEnc) != XSTDOK) return XSTDERR;
 
         /* This frame is gone with the encoder that could not take it; the

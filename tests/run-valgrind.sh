@@ -28,12 +28,20 @@ find "$BUILD/tests" -maxdepth 1 -type f -perm -111 -name '*_smoke' -print | sort
     exit 1
 }
 
+# Opening a GPU device makes libva dlopen the vendor's driver, and a driver
+# that fails to initialise - the ordinary case on a hybrid box, where the
+# first render node is not the one that encodes - keeps what it allocated on
+# the way. Nothing this agent writes can free it, so the file below excuses
+# that one stack and nothing above it.
+SUPPRESSIONS="$ROOT/tests/valgrind.supp"
+
 while IFS= read -r test; do
     echo "Valgrind: $(basename "$test")"
     valgrind \
         --leak-check=full \
         --show-leak-kinds=definite,indirect,possible \
         --errors-for-leak-kinds=definite,indirect,possible \
+        --suppressions="$SUPPRESSIONS" \
         --track-origins=yes \
         --error-exitcode=1 \
         "$test"

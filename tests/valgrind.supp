@@ -1,0 +1,40 @@
+# Valgrind suppressions for the smoke tests.
+#
+# Only third-party allocations belong here. Everything this agent is
+# responsible for must still be reported, so each entry names the narrowest
+# frame that identifies the foreign code.
+
+{
+   libva loads the vendor's GPU driver and the driver keeps what it allocated
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   ...
+   fun:vaInitialize
+   ...
+}
+
+# Loading a library at run time makes glibc grow the thread-local storage
+# vector, and valgrind cannot see the TLS pointers that keep those blocks -
+# so they are reported as "possibly lost" for the rest of the process. This
+# agent dlopens by design (OpenH264, libavcodec, libavfilter, libva and the
+# GPU driver behind it), so the pattern is unavoidable and is glibc's, not
+# the agent's. Only "possible" is excused: a block glibc definitely lost
+# would still be reported.
+
+{
+   glibc allocates thread-local storage while a library is being loaded
+   Memcheck:Leak
+   match-leak-kinds: possible
+   ...
+   fun:allocate_dtv_entry
+   ...
+}
+
+{
+   glibc resizes the thread-local storage vector while a library is being loaded
+   Memcheck:Leak
+   match-leak-kinds: possible
+   ...
+   fun:_dl_resize_dtv
+   ...
+}
