@@ -31,6 +31,7 @@
 #include <X11/extensions/Xrandr.h>
 #ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
 #include "common.h"
+#include "hwenc.h"
 #include "wayland.h"
 #endif
 #elif defined(__APPLE__)
@@ -532,7 +533,26 @@ static int DirectGate_Desktop_OpenWayland(directgate_session_t *pSession)
         char sTokenPath[XPATH_MAX + 64];
         DirectGate_Desktop_WaylandTokenPath(sTokenPath, sizeof(sTokenPath));
 
-        g_pPendingWayland = DirectGate_WL_SourceCreate(sTokenPath);
+        /* Whether to ask the compositor for its frames as GPU buffers has to
+         * be decided here, before the stream is negotiated - and the only
+         * thing that makes it worth asking is an encoder able to take one. A
+         * machine without one is not told about it and streams exactly as it
+         * did before. */
+        char sImport[DIRECTGATE_DESKTOP_REASON_LEN] = { 0 };
+        xbool_t bZeroCopy = XFALSE;
+
+#ifdef DIRECTGATE_HAVE_HWENC
+        bZeroCopy = DirectGate_HWEnc_ImportAvailable(sImport, sizeof(sImport));
+#else
+        xstrncpy(sImport, sizeof(sImport), "this agent was built without GPU encoding");
+#endif
+        if (!bZeroCopy)
+        {
+            xlogi("Wayland zero-copy capture is not available, frames will be copied: reason(%s)",
+                xstrused(sImport) ? sImport : "unknown");
+        }
+
+        g_pPendingWayland = DirectGate_WL_SourceCreate(sTokenPath, bZeroCopy);
         if (g_pPendingWayland == NULL)
         {
             DirectGate_Desktop_SetReason(pDesktop, "Failed to start Wayland desktop capture.");

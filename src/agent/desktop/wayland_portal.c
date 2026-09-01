@@ -126,6 +126,12 @@ struct directgate_wl_portal_ {
     uint32_t nDevices;        /* device types the portal actually granted */
     uint32_t nInputErrors;    /* refused input events already reported */
     xbool_t bKeysymRefused;   /* this portal will not type by character */
+    /* The last absolute pointer coordinate that went out. Refusals come back
+     * on the bus after the event that caused them, so this is the closest
+     * thing to "which coordinate was refused", near enough to tell an
+     * out-of-range one from a session that was never started. */
+    double nLastMotionX;
+    double nLastMotionY;
     uint32_t nTokenSeq;
     /* Raised when a person answered the prompt with "no", as opposed to the
      * request failing. The caller's flag, not this struct's, because the
@@ -1150,10 +1156,23 @@ static void DirectGate_WL_PortalDrainErrors(directgate_wl_portal_t *pPortal, con
              * than left wondering why some keys do nothing. */
             if (xstrcmp(pMethod, "NotifyKeyboardKeysym")) pPortal->bKeysymRefused = XTRUE;
 
-            if (pPortal->nInputErrors < 3)
+            /* The name is almost always the generic org.freedesktop.DBus.Error.Failed;
+             * the reason is in the message body, and it is the whole content
+             * of the reply - "Session not started", "Unknown stream" and a
+             * coordinate the compositor would not map all arrive under that
+             * one name and mean completely different things. */
+            const char *pReason = NULL;
+            DBusMessageIter iter;
+
+            if (g_dbus.iterInit(pMessage, &iter) && g_dbus.iterArgType(&iter) == DBUS_TYPE_STRING)
+                g_dbus.iterGet(&iter, &pReason);
+
+            if (pPortal->nInputErrors < 8)
             {
                 pPortal->nInputErrors++;
-                xloge("The desktop portal refused an input event: method(%s), error(%s)", pMethod, pName);
+                xloge("The desktop portal refused an input event: method(%s), error(%s), reason(%s), last(%.1f,%.1f)",
+                    pMethod, pName, xstrused(pReason) ? pReason : "not stated",
+                    pPortal->nLastMotionX, pPortal->nLastMotionY);
             }
         }
 
@@ -1236,6 +1255,8 @@ static void DirectGate_WL_KeyArgs(DBusMessageIter *pArgs, void *pCtx)
 int DirectGate_WL_PortalPointerMotion(directgate_wl_portal_t *pPortal, uint32_t nStream, double nX, double nY)
 {
     directgate_wl_motion_t motion = { nStream ? nStream : DirectGate_WL_PortalNodeId(pPortal), nX, nY };
+    pPortal->nLastMotionX = nX;
+    pPortal->nLastMotionY = nY;
     return DirectGate_WL_PortalNotify(pPortal, "NotifyPointerMotionAbsolute", DirectGate_WL_MotionArgs, &motion);
 }
 
@@ -1243,6 +1264,14 @@ int DirectGate_WL_PortalPointerButton(directgate_wl_portal_t *pPortal, int32_t n
 {
     directgate_wl_button_t button = { (dbus_int32_t)nButton, bPressed ? 1U : 0U };
     return DirectGate_WL_PortalNotify(pPortal, "NotifyPointerButton", DirectGate_WL_ButtonArgs, &button);
+}
+
+int DirectGate_WL_PortalPointerMotionRelative(directgate_wl_portal_t *pPortal, double nDx, double nDy)
+{
+    /* Same wire shape as the axis call - two doubles after the session and
+     * the options - so the one argument writer serves both. */
+    directgate_wl_axis_t motion = { nDx, nDy };
+    return DirectGate_WL_PortalNotify(pPortal, "NotifyPointerMotion", DirectGate_WL_AxisArgs, &motion);
 }
 
 int DirectGate_WL_PortalPointerAxis(directgate_wl_portal_t *pPortal, double nDx, double nDy)

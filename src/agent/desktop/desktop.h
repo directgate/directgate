@@ -127,6 +127,35 @@ typedef struct directgate_desktop_scratch_key_ {
     xbool_t bHeld;      /* Injected press outstanding, must not be rebound */
 } directgate_desktop_scratch_key_t;
 
+#if defined(__linux__)
+/* Room for the planes of a packed RGB frame; a screen cast never carries
+ * more, and anything that does is refused rather than half-imported. */
+#define DIRECTGATE_DESKTOP_MAX_PLANES 4
+
+/* One captured frame that never left the GPU: the compositor exported it as
+ * a DMA-BUF and this is the handle, not the pixels.
+ *
+ * Deliberately plain - file descriptors, offsets and strides - so the capture
+ * side can fill it in without knowing what libavcodec is, and the encoder can
+ * consume it without knowing what PipeWire is. The descriptors belong to the
+ * buffer they came from and are valid only until it is given back, so nothing
+ * here is ever stored past the frame it describes.
+ *
+ * @a nFourCC is a DRM format code (XR24, AR24) and @a nModifier the DRM
+ * layout modifier the compositor allocated with. */
+typedef struct directgate_desktop_dmabuf_ {
+    uint32_t nWidth;
+    uint32_t nHeight;
+    uint32_t nFourCC;
+    uint64_t nModifier;
+    uint32_t nPlanes;
+    uint64_t nSize;                                    /* whole object, all planes */
+    uint32_t nOffsets[DIRECTGATE_DESKTOP_MAX_PLANES];
+    uint32_t nStrides[DIRECTGATE_DESKTOP_MAX_PLANES];
+    int nFds[DIRECTGATE_DESKTOP_MAX_PLANES];
+} directgate_desktop_dmabuf_t;
+#endif
+
 typedef struct directgate_desktop_ {
     xbool_t bRunning;
     xbool_t bInputReady;
@@ -173,6 +202,7 @@ typedef struct directgate_desktop_ {
     double nWlPointerX;
     double nWlPointerY;
     xbool_t bWlPointerValid;
+    uint64_t nWlPointerLogMs;
     /* Double/triple click tracking for platforms where the injected event
      * must carry an explicit click count (macOS kCGMouseEventClickState). */
     uint64_t nLastClickMs;

@@ -25,6 +25,9 @@
 
 #include "yuv.h"
 
+#include <sys/eventfd.h>
+#include <poll.h>
+
 /* A Wayland source deliberately stops at "here is the newest frame in BGRA".
  * Everything after that - scaling to the encode size, I420 conversion, the
  * hardware or software H.264 encoder, the adaptive bitrate controller, the
@@ -50,6 +53,30 @@ struct directgate_wl_source_ {
     uint32_t nFrameHeight;
     xbool_t bFrameFresh;
 
+    /* When the compositor exports its buffers the slot holds a handle to one
+     * instead of a copy of it. The rules are the same - one at a time, the
+     * newest wins - but an overtaken frame now has to be handed back rather
+     * than simply overwritten, because until it is the compositor has one
+     * fewer buffer to draw into. pFrameCapture is the stream it came from,
+     * remembered here because a screen switch replaces pCapture. */
+    xbool_t bFrameExported;
+    directgate_desktop_dmabuf_t frameDma;
+    void *pFrameHandle;
+    directgate_wl_capture_t *pFrameCapture;
+    directgate_wl_capture_t *pTakenCapture;   /* stream of the frame in the encoder */
+
+    xbool_t bWantDmaBuf;      /* ask the compositor to export, if it will */
+
+    /* Tells the encoder that a frame has landed, instead of leaving it to
+     * find one on its next tick. The compositor sends nothing at all while
+     * the screen is still, so the first change after a still moment arrives
+     * whenever it arrives - and sleeping out the rest of the frame period
+     * with it already in hand is latency the X11 path never pays, because it
+     * captures at the tick and what it captures is always current. A counter
+     * rather than a flag only because that is what an eventfd is; the value
+     * is never read for anything. */
+    int nFrameFd;
+
     uint32_t nActiveNode;         /* screen the capture is currently bound to */
 
     /* The setup thread's result, read by the event loop. Published under this
@@ -63,6 +90,13 @@ struct directgate_wl_source_ {
 
     char sTokenPath[XPATH_MAX];
 };
+
+static uint64_t DirectGate_WL_MonotonicUs(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) return 0;
+    return (uint64_t)now.tv_sec * 1000000ULL + (uint64_t)now.tv_nsec / 1000ULL;
+}
 
 /* Both halves of publishing a result, so no caller can do half of it. */
 static void DirectGate_WL_SourcePublish(directgate_wl_source_t *pSource,
@@ -145,12 +179,75 @@ static xbool_t DirectGate_WL_TokenLoad(const char *pPath, char *pBuf, size_t nSi
     return pBuf[0] != '\0';
 }
 
+/* Hands one exported buffer back from inside a frame callback. Dropping is
+ * the cheap way and only works on the stream whose thread this is; a buffer
+ * from the stream a screen switch just replaced belongs to another loop, and
+ * that one has to be locked like any other thread would. */
+static void DirectGate_WL_SourceReturn(directgate_wl_capture_t *pCapture,
+                                       directgate_wl_capture_t *pCurrent, void *pHandle)
+{
+    if (pCapture == NULL || pHandle == NULL) return;
+
+    if (pCapture == pCurrent) DirectGate_WL_CaptureDrop(pCapture, pHandle);
+    else DirectGate_WL_CaptureRelease(pCapture, pHandle);
+}
+
+/* Wakes the encoder, which is either waiting for exactly this or about to
+ * look anyway. Split out because both kinds of frame end the same way. */
+static void DirectGate_WL_SourceSignal(directgate_wl_source_t *pSource)
+{
+    /* Nothing is done about a failure and nothing needs to be: a saturated
+     * counter (EAGAIN) means nobody has drained it for a very long time, and
+     * the waiter clears it before it looks at anything. */
+    if (pSource->nFrameFd < 0) return;
+
+    uint64_t nTick = 1;
+    ssize_t nSignalled = write(pSource->nFrameFd, &nTick, sizeof(nTick));
+    (void)nSignalled;
+}
+
 static void DirectGate_WL_OnFrame(void *pUserCtx, const directgate_wl_frame_t *pFrame)
 {
     directgate_wl_source_t *pSource = (directgate_wl_source_t*)pUserCtx;
+
+    if (pFrame->eKind == DIRECTGATE_WL_FRAME_EXPORTED)
+    {
+        /* Nothing is copied here at all - the whole point - so this is only
+         * the hand-over: the descriptors and the buffer they belong to go
+         * into the slot, and whatever was in it goes back to the compositor. */
+        XSync_Lock(&pSource->frameLock);
+
+        void *pStale = pSource->bFrameExported ? pSource->pFrameHandle : NULL;
+        directgate_wl_capture_t *pStaleCapture = pSource->pFrameCapture;
+
+        pSource->frameDma = pFrame->dmabuf;
+        pSource->pFrameHandle = pFrame->pHandle;
+        pSource->pFrameCapture = pFrame->pCapture;
+        pSource->bFrameExported = XTRUE;
+        pSource->nFrameWidth = pFrame->nWidth;
+        pSource->nFrameHeight = pFrame->nHeight;
+        pSource->bFrameFresh = XTRUE;
+
+        XSync_Unlock(&pSource->frameLock);
+
+        DirectGate_WL_SourceReturn(pStaleCapture, pFrame->pCapture, pStale);
+        DirectGate_WL_SourceSignal(pSource);
+
+        return;
+    }
+
     size_t nNeeded = (size_t)pFrame->nWidth * pFrame->nHeight * 4U;
 
     XSync_Lock(&pSource->frameLock);
+
+    /* A renegotiation can turn an exporting stream back into a mapped one
+     * mid-session; anything left over from before it belongs to the
+     * compositor and goes back before this frame takes the slot. */
+    void *pStale = pSource->bFrameExported ? pSource->pFrameHandle : NULL;
+    directgate_wl_capture_t *pStaleCapture = pSource->pFrameCapture;
+
+    pSource->bFrameExported = XFALSE;
+    pSource->pFrameHandle = NULL;
 
     if (pSource->nFrameSize < nNeeded)
     {
@@ -158,6 +255,8 @@ static void DirectGate_WL_OnFrame(void *pUserCtx, const directgate_wl_frame_t *p
         if (pGrown == NULL)
         {
             XSync_Unlock(&pSource->frameLock);
+            DirectGate_WL_SourceReturn(pStaleCapture, pFrame->pCapture, pStale);
+
             return;
         }
 
@@ -181,6 +280,9 @@ static void DirectGate_WL_OnFrame(void *pUserCtx, const directgate_wl_frame_t *p
     pSource->bFrameFresh = XTRUE;
 
     XSync_Unlock(&pSource->frameLock);
+
+    DirectGate_WL_SourceReturn(pStaleCapture, pFrame->pCapture, pStale);
+    DirectGate_WL_SourceSignal(pSource);
 }
 
 static void* DirectGate_WL_SetupWorker(void *pCtx)
@@ -255,7 +357,7 @@ static void* DirectGate_WL_SetupWorker(void *pCtx)
 
     pSource->pCapture = DirectGate_WL_CaptureStart(nFd,
         DirectGate_WL_PortalNodeId(pSource->pPortal),
-        DirectGate_WL_OnFrame, pSource, sError, sizeof(sError));
+        DirectGate_WL_OnFrame, pSource, pSource->bWantDmaBuf, sError, sizeof(sError));
 
     if (pSource->pCapture == NULL)
     {
@@ -281,11 +383,15 @@ static void* DirectGate_WL_SetupWorker(void *pCtx)
     return NULL;
 }
 
-directgate_wl_source_t* DirectGate_WL_SourceCreate(const char *pTokenPath)
+directgate_wl_source_t* DirectGate_WL_SourceCreate(const char *pTokenPath, xbool_t bWantDmaBuf)
 {
     directgate_wl_source_t *pSource = (directgate_wl_source_t*)calloc(1, sizeof(*pSource));
     XCHECK_NL((pSource != NULL), NULL);
 
+    /* Not zero: calloc's zero is standard input, and closing that on the way
+     * out would take the agent's own descriptor with it. */
+    pSource->nFrameFd = -1;
+    pSource->bWantDmaBuf = bWantDmaBuf;
     pSource->eState = DIRECTGATE_WL_PENDING;
     if (xstrused(pTokenPath))
         xstrncpy(pSource->sTokenPath, sizeof(pSource->sTokenPath), pTokenPath);
@@ -303,12 +409,24 @@ directgate_wl_source_t* DirectGate_WL_SourceCreate(const char *pTokenPath)
         return NULL;
     }
 
+    /* Losing this costs latency, not frames: without it the encoder falls
+     * back to looking for a frame on its own tick, which is what it did
+     * before there was one. Not a reason to refuse the session. */
+    pSource->nFrameFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (pSource->nFrameFd < 0)
+    {
+        xlogw("Failed to create the Wayland frame signal, frames will wait for the next tick: error(%s)",
+            strerror(errno));
+    }
+
     /* Started last: the thread publishes into this struct from its first
      * line, so everything it touches has to exist before it runs. */
     if (XThread_Create(&pSource->setupThread, DirectGate_WL_SetupWorker, pSource, XFALSE) < 0)
     {
         XSync_Destroy(&pSource->stateLock);
         XSync_Destroy(&pSource->frameLock);
+        if (pSource->nFrameFd >= 0) close(pSource->nFrameFd);
+
         free(pSource);
         return NULL;
     }
@@ -402,7 +520,7 @@ int DirectGate_WL_SourceSelect(directgate_wl_source_t *pSource, uint32_t nNodeId
     }
 
     directgate_wl_capture_t *pCapture = DirectGate_WL_CaptureStart(nFd, nNodeId,
-        DirectGate_WL_OnFrame, pSource, sError, sizeof(sError));
+        DirectGate_WL_OnFrame, pSource, pSource->bWantDmaBuf, sError, sizeof(sError));
 
     if (pCapture == NULL)
     {
@@ -422,10 +540,21 @@ int DirectGate_WL_SourceSelect(directgate_wl_source_t *pSource, uint32_t nNodeId
     directgate_wl_capture_t *pOld = pSource->pCapture;
 
     XSync_Lock(&pSource->frameLock);
+    void *pPending = pSource->bFrameExported ? pSource->pFrameHandle : NULL;
+    directgate_wl_capture_t *pPendingCapture = pSource->pFrameCapture;
+
     pSource->pCapture = pCapture;
     pSource->nActiveNode = nNodeId;
     pSource->bFrameFresh = XFALSE;
+    pSource->bFrameExported = XFALSE;
+    pSource->pFrameHandle = NULL;
+    pSource->pFrameCapture = NULL;
     XSync_Unlock(&pSource->frameLock);
+
+    /* Before the stream that owns it is stopped, and from a thread that is
+     * not its loop - so this one locks rather than drops. */
+    if (pPending != NULL && pPendingCapture != NULL)
+        DirectGate_WL_CaptureRelease(pPendingCapture, pPending);
 
     if (pOld != NULL) DirectGate_WL_CaptureStop(pOld);
 
@@ -439,15 +568,52 @@ directgate_wl_portal_t* DirectGate_WL_SourcePortal(directgate_wl_source_t *pSour
     return pSource->pPortal;
 }
 
-int DirectGate_WL_SourceTakeFrame(directgate_wl_source_t *pSource, uint8_t *pDst,
-                                  uint32_t nWidth, uint32_t nHeight)
+int DirectGate_WL_SourceWaitFrame(directgate_wl_source_t *pSource, uint64_t nTimeoutUs)
 {
-    XCHECK((pSource != NULL && pDst != NULL), XSTDERR);
+    XCHECK((pSource != NULL), XSTDERR);
+    if (pSource->nFrameFd < 0) return XSTDNON;
+
+    uint64_t nDeadlineUs = DirectGate_WL_MonotonicUs() + nTimeoutUs;
+
+    for (;;)
+    {
+        /* The signals left behind by frames that have already been encoded
+         * would return this at once with nothing new to show. They are
+         * cleared before the flag is read and never after: a frame published
+         * in between is still seen by the read, and one published after it
+         * leaves its own signal for the poll below. */
+        uint64_t nTicks = 0;
+        while (read(pSource->nFrameFd, &nTicks, sizeof(nTicks)) > 0) { /* drain */ }
+
+        XSync_Lock(&pSource->frameLock);
+        xbool_t bFresh = pSource->bFrameFresh;
+        XSync_Unlock(&pSource->frameLock);
+
+        if (bFresh) return XSTDOK;
+
+        uint64_t nNowUs = DirectGate_WL_MonotonicUs();
+        if (nNowUs >= nDeadlineUs) return XSTDNON;
+
+        struct pollfd waitFd;
+        waitFd.fd = pSource->nFrameFd;
+        waitFd.events = POLLIN;
+        waitFd.revents = 0;
+
+        int nCount = poll(&waitFd, 1, (int)((nDeadlineUs - nNowUs + 999ULL) / 1000ULL));
+        if (nCount == 0) return XSTDNON;
+        if (nCount < 0 && errno != EINTR) return XSTDERR;
+    }
+}
+
+int DirectGate_WL_SourceTakeFrame(directgate_wl_source_t *pSource, uint8_t **ppDst,
+                                  size_t nDstSize, uint32_t nWidth, uint32_t nHeight)
+{
+    XCHECK((pSource != NULL && ppDst != NULL && *ppDst != NULL), XSTDERR);
     XCHECK((nWidth > 0 && nHeight > 0), XSTDERR);
 
     XSync_Lock(&pSource->frameLock);
 
-    if (!pSource->bFrameFresh || pSource->pFrame == NULL)
+    if (!pSource->bFrameFresh || pSource->bFrameExported || pSource->pFrame == NULL)
     {
         XSync_Unlock(&pSource->frameLock);
         return XSTDNON;
@@ -455,11 +621,14 @@ int DirectGate_WL_SourceTakeFrame(directgate_wl_source_t *pSource, uint8_t *pDst
 
     if (pSource->nFrameWidth == nWidth && pSource->nFrameHeight == nHeight)
     {
-        memcpy(pDst, pSource->pFrame, (size_t)nWidth * nHeight * 4U);
+        uint8_t *pSwap = pSource->pFrame;
+        pSource->pFrame = *ppDst;
+        pSource->nFrameSize = nDstSize;
+        *ppDst = pSwap;
     }
     else
     {
-        DirectGate_YUV_ScaleBGRA(pDst, nWidth, nHeight, pSource->pFrame,
+        DirectGate_YUV_ScaleBGRA(*ppDst, nWidth, nHeight, pSource->pFrame,
             pSource->nFrameWidth, pSource->nFrameHeight,
             (size_t)pSource->nFrameWidth * 4U);
     }
@@ -470,6 +639,67 @@ int DirectGate_WL_SourceTakeFrame(directgate_wl_source_t *pSource, uint8_t *pDst
     return XSTDOK;
 }
 
+xbool_t DirectGate_WL_SourceIsDmaBuf(directgate_wl_source_t *pSource, uint32_t *pFourCC, uint64_t *pModifier)
+{
+    XCHECK_NL((pSource != NULL && pSource->pCapture != NULL), XFALSE);
+    return DirectGate_WL_CaptureIsDmaBuf(pSource->pCapture, pFourCC, pModifier);
+}
+
+int DirectGate_WL_SourceTakeDmaBuf(directgate_wl_source_t *pSource, directgate_desktop_dmabuf_t *pFrame, void **ppHandle)
+{
+    XCHECK((pSource != NULL && pFrame != NULL && ppHandle != NULL), XSTDERR);
+
+    XSync_Lock(&pSource->frameLock);
+
+    if (!pSource->bFrameFresh || !pSource->bFrameExported || pSource->pFrameHandle == NULL)
+    {
+        XSync_Unlock(&pSource->frameLock);
+        return XSTDNON;
+    }
+
+    /* Handed over whole: the descriptors are copied out, the buffer becomes
+     * the caller's, and the slot is empty until the compositor fills it
+     * again. Which stream it belongs to is remembered here rather than read
+     * back later, so that giving it back cannot land on another one. */
+    *pFrame = pSource->frameDma;
+    *ppHandle = pSource->pFrameHandle;
+
+    pSource->pTakenCapture = pSource->pFrameCapture;
+    pSource->pFrameHandle = NULL;
+    pSource->bFrameFresh = XFALSE;
+
+    XSync_Unlock(&pSource->frameLock);
+    return XSTDOK;
+}
+
+void DirectGate_WL_SourceReleaseFrame(directgate_wl_source_t *pSource, void *pHandle)
+{
+    XCHECK_VOID_NL((pSource != NULL && pHandle != NULL));
+    if (pSource->pTakenCapture != NULL) DirectGate_WL_CaptureRelease(pSource->pTakenCapture, pHandle);
+}
+
+void DirectGate_WL_SourceDisableDmaBuf(directgate_wl_source_t *pSource)
+{
+    XCHECK_VOID_NL((pSource != NULL));
+
+    XSync_Lock(&pSource->frameLock);
+    void *pPending = pSource->bFrameExported ? pSource->pFrameHandle : NULL;
+    directgate_wl_capture_t *pPendingCapture = pSource->pFrameCapture;
+
+    pSource->bFrameExported = XFALSE;
+    pSource->bFrameFresh = XFALSE;
+    pSource->pFrameHandle = NULL;
+    pSource->bWantDmaBuf = XFALSE;
+    XSync_Unlock(&pSource->frameLock);
+
+    /* The compositor's pool is put back the way it was found before it is
+     * asked to start filling it differently. */
+    if (pPending != NULL && pPendingCapture != NULL)
+        DirectGate_WL_CaptureRelease(pPendingCapture, pPending);
+
+    if (pSource->pCapture != NULL) DirectGate_WL_CaptureDisableDmaBuf(pSource->pCapture);
+}
+
 void DirectGate_WL_SourceDestroy(directgate_wl_source_t *pSource)
 {
     XCHECK_VOID_NL((pSource != NULL));
@@ -478,11 +708,27 @@ void DirectGate_WL_SourceDestroy(directgate_wl_source_t *pSource)
      * is joined rather than abandoned: it writes into this struct, and there
      * is no safe way to free memory a live thread still owns. */
     if (pSource->bThreadStarted) XThread_Join(&pSource->setupThread);
+
+    /* An exported buffer still in the slot belongs to the stream below and
+     * has to go back before it is torn down. Nothing is racing for it: the
+     * encoder that could have taken it was stopped before this. */
+    if (pSource->bFrameExported && pSource->pFrameHandle != NULL && pSource->pFrameCapture != NULL)
+    {
+        DirectGate_WL_CaptureRelease(pSource->pFrameCapture, pSource->pFrameHandle);
+        pSource->pFrameHandle = NULL;
+        pSource->bFrameExported = XFALSE;
+    }
+
     if (pSource->pCapture != NULL) DirectGate_WL_CaptureStop(pSource->pCapture);
     if (pSource->pPortal != NULL) DirectGate_WL_PortalClose(pSource->pPortal);
 
     XSync_Destroy(&pSource->stateLock);
     XSync_Destroy(&pSource->frameLock);
+
+    /* Only now: the capture thread writes to it on every frame, and it has
+     * been stopped above. */
+    if (pSource->nFrameFd >= 0) close(pSource->nFrameFd);
+
     free(pSource->pFrame);
     free(pSource);
 }

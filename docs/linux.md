@@ -24,6 +24,8 @@ Configure prints which one it took:
 -- Wayland desktop streaming: enabled (PipeWire 1.4.11 headers, runtime dlopen)
 ```
 
+Any PipeWire from 0.3.6 onwards will do. The build images are older than the SPA headers that name the DMA-BUF negotiation constants and report a buffer layout through the parsed format struct, so the two flags are defined here when the header does not carry them - their values are part of the pod wire format and have never moved - and the layout is read from the format itself, where it has always been.
+
 If it says `disabled`, the agent reports *"This agent was built without Wayland desktop streaming"* at run time. Install the packages and **re-run cmake** - a plain `cmake --build` will not re-check. If configure still says disabled afterwards, delete `CMakeCache.txt` and configure again.
 
 ## Wayland sessions
@@ -61,6 +63,24 @@ Desktop portal accepted the input options: options(types+persist)           <- p
 Desktop sharing permission remembered: restore(yes)                         <- a token came back
 Wayland sharing permission stored; the next connection should not prompt
 ```
+
+**The encoder is the same one Xorg uses.** A Wayland session is a different *source* of frames, not a second pipeline: the portal's PipeWire stream replaces the XShm capture, and everything after it - the scale to the encode size, the colour conversion, the GPU encoder probe (`h264_nvenc` -> `h264_vaapi` -> `h264_qsv` -> `h264_amf` -> `h264_v4l2m2m`), the adaptive bitrate controller, the frame mailbox - is the code in `desktop_linux.c` that Xorg runs. Hardware encoding is therefore neither enabled nor disabled by the session type, and the pipeline start line names the backend the frames actually came from:
+
+```
+Wayland H.264 pipeline started: sid(3), capture(0,0 2560x1440), encode(1920x1080), shm(n/a), encoder(hardware: h264_vaapi, zero-copy DMA-BUF), preset(balanced)
+```
+
+What does differ is *when* a frame reaches that encoder. Xorg is pulled - being due and capturing are the same instant, so what is encoded is the screen as it is right now - while PipeWire pushes on the compositor's clock and sends nothing at all while the screen is still. A tick that finds nothing has therefore not proved the desktop is idle, so the capture thread waits for the frame (for at most one frame period, which the tick has already spent) instead of going back to sleep and letting a change that landed a millisecond too late sit there until the next one. That is worth up to a whole frame period on exactly the case a remote desktop is judged on: the first frame after a still moment, which is what a keystroke produces. The frame itself is then handed to the encoder rather than copied into it.
+
+**Zero-copy: the frame need not come back to the CPU at all.** When the encoder that would be used is VAAPI, the agent offers the compositor a second way to hand frames over - as DMA-BUF, the GPU buffer itself rather than a readback of it. What arrives is then a handle, not pixels: it is mapped into a VAAPI surface (`av_hwframe_map`), the driver's video post-processor does the colour conversion *and* the resize to the encode size (`scale_vaapi`), and the encoder is opened on the post-processor's own output pool so the surface it writes is the surface the encoder reads. Nothing between the screen and the H.264 bitstream is read, converted or copied by this process. On a 4K screen that removes a GPU readback, two full-frame copies, a scalar BGRA-to-NV12 pass and an upload, per frame.
+
+It is an offer, and every part of it can decline:
+
+- **The encoder.** Only VAAPI can be handed a DRM object through libavcodec, so a host whose encoder is NVENC keeps the copied path. `libavfilter` is dlopen'd for the post-processor exactly like libavcodec and is optional at build time; without it, or without a `scale_vaapi` filter in the installed FFmpeg, or without any VAAPI device, the offer is never made.
+- **The compositor.** The agent offers only the `INVALID` (driver's own) and `LINEAR` buffer layouts, because naming the tiled ones a GPU supports would mean linking an EGL stack into the agent. A compositor that will only produce something else simply negotiates the memory format instead, which is offered alongside.
+- **The GPU, at the first frame.** An import the driver refuses cannot be discovered by asking, only by trying. The stream is then renegotiated for mapped memory in place and the encoder is rebuilt around it - the portal grant is untouched, so nobody is prompted and the session carries on with a keyframe.
+
+`DIRECTGATE_HWENC_ZEROCOPY=0` turns the offer off. The pipeline start line says which way it went: `encoder(hardware: h264_vaapi, zero-copy DMA-BUF)` against `encoder(hardware: h264_vaapi (VA-API H.264 encoder))`, and the capture line says `frames(exported by the GPU)` or `frames(mapped memory)`.
 
 One behaviour differs from X11 and is the compositor's rule, not a choice this agent makes:
 

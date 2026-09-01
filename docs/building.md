@@ -19,6 +19,8 @@ For H.264 desktop streaming on Linux the agent loads `libopenh264.so` at runtime
 
 Linux desktop sessions prefer the **GPU** encoder when one is usable (NVENC, VAAPI, QSV, AMF or V4L2 M2M), reached through libavcodec. If the `libavcodec`/`libavutil` development headers are present at configure time - `ffmpeg-devel` on Fedora, `libavcodec-dev libavutil-dev` on Debian/Ubuntu - CMake reports `GPU desktop encoding: enabled` and compiles the support in; the libraries themselves are dlopen'd at runtime and never linked, so they stay optional and add no package dependency. Building without those headers, or running on a host with no libavcodec, no GPU or no usable encoder, simply keeps the OpenH264 software path. Set `DIRECTGATE_HWENC=0` to force software encoding, or `DIRECTGATE_HWENC_ENCODER=h264_vaapi` to pin one.
 
+`libavfilter`'s headers (`libavfilter-dev`, part of `ffmpeg-devel`) are looked for alongside and are equally optional: they add the GPU post-processor that the Wayland zero-copy path needs to convert an imported DMA-BUF into something the encoder takes, and CMake reports `Wayland zero-copy encoding: enabled` when they are there. Without them everything else builds and runs unchanged and the compositor is simply never asked to export its frames - see [Desktop streaming on Linux](linux.md#wayland-sessions). `DIRECTGATE_HWENC_ZEROCOPY=0` turns it off at run time.
+
 ### Talking to more than one libavcodec
 
 The struct layouts come from the build-time headers, so one compiled encoder only accepts a runtime libavcodec with the *same major soname* - a mismatch is treated like "not installed" and falls back to software, silently. A single build would therefore reach the GPU only on hosts running the same FFmpeg generation as the machine that built it.
@@ -26,7 +28,7 @@ The struct layouts come from the build-time headers, so one compiled encoder onl
 A binary meant to run on machines other than the one that built it can carry several instead. [`misc/ffmpeg-headers.sh`](../misc/ffmpeg-headers.sh) populates a directory with one FFmpeg public-header tree per major, and `DIRECTGATE_HWENC_HEADERS` points CMake at it:
 
 ```
-<dir>/58/libavcodec/*.h   <dir>/58/libavutil/*.h
+<dir>/58/libavcodec/*.h   <dir>/58/libavutil/*.h   <dir>/58/libavfilter/*.h
 <dir>/59/...              <dir>/60/...   <dir>/61/...   <dir>/62/...
 ```
 
@@ -45,11 +47,11 @@ A binary meant to run on machines other than the one that built it can carry sev
 cmake -B build -DDIRECTGATE_HWENC_HEADERS=/tmp/ffmpeg-headers
 ```
 
-The trees are ordinary `libavcodec/` and `libavutil/` directories from an FFmpeg release tarball, plus a `libavutil/avconfig.h` (two macros, which FFmpeg's `configure` normally generates) - so a distribution's own `-dev` package works just as well if you symlink it in. CMake takes whatever majors it finds, so adding one as distributions move on means another release line in that script plus the matching pair of `#if` blocks in `hwenc_abi.c`.
+The trees are ordinary `libavcodec/`, `libavutil/` and `libavfilter/` directories from an FFmpeg release tarball, plus a `libavutil/avconfig.h` (two macros, which FFmpeg's `configure` normally generates) - so a distribution's own `-dev` package works just as well if you symlink it in. CMake takes whatever majors it finds, so adding one as distributions move on means another release line in that script plus the matching pair of `#if` blocks in `hwenc_abi.c`.
 
 A plain `cmake -B build` passes no header trees and keeps the single-variant behaviour, compiled against whatever FFmpeg is installed - which is what you want on a machine that only has to run its own build.
 
-Two switches guard this for release builds, and the `hwenc-abi` CI job exercises both on every push. `-DDIRECTGATE_REQUIRE_HWENC=ON` fails at configure time when no FFmpeg headers are found at all, instead of quietly producing a permanently software-only binary - the decision is baked in at compile time and no user can repair it afterwards. And the `hwenc_abi_smoke` test loads the build machine's own libavcodec through the dispatcher, so a variant that compiles but cannot be selected fails too.
+Two switches guard this for release builds, and the `hwenc-abi` CI job exercises both on every push. `-DDIRECTGATE_REQUIRE_HWENC=ON` fails at configure time when no FFmpeg headers are found at all, instead of quietly producing a permanently software-only binary - the decision is baked in at compile time and no user can repair it afterwards. And the `hwenc_abi_smoke` test loads the build machine's own libavcodec through the dispatcher, so a variant that compiles but cannot be selected fails too; on a machine with a usable GPU it goes on to build the whole Wayland zero-copy chain - libavfilter, the post-processor graph and an encoder opened on its frame pool - which is the part with the most that can differ between hosts.
 
 On macOS and Windows desktop streaming uses only OS components (ScreenCaptureKit + VideoToolbox, and DXGI Desktop Duplication + Media Foundation respectively) - nothing extra to install; see [Building for Windows](windows.md#desktop-streaming) for the Windows specifics.
 

@@ -54,6 +54,11 @@ typedef struct directgate_hwenc_abi_ {
     int (*pEncode)(directgate_hwenc_t*, const uint8_t*, uint64_t, xbool_t, xbyte_buffer_t*, xbool_t*);
     int (*pApplyQuality)(directgate_hwenc_t*, const directgate_desktop_quality_t*);
     int (*pSetBitrate)(directgate_hwenc_t*, uint32_t);
+    xbool_t (*pImportAvailable)(char*, size_t);
+    directgate_hwenc_t* (*pCreateImport)(uint32_t, uint32_t, uint32_t, uint64_t,
+        uint32_t, uint32_t, const directgate_desktop_quality_t*, char*, size_t);
+    int (*pEncodeImport)(directgate_hwenc_t*, const directgate_desktop_dmabuf_t*,
+        uint64_t, xbool_t, xbyte_buffer_t*, xbool_t*);
 } directgate_hwenc_abi_t;
 
 /* Mirrors the renaming hwenc.c applies to itself under DIRECTGATE_HWENC_ABI. */
@@ -68,7 +73,13 @@ typedef struct directgate_hwenc_abi_ {
         xbool_t, xbyte_buffer_t*, xbool_t*);                                            \
     int DirectGate_HWEnc_ApplyQuality_abi##v(directgate_hwenc_t*,                       \
         const directgate_desktop_quality_t*);                                           \
-    int DirectGate_HWEnc_SetBitrate_abi##v(directgate_hwenc_t*, uint32_t)
+    int DirectGate_HWEnc_SetBitrate_abi##v(directgate_hwenc_t*, uint32_t);              \
+    xbool_t DirectGate_HWEnc_ImportAvailable_abi##v(char*, size_t);                     \
+    directgate_hwenc_t* DirectGate_HWEnc_CreateImport_abi##v(uint32_t, uint32_t,        \
+        uint32_t, uint64_t, uint32_t, uint32_t,                                         \
+        const directgate_desktop_quality_t*, char*, size_t);                            \
+    int DirectGate_HWEnc_EncodeImport_abi##v(directgate_hwenc_t*,                       \
+        const directgate_desktop_dmabuf_t*, uint64_t, xbool_t, xbyte_buffer_t*, xbool_t*)
 
 #define DIRECTGATE_HWENC_ENTRY(v) {                 \
     (v),                                            \
@@ -79,7 +90,10 @@ typedef struct directgate_hwenc_abi_ {
     DirectGate_HWEnc_Describe_abi##v,               \
     DirectGate_HWEnc_Encode_abi##v,                 \
     DirectGate_HWEnc_ApplyQuality_abi##v,           \
-    DirectGate_HWEnc_SetBitrate_abi##v              \
+    DirectGate_HWEnc_SetBitrate_abi##v,             \
+    DirectGate_HWEnc_ImportAvailable_abi##v,        \
+    DirectGate_HWEnc_CreateImport_abi##v,           \
+    DirectGate_HWEnc_EncodeImport_abi##v            \
 }
 
 /* CMake defines DIRECTGATE_HWENC_HAS_<major> for each variant it built, so the
@@ -224,6 +238,37 @@ int DirectGate_HWEnc_SetBitrate(directgate_hwenc_t *pEncoder, uint32_t nBitrateK
 {
     XCHECK_NL((pEncoder != NULL && g_pHwencAbi != NULL), XSTDERR);
     return g_pHwencAbi->pSetBitrate(pEncoder, nBitrateKbps);
+}
+
+xbool_t DirectGate_HWEnc_ImportAvailable(char *pErrBuf, size_t nErrSize)
+{
+    /* Asked before anything else on a Wayland session - it decides what the
+     * compositor is asked to hand over - so the variant is selected here too. */
+    if (DirectGate_HWEnc_Load(pErrBuf, nErrSize) != XSTDOK) return XFALSE;
+    return g_pHwencAbi->pImportAvailable(pErrBuf, nErrSize);
+}
+
+directgate_hwenc_t* DirectGate_HWEnc_CreateImport(uint32_t nSrcWidth, uint32_t nSrcHeight,
+                                                  uint32_t nFourCC, uint64_t nModifier,
+                                                  uint32_t nWidth, uint32_t nHeight,
+                                                  const directgate_desktop_quality_t *pQuality,
+                                                  char *pErrBuf, size_t nErrSize)
+{
+    if (DirectGate_HWEnc_Load(pErrBuf, nErrSize) != XSTDOK) return NULL;
+
+    return g_pHwencAbi->pCreateImport(nSrcWidth, nSrcHeight, nFourCC, nModifier,
+        nWidth, nHeight, pQuality, pErrBuf, nErrSize);
+}
+
+int DirectGate_HWEnc_EncodeImport(directgate_hwenc_t *pEncoder,
+                                  const directgate_desktop_dmabuf_t *pFrame,
+                                  uint64_t nPtsUs,
+                                  xbool_t bForceKeyframe,
+                                  xbyte_buffer_t *pOut,
+                                  xbool_t *pKeyframe)
+{
+    XCHECK_NL((pEncoder != NULL && g_pHwencAbi != NULL), XSTDERR);
+    return g_pHwencAbi->pEncodeImport(pEncoder, pFrame, nPtsUs, bForceKeyframe, pOut, pKeyframe);
 }
 
 #endif /* DIRECTGATE_HAVE_HWENC */
