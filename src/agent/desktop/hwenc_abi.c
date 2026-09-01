@@ -255,9 +255,7 @@ directgate_hwenc_t* DirectGate_HWEnc_CreateImport(uint32_t nSrcWidth, uint32_t n
                                                   char *pErrBuf, size_t nErrSize)
 {
     if (DirectGate_HWEnc_Load(pErrBuf, nErrSize) != XSTDOK) return NULL;
-
-    return g_pHwencAbi->pCreateImport(nSrcWidth, nSrcHeight, nFourCC, nModifier,
-        nWidth, nHeight, pQuality, pErrBuf, nErrSize);
+    return g_pHwencAbi->pCreateImport(nSrcWidth, nSrcHeight, nFourCC, nModifier, nWidth, nHeight, pQuality, pErrBuf, nErrSize);
 }
 
 int DirectGate_HWEnc_EncodeImport(directgate_hwenc_t *pEncoder,
