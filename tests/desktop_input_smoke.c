@@ -293,6 +293,32 @@ int main(void)
     CHECK(desktop.scratchKeys[1].bHeld == XFALSE, "release did not unpin the slot");
     CHECK(desktop.scratchKeys[0].bHeld == XTRUE, "release unpinned the wrong slot");
 
+    /* Pointer buttons. A release the host has no press for is dropped: on
+       Windows a bare right-button up *is* the context-menu gesture, so a
+       client letting go of buttons it never held popped a menu on the remote
+       desktop every time the browser lost focus. (The struct above still has
+       its zeroed button mask; the scratch-key tests do not touch it.) */
+    CHECK(!DirectGate_Desktop_TrackPointerButton(&desktop, 3, XFALSE),
+        "release of an unpressed button was injected");
+    CHECK(DirectGate_Desktop_TrackPointerButton(&desktop, 3, XTRUE),
+        "button press was dropped");
+    CHECK(DirectGate_Desktop_TrackPointerButton(&desktop, 3, XFALSE),
+        "release of a held button was dropped");
+    CHECK(!DirectGate_Desktop_TrackPointerButton(&desktop, 3, XFALSE),
+        "the same button was released twice");
+
+    /* Buttons are tracked apart, so a blanket release still lets go of the
+       one button that is actually down. */
+    CHECK(DirectGate_Desktop_TrackPointerButton(&desktop, 1, XTRUE),
+        "left press was dropped");
+    CHECK(!DirectGate_Desktop_TrackPointerButton(&desktop, 2, XFALSE),
+        "unpressed middle release rode along with the left one");
+    CHECK(DirectGate_Desktop_TrackPointerButton(&desktop, 1, XFALSE),
+        "held left release was dropped");
+    CHECK(desktop.nPointerButtons == 0, "button mask left dirty");
+    CHECK(!DirectGate_Desktop_TrackPointerButton(&desktop, 0, XTRUE),
+        "button id 0 accepted");
+
     printf("desktop_input_smoke: OK\n");
     return 0;
 }
