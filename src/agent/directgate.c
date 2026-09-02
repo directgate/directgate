@@ -34,6 +34,7 @@
 #include "files.h"
 #include "term.h"
 #include "desktop.h"
+#include "auth.h"
 #include "e2e.h"
 #include "srp.h"
 
@@ -214,7 +215,11 @@ static const char* DirectGate_GetRelayUrl(const directgate_cfg_t *pCfg)
     return pCfg->sRelayUrl;
 }
 
-static xbool_t DirectGate_IsReconnectSuppressedReason(const char *pReason)
+/* Reasons a relay cites when it believes this device is no longer enrolled. The relay is not the authority on that:
+   the error frame carrying them is unauthenticated and unencrypted, so acting on one directly would let anything able
+   to inject a single frame wipe the enrollment and keep the device offline until somebody re-pairs it by hand. The
+   claim only schedules a check against the API, which is authenticated over TLS and does hold that authority. */
+static xbool_t DirectGate_IsEnrollmentDoubtReason(const char *pReason)
 {
     XCHECK_NL((xstrused(pReason)), XFALSE);
     return (xstrcmp(pReason, "device-revoked") ||
@@ -381,19 +386,25 @@ static xbool_t DirectGate_PreConnectRefresh(directgate_conn_t *pConn)
     XCHECK_NL((pCfg->enroll.bEnrolled), XFALSE);
 
     xbool_t bStartupRefresh = !pConn->bStartupRelayRefreshDone;
-    if (!bStartupRefresh && !DirectGate_Enroll_NeedsRefresh(pCfg)) return XTRUE;
+    xbool_t bDoubt = pConn->bEnrollmentDoubt;
+
+    if (!bStartupRefresh && !bDoubt && !DirectGate_Enroll_NeedsRefresh(pCfg)) return XTRUE;
     if (bStartupRefresh) pConn->bStartupRelayRefreshDone = XTRUE;
+    pConn->bEnrollmentDoubt = XFALSE;
 
     xlogi("%s access token before connect: id(%u), fd(%d), relay(%s)",
-        bStartupRefresh ? "Resolving relay and refreshing" : "Refreshing",
+        bDoubt ? "Verifying the relay's enrollment claim and refreshing" :
+        (bStartupRefresh ? "Resolving relay and refreshing" : "Refreshing"),
         DirectGate_Conn_GetID(pConn, NULL), DirectGate_Conn_GetFD(pConn, NULL),
         xstrused(pCfg->sRelayUrl) ? pCfg->sRelayUrl : DIRECTGATE_NO_ANSWER);
 
     char sReason[XSTR_TINY];
     directgate_enroll_status_t eStatus = DirectGate_Enroll_Refresh(pCfg, sReason, sizeof(sReason));
 
-    return DirectGate_HandleRefreshStatus(pConn, eStatus, sReason, bStartupRefresh ?
-        "startup relay refresh" : "pre-connect token refresh", XFALSE);
+    const char *pStage = bDoubt ? "relay-reported enrollment check" :
+        (bStartupRefresh ? "startup relay refresh" : "pre-connect token refresh");
+
+    return DirectGate_HandleRefreshStatus(pConn, eStatus, sReason, pStage, XFALSE);
 }
 
 /* If reconnects keep failing, ask the API for a fresh relay URL. If presence
@@ -884,8 +895,14 @@ static int DirectGate_HandleError(xapi_session_t *pApiSession, directgate_pkg_t 
         DirectGate_Conn_GetFD(pConn, pApiSession),
         pReason);
 
-    if (pConn != NULL && DirectGate_IsReconnectSuppressedReason(pReason))
-        DirectGate_SuppressReconnect(pConn, pReason);
+    /* Recorded, not acted on. The next connect asks the API, and only its answer clears the enrollment. */
+    if (pConn != NULL && DirectGate_IsEnrollmentDoubtReason(pReason))
+    {
+        xlogw("Relay reports this device is no longer enrolled, asking the API before acting: id(%u), fd(%d), reason(%s)",
+            DirectGate_Conn_GetID(pConn, pApiSession), DirectGate_Conn_GetFD(pConn, pApiSession), pReason);
+
+        pConn->bEnrollmentDoubt = XTRUE;
+    }
 
     return XAPI_CONTINUE;
 }
@@ -1813,6 +1830,7 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
             xloge("Key-auth proof verification failed: sid(%u), wsfd(%d)",
                 pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
 
+            DirectGate_SessionMgr_NoteAuthFailure(&pConn->mgr);
             DirectGate_KeyAuth_Cleanse(&pSession->keyauth);
             pSession->bKeyAuthActive = XFALSE;
 
@@ -1854,6 +1872,8 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
         }
 
         DirectGate_KeyAuth_Cleanse(&pSession->keyauth);
+        DirectGate_SessionMgr_NoteAuthSuccess(&pConn->mgr);
+
         pSession->bKeyAuthActive = XFALSE;
         pSession->bAuthenticated = XTRUE;
         pSession->term.bEncrypt = XTRUE;
@@ -2020,6 +2040,7 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
                     pTemporaryShare->bUsed = XTRUE;
             }
 
+            DirectGate_SessionMgr_NoteAuthFailure(&pConn->mgr);
             DirectGate_Session_SendAuthResp(pSession, "failed", NULL, "invalid proof");
             return DirectGate_Session_Close(pSession, "SRP proof failed");
         }
@@ -2054,6 +2075,7 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
             return DirectGate_Session_Close(pSession, "E2E key derivation failed");
         }
 
+        DirectGate_SessionMgr_NoteAuthSuccess(&pConn->mgr);
         pSession->bAuthenticated = XTRUE;
         pSession->term.bEncrypt = XTRUE;
 

@@ -730,7 +730,9 @@ static void DirectGate_WinLauncher_SendSAS(void)
 
     if (!bResolved)
     {
-        HMODULE hSas = LoadLibraryW(L"sas.dll");
+        /* System32 only. A bare name lets the loader consider the application directory first, and this process
+           is LocalSystem - the one place where an unexpected DLL on the search path would be worth planting. */
+        HMODULE hSas = LoadLibraryExW(L"sas.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (hSas != NULL) pSendSAS = (directgate_send_sas_fn)(void*)GetProcAddress(hSas, "SendSAS");
         bResolved = XTRUE;
     }
@@ -875,6 +877,59 @@ static void DirectGate_WinLauncher_Stop(void)
 }
 
 /*
+ * Windows gives a process object a default DACL that grants its own user full access, so anything running as
+ * shell.user can OpenProcess the agent with PROCESS_DUP_HANDLE or PROCESS_VM_READ. Either is enough to defeat the
+ * privilege separation this launcher exists to provide: the first steals the agent's handle to the SYSTEM desktop
+ * helper and drives privileged input through it, the second reads session keys, the SRP verifier and the identity
+ * seed straight out of the agent's memory. POSIX gets this for free from ptrace_scope; Windows has no equivalent
+ * default, so the launcher tightens the object itself while it still holds the only full-access handle.
+ *
+ * SYSTEM and Administrators keep full access - they can already do anything - and everyone else, the agent's own
+ * account included, is left with what it actually needs: query its own integrity level, wait on it, terminate it.
+ * The OWNER RIGHTS ACE is what makes that stick, because an owner otherwise keeps an implicit WRITE_DAC it could
+ * use to put the default DACL back.
+ */
+static void DirectGate_WinLauncher_ProtectAgent(HANDLE hProcess, HANDLE hToken)
+{
+    /* PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE */
+    static const char *pUserRights = "0x00101001";
+
+    uint8_t sUserBuf[SECURITY_MAX_SID_SIZE + sizeof(TOKEN_USER)];
+    LPSTR pUserSid = NULL;
+    DWORD nLen = 0;
+
+    if (GetTokenInformation(hToken, TokenUser, sUserBuf, (DWORD)sizeof(sUserBuf), &nLen))
+        ConvertSidToStringSidA(((TOKEN_USER*)sUserBuf)->User.Sid, &pUserSid);
+
+    char sSDDL[XSTR_MID];
+    if (pUserSid != NULL)
+    {
+        xstrncpyf(sSDDL, sizeof(sSDDL), "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;%s;;;%s)(A;;%s;;;OW)",
+            pUserRights, pUserSid, pUserRights);
+
+        LocalFree(pUserSid);
+    }
+    else xstrncpyf(sSDDL, sizeof(sSDDL), "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;%s;;;OW)", pUserRights);
+
+    PSECURITY_DESCRIPTOR pDescriptor = NULL;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(sSDDL, SDDL_REVISION_1, &pDescriptor, NULL))
+    {
+        xlogw("launcher: could not build the agent process DACL, leaving the default: error(%lu)", GetLastError());
+        return;
+    }
+
+    /* Best effort on purpose: a hardening step must not be the reason a device stops coming online. */
+    if (!SetKernelObjectSecurity(hProcess, DACL_SECURITY_INFORMATION, pDescriptor))
+    {
+        xlogw("launcher: could not restrict access to the agent process, its memory and "
+              "handles stay readable by the account it runs as: error(%lu)", GetLastError());
+    }
+    else xlogd("launcher: restricted access to the agent process");
+
+    LocalFree(pDescriptor);
+}
+
+/*
  * Spawn the agent itself (same executable, no launcher flag) inside shell.user's
  * session via their logon token, so the agent and everything it does runs AS
  * shell.user. The identity comes only from the token the launcher minted for the
@@ -981,6 +1036,10 @@ static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfg
 
     CloseHandle(pi.hThread);
     *phProcess = pi.hProcess;
+
+    /* Before the agent has done anything: from here on its memory and its handles are out of reach of the
+       account it runs as, which is what keeps a compromise of that account from reaching the SYSTEM helper. */
+    DirectGate_WinLauncher_ProtectAgent(pi.hProcess, hToken);
 
     /* Asked of the OS rather than assumed from the token: this is the session
        the supervisor watches for the rest of the agent's life, and a session

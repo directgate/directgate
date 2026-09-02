@@ -152,7 +152,7 @@ int DirectGate_MFEnc_Load(char *pErrBuf, size_t nErrSize)
     }
 
     pLib->bLoadAttempted = XTRUE;
-    HMODULE hModule = LoadLibraryW(L"mfplat.dll");
+    HMODULE hModule = LoadLibraryExW(L"mfplat.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (hModule == NULL)
     {
         DirectGate_MFEnc_SetError(pErrBuf, nErrSize,

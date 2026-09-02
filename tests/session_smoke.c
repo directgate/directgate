@@ -327,6 +327,40 @@ int main(void)
         "pre-auth rate limit should reset for a new window");
     DirectGate_SessionMgr_Destroy(&rateMgr);
 
+    /* Repeated rejected proofs have to cost the next attempt time, and a relay that drops the link must not be able
+       to buy back a clean slate: the count lives on the manager, which outlives a reconnect. */
+    directgate_session_mgr_t lockMgr;
+    DirectGate_SessionMgr_Init(&lockMgr, &cfg);
+
+    for (uint32_t i = 0; i < DIRECTGATE_AUTH_FAILURE_GRACE; i++)
+    {
+        DirectGate_SessionMgr_NoteAuthFailure(&lockMgr);
+        CHECK(!DirectGate_SessionMgr_IsAuthLocked(&lockMgr, NULL), "failures within the grace should not throttle");
+    }
+
+    DirectGate_SessionMgr_NoteAuthFailure(&lockMgr);
+    CHECK(DirectGate_SessionMgr_IsAuthLocked(&lockMgr, NULL), "the failure past the grace should throttle");
+    CHECK(DirectGate_SessionMgr_GetOrCreate(&lockMgr, &apiSession, 3000) == NULL,
+        "a throttled manager should refuse new pre-auth sessions");
+
+    uint64_t nFirstMs = 0;
+    CHECK(DirectGate_SessionMgr_IsAuthLocked(&lockMgr, &nFirstMs), "throttle should report its remaining time");
+
+    DirectGate_SessionMgr_NoteAuthFailure(&lockMgr);
+    uint64_t nSecondMs = 0;
+    CHECK(DirectGate_SessionMgr_IsAuthLocked(&lockMgr, &nSecondMs), "another failure should still throttle");
+    CHECK(nSecondMs > nFirstMs, "each further failure should cost more time than the last");
+
+    DirectGate_SessionMgr_Destroy(&lockMgr);
+    CHECK(DirectGate_SessionMgr_IsAuthLocked(&lockMgr, NULL),
+        "dropping the relay connection should not clear the throttle");
+
+    DirectGate_SessionMgr_NoteAuthSuccess(&lockMgr);
+    CHECK(!DirectGate_SessionMgr_IsAuthLocked(&lockMgr, NULL), "a successful proof should clear the throttle");
+    CHECK(DirectGate_SessionMgr_GetOrCreate(&lockMgr, &apiSession, 3001) != NULL,
+        "a cleared throttle should accept pre-auth sessions again");
+    DirectGate_SessionMgr_Destroy(&lockMgr);
+
     puts("session_smoke: OK");
     return 0;
 }

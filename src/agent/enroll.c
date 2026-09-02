@@ -89,6 +89,32 @@ static void DirectGate_Enroll_LogErrorBody(const char *pLabel, const uint8_t *pB
     XJSON_Destroy(&json);
 }
 
+typedef struct directgate_enroll_field_ {
+    const char *pKey;
+    const char *pValue;
+} directgate_enroll_field_t;
+
+/* Serializes a request body with the JSON writer instead of interpolating values into a format string. Every value
+   here is operator-supplied rather than attacker-supplied, so this is about not producing a body the API can only
+   reject: a device id or token carrying a quote or a backslash comes out escaped. Fields with an empty value are
+   left out, which is what makes agentPub optional. Returns a malloc'd buffer the caller frees. */
+static char* DirectGate_Enroll_BuildBody(const directgate_enroll_field_t *pFields, size_t nCount, size_t *pLength)
+{
+    XCHECK_NL((pFields != NULL && nCount > 0 && pLength != NULL), NULL);
+    *pLength = 0;
+
+    xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, XTRUE);
+    XCHECK_NL((pRoot != NULL), NULL);
+
+    for (size_t i = 0; i < nCount; i++)
+        XJSON_AddStrIfUsed(pRoot, pFields[i].pKey, pFields[i].pValue);
+
+    char *pDump = XJSON_DumpObj(pRoot, 0, pLength);
+    XJSON_FreeObject(pRoot);
+
+    return pDump;
+}
+
 static xbool_t DirectGate_Enroll_ParseExpiry(const xjson_obj_t *pRoot, const char *pExpiresAtKey, uint64_t *pExpiry)
 {
     XCHECK((pRoot != NULL), XFALSE);
@@ -414,41 +440,27 @@ xbool_t DirectGate_Enroll_Pair(directgate_cfg_t *pCfg, const char *pPairingToken
     char sUrl[XPATH_MAX + 64];
     snprintf(sUrl, sizeof(sUrl), "%s/api/v1/devices/pair", pCfg->enroll.sApiUrl);
 
-    char sBody[XSTR_BIG];
-    if (xstrused(pCfg->keyauth.sIdentityPubB64))
-    {
-        snprintf(sBody, sizeof(sBody),
-            "{"
-                "\"deviceId\": \"%s\","
-                "\"pairingToken\": \"%s\","
-                "\"agentVersion\": \"%s\","
-                "\"agentPub\": \"%s\""
-            "}",
-            pCfg->sDeviceId,
-            pPairingToken,
-            DirectGate_GetVersionShort(),
-            pCfg->keyauth.sIdentityPubB64);
-    }
-    else
-    {
-        snprintf(sBody, sizeof(sBody),
-            "{"
-                "\"deviceId\": \"%s\","
-                "\"pairingToken\": \"%s\","
-                "\"agentVersion\": \"%s\""
-            "}",
-            pCfg->sDeviceId,
-            pPairingToken,
-            DirectGate_GetVersionShort());
-    }
+    const directgate_enroll_field_t fields[] = {
+        { "deviceId", pCfg->sDeviceId },
+        { "pairingToken", pPairingToken },
+        { "agentVersion", DirectGate_GetVersionShort() },
+        { "agentPub", pCfg->keyauth.sIdentityPubB64 }
+    };
+
+    size_t nReqLen = 0;
+    char *pReqBody = DirectGate_Enroll_BuildBody(fields, XARR_SIZE(fields), &nReqLen);
+    XCHECK((pReqBody != NULL && nReqLen > 0), xthrowr(XFALSE, "Failed to build the pair request body"));
 
     xhttp_t handle;
     XHTTP_InitRequest(&handle, XHTTP_POST, "/api/v1/devices/pair", NULL);
     XHTTP_AddHeader(&handle, "Content-Type", "application/json");
     XHTTP_AddHeader(&handle, "Accept", "application/json");
 
-    xhttp_status_t status = XHTTP_EasyPerform(&handle,
-        sUrl, (const uint8_t*)sBody, strlen(sBody));
+    xhttp_status_t status = XHTTP_EasyPerform(&handle, sUrl, (const uint8_t*)pReqBody, nReqLen);
+
+    /* Carries the pairing token, so it does not linger on the heap after the request. */
+    OPENSSL_cleanse(pReqBody, nReqLen);
+    free(pReqBody);
 
     if (status != XHTTP_COMPLETE)
     {
@@ -509,22 +521,24 @@ xbool_t DirectGate_Enroll_RotateAgentKey(directgate_cfg_t *pCfg)
     char sUrl[XPATH_MAX + 64];
     xstrncpyf(sUrl, sizeof(sUrl), "%s/api/v1/devices/rotate-agent-key", pCfg->enroll.sApiUrl);
 
-    char sBody[XSTR_BIG];
-    xstrncpyf(sBody, sizeof(sBody),
-        "{"
-            "\"refreshToken\": \"%s\","
-            "\"agentPub\": \"%s\""
-        "}",
-        pCfg->enroll.sRefreshToken,
-        pCfg->keyauth.sIdentityPubB64);
+    const directgate_enroll_field_t fields[] = {
+        { "refreshToken", pCfg->enroll.sRefreshToken },
+        { "agentPub", pCfg->keyauth.sIdentityPubB64 }
+    };
+
+    size_t nReqLen = 0;
+    char *pReqBody = DirectGate_Enroll_BuildBody(fields, XARR_SIZE(fields), &nReqLen);
+    XCHECK((pReqBody != NULL && nReqLen > 0), xthrowr(XFALSE, "Failed to build the key rotation request body"));
 
     xhttp_t handle;
     XHTTP_InitRequest(&handle, XHTTP_POST, "/api/v1/devices/rotate-agent-key", NULL);
     XHTTP_AddHeader(&handle, "Content-Type", "application/json");
     XHTTP_AddHeader(&handle, "Accept", "application/json");
 
-    xhttp_status_t status = XHTTP_EasyPerform(&handle,
-        sUrl, (const uint8_t*)sBody, strlen(sBody));
+    xhttp_status_t status = XHTTP_EasyPerform(&handle, sUrl, (const uint8_t*)pReqBody, nReqLen);
+
+    OPENSSL_cleanse(pReqBody, nReqLen);
+    free(pReqBody);
 
     if (status != XHTTP_COMPLETE)
     {
@@ -589,22 +603,30 @@ directgate_enroll_status_t DirectGate_Enroll_Refresh(directgate_cfg_t *pCfg, cha
     char sUrl[XPATH_MAX + 64];
     xstrncpyf(sUrl, sizeof(sUrl), "%s/api/v1/devices/refresh", pEnroll->sApiUrl);
 
-    char sBody[XSTR_BIG];
-    xstrncpyf(sBody, sizeof(sBody),
-        "{"
-            "\"refreshToken\": \"%s\","
-            "\"agentVersion\": \"%s\""
-        "}",
-        pEnroll->sRefreshToken,
-        DirectGate_GetVersionShort());
+    const directgate_enroll_field_t fields[] = {
+        { "refreshToken", pEnroll->sRefreshToken },
+        { "agentVersion", DirectGate_GetVersionShort() }
+    };
+
+    size_t nReqLen = 0;
+    char *pReqBody = DirectGate_Enroll_BuildBody(fields, XARR_SIZE(fields), &nReqLen);
+    if (pReqBody == NULL || nReqLen == 0)
+    {
+        free(pReqBody);
+        xloge("Failed to build the token refresh request body: dev(%s)", DirectGate_Enroll_GetDeviceId(pCfg));
+        return DIRECTGATE_ENROLL_REFRESH_TRANSIENT;
+    }
 
     xhttp_t handle;
     XHTTP_InitRequest(&handle, XHTTP_POST, "/api/v1/devices/refresh", NULL);
     XHTTP_AddHeader(&handle, "Content-Type", "application/json");
     XHTTP_AddHeader(&handle, "Accept", "application/json");
 
-    xhttp_status_t status = XHTTP_EasyPerform(&handle,
-        sUrl, (const uint8_t*)sBody, strlen(sBody));
+    xhttp_status_t status = XHTTP_EasyPerform(&handle, sUrl, (const uint8_t*)pReqBody, nReqLen);
+
+    /* Carries the refresh token. */
+    OPENSSL_cleanse(pReqBody, nReqLen);
+    free(pReqBody);
 
     if (status != XHTTP_COMPLETE)
     {
