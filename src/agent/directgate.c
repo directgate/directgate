@@ -2923,7 +2923,12 @@ static void DirectGate_ChownToUser(const char *pPath, uid_t nUid, gid_t nGid)
 {
     if (!xstrused(pPath)) return;
 
-    if (chown(pPath, nUid, nGid) != 0 && errno != ENOENT)
+    /* lchown(), never chown(). The config directory is handed to shell.user below,
+       so that account can plant a symlink where one of these paths is expected.
+       The chown() would follow it and retarget root's grant at whatever the link
+       points to - /etc/shadow is the obvious choice, which turns a convenience
+       into a privilege escalation. Chowning the link itself grants nothing. */
+    if (lchown(pPath, nUid, nGid) != 0 && errno != ENOENT)
     {
         xlogw("Failed to hand path to shell user, runtime writes may fail: "
               "path(%s), uid(%u), errno(%d)", pPath, (unsigned)nUid, errno);
@@ -2990,8 +2995,17 @@ static xbool_t DirectGate_DropPrivileges(const directgate_cfg_t *pCfg)
         DirectGate_ChownToUser(sCfgDir, pUser->pw_uid, pUser->pw_gid);
     }
 
-    if (pCfg->log.bToFile && xstrused(pCfg->log.sPath))
-        DirectGate_ChownToUser(pCfg->log.sPath, pUser->pw_uid, pUser->pw_gid);
+    /* The directory logging actually settled on, never the one the config
+       asked for. When the config is one shell.user can rewrite, LogApply
+       has already refused its path and redirected to the platform default,
+       and it is that default, a compile-time constant, not something the
+       unprivileged account chose - which gets handed over here. Chowning
+       pCfg->log.sPath directly would put an attacker-chosen path back into
+       a root chown(). */
+    const char *pActiveLog = DirectGate_LogGetActivePath();
+
+    if (pCfg->log.bToFile && xstrused(pActiveLog))
+        DirectGate_ChownToUser(pActiveLog, pUser->pw_uid, pUser->pw_gid);
 
     /* Order matters: supplementary groups, then gid, then uid. */
     if (initgroups(pUser->pw_name, pUser->pw_gid) != 0)
@@ -3039,6 +3053,60 @@ static xbool_t DirectGate_DropPrivileges(const directgate_cfg_t *pCfg)
 }
 #endif /* _WIN32 */
 
+/*
+ * Whether this process may take filesystem paths (today: the log directory
+ * and log file name) out of agent.json.
+ *
+ * The agent has to be able to rewrite that file - it persists refreshed
+ * enrolment tokens into it - so it is deliberately owned by shell.user. Any
+ * process that outranks that account is therefore reading a file a
+ * lower-privileged principal controls, and must not let it choose where
+ * directories get created or files get opened.
+ */
+static xbool_t DirectGate_ConfigIsPrivilegedSafe(const directgate_cfg_t *pCfg)
+{
+    XCHECK_NL((pCfg != NULL), XFALSE);
+
+#ifdef _WIN32
+    /* agent.json lives under ProgramData with a DACL that grants its owner,
+       and the agent that owns it runs as shell.user. A LocalSystem process -
+       the launcher, the desktop helper, or the pre-logon agent - never treats
+       it as its own. */
+    return DirectGate_IsLocalSystem() ? XFALSE : XTRUE;
+#else
+    /* Not root: this process holds no more privilege than whoever can write
+       the file, so there is nothing to escalate. */
+    if (geteuid() != 0) return XTRUE;
+
+    /* Root: the file and the directory holding it must both be root-owned and
+       closed to group and other. Checking the immediate parent matters because
+       DropPrivileges() hands that directory to shell.user, which is exactly
+       what would let it swap the file for one of its own. */
+    struct stat st;
+    if (!xstrused(pCfg->sCfgPath)) return XFALSE;
+    if (lstat(pCfg->sCfgPath, &st) != 0) return XFALSE;
+
+    if (!S_ISREG(st.st_mode) || st.st_uid != 0 ||
+        (st.st_mode & (S_IWGRP | S_IWOTH))) return XFALSE;
+
+    char sDir[XPATH_MAX];
+    xstrncpy(sDir, sizeof(sDir), pCfg->sCfgPath);
+
+    char *pSlash = strrchr(sDir, '/');
+
+    /* A bare name means the working directory, which is no more trustworthy
+       than any other parent - check it rather than waving it through. */
+    if (pSlash == NULL) xstrncpy(sDir, sizeof(sDir), ".");
+    else if (pSlash == sDir) sDir[1] = '\0';
+    else *pSlash = '\0';
+
+    if (lstat(sDir, &st) != 0) return XFALSE;
+
+    return (S_ISDIR(st.st_mode) && st.st_uid == 0 &&
+            !(st.st_mode & (S_IWGRP | S_IWOTH))) ? XTRUE : XFALSE;
+#endif
+}
+
 #ifndef DIRECTGATE_TESTING
 int DirectGate_RunAgent(int argc, char* argv[])
 {
@@ -3066,6 +3134,13 @@ int DirectGate_RunAgent(int argc, char* argv[])
         XLog_Destroy();
         return args.bHelp ? XSTDNON : XSTDERR;
     }
+
+    /* Before the first DirectGate_LogApply. A root or LocalSystem agent must
+       not create directories or open files where a shell.user-owned config
+       tells it to; the pre-logon agent never stops being LocalSystem, so for
+       it this holds for the whole run. */
+    xbool_t bLogPathsRestricted = !DirectGate_ConfigIsPrivilegedSafe(&args);
+    if (bLogPathsRestricted) DirectGate_LogRestrictConfigPaths();
 
     int nStatus = DirectGate_ApplyConfig(&args);
     if (nStatus <= 0)
@@ -3099,6 +3174,16 @@ int DirectGate_RunAgent(int argc, char* argv[])
     {
         XLog_Destroy();
         return XSTDERR;
+    }
+
+    /* The drop is verified, so on POSIX this process now holds exactly the
+       privilege of the account that owns the config and its log directory is
+       safe to honour. The same call re-checks rather than assumes, which is
+       what keeps a still-LocalSystem pre-logon agent restricted. */
+    if (bLogPathsRestricted && DirectGate_ConfigIsPrivilegedSafe(&args))
+    {
+        DirectGate_LogAllowConfigPaths();
+        DirectGate_LogApply(&args.log);
     }
 
     directgate_conn_t conn;

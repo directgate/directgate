@@ -989,6 +989,7 @@ xbool_t DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
                 break;
             case 'l':
                 xstrncpy(pCfg->log.sPath, sizeof(pCfg->log.sPath), optarg);
+                pCfg->log.bPathFromConfig = XFALSE;
                 break;
             case 'g':
                 xstrncpy(pCfg->sGenKeyPath, sizeof(pCfg->sGenKeyPath), optarg);
@@ -1071,6 +1072,8 @@ xbool_t DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
             if (!DirectGate_PromptString("Log path", pCfg->log.sPath,
                 sizeof(pCfg->log.sPath), pCfg->log.sPath, XFALSE))
                 return XFALSE;
+
+            pCfg->log.bPathFromConfig = XTRUE;
         }
 
         if (!DirectGate_PromptString("Shell user", pCfg->sShellUser,

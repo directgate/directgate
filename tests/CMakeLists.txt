@@ -76,6 +76,7 @@ foreach(test
         keyauth_client_smoke
         files_static_smoke
         auth_logger_smoke
+        log_privpath_smoke
         hash_vectors_smoke
         json_smoke
         proto_crypt_smoke

@@ -453,7 +453,12 @@ static HANDLE g_hElevThread = NULL;
 static HANDLE g_hElevHelper = NULL;
 static xbool_t g_bElevEnabled = XTRUE;
 static xbool_t g_bElevLockScreen = XTRUE;
-static char g_sElevCfgPath[XPATH_MAX] = { 0 };
+
+/* Verbosity the helper should run at, taken from the launcher's own resolved
+   config. It is passed on the command line rather than letting the helper read
+   agent.json: that file belongs to shell.user, and a SYSTEM process has no
+   business opening it. A number cannot name a path. */
+static uint16_t g_nElevLogFlags = XLOG_ERROR | XLOG_WARN | XLOG_NOTE | XLOG_INFO;
 
 /* Builds a single-entry PROC_THREAD_ATTRIBUTE_HANDLE_LIST so a child inherits exactly the
    handles named here and nothing else that happens to be inheritable in this process. */
@@ -627,7 +632,7 @@ static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid
         char sCmd[XPATH_MAX * 2 + 512];
         xstrncpyf(sCmd, sizeof(sCmd),
             "\"%s\" %s --cmd %llu --shm %llu --shm-bytes %llu --ready %llu --taken %llu "
-            "--agent %llu --agent-pid %lu --allow-lock %d -c \"%s\"",
+            "--agent %llu --agent-pid %lu --allow-lock %d --log-flags %u",
             sSelf, DIRECTGATE_ELEV_HELPER_FLAG,
             (unsigned long long)(uintptr_t)hCmdRead,
             (unsigned long long)(uintptr_t)hSection,
@@ -637,7 +642,7 @@ static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid
             (unsigned long long)(uintptr_t)hAgentInherit,
             (unsigned long)nAgentPid,
             (g_bAgentPreLogon || g_bElevLockScreen) ? 1 : 0,
-            g_sElevCfgPath);
+            (unsigned)g_nElevLogFlags);
 
         HANDLE sHandles[5] = { hCmdRead, hSection, hReady, hTaken, hAgentInherit };
         pAttrs = DirectGate_WinLauncher_HandleList(sHandles, 5);
@@ -1054,7 +1059,13 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
     }
 
     SetConsoleCtrlHandler(DirectGate_WinLauncher_CtrlHandler, TRUE);
-    xstrncpy(g_sElevCfgPath, sizeof(g_sElevCfgPath), pCfgPath);
+
+    /* This process is the LocalSystem supervisor and agent.json is owned by
+       shell.user, so every path in that file is attacker-choosable from the
+       launcher's point of view. Refuse them before the first LogApply below:
+       honouring log.path would let an unprivileged account decide where a
+       SYSTEM process creates directories and opens files. */
+    DirectGate_LogRestrictConfigPaths();
 
     /*
        Wait for a usable configuration rather than exiting without one.
@@ -1081,7 +1092,8 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
        console. A separate ident keeps the file apart from the agent's own. */
     DirectGate_InitConfig(&cfg);
     if (XPath_Exists(pCfgPath)) (void)DirectGate_LoadConfig(&cfg, pCfgPath);
-    xstrncpy(cfg.log.sIdent, sizeof(cfg.log.sIdent), "directgate-launcher");
+    DirectGate_LogSetIdent(&cfg.log, "directgate-launcher");
+    g_nElevLogFlags = cfg.log.nFlags;
     DirectGate_LogApply(&cfg.log);
 
     while (!DirectGate_WinLauncher_Stopping())
@@ -1120,7 +1132,8 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
                 g_bPreLogon = XFALSE;
             }
 
-            xstrncpy(cfg.log.sIdent, sizeof(cfg.log.sIdent), "directgate-launcher");
+            DirectGate_LogSetIdent(&cfg.log, "directgate-launcher");
+            g_nElevLogFlags = cfg.log.nFlags;
             DirectGate_LogApply(&cfg.log);
             break;
         }

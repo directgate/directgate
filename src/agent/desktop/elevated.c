@@ -1308,41 +1308,23 @@ static uint64_t DirectGate_Elev_ArgNumber(int argc, char *argv[], const char *pN
     return nDefault;
 }
 
-static const char* DirectGate_Elev_ArgString(int argc, char *argv[], const char *pName)
-{
-    for (int i = 1; i + 1 < argc; i++)
-    {
-        if (!xstrcmp(argv[i], pName)) continue;
-        return argv[i + 1];
-    }
-
-    return NULL;
-}
-
 XSTATUS DirectGate_Elevated_HelperMain(int argc, char *argv[])
 {
     directgate_log_t log;
     DirectGate_LogInit(&log, "directgate-helper", XLOG_ERROR | XLOG_WARN | XLOG_NOTE | XLOG_INFO);
 
-    /* Log settings only: the helper deliberately reads nothing else out of the
-       config and never touches the network or the session protocol. */
-    const char *pCfgPath = DirectGate_Elev_ArgString(argc, argv, "-c");
-    if (xstrused(pCfgPath))
-    {
-        xjson_t json;
-        char *pBuffer = (char*)XPath_Load(pCfgPath, NULL);
-
-        if (pBuffer != NULL)
-        {
-            if (XJSON_Parse(&json, NULL, pBuffer, strlen(pBuffer)))
-            {
-                DirectGate_LogLoad(&log, json.pRootObj);
-                XJSON_Destroy(&json);
-            }
-
-            free(pBuffer);
-        }
-    }
+    /*
+     * Verbosity arrives as a number from the launcher, and nothing else does.
+     * This process is SYSTEM and agent.json belongs to shell.user, so reading
+     * that file here would mean a SYSTEM process running the same JSON parser
+     * the protocol uses over data an unprivileged account controls - and, far
+     * worse, taking log.path and log.ident from it, which is a SYSTEM file
+     * write at a path of that account's choosing. The helper keeps its own
+     * name and its own directory; the only thing the config is allowed to
+     * decide is how much gets written.
+     */
+    uint64_t nFlags = DirectGate_Elev_ArgNumber(argc, argv, "--log-flags", (uint64_t)log.nFlags);
+    if (nFlags <= UINT16_MAX) log.nFlags = (uint16_t)nFlags;
 
     xlog_defaults();
     xlog_indent(XTRUE);

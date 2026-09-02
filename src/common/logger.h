@@ -39,10 +39,59 @@ typedef struct directgate_log_ {
     xbool_t bToFile;
     xbool_t bFlush;
     uint16_t nFlags;
+    /* Provenance of sPath / sIdent: XTRUE when they came out of agent.json
+       rather than from a command-line switch or the built-in default. A
+       privileged process refuses the former and honours the latter, so the
+       two cannot be told apart after the fact - see
+       DirectGate_LogRestrictConfigPaths(). */
+    xbool_t bPathFromConfig;
+    xbool_t bIdentFromConfig;
 } directgate_log_t;
 
 void DirectGate_LogInit(directgate_log_t *pLog, const char *pDefaultIdent, uint16_t nDefaultFlags);
 XSTATUS DirectGate_LogApply(const directgate_log_t *pLog);
+
+/* Writes the platform's own log directory (/var/log/directgate, or
+   %ProgramData%\directgate on Windows) into @p pPath. */
+void DirectGate_LogGetDefaultPath(char *pPath, size_t nSize);
+
+/*
+ * Stops DirectGate_LogApply from honouring a log directory or log file name
+ * that came out of agent.json, falling back to the platform's own directory
+ * and to the ident the process set for itself.
+ *
+ * agent.json is owned and rewritten by shell.user - it has to be, because the
+ * agent persists refreshed enrolment tokens into it - so every process that
+ * runs with more privilege than that account must treat log.path and
+ * log.ident as untrusted input. Honouring them would let the unprivileged
+ * account pick where a SYSTEM or root process creates directories and opens
+ * files, which is a privilege-escalation primitive rather than a logging
+ * preference. It applies to the Windows LocalSystem launcher, the SYSTEM
+ * desktop helper, the pre-logon SYSTEM agent, and a POSIX agent that has not
+ * dropped privileges yet.
+ *
+ * Verbosity, the screen/file sinks and flush behaviour stay configurable:
+ * those decide how much is written, never where.
+ */
+void DirectGate_LogRestrictConfigPaths(void);
+
+/* Lifts the restriction. Called by the POSIX agent once it has verifiably
+   dropped to shell.user, because from then on it holds exactly the privilege
+   of the account that owns the file it is reading the path from. */
+void DirectGate_LogAllowConfigPaths(void);
+
+/* The directory the last DirectGate_LogApply() actually settled on, which is
+   not always pLog->sPath - a restricted process is redirected to the platform
+   default. Empty until the first apply. Callers that need to act on the log
+   directory (the privilege drop hands it to shell.user) must use this rather
+   than the configured path, so they can never act on one that was refused. */
+const char* DirectGate_LogGetActivePath(void);
+
+/* Replaces the log identity with one the process picked for itself and drops
+   the config provenance with it, so a restricted process still honours it.
+   Assigning sIdent directly would leave bIdentFromConfig set from an earlier
+   DirectGate_LogLoad() and get the new name refused along with the old one. */
+void DirectGate_LogSetIdent(directgate_log_t *pLog, const char *pIdent);
 
 xbool_t DirectGate_LogLoad(directgate_log_t *pLog, xjson_obj_t *pRoot);
 xbool_t DirectGate_LogSave(const directgate_log_t *pLog, xjson_obj_t *pRoot);

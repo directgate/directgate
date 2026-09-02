@@ -389,6 +389,7 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
                 break;
             case 'l':
                 xstrncpy(pCfg->log.sPath, sizeof(pCfg->log.sPath), optarg);
+                pCfg->log.bPathFromConfig = XFALSE;
                 break;
             case 'v':
                 pCfg->nVerbose = (uint16_t)atoi(optarg);
