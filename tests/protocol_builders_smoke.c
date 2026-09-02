@@ -353,6 +353,82 @@ int main(void)
             "zero header length");
     }
 
+    /* Header lengths that make (PREAMBLE + nHdrLen) wrap where size_t is 32
+     * bits wide. The bound has to be computed by subtracting from the bytes
+     * that are actually present; adding to them let a four-byte packet claim a
+     * 4 GB header on ARMHF and walk the JSON parser off the allocation. These
+     * are rejected on any word size, but only a 32-bit build regresses. */
+    {
+        static const uint32_t sWrapping[] = {
+            0xFFFFFFFFu, /* + 4 wraps to 3  */
+            0xFFFFFFFEu, /* + 4 wraps to 2  */
+            0xFFFFFFFDu, /* + 4 wraps to 1  */
+            0xFFFFFFFCu  /* + 4 wraps to 0  */
+        };
+
+        for (size_t i = 0; i < sizeof(sWrapping) / sizeof(sWrapping[0]); i++)
+        {
+            uint8_t sWrap[16];
+            memset(sWrap, 0, sizeof(sWrap));
+
+            sWrap[0] = (uint8_t)(sWrapping[i] & 0xff);
+            sWrap[1] = (uint8_t)((sWrapping[i] >> 8) & 0xff);
+            sWrap[2] = (uint8_t)((sWrapping[i] >> 16) & 0xff);
+            sWrap[3] = (uint8_t)((sWrapping[i] >> 24) & 0xff);
+
+            /* Every prefix length, including the smallest packet that carries a
+             * preamble at all - which is the one the wrap made pass. */
+            CHECK(!DirectGate_Package_Parse(&pkg, sWrap, DIRECTGATE_PROTO_PREAMBLE_SIZE),
+                "wrapping header length, preamble-sized packet");
+            CHECK(!DirectGate_Package_Parse(&pkg, sWrap, sizeof(sWrap)),
+                "wrapping header length");
+        }
+    }
+
+    /* payloadSize near UINT32_MAX wraps (offset + payload) the same way, which
+     * handed the caller a live pointer with a 4 GB length attached. */
+    {
+        const char *pJson =
+            "{\"type\":\"data\",\"version\":1,\"sessionId\":1,\"payloadSize\":4294967280}";
+        size_t nJsonLen = strlen(pJson);
+
+        xbyte_buffer_t bad;
+        XByteBuffer_Init(&bad, XSTDNON, XFALSE);
+        uint8_t sPre[4] = { (uint8_t)nJsonLen, 0, 0, 0 };
+        CHECK(XByteBuffer_Add(&bad, sPre, 4) > 0, "wrapping payload preamble");
+        CHECK(XByteBuffer_Add(&bad, (const uint8_t*)pJson, nJsonLen) > 0,
+            "wrapping payload header");
+        CHECK(XByteBuffer_Add(&bad, (const uint8_t*)"payload", 7) > 0,
+            "wrapping payload body");
+        CHECK(!DirectGate_Package_Parse(&pkg, bad.pData, bad.nUsed),
+            "wrapping payload size rejected");
+        XByteBuffer_Clear(&bad);
+    }
+
+    /* The other half of the same bound: a header that exactly fills the packet
+     * is legal and must still parse, so a future tightening cannot go one byte
+     * too far and reject every payload-less message. */
+    {
+        const char *pJson = "{\"type\":\"status\",\"version\":1,\"sessionId\":1,\"status\":\"ready\"}";
+        size_t nJsonLen = strlen(pJson);
+
+        xbyte_buffer_t exact;
+        XByteBuffer_Init(&exact, XSTDNON, XFALSE);
+        uint8_t sPre[4] = { (uint8_t)nJsonLen, 0, 0, 0 };
+        CHECK(XByteBuffer_Add(&exact, sPre, 4) > 0, "exact-fit preamble");
+        CHECK(XByteBuffer_Add(&exact, (const uint8_t*)pJson, nJsonLen) > 0,
+            "exact-fit header");
+
+        CHECK(DirectGate_Package_Parse(&pkg, exact.pData, exact.nUsed),
+            "header exactly filling the packet accepted");
+        DirectGate_Package_Clear(&pkg);
+
+        /* One byte short of that is still a truncated header. */
+        CHECK(!DirectGate_Package_Parse(&pkg, exact.pData, exact.nUsed - 1),
+            "header one byte past the packet rejected");
+        XByteBuffer_Clear(&exact);
+    }
+
     XByteBuffer_Clear(&wire);
 
     puts("protocol_builders_smoke: OK");
