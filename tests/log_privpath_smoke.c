@@ -44,6 +44,12 @@ static int load_from_json(directgate_log_t *pLog, const char *pJson)
 
 int main(void)
 {
+    /* The agent, the launcher and the helper all call this before their first
+     * DirectGate_LogApply(). It matters here because it is what sets the file
+     * sink's default directory to "." - without it the fallback is an empty
+     * path and the working-directory case below cannot be observed at all. */
+    xlog_defaults();
+
     char sConfigDir[XPATH_MAX];
     char sArgvDir[XPATH_MAX];
 
@@ -55,7 +61,7 @@ int main(void)
 
     /* ---- provenance is recorded when the path comes from the config ---- */
     directgate_log_t log;
-    DirectGate_LogInit(&log, "dg-test", XLOG_ERROR);
+    DirectGate_LogInit(&log, "dg-test", XLOG_WARN | XLOG_ERROR);
     CHECK(!log.bPathFromConfig, "the built-in default path is not config-sourced");
     CHECK(!log.bIdentFromConfig, "the built-in default ident is not config-sourced");
 
@@ -74,18 +80,54 @@ int main(void)
     CHECK(!XPath_Exists(sConfigDir),
         "a privileged process must not create the log directory agent.json names");
 
+    /* The diagnostic explaining the refusal must not itself be written before
+     * xlog_path() has a destination: libxutils' default sink is ".", so an
+     * early line would drop a log file into the working directory - for a
+     * service, a system directory. Both names are checked because a refused
+     * config ident leaves the libxutils default ("xlog") in place, while an
+     * accepted one gives the file the process's own name. */
+    CHECK(!XPath_Exists("./xlog.log") && !XPath_Exists("./dg-test.log"),
+        "the refusal diagnostic must not create a log file in the working directory");
+
     /* The privilege drop hands the active log directory to shell.user with a
-     * chown, so the accessor must never report the refused path back. */
-    CHECK(strcmp(DirectGate_LogGetActivePath(), sConfigDir) != 0,
+     * chown, so the accessor must never report the refused path back.
+     *
+     * The fallback is the platform log directory (/var/log/directgate,
+     * %ProgramData%\directgate), which the privileged processes this
+     * restriction exists for can always create - but an unprivileged test
+     * runner cannot, and then LogApply bails out before recording anything.
+     * Both outcomes are correct; what must never happen is the refused path
+     * becoming active. Requiring a non-empty value here would only assert
+     * that the machine running the test already had that directory. */
+    char sDefault[XPATH_MAX];
+    DirectGate_LogGetDefaultPath(sDefault, sizeof(sDefault));
+
+    const char *pActive = DirectGate_LogGetActivePath();
+    CHECK(strcmp(pActive, sConfigDir) != 0,
         "the refused path must not be reported as the active one");
-    CHECK(xstrused(DirectGate_LogGetActivePath()),
-        "a restricted apply still reports the directory it fell back to");
+    CHECK(!xstrused(pActive) || strcmp(pActive, sDefault) == 0,
+        "a restricted apply falls back to the platform directory or to nothing");
+
+    /* ---- a config that echoes the process's own defaults back is not an
+            override: every saved agent.json does exactly that, and a
+            privileged process must neither warn about it nor lose its own
+            name over it ---- */
+    directgate_log_t echoed;
+    DirectGate_LogInit(&echoed, "dg-test", XLOG_WARN | XLOG_ERROR);
+
+    char sEcho[XPATH_MAX + 128];
+    snprintf(sEcho, sizeof(sEcho),
+        "{\"log\":{\"toFile\":true,\"path\":\"%s\",\"ident\":\"dg-test\"}}", echoed.sPath);
+
+    CHECK(load_from_json(&echoed, sEcho), "echoed log config parses");
+    CHECK(!echoed.bPathFromConfig, "a path echoing the default is not an override");
+    CHECK(!echoed.bIdentFromConfig, "an ident echoing the process default is not an override");
 
     /* ---- restricted: an ident the process picked for itself survives, the
             way the launcher renames its own log. Assigning sIdent directly
             would leave the config provenance behind and get it refused. ---- */
     directgate_log_t named;
-    DirectGate_LogInit(&named, "dg-test", XLOG_ERROR);
+    DirectGate_LogInit(&named, "dg-test", XLOG_WARN | XLOG_ERROR);
     CHECK(load_from_json(&named, sJson), "log config parses again");
     CHECK(named.bIdentFromConfig, "ident starts out config-sourced");
 
@@ -96,7 +138,7 @@ int main(void)
     /* ---- restricted: a path the operator passed on argv is still honoured,
             because argv comes from whoever started the process ---- */
     directgate_log_t argvLog;
-    DirectGate_LogInit(&argvLog, "dg-test", XLOG_ERROR);
+    DirectGate_LogInit(&argvLog, "dg-test", XLOG_WARN | XLOG_ERROR);
     xstrncpy(argvLog.sPath, sizeof(argvLog.sPath), sArgvDir);
     argvLog.bPathFromConfig = XFALSE;
     argvLog.bToFile = XTRUE;

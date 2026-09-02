@@ -1326,6 +1326,10 @@ XSTATUS DirectGate_Elevated_HelperMain(int argc, char *argv[])
     uint64_t nFlags = DirectGate_Elev_ArgNumber(argc, argv, "--log-flags", (uint64_t)log.nFlags);
     if (nFlags <= UINT16_MAX) log.nFlags = (uint16_t)nFlags;
 
+    /* log.toFile travels with it, so turning file logging off in the config
+       still silences the helper the way it always did. */
+    log.bToFile = DirectGate_Elev_ArgNumber(argc, argv, "--log-file", 1) ? XTRUE : XFALSE;
+
     xlog_defaults();
     xlog_indent(XTRUE);
     xlog_coloring(XFALSE);

@@ -459,6 +459,7 @@ static xbool_t g_bElevLockScreen = XTRUE;
    agent.json: that file belongs to shell.user, and a SYSTEM process has no
    business opening it. A number cannot name a path. */
 static uint16_t g_nElevLogFlags = XLOG_ERROR | XLOG_WARN | XLOG_NOTE | XLOG_INFO;
+static xbool_t g_bElevLogToFile = XTRUE;
 
 /* Builds a single-entry PROC_THREAD_ATTRIBUTE_HANDLE_LIST so a child inherits exactly the
    handles named here and nothing else that happens to be inheritable in this process. */
@@ -632,7 +633,7 @@ static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid
         char sCmd[XPATH_MAX * 2 + 512];
         xstrncpyf(sCmd, sizeof(sCmd),
             "\"%s\" %s --cmd %llu --shm %llu --shm-bytes %llu --ready %llu --taken %llu "
-            "--agent %llu --agent-pid %lu --allow-lock %d --log-flags %u",
+            "--agent %llu --agent-pid %lu --allow-lock %d --log-flags %u --log-file %d",
             sSelf, DIRECTGATE_ELEV_HELPER_FLAG,
             (unsigned long long)(uintptr_t)hCmdRead,
             (unsigned long long)(uintptr_t)hSection,
@@ -642,7 +643,7 @@ static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid
             (unsigned long long)(uintptr_t)hAgentInherit,
             (unsigned long)nAgentPid,
             (g_bAgentPreLogon || g_bElevLockScreen) ? 1 : 0,
-            (unsigned)g_nElevLogFlags);
+            (unsigned)g_nElevLogFlags, g_bElevLogToFile ? 1 : 0);
 
         HANDLE sHandles[5] = { hCmdRead, hSection, hReady, hTaken, hAgentInherit };
         pAttrs = DirectGate_WinLauncher_HandleList(sHandles, 5);
@@ -1094,6 +1095,7 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
     if (XPath_Exists(pCfgPath)) (void)DirectGate_LoadConfig(&cfg, pCfgPath);
     DirectGate_LogSetIdent(&cfg.log, "directgate-launcher");
     g_nElevLogFlags = cfg.log.nFlags;
+    g_bElevLogToFile = cfg.log.bToFile;
     DirectGate_LogApply(&cfg.log);
 
     while (!DirectGate_WinLauncher_Stopping())
@@ -1134,6 +1136,7 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
 
             DirectGate_LogSetIdent(&cfg.log, "directgate-launcher");
             g_nElevLogFlags = cfg.log.nFlags;
+            g_bElevLogToFile = cfg.log.bToFile;
             DirectGate_LogApply(&cfg.log);
             break;
         }

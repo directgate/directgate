@@ -218,16 +218,12 @@ XSTATUS DirectGate_LogApply(const directgate_log_t *pLog)
 
     char sDefault[XPATH_MAX];
     const char *pWanted = pLog->sPath;
+    xbool_t bRefused = (bRefuseConfig && pLog->bPathFromConfig) ? XTRUE : XFALSE;
 
-    if (bRefuseConfig && pLog->bPathFromConfig)
+    if (bRefused)
     {
         DirectGate_LogGetDefaultPath(sDefault, sizeof(sDefault));
         pWanted = sDefault;
-
-        xlogw("Ignoring the configured log directory: this process is more "
-              "privileged than the account that owns the config, so it logs "
-              "to its own directory instead: wanted(%s), using(%s)",
-            pLog->sPath, pWanted);
     }
 
     if (xstrused(pWanted))
@@ -255,6 +251,19 @@ XSTATUS DirectGate_LogApply(const directgate_log_t *pLog)
         xstrncpy(g_sActiveLogPath, sizeof(g_sActiveLogPath), sPath);
     }
 
+    /* Only once the destination is in place. Until xlog_path() runs the file
+       sink is still libxutils' default of ".", so a line written before it
+       lands in the process working directory - which for a service is a system
+       directory it has no business creating files in, and which is exactly the
+       kind of write this restriction exists to prevent. */
+    if (bRefused)
+    {
+        xlogw("Ignoring the configured log directory: this process is more "
+              "privileged than the account that owns the config, so it logs "
+              "to its own directory instead: wanted(%s), using(%s)",
+              pLog->sPath, pWanted);
+    }
+
     return XSTDOK;
 }
 
@@ -278,11 +287,18 @@ xbool_t DirectGate_LogLoad(directgate_log_t *pLog, xjson_obj_t *pRoot)
     xjson_obj_t *pFlush = XJSON_GetObject(pLogObj, "flush");
     if (pFlush != NULL) pLog->bFlush = XJSON_GetBool(pFlush);
 
+    /* Provenance marks a genuine override, not an echo. DirectGate_LogSave()
+       writes both fields back every time the config is persisted, so an
+       ordinary agent.json already contains the platform default path and the
+       process's own ident - and a privileged process must not then announce
+       that it is refusing a value in order to substitute the same one, nor
+       lose the name it was initialised with. Only a value that actually
+       differs from what this process already holds is the config choosing. */
     const char *pPath = XJSON_GetString(XJSON_GetObject(pLogObj, "path"));
     if (xstrused(pPath))
     {
+        if (!xstrcmp(pLog->sPath, pPath)) pLog->bPathFromConfig = XTRUE;
         xstrncpy(pLog->sPath, sizeof(pLog->sPath), pPath);
-        pLog->bPathFromConfig = XTRUE;
     }
 
     if (pToFile == NULL && xstrused(pPath)) pLog->bToFile = XTRUE;
@@ -290,8 +306,8 @@ xbool_t DirectGate_LogLoad(directgate_log_t *pLog, xjson_obj_t *pRoot)
     const char *pIdent = XJSON_GetString(XJSON_GetObject(pLogObj, "ident"));
     if (xstrused(pIdent))
     {
+        if (!xstrcmp(pLog->sIdent, pIdent)) pLog->bIdentFromConfig = XTRUE;
         xstrncpy(pLog->sIdent, sizeof(pLog->sIdent), pIdent);
-        pLog->bIdentFromConfig = XTRUE;
     }
 
     xjson_obj_t *pLevels = XJSON_GetObject(pLogObj, "levels");
