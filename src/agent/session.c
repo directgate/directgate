@@ -278,6 +278,15 @@ directgate_session_t* DirectGate_SessionMgr_GetOrCreate(directgate_session_mgr_t
     XCHECK((bSrpReady || bKeyReady),
         xthrowp(NULL, "Failed to create session: no auth method configured"));
 
+    uint64_t nRemainMs = 0;
+    if (DirectGate_SessionMgr_IsAuthLocked(pMgr, &nRemainMs))
+    {
+        xlogw("Pre-auth session refused while authentication is throttled: sid(%u), failures(%u), remainMs(%llu)",
+            nSessionId, pMgr->nAuthFailures, (unsigned long long)nRemainMs);
+
+        return NULL;
+    }
+
     uint64_t nNowMs = XTime_GetMs();
     if (pMgr->nAuthWindowStartMs == 0 || nNowMs < pMgr->nAuthWindowStartMs ||
         nNowMs - pMgr->nAuthWindowStartMs >= DIRECTGATE_AUTH_RATE_WINDOW_MS)
@@ -357,6 +366,51 @@ size_t DirectGate_SessionMgr_ExpireUnauthenticated(directgate_session_mgr_t *pMg
     }
 
     return nExpired;
+}
+
+xbool_t DirectGate_SessionMgr_IsAuthLocked(directgate_session_mgr_t *pMgr, uint64_t *pRemainMs)
+{
+    XCHECK_NL((pMgr != NULL), XFALSE);
+    uint64_t nNowMs = XTime_GetMs();
+
+    /* A clock that jumped backwards must not hold the door shut for longer than a lockout could ever last. */
+    if (pMgr->nAuthLockoutUntilMs > nNowMs + DIRECTGATE_AUTH_LOCKOUT_MAX_MS) pMgr->nAuthLockoutUntilMs = 0;
+    if (nNowMs >= pMgr->nAuthLockoutUntilMs) return XFALSE;
+
+    if (pRemainMs != NULL) *pRemainMs = pMgr->nAuthLockoutUntilMs - nNowMs;
+    return XTRUE;
+}
+
+void DirectGate_SessionMgr_NoteAuthFailure(directgate_session_mgr_t *pMgr)
+{
+    XCHECK_VOID_NL((pMgr != NULL));
+    if (pMgr->nAuthFailures < UINT32_MAX) pMgr->nAuthFailures++;
+    if (pMgr->nAuthFailures <= DIRECTGATE_AUTH_FAILURE_GRACE) return;
+
+    uint32_t nSteps = pMgr->nAuthFailures - DIRECTGATE_AUTH_FAILURE_GRACE - 1;
+    uint64_t nDelayMs = DIRECTGATE_AUTH_LOCKOUT_MAX_MS;
+
+    if (nSteps < 32)
+    {
+        nDelayMs = DIRECTGATE_AUTH_LOCKOUT_BASE_MS << nSteps;
+        if (nDelayMs > DIRECTGATE_AUTH_LOCKOUT_MAX_MS) nDelayMs = DIRECTGATE_AUTH_LOCKOUT_MAX_MS;
+    }
+
+    pMgr->nAuthLockoutUntilMs = XTime_GetMs() + nDelayMs;
+
+    xlogw("Throttling authentication after repeated failures: failures(%u), lockoutMs(%llu)",
+        pMgr->nAuthFailures, (unsigned long long)nDelayMs);
+}
+
+void DirectGate_SessionMgr_NoteAuthSuccess(directgate_session_mgr_t *pMgr)
+{
+    XCHECK_VOID_NL((pMgr != NULL));
+
+    if (pMgr->nAuthFailures > 0)
+        xlogi("Authentication succeeded, clearing the failure count: failures(%u)", pMgr->nAuthFailures);
+
+    pMgr->nAuthFailures = 0;
+    pMgr->nAuthLockoutUntilMs = 0;
 }
 
 xbool_t DirectGate_Session_ConsumeAuthMessage(directgate_session_t *pSession)

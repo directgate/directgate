@@ -131,8 +131,39 @@ int DirectGate_LogGetRTCLevel(const directgate_log_t *pLog)
     return RTC_LOG_NONE;
 }
 
+/* When set, a log directory or file name that came out of agent.json is
+   ignored in favour of the platform default. See the header for why. */
+static xbool_t g_bRestrictConfigPaths = XFALSE;
+
+void DirectGate_LogRestrictConfigPaths(void)
+{
+    g_bRestrictConfigPaths = XTRUE;
+}
+
+void DirectGate_LogAllowConfigPaths(void)
+{
+    g_bRestrictConfigPaths = XFALSE;
+}
+
+/* Set by DirectGate_LogApply() once it knows which directory it settled on. */
+static char g_sActiveLogPath[XPATH_MAX] = { 0 };
+
+const char* DirectGate_LogGetActivePath(void)
+{
+    return g_sActiveLogPath;
+}
+
+void DirectGate_LogSetIdent(directgate_log_t *pLog, const char *pIdent)
+{
+    XCHECK_VOID_NL((pLog != NULL));
+    XCHECK_VOID_NL((xstrused(pIdent)));
+
+    xstrncpy(pLog->sIdent, sizeof(pLog->sIdent), pIdent);
+    pLog->bIdentFromConfig = XFALSE;
+}
+
 /* Writes the platform's default log directory into @p pPath. */
-static void DirectGate_LogDefaultPath(char *pPath, size_t nSize)
+void DirectGate_LogGetDefaultPath(char *pPath, size_t nSize)
 {
 #ifdef _WIN32
     /* The literal above names the C: drive, but Windows is not always
@@ -167,7 +198,7 @@ void DirectGate_LogInit(directgate_log_t *pLog, const char *pDefaultIdent, uint1
     if (xstrused(pDefaultIdent))
         xstrncpy(pLog->sIdent, sizeof(pLog->sIdent), pDefaultIdent);
 
-    DirectGate_LogDefaultPath(pLog->sPath, sizeof(pLog->sPath));
+    DirectGate_LogGetDefaultPath(pLog->sPath, sizeof(pLog->sPath));
 }
 
 XSTATUS DirectGate_LogApply(const directgate_log_t *pLog)
@@ -178,15 +209,29 @@ XSTATUS DirectGate_LogApply(const directgate_log_t *pLog)
     xlog_setfl(pLog->nFlags);
     xlog_flush(pLog->bFlush);
 
-    if (xstrused(pLog->sIdent))
+    /* A privileged process keeps the name it chose for itself: a config-
+       supplied ident would otherwise let the unprivileged account pick the
+       file name a SYSTEM process opens. */
+    xbool_t bRefuseConfig = g_bRestrictConfigPaths;
+    if (xstrused(pLog->sIdent) && !(bRefuseConfig && pLog->bIdentFromConfig))
         xlog_name(pLog->sIdent);
 
-    if (xstrused(pLog->sPath))
+    char sDefault[XPATH_MAX];
+    const char *pWanted = pLog->sPath;
+    xbool_t bRefused = (bRefuseConfig && pLog->bPathFromConfig) ? XTRUE : XFALSE;
+
+    if (bRefused)
+    {
+        DirectGate_LogGetDefaultPath(sDefault, sizeof(sDefault));
+        pWanted = sDefault;
+    }
+
+    if (xstrused(pWanted))
     {
         char sPath[XPATH_MAX];
         xlog_file(XFALSE);
 
-        size_t nLen = xstrncpy(sPath, sizeof(sPath), pLog->sPath);
+        size_t nLen = xstrncpy(sPath, sizeof(sPath), pWanted);
 
 #ifdef _WIN32
         /* A path written into the config the way Windows writes paths is
@@ -202,6 +247,21 @@ XSTATUS DirectGate_LogApply(const directgate_log_t *pLog)
 
         xlog_file(pLog->bToFile);
         xlog_path(sPath);
+
+        xstrncpy(g_sActiveLogPath, sizeof(g_sActiveLogPath), sPath);
+    }
+
+    /* Only once the destination is in place. Until xlog_path() runs the file
+       sink is still libxutils' default of ".", so a line written before it
+       lands in the process working directory - which for a service is a system
+       directory it has no business creating files in, and which is exactly the
+       kind of write this restriction exists to prevent. */
+    if (bRefused)
+    {
+        xlogw("Ignoring the configured log directory: this process is more "
+              "privileged than the account that owns the config, so it logs "
+              "to its own directory instead: wanted(%s), using(%s)",
+              pLog->sPath, pWanted);
     }
 
     return XSTDOK;
@@ -227,12 +287,28 @@ xbool_t DirectGate_LogLoad(directgate_log_t *pLog, xjson_obj_t *pRoot)
     xjson_obj_t *pFlush = XJSON_GetObject(pLogObj, "flush");
     if (pFlush != NULL) pLog->bFlush = XJSON_GetBool(pFlush);
 
+    /* Provenance marks a genuine override, not an echo. DirectGate_LogSave()
+       writes both fields back every time the config is persisted, so an
+       ordinary agent.json already contains the platform default path and the
+       process's own ident - and a privileged process must not then announce
+       that it is refusing a value in order to substitute the same one, nor
+       lose the name it was initialised with. Only a value that actually
+       differs from what this process already holds is the config choosing. */
     const char *pPath = XJSON_GetString(XJSON_GetObject(pLogObj, "path"));
-    if (xstrused(pPath)) xstrncpy(pLog->sPath, sizeof(pLog->sPath), pPath);
+    if (xstrused(pPath))
+    {
+        if (!xstrcmp(pLog->sPath, pPath)) pLog->bPathFromConfig = XTRUE;
+        xstrncpy(pLog->sPath, sizeof(pLog->sPath), pPath);
+    }
+
     if (pToFile == NULL && xstrused(pPath)) pLog->bToFile = XTRUE;
 
     const char *pIdent = XJSON_GetString(XJSON_GetObject(pLogObj, "ident"));
-    if (xstrused(pIdent)) xstrncpy(pLog->sIdent, sizeof(pLog->sIdent), pIdent);
+    if (xstrused(pIdent))
+    {
+        if (!xstrcmp(pLog->sIdent, pIdent)) pLog->bIdentFromConfig = XTRUE;
+        xstrncpy(pLog->sIdent, sizeof(pLog->sIdent), pIdent);
+    }
 
     xjson_obj_t *pLevels = XJSON_GetObject(pLogObj, "levels");
     if (pLevels != NULL && pLevels->nType == XJSON_TYPE_ARRAY)

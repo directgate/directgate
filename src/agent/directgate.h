@@ -65,6 +65,10 @@ typedef struct directgate_conn_ {
     uint64_t nNextRefreshProbeMs;
     xstr_tiny_t sDisconnectReason;
     xbool_t bReconnectSuppressed;
+    /* A relay error frame claimed this device is no longer enrolled.
+       Unauthenticated, so it only forces the next connect to ask the API.
+       DirectGate_HandleRefreshStatus is what may then clear the enrollment. */
+    xbool_t bEnrollmentDoubt;
     xbool_t bRoleSent;
 
     /* Temporary desktop share with one time access, limited fail attempts and expiration time window */

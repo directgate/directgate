@@ -34,6 +34,7 @@
 #include "files.h"
 #include "term.h"
 #include "desktop.h"
+#include "auth.h"
 #include "e2e.h"
 #include "srp.h"
 
@@ -214,7 +215,11 @@ static const char* DirectGate_GetRelayUrl(const directgate_cfg_t *pCfg)
     return pCfg->sRelayUrl;
 }
 
-static xbool_t DirectGate_IsReconnectSuppressedReason(const char *pReason)
+/* Reasons a relay cites when it believes this device is no longer enrolled. The relay is not the authority on that:
+   the error frame carrying them is unauthenticated and unencrypted, so acting on one directly would let anything able
+   to inject a single frame wipe the enrollment and keep the device offline until somebody re-pairs it by hand. The
+   claim only schedules a check against the API, which is authenticated over TLS and does hold that authority. */
+static xbool_t DirectGate_IsEnrollmentDoubtReason(const char *pReason)
 {
     XCHECK_NL((xstrused(pReason)), XFALSE);
     return (xstrcmp(pReason, "device-revoked") ||
@@ -381,19 +386,25 @@ static xbool_t DirectGate_PreConnectRefresh(directgate_conn_t *pConn)
     XCHECK_NL((pCfg->enroll.bEnrolled), XFALSE);
 
     xbool_t bStartupRefresh = !pConn->bStartupRelayRefreshDone;
-    if (!bStartupRefresh && !DirectGate_Enroll_NeedsRefresh(pCfg)) return XTRUE;
+    xbool_t bDoubt = pConn->bEnrollmentDoubt;
+
+    if (!bStartupRefresh && !bDoubt && !DirectGate_Enroll_NeedsRefresh(pCfg)) return XTRUE;
     if (bStartupRefresh) pConn->bStartupRelayRefreshDone = XTRUE;
+    pConn->bEnrollmentDoubt = XFALSE;
 
     xlogi("%s access token before connect: id(%u), fd(%d), relay(%s)",
-        bStartupRefresh ? "Resolving relay and refreshing" : "Refreshing",
+        bDoubt ? "Verifying the relay's enrollment claim and refreshing" :
+        (bStartupRefresh ? "Resolving relay and refreshing" : "Refreshing"),
         DirectGate_Conn_GetID(pConn, NULL), DirectGate_Conn_GetFD(pConn, NULL),
         xstrused(pCfg->sRelayUrl) ? pCfg->sRelayUrl : DIRECTGATE_NO_ANSWER);
 
     char sReason[XSTR_TINY];
     directgate_enroll_status_t eStatus = DirectGate_Enroll_Refresh(pCfg, sReason, sizeof(sReason));
 
-    return DirectGate_HandleRefreshStatus(pConn, eStatus, sReason, bStartupRefresh ?
-        "startup relay refresh" : "pre-connect token refresh", XFALSE);
+    const char *pStage = bDoubt ? "relay-reported enrollment check" :
+        (bStartupRefresh ? "startup relay refresh" : "pre-connect token refresh");
+
+    return DirectGate_HandleRefreshStatus(pConn, eStatus, sReason, pStage, XFALSE);
 }
 
 /* If reconnects keep failing, ask the API for a fresh relay URL. If presence
@@ -884,8 +895,14 @@ static int DirectGate_HandleError(xapi_session_t *pApiSession, directgate_pkg_t 
         DirectGate_Conn_GetFD(pConn, pApiSession),
         pReason);
 
-    if (pConn != NULL && DirectGate_IsReconnectSuppressedReason(pReason))
-        DirectGate_SuppressReconnect(pConn, pReason);
+    /* Recorded, not acted on. The next connect asks the API, and only its answer clears the enrollment. */
+    if (pConn != NULL && DirectGate_IsEnrollmentDoubtReason(pReason))
+    {
+        xlogw("Relay reports this device is no longer enrolled, asking the API before acting: id(%u), fd(%d), reason(%s)",
+            DirectGate_Conn_GetID(pConn, pApiSession), DirectGate_Conn_GetFD(pConn, pApiSession), pReason);
+
+        pConn->bEnrollmentDoubt = XTRUE;
+    }
 
     return XAPI_CONTINUE;
 }
@@ -1813,6 +1830,7 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
             xloge("Key-auth proof verification failed: sid(%u), wsfd(%d)",
                 pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
 
+            DirectGate_SessionMgr_NoteAuthFailure(&pConn->mgr);
             DirectGate_KeyAuth_Cleanse(&pSession->keyauth);
             pSession->bKeyAuthActive = XFALSE;
 
@@ -1854,6 +1872,8 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
         }
 
         DirectGate_KeyAuth_Cleanse(&pSession->keyauth);
+        DirectGate_SessionMgr_NoteAuthSuccess(&pConn->mgr);
+
         pSession->bKeyAuthActive = XFALSE;
         pSession->bAuthenticated = XTRUE;
         pSession->term.bEncrypt = XTRUE;
@@ -2020,6 +2040,7 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
                     pTemporaryShare->bUsed = XTRUE;
             }
 
+            DirectGate_SessionMgr_NoteAuthFailure(&pConn->mgr);
             DirectGate_Session_SendAuthResp(pSession, "failed", NULL, "invalid proof");
             return DirectGate_Session_Close(pSession, "SRP proof failed");
         }
@@ -2054,6 +2075,7 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
             return DirectGate_Session_Close(pSession, "E2E key derivation failed");
         }
 
+        DirectGate_SessionMgr_NoteAuthSuccess(&pConn->mgr);
         pSession->bAuthenticated = XTRUE;
         pSession->term.bEncrypt = XTRUE;
 
@@ -2923,7 +2945,12 @@ static void DirectGate_ChownToUser(const char *pPath, uid_t nUid, gid_t nGid)
 {
     if (!xstrused(pPath)) return;
 
-    if (chown(pPath, nUid, nGid) != 0 && errno != ENOENT)
+    /* lchown(), never chown(). The config directory is handed to shell.user below,
+       so that account can plant a symlink where one of these paths is expected.
+       The chown() would follow it and retarget root's grant at whatever the link
+       points to - /etc/shadow is the obvious choice, which turns a convenience
+       into a privilege escalation. Chowning the link itself grants nothing. */
+    if (lchown(pPath, nUid, nGid) != 0 && errno != ENOENT)
     {
         xlogw("Failed to hand path to shell user, runtime writes may fail: "
               "path(%s), uid(%u), errno(%d)", pPath, (unsigned)nUid, errno);
@@ -2990,8 +3017,17 @@ static xbool_t DirectGate_DropPrivileges(const directgate_cfg_t *pCfg)
         DirectGate_ChownToUser(sCfgDir, pUser->pw_uid, pUser->pw_gid);
     }
 
-    if (pCfg->log.bToFile && xstrused(pCfg->log.sPath))
-        DirectGate_ChownToUser(pCfg->log.sPath, pUser->pw_uid, pUser->pw_gid);
+    /* The directory logging actually settled on, never the one the config
+       asked for. When the config is one shell.user can rewrite, LogApply
+       has already refused its path and redirected to the platform default,
+       and it is that default, a compile-time constant, not something the
+       unprivileged account chose - which gets handed over here. Chowning
+       pCfg->log.sPath directly would put an attacker-chosen path back into
+       a root chown(). */
+    const char *pActiveLog = DirectGate_LogGetActivePath();
+
+    if (pCfg->log.bToFile && xstrused(pActiveLog))
+        DirectGate_ChownToUser(pActiveLog, pUser->pw_uid, pUser->pw_gid);
 
     /* Order matters: supplementary groups, then gid, then uid. */
     if (initgroups(pUser->pw_name, pUser->pw_gid) != 0)
@@ -3039,6 +3075,60 @@ static xbool_t DirectGate_DropPrivileges(const directgate_cfg_t *pCfg)
 }
 #endif /* _WIN32 */
 
+/*
+ * Whether this process may take filesystem paths (today: the log directory
+ * and log file name) out of agent.json.
+ *
+ * The agent has to be able to rewrite that file - it persists refreshed
+ * enrolment tokens into it - so it is deliberately owned by shell.user. Any
+ * process that outranks that account is therefore reading a file a
+ * lower-privileged principal controls, and must not let it choose where
+ * directories get created or files get opened.
+ */
+static xbool_t DirectGate_ConfigIsPrivilegedSafe(const directgate_cfg_t *pCfg)
+{
+    XCHECK_NL((pCfg != NULL), XFALSE);
+
+#ifdef _WIN32
+    /* agent.json lives under ProgramData with a DACL that grants its owner,
+       and the agent that owns it runs as shell.user. A LocalSystem process -
+       the launcher, the desktop helper, or the pre-logon agent - never treats
+       it as its own. */
+    return DirectGate_IsLocalSystem() ? XFALSE : XTRUE;
+#else
+    /* Not root: this process holds no more privilege than whoever can write
+       the file, so there is nothing to escalate. */
+    if (geteuid() != 0) return XTRUE;
+
+    /* Root: the file and the directory holding it must both be root-owned and
+       closed to group and other. Checking the immediate parent matters because
+       DropPrivileges() hands that directory to shell.user, which is exactly
+       what would let it swap the file for one of its own. */
+    struct stat st;
+    if (!xstrused(pCfg->sCfgPath)) return XFALSE;
+    if (lstat(pCfg->sCfgPath, &st) != 0) return XFALSE;
+
+    if (!S_ISREG(st.st_mode) || st.st_uid != 0 ||
+        (st.st_mode & (S_IWGRP | S_IWOTH))) return XFALSE;
+
+    char sDir[XPATH_MAX];
+    xstrncpy(sDir, sizeof(sDir), pCfg->sCfgPath);
+
+    char *pSlash = strrchr(sDir, '/');
+
+    /* A bare name means the working directory, which is no more trustworthy
+       than any other parent - check it rather than waving it through. */
+    if (pSlash == NULL) xstrncpy(sDir, sizeof(sDir), ".");
+    else if (pSlash == sDir) sDir[1] = '\0';
+    else *pSlash = '\0';
+
+    if (lstat(sDir, &st) != 0) return XFALSE;
+
+    return (S_ISDIR(st.st_mode) && st.st_uid == 0 &&
+            !(st.st_mode & (S_IWGRP | S_IWOTH))) ? XTRUE : XFALSE;
+#endif
+}
+
 #ifndef DIRECTGATE_TESTING
 int DirectGate_RunAgent(int argc, char* argv[])
 {
@@ -3066,6 +3156,13 @@ int DirectGate_RunAgent(int argc, char* argv[])
         XLog_Destroy();
         return args.bHelp ? XSTDNON : XSTDERR;
     }
+
+    /* Before the first DirectGate_LogApply. A root or LocalSystem agent must
+       not create directories or open files where a shell.user-owned config
+       tells it to; the pre-logon agent never stops being LocalSystem, so for
+       it this holds for the whole run. */
+    xbool_t bLogPathsRestricted = !DirectGate_ConfigIsPrivilegedSafe(&args);
+    if (bLogPathsRestricted) DirectGate_LogRestrictConfigPaths();
 
     int nStatus = DirectGate_ApplyConfig(&args);
     if (nStatus <= 0)
@@ -3099,6 +3196,16 @@ int DirectGate_RunAgent(int argc, char* argv[])
     {
         XLog_Destroy();
         return XSTDERR;
+    }
+
+    /* The drop is verified, so on POSIX this process now holds exactly the
+       privilege of the account that owns the config and its log directory is
+       safe to honour. The same call re-checks rather than assumes, which is
+       what keeps a still-LocalSystem pre-logon agent restricted. */
+    if (bLogPathsRestricted && DirectGate_ConfigIsPrivilegedSafe(&args))
+    {
+        DirectGate_LogAllowConfigPaths();
+        DirectGate_LogApply(&args.log);
     }
 
     directgate_conn_t conn;

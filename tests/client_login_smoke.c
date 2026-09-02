@@ -57,7 +57,7 @@ static int test_start_url(void)
     ctx.pWebUrl = "https://directgate.io";
 
     char sUrl[XPATH_MAX];
-    CHECK(DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 40777, XFALSE, "chal") > 0,
+    CHECK(DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 40777, XFALSE, "chal", "st8") > 0,
         "build start URL");
 
     /* The printed link has to be ours, and the binary must not carry the
@@ -66,37 +66,38 @@ static int test_start_url(void)
     CHECK(strstr(sUrl, "port=40777") != NULL, "loopback port");
     CHECK(strstr(sUrl, "mode=loopback") != NULL, "loopback mode");
     CHECK(strstr(sUrl, "challenge=chal") != NULL, "challenge parameter");
+    CHECK(strstr(sUrl, "state=st8") != NULL, "state parameter");
     CHECK(strstr(sUrl, "supabase") == NULL, "start URL never leaks the provider host");
 
     /* redirect_to is rebuilt by the page, so it must never be a parameter */
     CHECK(strstr(sUrl, "redirect_to") == NULL, "no caller supplied redirect");
 
-    CHECK(DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 40780, XTRUE, "chal") > 0,
+    CHECK(DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 40780, XTRUE, "chal", "st8") > 0,
         "build paste-mode start URL");
     CHECK(strstr(sUrl, "mode=paste") != NULL, "paste mode");
     CHECK(strstr(sUrl, "port=40780") != NULL, "paste mode keeps the port");
 
     ctx.pProvider = "google";
-    CHECK(DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 40777, XFALSE, "chal") > 0,
+    CHECK(DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 40777, XFALSE, "chal", "st8") > 0,
         "build with default provider");
     CHECK(strstr(sUrl, "provider=") == NULL, "default provider stays implicit");
 
     ctx.pProvider = "github";
-    CHECK(DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 40777, XFALSE, "chal") > 0,
+    CHECK(DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 40777, XFALSE, "chal", "st8") > 0,
         "build with explicit provider");
     CHECK(strstr(sUrl, "provider=github") != NULL, "explicit provider is carried");
 
     /* Without a web URL the caller has to fall back to the provider URL */
     ctx.pWebUrl = NULL;
-    CHECK(!DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 40777, XFALSE, "chal"),
+    CHECK(!DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 40777, XFALSE, "chal", "st8"),
         "reject missing web URL");
 
     ctx.pWebUrl = "https://directgate.io";
-    CHECK(!DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 0, XFALSE, "chal"),
+    CHECK(!DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 0, XFALSE, "chal", "st8"),
         "reject zero port");
-    CHECK(!DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 40777, XFALSE, NULL),
+    CHECK(!DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), &ctx, 40777, XFALSE, NULL, "st8"),
         "reject missing challenge");
-    CHECK(!DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), NULL, 40777, XFALSE, "chal"),
+    CHECK(!DirectGate_Login_StartUrl(sUrl, sizeof(sUrl), NULL, 40777, XFALSE, "chal", "st8"),
         "reject NULL context");
 
     return 0;
@@ -108,34 +109,68 @@ static int test_parse_request(void)
     char sError[128];
 
     CHECK(DirectGate_Login_ParseRequest(
-        "GET /callback?code=abc123 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        "GET /callback?code=abc123 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", NULL,
         sCode, sizeof(sCode), sError, sizeof(sError)), "parse GET redirect");
     CHECK(strcmp(sCode, "abc123") == 0, "GET code value");
 
     CHECK(DirectGate_Login_ParseRequest(
-        "GET /callback?state=x&code=pkce%2Fcode%3D1&extra=y HTTP/1.1\r\n\r\n",
+        "GET /callback?state=x&code=pkce%2Fcode%3D1&extra=y HTTP/1.1\r\n\r\n", NULL,
         sCode, sizeof(sCode), sError, sizeof(sError)), "parse encoded code");
     CHECK(strcmp(sCode, "pkce/code=1") == 0, "percent decoded code");
 
     /* The bounce page hands the code over as a JSON body instead */
     CHECK(DirectGate_Login_ParseRequest(
         "POST /callback HTTP/1.1\r\nContent-Type: text/plain\r\n"
-        "Content-Length: 20\r\n\r\n{\"code\":\"posted-1\"}",
+        "Content-Length: 20\r\n\r\n{\"code\":\"posted-1\"}", NULL,
         sCode, sizeof(sCode), sError, sizeof(sError)), "parse POST handoff");
     CHECK(strcmp(sCode, "posted-1") == 0, "POST code value");
 
     CHECK(!DirectGate_Login_ParseRequest(
-        "GET /callback?error=access_denied&error_description=User+declined HTTP/1.1\r\n\r\n",
+        "GET /callback?error=access_denied&error_description=User+declined HTTP/1.1\r\n\r\n", NULL,
         sCode, sizeof(sCode), sError, sizeof(sError)), "reject provider error");
     CHECK(strcmp(sError, "User declined") == 0, "provider error reason");
 
-    CHECK(!DirectGate_Login_ParseRequest("GET /favicon.ico HTTP/1.1\r\n\r\n",
+    CHECK(!DirectGate_Login_ParseRequest("GET /favicon.ico HTTP/1.1\r\n\r\n", NULL,
         sCode, sizeof(sCode), sError, sizeof(sError)), "ignore unrelated request");
     CHECK(sCode[0] == '\0', "unrelated request leaves no code");
 
-    CHECK(!DirectGate_Login_ParseRequest(NULL, sCode, sizeof(sCode), sError, sizeof(sError)),
+    /* A callback that carries a state must carry ours. One that carries none is a page that does not echo it
+       yet, and is still accepted so sign-in keeps working until it does. */
+    directgate_login_guard_t guard;
+    guard.pState = "st8";
+    guard.pOrigin = "https://directgate.io";
+
+    CHECK(DirectGate_Login_ParseRequest(
+        "GET /callback?code=abc123&state=st8 HTTP/1.1\r\n\r\n", &guard,
+        sCode, sizeof(sCode), sError, sizeof(sError)), "accept matching state");
+
+    CHECK(!DirectGate_Login_ParseRequest(
+        "GET /callback?code=abc123&state=other HTTP/1.1\r\n\r\n", &guard,
+        sCode, sizeof(sCode), sError, sizeof(sError)), "reject foreign state");
+    CHECK(sCode[0] == '\0', "rejected state leaves no code");
+
+    CHECK(DirectGate_Login_ParseRequest(
+        "GET /callback?code=abc123 HTTP/1.1\r\n\r\n", &guard,
+        sCode, sizeof(sCode), sError, sizeof(sError)), "accept callback without state");
+
+    /* The bounce page posts with an Origin; anything else on the box that just opens the port does not. */
+    CHECK(DirectGate_Login_ParseRequest(
+        "POST /callback HTTP/1.1\r\nOrigin: https://directgate.io\r\n"
+        "Content-Length: 20\r\n\r\n{\"code\":\"posted-1\"}", &guard,
+        sCode, sizeof(sCode), sError, sizeof(sError)), "accept POST from the web origin");
+
+    CHECK(!DirectGate_Login_ParseRequest(
+        "POST /callback HTTP/1.1\r\nContent-Length: 20\r\n\r\n{\"code\":\"posted-1\"}", &guard,
+        sCode, sizeof(sCode), sError, sizeof(sError)), "reject POST without an origin");
+
+    CHECK(!DirectGate_Login_ParseRequest(
+        "POST /callback HTTP/1.1\r\nOrigin: http://evil.local\r\n"
+        "Content-Length: 20\r\n\r\n{\"code\":\"posted-1\"}", &guard,
+        sCode, sizeof(sCode), sError, sizeof(sError)), "reject POST from another origin");
+
+    CHECK(!DirectGate_Login_ParseRequest(NULL, NULL, sCode, sizeof(sCode), sError, sizeof(sError)),
         "reject NULL request");
-    CHECK(!DirectGate_Login_ParseRequest("garbage", sCode, sizeof(sCode), sError, sizeof(sError)),
+    CHECK(!DirectGate_Login_ParseRequest("garbage", NULL, sCode, sizeof(sCode), sError, sizeof(sError)),
         "reject malformed request");
 
     return 0;

@@ -101,12 +101,28 @@ size_t DirectGate_Login_StartUrl(char *pOut, size_t nSize,
                                  const directgate_login_ctx_t *pCtx,
                                  uint16_t nPort,
                                  xbool_t bPaste,
-                                 const char *pChallenge);
+                                 const char *pChallenge,
+                                 const char *pState);
 
 /* Pulls the authorization code out of a loopback HTTP request (either the
  * OAuth redirect "GET /callback?code=..." or the bounce page's JSON POST).
  * Populates pError instead when the provider reported a failure. */
-xbool_t DirectGate_Login_ParseRequest(const char *pRequest,
+/*
+ * What the loopback listener requires of a callback before it accepts the code in it.
+ *
+ * pState is the value the CLI put on the sign-in URL. It is checked only when the callback carries one back, so a
+ * hosted page that does not echo it yet keeps working; once it does, a callback that came from a different flow is
+ * refused. pOrigin is the web origin the bounce page posts from and is required on the POST path, where a browser
+ * always sends it. A top-level redirect carries no Origin, so that path rests on the state check.
+ *
+ * Either field may be NULL to skip that check.
+ */
+typedef struct directgate_login_guard_ {
+    const char *pState;
+    const char *pOrigin;
+} directgate_login_guard_t;
+
+xbool_t DirectGate_Login_ParseRequest(const char *pRequest, const directgate_login_guard_t *pGuard,
                                       char *pCode, size_t nCodeSize,
                                       char *pError, size_t nErrSize);
 

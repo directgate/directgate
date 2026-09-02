@@ -30,6 +30,8 @@ The agent uses a JSON configuration file. You can point to one with `-c <path>`,
 
 The default log directory is platform-specific: `/var/log/directgate` on Linux and macOS, and `%ProgramData%\directgate` (normally `C:\ProgramData\directgate`) on Windows, next to the machine-wide `agent.json`. Setting `log.path` overrides it everywhere; on Windows either separator may be used.
 
+`log.path` and `log.ident` are honoured by the agent itself, which runs as `shell.user` - the same account that owns `agent.json`. They are **ignored** by any process that outranks that account: the Windows LocalSystem launcher, the SYSTEM desktop helper, the pre-logon agent, and a POSIX agent that has not dropped privileges yet all log to the platform default under their own names, and say so in the log when they do. Letting a file the unprivileged account can rewrite choose where a SYSTEM or root process creates directories would be a privilege-escalation path, not a setting. An explicit `-l <path>` still applies everywhere, because that comes from whoever started the process rather than from the file.
+
 ## Agent configuration
 
 ```json

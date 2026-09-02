@@ -46,6 +46,13 @@ extern "C" {
 #define DIRECTGATE_AUTH_RATE_MAX_ATTEMPTS DIRECTGATE_MAX_SESSIONS
 #define DIRECTGATE_AUTH_MAX_MESSAGES 4
 
+/* Consecutive failed proofs the agent answers at full speed before it starts making the next attempt wait. A few
+ * are ordinary, a mistyped password, a client retrying, so the grace keeps the honest case unpunished, while the
+ * doubling past it turns a sustained guessing run from tens of thousands of tries a day into a few hundred. */
+#define DIRECTGATE_AUTH_FAILURE_GRACE 5
+#define DIRECTGATE_AUTH_LOCKOUT_BASE_MS 2000ULL
+#define DIRECTGATE_AUTH_LOCKOUT_MAX_MS 300000ULL
+
 typedef enum directgate_session_mode_ {
     DIRECTGATE_SESSION_MODE_NONE = 0,
     DIRECTGATE_SESSION_MODE_TERMINAL,
@@ -93,6 +100,8 @@ typedef struct directgate_session_mgr_ {
     const directgate_cfg_t *pCfg;
     uint64_t nAuthWindowStartMs;
     uint32_t nAuthAttempts;
+    uint32_t nAuthFailures;
+    uint64_t nAuthLockoutUntilMs;
 } directgate_session_mgr_t;
 
 void DirectGate_SessionMgr_Init(directgate_session_mgr_t *pMgr, const directgate_cfg_t *pCfg);
@@ -107,6 +116,16 @@ int DirectGate_SessionMgr_Close(directgate_session_mgr_t *pMgr, uint32_t nSessio
 void DirectGate_SessionMgr_Remove(directgate_session_mgr_t *pMgr, directgate_session_t *pSession);
 void DirectGate_SessionMgr_RemoveWithId(directgate_session_mgr_t *pMgr, uint32_t nSessionId);
 size_t DirectGate_SessionMgr_ExpireUnauthenticated(directgate_session_mgr_t *pMgr, uint64_t nNowMs);
+
+/*!
+ * @brief Report the outcome of a cryptographic proof so repeated failures are throttled.
+ *
+ * Only a proof that was actually verified and rejected counts. A client whose key is simply not authorized falls
+ * back to the password by design, and punishing that would throttle the normal path instead of an attacker.
+ */
+void DirectGate_SessionMgr_NoteAuthFailure(directgate_session_mgr_t *pMgr);
+void DirectGate_SessionMgr_NoteAuthSuccess(directgate_session_mgr_t *pMgr);
+xbool_t DirectGate_SessionMgr_IsAuthLocked(directgate_session_mgr_t *pMgr, uint64_t *pRemainMs);
 
 // Session-level operations
 int DirectGate_Session_Send(directgate_session_t *pSession, xjson_obj_t *pHeader,

@@ -225,7 +225,8 @@ size_t DirectGate_Login_StartUrl(char *pOut, size_t nSize,
                                  const directgate_login_ctx_t *pCtx,
                                  uint16_t nPort,
                                  xbool_t bPaste,
-                                 const char *pChallenge)
+                                 const char *pChallenge,
+                                 const char *pState)
 {
     XCHECK((pOut != NULL && nSize > 0), XSTDNON);
     pOut[0] = XSTR_NUL;
@@ -241,6 +242,7 @@ size_t DirectGate_Login_StartUrl(char *pOut, size_t nSize,
         "%s/cli-auth/start?port=%u&mode=%s&challenge=%s",
         pCtx->pWebUrl, (unsigned)nPort, bPaste ? "paste" : "loopback", pChallenge);
 
+    if (xstrused(pState)) nLength = xstrncat(pOut, nSize, "&state=%s", pState);
     if (xstrused(pCtx->pProvider) && strcmp(pCtx->pProvider, DIRECTGATE_LOGIN_PROVIDER))
         nLength = xstrncat(pOut, nSize, "&provider=%s", pCtx->pProvider);
 
@@ -298,7 +300,48 @@ static xbool_t DirectGate_Login_QueryValue(const char *pQuery, const char *pKey,
     return XFALSE;
 }
 
-xbool_t DirectGate_Login_ParseRequest(const char *pRequest,
+/* Copies one request header's value out of the raw request, trimmed. Same manual scan as ContentLength above,
+ * because mingw has no strcasestr and the header block is not NUL-separated. */
+static xbool_t DirectGate_Login_Header(const char *pRequest, const char *pName, char *pOut, size_t nSize)
+{
+    XCHECK_NL((xstrused(pRequest) && xstrused(pName) && pOut != NULL && nSize > 0), XFALSE);
+    pOut[0] = XSTR_NUL;
+
+    size_t nNameLen = strlen(pName);
+    for (const char *pIt = pRequest; pIt[0] != XSTR_NUL; pIt++)
+    {
+        if (pIt != pRequest && pIt[-1] != '\n') continue;
+        if (!xstrncasecmp(pIt, pName, nNameLen)) continue;
+
+        const char *pValue = pIt + nNameLen;
+        while (*pValue == ' ' || *pValue == '\t') pValue++;
+
+        size_t nLength = 0;
+        while (pValue[nLength] != XSTR_NUL && pValue[nLength] != '\r' && pValue[nLength] != '\n') nLength++;
+        while (nLength > 0 && (pValue[nLength - 1] == ' ' || pValue[nLength - 1] == '\t')) nLength--;
+
+        if (nLength == 0 || nLength >= nSize) return XFALSE;
+
+        memcpy(pOut, pValue, nLength);
+        pOut[nLength] = XSTR_NUL;
+        return XTRUE;
+    }
+
+    return XFALSE;
+}
+
+/* The state the CLI generated must match the one that comes back. A callback without any state is left alone: the
+ * hosted page does not echo it yet, and refusing those would break every sign-in before the page catches up. */
+static xbool_t DirectGate_Login_StateOk(const directgate_login_guard_t *pGuard, const char *pGot)
+{
+    if (pGuard == NULL || !xstrused(pGuard->pState) || !xstrused(pGot)) return XTRUE;
+    if (strcmp(pGuard->pState, pGot) == 0) return XTRUE;
+
+    xloge("Sign-in callback carries a state from another flow, refusing it");
+    return XFALSE;
+}
+
+xbool_t DirectGate_Login_ParseRequest(const char *pRequest, const directgate_login_guard_t *pGuard,
                                       char *pCode, size_t nCodeSize,
                                       char *pError, size_t nErrSize)
 {
@@ -327,7 +370,15 @@ xbool_t DirectGate_Login_ParseRequest(const char *pRequest,
         memcpy(sQuery, pQuery + 1, nQueryLen);
         sQuery[nQueryLen] = XSTR_NUL;
 
-        if (DirectGate_Login_QueryValue(sQuery, "code", pCode, nCodeSize)) return XTRUE;
+        if (DirectGate_Login_QueryValue(sQuery, "code", pCode, nCodeSize))
+        {
+            char sState[DIRECTGATE_PKCE_VERIFIER_SIZE];
+            if (!DirectGate_Login_QueryValue(sQuery, "state", sState, sizeof(sState))) sState[0] = XSTR_NUL;
+            if (DirectGate_Login_StateOk(pGuard, sState)) return XTRUE;
+
+            pCode[0] = XSTR_NUL;
+            return XFALSE;
+        }
 
         char sReason[XSTR_TINY];
         if (pError != NULL && nErrSize > 0 &&
@@ -343,6 +394,19 @@ xbool_t DirectGate_Login_ParseRequest(const char *pRequest,
     pBody += (*pBody == '\r') ? 4 : 2;
     if (*pBody == '\0') return XFALSE;
 
+    /* A browser always sends Origin on the cross-origin POST the bounce page makes, so requiring it here costs the
+       real flow nothing and shuts out anything else on the machine that simply opens the port and posts a code. */
+    if (pGuard != NULL && xstrused(pGuard->pOrigin))
+    {
+        char sOrigin[XPATH_MAX];
+        if (!DirectGate_Login_Header(pRequest, "origin:", sOrigin, sizeof(sOrigin)) ||
+            strcmp(sOrigin, pGuard->pOrigin) != 0)
+        {
+            xloge("Sign-in callback posted from an unexpected origin, refusing it");
+            return XFALSE;
+        }
+    }
+
     xjson_t json;
     if (!XJSON_Parse(&json, NULL, pBody, strlen(pBody)))
     {
@@ -352,6 +416,13 @@ xbool_t DirectGate_Login_ParseRequest(const char *pRequest,
 
     const char *pValue = XJSON_GetString(XJSON_GetObject(json.pRootObj, "code"));
     xbool_t bFound = xstrused(pValue) ? XTRUE : XFALSE;
+
+    if (bFound && !DirectGate_Login_StateOk(pGuard, XJSON_GetString(XJSON_GetObject(json.pRootObj, "state"))))
+    {
+        XJSON_Destroy(&json);
+        return XFALSE;
+    }
+
     if (bFound) xstrncpy(pCode, nCodeSize, pValue);
 
     if (!bFound && pError != NULL && nErrSize > 0)
@@ -518,9 +589,8 @@ static size_t DirectGate_Login_ContentLength(const char *pRequest, const char *p
 /* Serves a single connection. Returns XTRUE once a code has been captured,
  * XFALSE for anything the browser sends before that (CORS preflight, the
  * favicon probe, a provider error). */
-static xbool_t DirectGate_Login_ServeOnce(xsock_t *pListener,
-                                          char *pCode, size_t nCodeSize,
-                                          char *pError, size_t nErrSize)
+static xbool_t DirectGate_Login_ServeOnce(xsock_t *pListener, const directgate_login_guard_t *pGuard,
+                                          char *pCode, size_t nCodeSize, char *pError, size_t nErrSize)
 {
     xsock_t peer;
     if (XSock_Accept(pListener, &peer) == XSOCK_INVALID) return XFALSE;
@@ -568,7 +638,7 @@ static xbool_t DirectGate_Login_ServeOnce(xsock_t *pListener,
     XSock_Close(&peer);
 
     if (!strcmp(sMethod, "OPTIONS")) return XFALSE;
-    return DirectGate_Login_ParseRequest(sRequest, pCode, nCodeSize, pError, nErrSize);
+    return DirectGate_Login_ParseRequest(sRequest, pGuard, pCode, nCodeSize, pError, nErrSize);
 }
 
 #ifdef _WIN32
@@ -604,7 +674,8 @@ static xbool_t DirectGate_Login_ReadPaste(char *pCode, size_t nCodeSize)
     return xstrused(pCode) ? XTRUE : XFALSE;
 }
 
-static xbool_t DirectGate_Login_Await(xsock_t *pListener, xbool_t bAllowPaste, char *pCode, size_t nCodeSize)
+static xbool_t DirectGate_Login_Await(xsock_t *pListener, const directgate_login_guard_t *pGuard,
+                                      xbool_t bAllowPaste, char *pCode, size_t nCodeSize)
 {
     XCHECK((pListener != NULL && pCode != NULL), XFALSE);
     pCode[0] = XSTR_NUL;
@@ -650,7 +721,7 @@ static xbool_t DirectGate_Login_Await(xsock_t *pListener, xbool_t bAllowPaste, c
 
         if (!nReady) continue;
 
-        if (DirectGate_Login_ServeOnce(pListener, pCode, nCodeSize, sError, sizeof(sError)))
+        if (DirectGate_Login_ServeOnce(pListener, pGuard, pCode, nCodeSize, sError, sizeof(sError)))
             return XTRUE;
 
         if (xstrused(sError))
@@ -735,11 +806,22 @@ xbool_t DirectGate_Login_Interactive(directgate_account_t *pAccount,
 
     char sVerifier[DIRECTGATE_PKCE_VERIFIER_SIZE];
     char sChallenge[DIRECTGATE_PKCE_CHALLENGE_SIZE];
+    char sState[DIRECTGATE_PKCE_VERIFIER_SIZE];
 
     if (!DirectGate_Login_NewVerifier(sVerifier, sizeof(sVerifier)) ||
         !DirectGate_Login_Challenge(sVerifier, sChallenge, sizeof(sChallenge)))
     {
         xloge("Failed to derive the PKCE challenge");
+        return XFALSE;
+    }
+
+    /* Ties the callback to this run. PKCE already stops a code minted for someone else's challenge from being
+       exchanged with our verifier; this is what stops a code minted for ours by whoever read it off our
+       command line, which PKCE alone cannot tell apart from the real thing. */
+    if (!DirectGate_Login_NewVerifier(sState, sizeof(sState)))
+    {
+        xloge("Failed to generate the sign-in state");
+        OPENSSL_cleanse(sVerifier, sizeof(sVerifier));
         return XFALSE;
     }
 
@@ -767,7 +849,7 @@ xbool_t DirectGate_Login_Interactive(directgate_account_t *pAccount,
         forward the browser.
     */
     char sAuthUrl[XPATH_MAX];
-    size_t nUrlLength = DirectGate_Login_StartUrl(sAuthUrl, sizeof(sAuthUrl), pCtx, nPort, !bUseBrowser, sChallenge);
+    size_t nUrlLength = DirectGate_Login_StartUrl(sAuthUrl, sizeof(sAuthUrl), pCtx, nPort, !bUseBrowser, sChallenge, sState);
     if (!nUrlLength)
     {
         xloge("Failed to build the sign-in URL");
@@ -792,7 +874,11 @@ xbool_t DirectGate_Login_Interactive(directgate_account_t *pAccount,
     fflush(stdout);
 
     char sCode[XSTR_MID];
-    xbool_t bGotCode = DirectGate_Login_Await(&listener, !bUseBrowser, sCode, sizeof(sCode));
+    directgate_login_guard_t guard;
+    guard.pState = sState;
+    guard.pOrigin = pCtx->pWebUrl;
+
+    xbool_t bGotCode = DirectGate_Login_Await(&listener, &guard, !bUseBrowser, sCode, sizeof(sCode));
     XSock_Close(&listener);
 
     if (!bGotCode)

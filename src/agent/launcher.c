@@ -453,7 +453,13 @@ static HANDLE g_hElevThread = NULL;
 static HANDLE g_hElevHelper = NULL;
 static xbool_t g_bElevEnabled = XTRUE;
 static xbool_t g_bElevLockScreen = XTRUE;
-static char g_sElevCfgPath[XPATH_MAX] = { 0 };
+
+/* Verbosity the helper should run at, taken from the launcher's own resolved
+   config. It is passed on the command line rather than letting the helper read
+   agent.json: that file belongs to shell.user, and a SYSTEM process has no
+   business opening it. A number cannot name a path. */
+static uint16_t g_nElevLogFlags = XLOG_ERROR | XLOG_WARN | XLOG_NOTE | XLOG_INFO;
+static xbool_t g_bElevLogToFile = XTRUE;
 
 /* Builds a single-entry PROC_THREAD_ATTRIBUTE_HANDLE_LIST so a child inherits exactly the
    handles named here and nothing else that happens to be inheritable in this process. */
@@ -627,7 +633,7 @@ static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid
         char sCmd[XPATH_MAX * 2 + 512];
         xstrncpyf(sCmd, sizeof(sCmd),
             "\"%s\" %s --cmd %llu --shm %llu --shm-bytes %llu --ready %llu --taken %llu "
-            "--agent %llu --agent-pid %lu --allow-lock %d -c \"%s\"",
+            "--agent %llu --agent-pid %lu --allow-lock %d --log-flags %u --log-file %d",
             sSelf, DIRECTGATE_ELEV_HELPER_FLAG,
             (unsigned long long)(uintptr_t)hCmdRead,
             (unsigned long long)(uintptr_t)hSection,
@@ -637,7 +643,7 @@ static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid
             (unsigned long long)(uintptr_t)hAgentInherit,
             (unsigned long)nAgentPid,
             (g_bAgentPreLogon || g_bElevLockScreen) ? 1 : 0,
-            g_sElevCfgPath);
+            (unsigned)g_nElevLogFlags, g_bElevLogToFile ? 1 : 0);
 
         HANDLE sHandles[5] = { hCmdRead, hSection, hReady, hTaken, hAgentInherit };
         pAttrs = DirectGate_WinLauncher_HandleList(sHandles, 5);
@@ -724,7 +730,9 @@ static void DirectGate_WinLauncher_SendSAS(void)
 
     if (!bResolved)
     {
-        HMODULE hSas = LoadLibraryW(L"sas.dll");
+        /* System32 only. A bare name lets the loader consider the application directory first, and this process
+           is LocalSystem - the one place where an unexpected DLL on the search path would be worth planting. */
+        HMODULE hSas = LoadLibraryExW(L"sas.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (hSas != NULL) pSendSAS = (directgate_send_sas_fn)(void*)GetProcAddress(hSas, "SendSAS");
         bResolved = XTRUE;
     }
@@ -869,6 +877,59 @@ static void DirectGate_WinLauncher_Stop(void)
 }
 
 /*
+ * Windows gives a process object a default DACL that grants its own user full access, so anything running as
+ * shell.user can OpenProcess the agent with PROCESS_DUP_HANDLE or PROCESS_VM_READ. Either is enough to defeat the
+ * privilege separation this launcher exists to provide: the first steals the agent's handle to the SYSTEM desktop
+ * helper and drives privileged input through it, the second reads session keys, the SRP verifier and the identity
+ * seed straight out of the agent's memory. POSIX gets this for free from ptrace_scope; Windows has no equivalent
+ * default, so the launcher tightens the object itself while it still holds the only full-access handle.
+ *
+ * SYSTEM and Administrators keep full access - they can already do anything - and everyone else, the agent's own
+ * account included, is left with what it actually needs: query its own integrity level, wait on it, terminate it.
+ * The OWNER RIGHTS ACE is what makes that stick, because an owner otherwise keeps an implicit WRITE_DAC it could
+ * use to put the default DACL back.
+ */
+static void DirectGate_WinLauncher_ProtectAgent(HANDLE hProcess, HANDLE hToken)
+{
+    /* PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE */
+    static const char *pUserRights = "0x00101001";
+
+    uint8_t sUserBuf[SECURITY_MAX_SID_SIZE + sizeof(TOKEN_USER)];
+    LPSTR pUserSid = NULL;
+    DWORD nLen = 0;
+
+    if (GetTokenInformation(hToken, TokenUser, sUserBuf, (DWORD)sizeof(sUserBuf), &nLen))
+        ConvertSidToStringSidA(((TOKEN_USER*)sUserBuf)->User.Sid, &pUserSid);
+
+    char sSDDL[XSTR_MID];
+    if (pUserSid != NULL)
+    {
+        xstrncpyf(sSDDL, sizeof(sSDDL), "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;%s;;;%s)(A;;%s;;;OW)",
+            pUserRights, pUserSid, pUserRights);
+
+        LocalFree(pUserSid);
+    }
+    else xstrncpyf(sSDDL, sizeof(sSDDL), "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;%s;;;OW)", pUserRights);
+
+    PSECURITY_DESCRIPTOR pDescriptor = NULL;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(sSDDL, SDDL_REVISION_1, &pDescriptor, NULL))
+    {
+        xlogw("launcher: could not build the agent process DACL, leaving the default: error(%lu)", GetLastError());
+        return;
+    }
+
+    /* Best effort on purpose: a hardening step must not be the reason a device stops coming online. */
+    if (!SetKernelObjectSecurity(hProcess, DACL_SECURITY_INFORMATION, pDescriptor))
+    {
+        xlogw("launcher: could not restrict access to the agent process, its memory and "
+              "handles stay readable by the account it runs as: error(%lu)", GetLastError());
+    }
+    else xlogd("launcher: restricted access to the agent process");
+
+    LocalFree(pDescriptor);
+}
+
+/*
  * Spawn the agent itself (same executable, no launcher flag) inside shell.user's
  * session via their logon token, so the agent and everything it does runs AS
  * shell.user. The identity comes only from the token the launcher minted for the
@@ -976,6 +1037,10 @@ static XSTATUS DirectGate_WinLauncher_SpawnAgent(HANDLE hToken, const char *pCfg
     CloseHandle(pi.hThread);
     *phProcess = pi.hProcess;
 
+    /* Before the agent has done anything: from here on its memory and its handles are out of reach of the
+       account it runs as, which is what keeps a compromise of that account from reaching the SYSTEM helper. */
+    DirectGate_WinLauncher_ProtectAgent(pi.hProcess, hToken);
+
     /* Asked of the OS rather than assumed from the token: this is the session
        the supervisor watches for the rest of the agent's life, and a session
        the agent is not actually in would make every check below meaningless. */
@@ -1054,7 +1119,13 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
     }
 
     SetConsoleCtrlHandler(DirectGate_WinLauncher_CtrlHandler, TRUE);
-    xstrncpy(g_sElevCfgPath, sizeof(g_sElevCfgPath), pCfgPath);
+
+    /* This process is the LocalSystem supervisor and agent.json is owned by
+       shell.user, so every path in that file is attacker-choosable from the
+       launcher's point of view. Refuse them before the first LogApply below:
+       honouring log.path would let an unprivileged account decide where a
+       SYSTEM process creates directories and opens files. */
+    DirectGate_LogRestrictConfigPaths();
 
     /*
        Wait for a usable configuration rather than exiting without one.
@@ -1081,7 +1152,9 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
        console. A separate ident keeps the file apart from the agent's own. */
     DirectGate_InitConfig(&cfg);
     if (XPath_Exists(pCfgPath)) (void)DirectGate_LoadConfig(&cfg, pCfgPath);
-    xstrncpy(cfg.log.sIdent, sizeof(cfg.log.sIdent), "directgate-launcher");
+    DirectGate_LogSetIdent(&cfg.log, "directgate-launcher");
+    g_nElevLogFlags = cfg.log.nFlags;
+    g_bElevLogToFile = cfg.log.bToFile;
     DirectGate_LogApply(&cfg.log);
 
     while (!DirectGate_WinLauncher_Stopping())
@@ -1120,7 +1193,9 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
                 g_bPreLogon = XFALSE;
             }
 
-            xstrncpy(cfg.log.sIdent, sizeof(cfg.log.sIdent), "directgate-launcher");
+            DirectGate_LogSetIdent(&cfg.log, "directgate-launcher");
+            g_nElevLogFlags = cfg.log.nFlags;
+            g_bElevLogToFile = cfg.log.bToFile;
             DirectGate_LogApply(&cfg.log);
             break;
         }

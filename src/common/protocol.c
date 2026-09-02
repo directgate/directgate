@@ -160,7 +160,12 @@ static xbool_t DirectGate_Package_ParsePayload(directgate_pkg_data_t *pData, xjs
     size_t nOffset = DIRECTGATE_PROTO_PREAMBLE_SIZE + (size_t)nHdrLen;
     if (nPayload)
     {
-        if (nRawSize < nOffset + nPayload)
+        /* Same rule as the header bound: the remaining-bytes comparison is a
+           subtraction, so a payloadSize near UINT32_MAX cannot wrap the sum and
+           hand the caller a pointer with a 4 GB length attached. nOffset is
+           re-tested rather than assumed, so this stays correct even if a future
+           caller reaches it without Package_Parse having validated nHdrLen. */
+        if (nOffset > nRawSize || nPayload > nRawSize - nOffset)
         {
             xlogw("Protocol packet payload is truncated: payload(%u), hdr(%u), packetBytes(%zu)",
                 nPayload, nHdrLen, nRawSize);
@@ -413,7 +418,15 @@ xbool_t DirectGate_Package_Parse(directgate_pkg_t *pPkg, const uint8_t *pData, s
     XCHECK_NL((nSize >= DIRECTGATE_PROTO_PREAMBLE_SIZE), XFALSE);
 
     uint32_t nHdrLen = DirectGate_Proto_ReadU32LE(pData);
-    if (!nHdrLen || nSize < (size_t)DIRECTGATE_PROTO_PREAMBLE_SIZE + nHdrLen)
+
+    /* Bound the attacker-supplied length by SUBTRACTING from what is actually
+       here, never by adding to it. The check above guarantees nSize is at least
+       the preamble, so the subtraction cannot underflow - while the addition it
+       replaces wraps wherever size_t is 32 bits (ARMHF is a shipped target):
+       nHdrLen of 0xFFFFFFFF made (PREAMBLE + nHdrLen) evaluate to 3, so a
+       four-byte packet passed and the header parser was handed a 4 GB length
+       over a four-byte buffer. */
+    if (!nHdrLen || nHdrLen > nSize - DIRECTGATE_PROTO_PREAMBLE_SIZE)
     {
         xlogw("Protocol packet header is incomplete: hdr(%u), packetBytes(%zu)", nHdrLen, nSize);
         return XFALSE;
@@ -814,7 +827,11 @@ xbool_t DirectGate_Proto_CheckCC(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E)
     XCHECK_NL((pOut->nUsed >= DIRECTGATE_PROTO_PREAMBLE_SIZE), XFALSE);
 
     uint32_t nHdrLen = DirectGate_Proto_ReadU32LE(pOut->pData);
-    if (nHdrLen > 0 && pOut->nUsed >= (size_t)DIRECTGATE_PROTO_PREAMBLE_SIZE + nHdrLen)
+
+    /* Decrypted, so the length is authenticated but a peer that has completed
+       the handshake is still not trusted to be well behaved, and the wrap this
+       avoids is the same one Package_Parse guards. */
+    if (nHdrLen > 0 && nHdrLen <= pOut->nUsed - DIRECTGATE_PROTO_PREAMBLE_SIZE)
     {
         const char *pJsonData = (const char*)(pOut->pData + DIRECTGATE_PROTO_PREAMBLE_SIZE);
         xjson_t json;
