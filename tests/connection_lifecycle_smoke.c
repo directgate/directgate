@@ -270,6 +270,47 @@ int main(void)
             "custom endpoint data must never be written through as a connection");
     }
 
+    /* A relay error frame is unauthenticated and unencrypted, so a claim that this device is no longer enrolled
+       must not be acted on locally. It only marks the enrollment for a check against the API on the next connect;
+       clearing the tokens here would let one injected frame take the device offline until somebody re-pairs it. */
+    directgate_cfg_t revokeCfg;
+    memset(&revokeCfg, 0, sizeof(revokeCfg));
+    xstrncpy(revokeCfg.auth.sSaltHex, sizeof(revokeCfg.auth.sSaltHex),
+        "00000000000000000000000000000000"
+        "00000000000000000000000000000000");
+    xstrncpy(revokeCfg.auth.sVerifierHex, sizeof(revokeCfg.auth.sVerifierHex), "configured");
+    xstrncpy(revokeCfg.enroll.sAccessToken, sizeof(revokeCfg.enroll.sAccessToken), "access-token");
+    xstrncpy(revokeCfg.enroll.sRefreshToken, sizeof(revokeCfg.enroll.sRefreshToken), "refresh-token");
+    xstrncpy(revokeCfg.sRelayUrl, sizeof(revokeCfg.sRelayUrl), "wss://relay1.directgate.io/websock");
+    xstrncpy(revokeCfg.sRoutingKey, sizeof(revokeCfg.sRoutingKey), "routing-key");
+    revokeCfg.enroll.bEnrolled = XTRUE;
+
+    directgate_conn_t revokeConn;
+    memset(&revokeConn, 0, sizeof(revokeConn));
+    revokeConn.pCfg = &revokeCfg;
+    DirectGate_SessionMgr_Init(&revokeConn.mgr, &revokeCfg);
+
+    xapi_session_t revokeRelay;
+    CHECK(dispatch(&revokeConn, &revokeRelay, XAPI_CB_CONNECTED) == XAPI_CONTINUE,
+        "relay connection for the revocation test should be accepted");
+
+    CHECK(send_header(&revokeConn, &revokeRelay,
+        DirectGate_Proto_BuildError("device-revoked", 0)) == XAPI_CONTINUE,
+        "a relay revocation claim should be accepted as a message");
+
+    CHECK(!revokeConn.bReconnectSuppressed,
+        "a relay revocation claim must not suppress reconnects on its own");
+    CHECK(revokeConn.bEnrollmentDoubt,
+        "a relay revocation claim should mark the enrollment for an API check");
+    CHECK(revokeCfg.enroll.bEnrolled,
+        "a relay revocation claim must not clear the enrollment");
+    CHECK(strcmp(revokeCfg.enroll.sRefreshToken, "refresh-token") == 0,
+        "a relay revocation claim must not wipe the refresh token");
+    CHECK(strcmp(revokeCfg.sRoutingKey, "routing-key") == 0,
+        "a relay revocation claim must not wipe the routing key");
+
+    DirectGate_SessionMgr_Destroy(&revokeConn.mgr);
+
     puts("connection_lifecycle_smoke: OK");
     return 0;
 }

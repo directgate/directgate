@@ -129,7 +129,7 @@ These operational messages do not contain terminal output, file contents, sessio
 - **Continuity counter** - each encrypted packet carries a monotonic counter to prevent replay attacks
 - **Zero-knowledge payloads** - in relay mode, the server is cryptographically incapable of decrypting session data, but necessarily sees the routing and traffic metadata described above
 - **P2P bypass** - when the WebRTC channel is active, terminal data does not pass through the relay at all
-- The agent allows to set any password you want and it is up to you to use strong passwords for SRP credentials (according to NIST, 15+ characters is recommended)
+- The agent allows to set any password you want and it is up to you to use strong passwords for SRP credentials (according to NIST, 15+ characters is recommended). Repeated failed proofs are throttled with a doubling delay, which slows guessing but is no substitute for a strong password
 - Review the `shell.user` permissions in the agent configuration - the agent grants shell access as that user
 - A desktop session can capture the screen and inject mouse/keyboard input as `shell.user`, with no local on-screen indicator; it requires authentication, and grants no privilege the terminal does not already grant
 - Keep the agent updated through the package repositories (or build from source) so you receive security fixes
