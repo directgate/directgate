@@ -19,6 +19,10 @@ function(directgate_smoke name)
         target_link_libraries(${name} PRIVATE ${UTIL_LIBRARY})
     endif()
     add_test(NAME ${name} COMMAND ${name})
+    # A smoke test that blocks must fail, not burn a CI runner. The cap is far
+    # above the slowest test (the enrollment retry backoff, ~3s) so it can only
+    # trip on a genuine hang.
+    set_tests_properties(${name} PROPERTIES TIMEOUT 120)
 endfunction()
 
 # Targets that compile session.c / directgate.c pull in the desktop module,

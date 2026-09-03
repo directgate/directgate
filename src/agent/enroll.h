@@ -36,6 +36,18 @@ typedef enum directgate_enroll_refresh_status_ {
 
 xbool_t DirectGate_Enroll_ApplyPairResponse(directgate_cfg_t *pCfg, const uint8_t *pBody, size_t nBodyLen);
 xbool_t DirectGate_Enroll_ApplyRefreshResponse(directgate_cfg_t *pCfg, const uint8_t *pBody, size_t nBodyLen);
+
+/*!
+ * @brief Build an enrollment API request: Host, User-Agent, JSON headers and
+ *        the receive timeout. Does not perform any I/O.
+ *
+ * Exposed only so the Host header stays under test. libxutils defaults
+ * requests to HTTP/1.0 and XHTTP_EasyPerform() synthesizes no headers, so
+ * without it the request is routable by TLS SNI alone - which plain nginx
+ * accepts and a CDN or WAF edge answers 403 to, before the origin is reached.
+ */
+xbool_t DirectGate_Enroll_BuildRequest(xhttp_t *pHandle, const char *pUrl, const char *pPath);
+
 xbool_t DirectGate_Enroll_Pair(directgate_cfg_t *pCfg, const char *pPairingToken);
 xbool_t DirectGate_Enroll_RotateAgentKey(directgate_cfg_t *pCfg);
 xbool_t DirectGate_Enroll_AccessTokenIsUsable(const directgate_cfg_t *pCfg);

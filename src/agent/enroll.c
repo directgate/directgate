@@ -114,18 +114,19 @@ static xbool_t DirectGate_Enroll_IsTransientTransport(xhttp_status_t eStatus)
  * @param nAttempts Total attempts. Must be 1 on any caller that runs on the
  *                  event loop, since the backoff sleeps in-line.
  */
-static xhttp_status_t DirectGate_Enroll_Perform(xhttp_t *pHandle, directgate_enroll_trace_t *pTrace,
-                                                const char *pUrl, const char *pPath, const uint8_t *pBody,
-                                                size_t nBodyLen, uint32_t nAttempts)
+xbool_t DirectGate_Enroll_BuildRequest(xhttp_t *pHandle, const char *pUrl, const char *pPath)
 {
-    XCHECK((pHandle != NULL && pTrace != NULL), XHTTP_EINIT);
-
-    /* Cleared before any early return, since every caller logs it afterwards. */
-    xstrnul(pTrace->sPeer);
-    XCHECK((xstrused(pUrl) && xstrused(pPath)), XHTTP_ELINK);
+    XCHECK((pHandle != NULL), XFALSE);
+    XCHECK((xstrused(pUrl) && xstrused(pPath)), XFALSE);
 
     xlink_t link;
-    XCHECK((XLink_Parse(&link, pUrl) >= 0), XHTTP_ELINK);
+    XCHECK((XLink_Parse(&link, pUrl) >= 0), XFALSE);
+    XCHECK((XHTTP_InitRequest(pHandle, XHTTP_POST, pPath, NULL) >= 0), XFALSE);
+
+    /* Without a receive timeout a connection that opens and then goes silent
+     * parks the caller on recv() forever, so a dropped NAT entry hangs
+     * enrollment instead of failing it. */
+    pHandle->nTimeout = DIRECTGATE_ENROLL_HTTP_TIMEOUT;
 
     /*
         XHTTP_EasyPerform() uses the link only to dial, it never synthesizes
@@ -141,26 +142,37 @@ static xhttp_status_t DirectGate_Enroll_Perform(xhttp_t *pHandle, directgate_enr
     xbool_t bDefaultPort = (xstrcmp(link.sProtocol, "https") && link.nPort == 443) ||
                            (xstrcmp(link.sProtocol, "http") && link.nPort == 80);
 
+    if (bDefaultPort) XHTTP_AddHeader(pHandle, "Host", "%s", link.sAddr);
+    else XHTTP_AddHeader(pHandle, "Host", "%s:%d", link.sAddr, link.nPort);
+
+    XHTTP_AddHeader(pHandle, "User-Agent", "directgate-agent/%s", DirectGate_GetVersionShort());
+    XHTTP_AddHeader(pHandle, "Content-Type", "application/json");
+    XHTTP_AddHeader(pHandle, "Accept", "application/json");
+
+    return XTRUE;
+}
+
+static xhttp_status_t DirectGate_Enroll_Perform(xhttp_t *pHandle, directgate_enroll_trace_t *pTrace,
+                                                const char *pUrl, const char *pPath, const uint8_t *pBody,
+                                                size_t nBodyLen, uint32_t nAttempts)
+{
+    XCHECK((pHandle != NULL && pTrace != NULL), XHTTP_EINIT);
+
+    /* Cleared before any early return, since every caller logs it afterwards. */
+    xstrnul(pTrace->sPeer);
+    XCHECK((xstrused(pUrl) && xstrused(pPath)), XHTTP_ELINK);
+
+    xlink_t link;
+    XCHECK((XLink_Parse(&link, pUrl) >= 0), XHTTP_ELINK);
+
     uint32_t nDelayMs = DIRECTGATE_ENROLL_RETRY_DELAY_MS;
     xhttp_status_t eStatus = XHTTP_EINIT;
     uint32_t nAttempt;
 
     for (nAttempt = 0; nAttempt < nAttempts; nAttempt++)
     {
-        XCHECK((XHTTP_InitRequest(pHandle, XHTTP_POST, pPath, NULL) >= 0), XHTTP_EINIT);
-
-        /* Without a receive timeout a connection that opens and then goes
-         * silent parks the caller on recv() forever, so a dropped NAT entry
-         * hangs enrollment instead of failing it. */
-        pHandle->nTimeout = DIRECTGATE_ENROLL_HTTP_TIMEOUT;
+        XCHECK((DirectGate_Enroll_BuildRequest(pHandle, pUrl, pPath)), XHTTP_EINIT);
         XHTTP_SetCallback(pHandle, DirectGate_Enroll_TraceCb, pTrace, XHTTP_STATUS);
-
-        if (bDefaultPort) XHTTP_AddHeader(pHandle, "Host", "%s", link.sAddr);
-        else XHTTP_AddHeader(pHandle, "Host", "%s:%d", link.sAddr, link.nPort);
-
-        XHTTP_AddHeader(pHandle, "User-Agent", "directgate-agent/%s", DirectGate_GetVersionShort());
-        XHTTP_AddHeader(pHandle, "Content-Type", "application/json");
-        XHTTP_AddHeader(pHandle, "Accept", "application/json");
 
         eStatus = XHTTP_EasyPerform(pHandle, pUrl, pBody, nBodyLen);
 
