@@ -65,7 +65,66 @@ static xbool_t DirectGate_Enroll_ValidateAPIEndpoint(const directgate_cfg_t *pCf
 
 typedef struct directgate_enroll_trace_ {
     char sPeer[XHTTP_OPTION_MAX];
+    int nOsError;
+    const char *pOsErrorName;
 } directgate_enroll_trace_t;
+
+/*
+ * The status string alone cannot tell a firewall from a dead route: a blocked
+ * connection, a blackholed one and a refused one all render as "Failed to
+ * connect remote server", which is exactly why field reports of enrolment
+ * failures have been undiagnosable. libxutils keeps only its own status enum
+ * on the socket and never records the OS error, so it is read here instead.
+ *
+ * Reading it after the call is sound for a failed connect(): the only call
+ * between the failure and this point is closesocket(), which leaves the last
+ * error alone on success. SSL is never initialised on a connect that failed,
+ * so nothing else runs in between.
+ */
+static int DirectGate_Enroll_LastNetError(void)
+{
+#ifdef _WIN32
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+static const char* DirectGate_Enroll_NetErrorName(int nError)
+{
+#ifdef _WIN32
+    switch (nError)
+    {
+        /* The one worth naming loudly: Windows reports a connection blocked by
+         * the firewall or by security software as WSAEACCES, not as a timeout. */
+        case WSAEACCES:          return "WSAEACCES/blocked-by-firewall-or-security-software";
+        case WSAETIMEDOUT:       return "WSAETIMEDOUT/no-response";
+        case WSAECONNREFUSED:    return "WSAECONNREFUSED/actively-refused";
+        case WSAECONNRESET:      return "WSAECONNRESET/reset-by-peer";
+        case WSAENETUNREACH:     return "WSAENETUNREACH/no-route";
+        case WSAEHOSTUNREACH:    return "WSAEHOSTUNREACH/host-unreachable";
+        case WSAENETDOWN:        return "WSAENETDOWN/network-down";
+        case WSAHOST_NOT_FOUND:  return "WSAHOST_NOT_FOUND/dns";
+        case WSANOTINITIALISED:  return "WSANOTINITIALISED/winsock-not-started";
+        default: break;
+    }
+#else
+    switch (nError)
+    {
+        case EACCES:        return "EACCES/blocked-by-local-policy";
+        case EPERM:         return "EPERM/blocked-by-local-policy";
+        case ETIMEDOUT:     return "ETIMEDOUT/no-response";
+        case ECONNREFUSED:  return "ECONNREFUSED/actively-refused";
+        case ECONNRESET:    return "ECONNRESET/reset-by-peer";
+        case ENETUNREACH:   return "ENETUNREACH/no-route";
+        case EHOSTUNREACH:  return "EHOSTUNREACH/host-unreachable";
+        case ENETDOWN:      return "ENETDOWN/network-down";
+        default: break;
+    }
+#endif
+
+    return "unmapped";
+}
 
 /* XHTTP_Connect() reports the address it resolved just before it dials it.
  * Keeping that string is what makes a transport failure diagnosable after the
@@ -160,6 +219,8 @@ static xhttp_status_t DirectGate_Enroll_Perform(xhttp_t *pHandle, directgate_enr
 
     /* Cleared before any early return, since every caller logs it afterwards. */
     xstrnul(pTrace->sPeer);
+    pTrace->nOsError = 0;
+    pTrace->pOsErrorName = "none";
     XCHECK((xstrused(pUrl) && xstrused(pPath)), XHTTP_ELINK);
 
     xlink_t link;
@@ -177,13 +238,19 @@ static xhttp_status_t DirectGate_Enroll_Perform(xhttp_t *pHandle, directgate_enr
         eStatus = XHTTP_EasyPerform(pHandle, pUrl, pBody, nBodyLen);
 
         if (eStatus == XHTTP_COMPLETE) break;
+
+        /* Captured before anything else can overwrite it. */
+        pTrace->nOsError = DirectGate_Enroll_LastNetError();
+        pTrace->pOsErrorName = DirectGate_Enroll_NetErrorName(pTrace->nOsError);
+
         if (!DirectGate_Enroll_IsTransientTransport(eStatus)) break;
         if (nAttempt + 1 >= nAttempts) break;
 
-        xlogw("Enrollment request failed, retrying: url(%s), peer(%s), attempt(%u/%u), status(%s), delay(%ums)",
+        xlogw("Enrollment request failed, retrying: url(%s), peer(%s), attempt(%u/%u), status(%s), oserr(%d/%s), delay(%ums)",
             pUrl, xstrused(pTrace->sPeer) ? pTrace->sPeer : "N/A",
             (unsigned int)(nAttempt + 1), (unsigned int)nAttempts,
-            XHTTP_GetStatusStr(eStatus), (unsigned int)nDelayMs);
+            XHTTP_GetStatusStr(eStatus), pTrace->nOsError, pTrace->pOsErrorName,
+            (unsigned int)nDelayMs);
 
         /* The next attempt rebuilds the request from scratch. */
         XHTTP_Clear(pHandle);
@@ -608,9 +675,10 @@ xbool_t DirectGate_Enroll_Pair(directgate_cfg_t *pCfg, const char *pPairingToken
 
     if (status != XHTTP_COMPLETE)
     {
-        xloge("Pair request failed: dev(%s), url(%s), peer(%s), status(%s)",
+        xloge("Pair request failed: dev(%s), url(%s), peer(%s), status(%s), oserr(%d/%s)",
             DirectGate_Enroll_GetDeviceId(pCfg), sUrl,
-            xstrused(trace.sPeer) ? trace.sPeer : "N/A", XHTTP_GetStatusStr(status));
+            xstrused(trace.sPeer) ? trace.sPeer : "N/A", XHTTP_GetStatusStr(status),
+            trace.nOsError, trace.pOsErrorName);
 
         XHTTP_Clear(&handle);
         return XFALSE;
@@ -688,9 +756,10 @@ xbool_t DirectGate_Enroll_RotateAgentKey(directgate_cfg_t *pCfg)
 
     if (status != XHTTP_COMPLETE)
     {
-        xloge("Agent key rotation request failed: dev(%s), url(%s), peer(%s), status(%s)",
+        xloge("Agent key rotation request failed: dev(%s), url(%s), peer(%s), status(%s), oserr(%d/%s)",
             DirectGate_Enroll_GetDeviceId(pCfg), sUrl,
-            xstrused(trace.sPeer) ? trace.sPeer : "N/A", XHTTP_GetStatusStr(status));
+            xstrused(trace.sPeer) ? trace.sPeer : "N/A", XHTTP_GetStatusStr(status),
+            trace.nOsError, trace.pOsErrorName);
 
         XHTTP_Clear(&handle);
         return XFALSE;
@@ -777,9 +846,10 @@ directgate_enroll_status_t DirectGate_Enroll_Refresh(directgate_cfg_t *pCfg, cha
 
     if (status != XHTTP_COMPLETE)
     {
-        xloge("Token refresh request failed: dev(%s), url(%s), peer(%s), status(%s)",
+        xloge("Token refresh request failed: dev(%s), url(%s), peer(%s), status(%s), oserr(%d/%s)",
             DirectGate_Enroll_GetDeviceId(pCfg), sUrl,
-            xstrused(trace.sPeer) ? trace.sPeer : "N/A", XHTTP_GetStatusStr(status));
+            xstrused(trace.sPeer) ? trace.sPeer : "N/A", XHTTP_GetStatusStr(status),
+            trace.nOsError, trace.pOsErrorName);
 
         XHTTP_Clear(&handle);
         return DIRECTGATE_ENROLL_REFRESH_TRANSIENT;
