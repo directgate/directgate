@@ -103,7 +103,8 @@ Installing `directgate-<release>_x64.msi` (double-click, or `msiexec /i directga
 
 - requests elevation once for the per-machine installation;
 - installs the `DirectGate P2P UDP` inbound Windows Firewall rule for `directgate.exe` on every profile, with edge traversal enabled;
-- removes that firewall rule automatically when DirectGate is uninstalled;
+- installs program-scoped **outbound** allow rules - `DirectGate Outbound TCP` and `DirectGate Outbound UDP` for `directgate.exe`, `DirectGate CLI Outbound TCP` for `dgcli.exe`. Windows allows outbound by default, so these do nothing on a stock machine; they exist for fleets where the outbound default has been set to Block, where the agent would otherwise fail to enrol or come online with an error indistinguishable from a network outage. They are installed with `IgnoreFailure="yes"`, so a machine that refuses them still installs. The Manager gets no rule because it opens no sockets: pairing runs `directgate -sed ... -t ...` through a pseudo-terminal, so the process on the network is always the agent;
+- removes those firewall rules automatically when DirectGate is uninstalled;
 - installs `directgate.exe` and `dgcli.exe` into `C:\Program Files\DirectGate\` and adds that directory to the system `PATH`;
 - creates `C:\ProgramData\directgate\`, the machine-wide config home and the default log directory (`log.path` in `agent.json` overrides it);
 - registers one Windows service, `directgate-agent`, running as **LocalSystem**

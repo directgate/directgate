@@ -143,6 +143,30 @@
                             EdgeTraversal="allow"
                             Enabled="yes"
                             IgnoreFailure="no" />
+
+                        <firewall:FirewallException
+                            Id="DirectGateOutboundTcpFirewall"
+                            Name="DirectGate Outbound TCP"
+                            Description="Allows DirectGate to reach the DirectGate API, relay and TURN over TCP"
+                            Protocol="tcp"
+                            Outbound="yes"
+                            Scope="any"
+                            Profile="all"
+                            Action="allow"
+                            Enabled="yes"
+                            IgnoreFailure="yes" />
+
+                        <firewall:FirewallException
+                            Id="DirectGateOutboundUdpFirewall"
+                            Name="DirectGate Outbound UDP"
+                            Description="Allows DirectGate WebRTC media and STUN/TURN over UDP"
+                            Protocol="udp"
+                            Outbound="yes"
+                            Scope="any"
+                            Profile="all"
+                            Action="allow"
+                            Enabled="yes"
+                            IgnoreFailure="yes" />
                     </File>
 
                     <!-- One LocalSystem service that runs the launcher. No account
@@ -187,7 +211,28 @@
                 <Component Id="CmpCliExe" Bitness="always64">
                     <File Id="FileCliExe"
                           Source="$(var.StageDir)/dgcli.exe"
-                          KeyPath="yes" />
+                          KeyPath="yes">
+                        <!-- dgcli signs in and drives the API over HTTPS, so it
+                             needs the same outbound allowance as the agent where
+                             the outbound default is Block. It never listens, so
+                             there is no inbound counterpart.
+
+                             The Manager gets no rule on purpose: it opens no
+                             sockets. Pairing runs `directgate -sed ... -t ...`
+                             through a pseudo-terminal, so the process on the
+                             network is always the agent above. -->
+                        <firewall:FirewallException
+                            Id="DirectGateCliOutboundTcpFirewall"
+                            Name="DirectGate CLI Outbound TCP"
+                            Description="Allows the DirectGate CLI to reach the DirectGate API over TCP"
+                            Protocol="tcp"
+                            Outbound="yes"
+                            Scope="any"
+                            Profile="all"
+                            Action="allow"
+                            Enabled="yes"
+                            IgnoreFailure="yes" />
+                    </File>
                 </Component>
 
                 <!-- The pairing / service-control GUI (Tauri app from manager/).
