@@ -24,6 +24,16 @@
 #include "enroll.h"
 #include "version.h"
 
+#define DIRECTGATE_ENROLL_HTTP_TIMEOUT      20U     /* Receive timeout, seconds. */
+#define DIRECTGATE_ENROLL_RETRY_ATTEMPTS    3U      /* Attempts for CLI-driven calls. */
+#define DIRECTGATE_ENROLL_RETRY_DELAY_MS    1000U   /* Doubled after every failed attempt. */
+#define DIRECTGATE_ENROLL_USEC_PER_MS       1000U
+
+/* Refresh runs on the relay event loop, where the in-line backoff of a retry
+ * would stall every live session. It gets one attempt and the caller's own
+ * transient handling drives the next one. */
+#define DIRECTGATE_ENROLL_ONESHOT           1U
+
 static const char* DirectGate_Enroll_GetDeviceId(const directgate_cfg_t *pCfg)
 {
     XCHECK_NL((pCfg != NULL), NULL);
@@ -51,6 +61,125 @@ static xbool_t DirectGate_Enroll_ValidateAPIEndpoint(const directgate_cfg_t *pCf
         DirectGate_Enroll_GetDeviceId(pCfg), DirectGate_Enroll_GetApiUrl(pCfg));
 
     return XFALSE;
+}
+
+typedef struct directgate_enroll_trace_ {
+    char sPeer[XHTTP_OPTION_MAX];
+} directgate_enroll_trace_t;
+
+/* XHTTP_Connect() reports the address it resolved just before it dials it.
+ * Keeping that string is what makes a transport failure diagnosable after the
+ * fact: the status string alone cannot separate a blackholed route from a
+ * refused port or a firewall drop. */
+static int DirectGate_Enroll_TraceCb(xhttp_t *pHttp, xhttp_ctx_t *pCbCtx)
+{
+    XCHECK_NL((pHttp != NULL && pCbCtx != NULL), XSTDOK);
+    directgate_enroll_trace_t *pTrace = (directgate_enroll_trace_t*)pHttp->pUserCtx;
+
+    XCHECK_NL((pTrace != NULL), XSTDOK);
+    XCHECK_NL((pCbCtx->eStatus == XHTTP_RESOLVED), XSTDOK);
+    XCHECK_NL((pCbCtx->pData != NULL), XSTDOK);
+
+    xstrncpy(pTrace->sPeer, sizeof(pTrace->sPeer), (const char*)pCbCtx->pData);
+    return XSTDOK;
+}
+
+/* Only failures that a later attempt can plausibly clear. A malformed link or
+ * an unsupported protocol is a configuration fault and retrying it just delays
+ * the error the operator needs to see. */
+static xbool_t DirectGate_Enroll_IsTransientTransport(xhttp_status_t eStatus)
+{
+    switch (eStatus)
+    {
+        case XHTTP_ERESOLVE:
+        case XHTTP_ECONNECT:
+        case XHTTP_EWRITE:
+        case XHTTP_EREAD:
+        case XHTTP_ETIMEO:
+        case XHTTP_INCOMPLETE:
+            return XTRUE;
+        default:
+            break;
+    }
+
+    return XFALSE;
+}
+
+/*!
+ * @brief Perform one enrollment API call, retrying transient transport errors.
+ *
+ * On return the handle is initialized and owned by the caller, which must
+ * XHTTP_Clear() it on every path - including the failure paths.
+ *
+ * @param nAttempts Total attempts. Must be 1 on any caller that runs on the
+ *                  event loop, since the backoff sleeps in-line.
+ */
+static xhttp_status_t DirectGate_Enroll_Perform(xhttp_t *pHandle, directgate_enroll_trace_t *pTrace,
+                                                const char *pUrl, const char *pPath, const uint8_t *pBody,
+                                                size_t nBodyLen, uint32_t nAttempts)
+{
+    XCHECK((pHandle != NULL && pTrace != NULL), XHTTP_EINIT);
+
+    /* Cleared before any early return, since every caller logs it afterwards. */
+    xstrnul(pTrace->sPeer);
+    XCHECK((xstrused(pUrl) && xstrused(pPath)), XHTTP_ELINK);
+
+    xlink_t link;
+    XCHECK((XLink_Parse(&link, pUrl) >= 0), XHTTP_ELINK);
+
+    /*
+        XHTTP_EasyPerform() uses the link only to dial, it never synthesizes
+        request headers and libxutils defaults requests to HTTP/1.0, where
+        Host is optional. That combination leaves the request routable only by
+        TLS SNI. Plain nginx accepts it, but a CDN or WAF edge answers 403
+        before the origin is ever reached, so the header is set by hand here.
+
+        XLink_Parse() folds the default port into sHost. Carrying that port
+        into the header makes the value differ from the certificate name the
+        edge matches on, so it is kept only when it is not the scheme default.
+    */
+    xbool_t bDefaultPort = (xstrcmp(link.sProtocol, "https") && link.nPort == 443) ||
+                           (xstrcmp(link.sProtocol, "http") && link.nPort == 80);
+
+    uint32_t nDelayMs = DIRECTGATE_ENROLL_RETRY_DELAY_MS;
+    xhttp_status_t eStatus = XHTTP_EINIT;
+    uint32_t nAttempt;
+
+    for (nAttempt = 0; nAttempt < nAttempts; nAttempt++)
+    {
+        XCHECK((XHTTP_InitRequest(pHandle, XHTTP_POST, pPath, NULL) >= 0), XHTTP_EINIT);
+
+        /* Without a receive timeout a connection that opens and then goes
+         * silent parks the caller on recv() forever, so a dropped NAT entry
+         * hangs enrollment instead of failing it. */
+        pHandle->nTimeout = DIRECTGATE_ENROLL_HTTP_TIMEOUT;
+        XHTTP_SetCallback(pHandle, DirectGate_Enroll_TraceCb, pTrace, XHTTP_STATUS);
+
+        if (bDefaultPort) XHTTP_AddHeader(pHandle, "Host", "%s", link.sAddr);
+        else XHTTP_AddHeader(pHandle, "Host", "%s:%d", link.sAddr, link.nPort);
+
+        XHTTP_AddHeader(pHandle, "User-Agent", "directgate-agent/%s", DirectGate_GetVersionShort());
+        XHTTP_AddHeader(pHandle, "Content-Type", "application/json");
+        XHTTP_AddHeader(pHandle, "Accept", "application/json");
+
+        eStatus = XHTTP_EasyPerform(pHandle, pUrl, pBody, nBodyLen);
+
+        if (eStatus == XHTTP_COMPLETE) break;
+        if (!DirectGate_Enroll_IsTransientTransport(eStatus)) break;
+        if (nAttempt + 1 >= nAttempts) break;
+
+        xlogw("Enrollment request failed, retrying: url(%s), peer(%s), attempt(%u/%u), status(%s), delay(%ums)",
+            pUrl, xstrused(pTrace->sPeer) ? pTrace->sPeer : "N/A",
+            (unsigned int)(nAttempt + 1), (unsigned int)nAttempts,
+            XHTTP_GetStatusStr(eStatus), (unsigned int)nDelayMs);
+
+        /* The next attempt rebuilds the request from scratch. */
+        XHTTP_Clear(pHandle);
+        xusleep(nDelayMs * DIRECTGATE_ENROLL_USEC_PER_MS);
+        nDelayMs *= 2;
+    }
+
+    return eStatus;
 }
 
 static void DirectGate_Enroll_SetReason(char *pReason, size_t nReasonSize, const char *pValue)
@@ -452,11 +581,14 @@ xbool_t DirectGate_Enroll_Pair(directgate_cfg_t *pCfg, const char *pPairingToken
     XCHECK((pReqBody != NULL && nReqLen > 0), xthrowr(XFALSE, "Failed to build the pair request body"));
 
     xhttp_t handle;
-    XHTTP_InitRequest(&handle, XHTTP_POST, "/api/v1/devices/pair", NULL);
-    XHTTP_AddHeader(&handle, "Content-Type", "application/json");
-    XHTTP_AddHeader(&handle, "Accept", "application/json");
+    directgate_enroll_trace_t trace;
 
-    xhttp_status_t status = XHTTP_EasyPerform(&handle, sUrl, (const uint8_t*)pReqBody, nReqLen);
+    /* Pairing runs from the interactive CLI, after the operator has already
+     * typed the pairing token and set the auth password. A transport blip must
+     * not throw that work away, and this path is not on the event loop. */
+    xhttp_status_t status = DirectGate_Enroll_Perform(&handle, &trace, sUrl,
+        "/api/v1/devices/pair", (const uint8_t*)pReqBody, nReqLen,
+        DIRECTGATE_ENROLL_RETRY_ATTEMPTS);
 
     /* Carries the pairing token, so it does not linger on the heap after the request. */
     OPENSSL_cleanse(pReqBody, nReqLen);
@@ -464,8 +596,9 @@ xbool_t DirectGate_Enroll_Pair(directgate_cfg_t *pCfg, const char *pPairingToken
 
     if (status != XHTTP_COMPLETE)
     {
-        xloge("Pair request failed: dev(%s), url(%s), status(%s)",
-            DirectGate_Enroll_GetDeviceId(pCfg), sUrl, XHTTP_GetStatusStr(status));
+        xloge("Pair request failed: dev(%s), url(%s), peer(%s), status(%s)",
+            DirectGate_Enroll_GetDeviceId(pCfg), sUrl,
+            xstrused(trace.sPeer) ? trace.sPeer : "N/A", XHTTP_GetStatusStr(status));
 
         XHTTP_Clear(&handle);
         return XFALSE;
@@ -531,19 +664,21 @@ xbool_t DirectGate_Enroll_RotateAgentKey(directgate_cfg_t *pCfg)
     XCHECK((pReqBody != NULL && nReqLen > 0), xthrowr(XFALSE, "Failed to build the key rotation request body"));
 
     xhttp_t handle;
-    XHTTP_InitRequest(&handle, XHTTP_POST, "/api/v1/devices/rotate-agent-key", NULL);
-    XHTTP_AddHeader(&handle, "Content-Type", "application/json");
-    XHTTP_AddHeader(&handle, "Accept", "application/json");
+    directgate_enroll_trace_t trace;
 
-    xhttp_status_t status = XHTTP_EasyPerform(&handle, sUrl, (const uint8_t*)pReqBody, nReqLen);
+    /* Also CLI-driven, so the same in-line retry applies. */
+    xhttp_status_t status = DirectGate_Enroll_Perform(&handle, &trace, sUrl,
+        "/api/v1/devices/rotate-agent-key", (const uint8_t*)pReqBody, nReqLen,
+        DIRECTGATE_ENROLL_RETRY_ATTEMPTS);
 
     OPENSSL_cleanse(pReqBody, nReqLen);
     free(pReqBody);
 
     if (status != XHTTP_COMPLETE)
     {
-        xloge("Agent key rotation request failed: dev(%s), url(%s), status(%s)",
-            DirectGate_Enroll_GetDeviceId(pCfg), sUrl, XHTTP_GetStatusStr(status));
+        xloge("Agent key rotation request failed: dev(%s), url(%s), peer(%s), status(%s)",
+            DirectGate_Enroll_GetDeviceId(pCfg), sUrl,
+            xstrused(trace.sPeer) ? trace.sPeer : "N/A", XHTTP_GetStatusStr(status));
 
         XHTTP_Clear(&handle);
         return XFALSE;
@@ -618,11 +753,11 @@ directgate_enroll_status_t DirectGate_Enroll_Refresh(directgate_cfg_t *pCfg, cha
     }
 
     xhttp_t handle;
-    XHTTP_InitRequest(&handle, XHTTP_POST, "/api/v1/devices/refresh", NULL);
-    XHTTP_AddHeader(&handle, "Content-Type", "application/json");
-    XHTTP_AddHeader(&handle, "Accept", "application/json");
+    directgate_enroll_trace_t trace;
 
-    xhttp_status_t status = XHTTP_EasyPerform(&handle, sUrl, (const uint8_t*)pReqBody, nReqLen);
+    xhttp_status_t status = DirectGate_Enroll_Perform(&handle, &trace, sUrl,
+        "/api/v1/devices/refresh", (const uint8_t*)pReqBody, nReqLen,
+        DIRECTGATE_ENROLL_ONESHOT);
 
     /* Carries the refresh token. */
     OPENSSL_cleanse(pReqBody, nReqLen);
@@ -630,8 +765,9 @@ directgate_enroll_status_t DirectGate_Enroll_Refresh(directgate_cfg_t *pCfg, cha
 
     if (status != XHTTP_COMPLETE)
     {
-        xloge("Token refresh request failed: dev(%s), url(%s)",
-            DirectGate_Enroll_GetDeviceId(pCfg), sUrl);
+        xloge("Token refresh request failed: dev(%s), url(%s), peer(%s), status(%s)",
+            DirectGate_Enroll_GetDeviceId(pCfg), sUrl,
+            xstrused(trace.sPeer) ? trace.sPeer : "N/A", XHTTP_GetStatusStr(status));
 
         XHTTP_Clear(&handle);
         return DIRECTGATE_ENROLL_REFRESH_TRANSIENT;

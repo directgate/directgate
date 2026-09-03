@@ -99,6 +99,7 @@ endif()
 # Agent tests that also compile specific agent sources.
 directgate_smoke(enroll_smoke        ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(enroll_edge_smoke   ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
+directgate_smoke(enroll_transport_smoke ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(add_key_smoke       ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(config_smoke        ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(config_extra_smoke  ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
