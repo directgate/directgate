@@ -124,20 +124,23 @@ static xbool_t DirectGate_SIV_JoinKey(uint8_t *pFullKey, size_t nFullSize, const
     return XTRUE;
 }
 
-/* One-time cached probe. OpenSSL >= 3.0 normally ships AES-SIV in the default
-   provider, but a stripped provider configuration can omit it; fall back to
-   libxutils in that case instead of failing. The benign race on first call
-   only re-runs an idempotent, thread-safe fetch. */
+/* OpenSSL >= 3.0 normally ships AES-SIV in the default provider. Publish the
+   cached probe through OpenSSL's once primitive: unsynchronized reads/writes
+   of the cached integer are a data race even if both probes agree. */
+static CRYPTO_ONCE sOpenSSLOnce = CRYPTO_ONCE_STATIC_INIT;
+static int sOpenSSLReady = 0;
+
+static void DirectGate_SIV_ProbeOpenSSL(void)
+{
+    EVP_CIPHER *pProbe = EVP_CIPHER_fetch(NULL, "AES-256-SIV", NULL);
+    sOpenSSLReady = (pProbe != NULL);
+    EVP_CIPHER_free(pProbe);
+}
+
 static xbool_t DirectGate_SIV_OpenSSLReady(void)
 {
-    static int nReady = -1;
-    if (nReady < 0)
-    {
-        EVP_CIPHER *pProbe = EVP_CIPHER_fetch(NULL, "AES-256-SIV", NULL);
-        nReady = (pProbe != NULL);
-        EVP_CIPHER_free(pProbe);
-    }
-    return nReady ? XTRUE : XFALSE;
+    return CRYPTO_THREAD_run_once(&sOpenSSLOnce, DirectGate_SIV_ProbeOpenSSL) &&
+        sOpenSSLReady ? XTRUE : XFALSE;
 }
 
 /* Writes `siv_tag || ciphertext` (XSIV_TAG_SIZE + nLength bytes) into pDst. The
@@ -220,6 +223,8 @@ static uint8_t* DirectGate_SIV_OpenSSLDecrypt(const uint8_t *pCmacKey, const uin
 uint8_t* DirectGate_SIV_Encrypt(const uint8_t *pCmacKey, const uint8_t *pCtrKey, size_t nKeyBits,
                                 const uint8_t *pData, size_t nLength, size_t *pOutLen)
 {
+    if (pOutLen != NULL) *pOutLen = 0;
+    XCHECK((nKeyBits == 128 || nKeyBits == 192 || nKeyBits == 256), NULL);
     XCHECK((pCmacKey != NULL && pCtrKey != NULL), NULL);
     XCHECK((pData != NULL && nLength > 0), NULL);
     XCHECK((pOutLen != NULL), NULL);
@@ -272,6 +277,8 @@ uint8_t* DirectGate_SIV_Encrypt(const uint8_t *pCmacKey, const uint8_t *pCtrKey,
 uint8_t* DirectGate_SIV_Decrypt(const uint8_t *pCmacKey, const uint8_t *pCtrKey, size_t nKeyBits,
                                 const uint8_t *pData, size_t nLength, size_t *pOutLen)
 {
+    if (pOutLen != NULL) *pOutLen = 0;
+    XCHECK((nKeyBits == 128 || nKeyBits == 192 || nKeyBits == 256), NULL);
     XCHECK((pCmacKey != NULL && pCtrKey != NULL), NULL);
     /* Need nonce + tag + at least one ciphertext byte. */
     XCHECK((pData != NULL && nLength > XSIV_NONCE_SIZE + XSIV_TAG_SIZE), NULL);

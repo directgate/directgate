@@ -44,7 +44,9 @@ xbool_t DirectGate_HKDF_Extract(const uint8_t *pSalt, size_t nSaltLen,
         nUseSaltLen = sizeof(sZeroSalt);
     }
 
+    XCHECK((nUseSaltLen <= INT_MAX), XFALSE);
     unsigned int nOutLen = 0;
+
     uint8_t *pOut = HMAC(EVP_sha256(), pUseSalt, (int)nUseSaltLen,
                          pIKM, nIKMLen, pPRK, &nOutLen);
 
@@ -57,6 +59,7 @@ xbool_t DirectGate_HKDF_Expand(const uint8_t *pPRK, size_t nPRKLen,
 {
     XCHECK((pPRK != NULL), XFALSE);
     XCHECK((nPRKLen > 0), XFALSE);
+    XCHECK((nPRKLen <= INT_MAX), XFALSE);
     XCHECK((pOKM != NULL), XFALSE);
     XCHECK((nOKMLen > 0), XFALSE);
 
@@ -74,9 +77,9 @@ xbool_t DirectGate_HKDF_Expand(const uint8_t *pPRK, size_t nPRKLen,
     size_t nTLen = 0;
     size_t nWritten = 0;
 
-    const uint8_t nBlocks = (uint8_t)((nOKMLen + XHKDF_SHA256_LEN - 1) / XHKDF_SHA256_LEN);
+    const size_t nBlocks = (nOKMLen + XHKDF_SHA256_LEN - 1) / XHKDF_SHA256_LEN;
 
-    for (uint8_t i = 1; i <= nBlocks; i++)
+    for (size_t i = 1; i <= nBlocks; i++)
     {
         unsigned int nOutLen = 0;
         HMAC_CTX *pCtx = HMAC_CTX_new();
@@ -90,7 +93,7 @@ xbool_t DirectGate_HKDF_Expand(const uint8_t *pPRK, size_t nPRKLen,
         if (nOk == 1 && nTLen > 0) nOk = HMAC_Update(pCtx, t, nTLen);
         if (nOk == 1 && nInfoLen > 0) nOk = HMAC_Update(pCtx, pInfoBytes, nInfoLen);
 
-        const uint8_t c = i;
+        const uint8_t c = (uint8_t)i;
         if (nOk == 1) nOk = HMAC_Update(pCtx, &c, 1);
         if (nOk == 1) nOk = HMAC_Final(pCtx, t, &nOutLen);
         HMAC_CTX_free(pCtx);

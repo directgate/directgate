@@ -55,6 +55,7 @@
     uint32_t nRingHead;
     uint32_t nRingTail;
     uint32_t nRingCount;
+    BOOL bStopped;               /* guarded by lock */
 }
 @property (nonatomic, strong) SCStream *stream;
 @property (nonatomic, strong) dispatch_queue_t queue;
@@ -107,6 +108,7 @@
 
 static int16_t DirectGate_SCK_ClampS16(float fSample)
 {
+    if (fSample != fSample) return 0;
     float fScaled = fSample * 32767.0f;
     if (fScaled > 32767.0f) fScaled = 32767.0f;
     else if (fScaled < -32768.0f) fScaled = -32768.0f;
@@ -204,6 +206,10 @@ static int16_t DirectGate_SCK_ClampS16(float fSample)
 
 - (void)stop
 {
+    pthread_mutex_lock(&lock);
+    bStopped = YES;
+    pthread_cond_broadcast(&cond);
+    pthread_mutex_unlock(&lock);
     SCStream *s = _stream;
     _stream = nil;
     if (s == nil) return;
@@ -214,6 +220,7 @@ static int16_t DirectGate_SCK_ClampS16(float fSample)
         dispatch_semaphore_signal(stopSem);
     }];
     dispatch_semaphore_wait(stopSem, dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC));
+    [s removeStreamOutput:self type:SCStreamOutputTypeAudio error:NULL];
 
     /* Wake a blocked reader so BackendClose returns promptly. */
     pthread_mutex_lock(&lock);
@@ -251,7 +258,11 @@ static int16_t DirectGate_SCK_ClampS16(float fSample)
         sampleBuffer, &nNeeded, (AudioBufferList *)&abl, sizeof(abl),
         kCFAllocatorDefault, kCFAllocatorDefault,
         kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, &blockBuffer);
-    if (st != noErr || blockBuffer == NULL) return;
+    if (st != noErr || blockBuffer == NULL)
+    {
+        if (blockBuffer != NULL) CFRelease(blockBuffer);
+        return;
+    }
 
     /* Only float32 (SCK's native audio format) is handled; other layouts are
      * ignored so a format surprise degrades to silence rather than noise. */
@@ -259,6 +270,10 @@ static int16_t DirectGate_SCK_ClampS16(float fSample)
     {
         if (bNonInterleaved && abl.mNumberBuffers >= 1)
         {
+            size_t nAvailable = abl.mBuffers[0].mDataByteSize / sizeof(float);
+            if (abl.mNumberBuffers >= 2 && abl.mBuffers[1].mDataByteSize / sizeof(float) < nAvailable)
+                nAvailable = abl.mBuffers[1].mDataByteSize / sizeof(float);
+            if ((uint64_t)nFrames > nAvailable) nFrames = (CMItemCount)nAvailable;
             const float *pL = (const float *)abl.mBuffers[0].mData;
             const float *pR = (abl.mNumberBuffers >= 2)
                 ? (const float *)abl.mBuffers[1].mData : pL;
@@ -268,6 +283,8 @@ static int16_t DirectGate_SCK_ClampS16(float fSample)
         }
         else if (abl.mNumberBuffers >= 1 && abl.mBuffers[0].mData != NULL)
         {
+            size_t nAvailable = abl.mBuffers[0].mDataByteSize / sizeof(float) / nChannels;
+            if ((uint64_t)nFrames > nAvailable) nFrames = (CMItemCount)nAvailable;
             const float *p = (const float *)abl.mBuffers[0].mData;
             for (CMItemCount i = 0; i < nFrames; i++)
             {
@@ -285,6 +302,10 @@ static int16_t DirectGate_SCK_ClampS16(float fSample)
 {
     (void)stream;
     (void)error;
+    pthread_mutex_lock(&lock);
+    bStopped = YES;
+    pthread_cond_broadcast(&cond);
+    pthread_mutex_unlock(&lock);
 }
 
 @end
@@ -299,7 +320,10 @@ void* DirectGate_Audio_BackendOpen(uint32_t nSampleRate, uint32_t nChannels,
     {
         DirectGateAudioCapture *pCapture = [[DirectGateAudioCapture alloc] init];
         if (![pCapture startWithError:pErr size:nErrSize])
+        {
+            [pCapture stop];
             return NULL;
+        }
 
         xlogi("Opened desktop audio ScreenCaptureKit capture: rate(%u), channels(%u)",
             DIRECTGATE_AUDIO_SAMPLE_RATE, DIRECTGATE_AUDIO_CHANNELS);
@@ -313,7 +337,8 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf,
                                  uint32_t nFrames, uint32_t nChannels)
 {
     XCHECK((pBackend != NULL && pBuf != NULL), XSTDERR);
-    XCHECK((nFrames > 0 && nChannels > 0), XSTDERR);
+    XCHECK((nFrames > 0 && nFrames <= DIRECTGATE_AUDIO_FRAME_SAMPLES &&
+        nChannels == DIRECTGATE_AUDIO_CHANNELS), XSTDERR);
 
     DirectGateAudioCapture *pCapture = (__bridge DirectGateAudioCapture *)pBackend;
     uint32_t nNeeded = nFrames * nChannels;
@@ -332,19 +357,25 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf,
         pCapture->nRingCount -= nDrop;
     }
 
-    /* Wait up to two frame periods for real samples; SCK pushes continuously
+    /* Wait up to one frame period for real samples; SCK pushes continuously
      * during playback, so a timeout only happens on silence - pad with silence
      * to keep a steady 20 ms cadence and let the worker observe a stop. */
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t nNs = (uint64_t)ts.tv_nsec + (uint64_t)(2U * DIRECTGATE_AUDIO_FRAME_MS) * 1000000ULL;
+    uint64_t nNs = (uint64_t)ts.tv_nsec + (uint64_t)DIRECTGATE_AUDIO_FRAME_MS * 1000000ULL;
     ts.tv_sec += (time_t)(nNs / 1000000000ULL);
     ts.tv_nsec = (long)(nNs % 1000000000ULL);
 
-    while (pCapture->nRingCount < nNeeded)
+    while (!pCapture->bStopped && pCapture->nRingCount < nNeeded)
     {
         if (pthread_cond_timedwait(&pCapture->cond, &pCapture->lock, &ts) != 0)
             break; /* timeout */
+    }
+
+    if (pCapture->bStopped)
+    {
+        pthread_mutex_unlock(&pCapture->lock);
+        return XSTDERR;
     }
 
     while (nGot < nNeeded && pCapture->nRingCount > 0)

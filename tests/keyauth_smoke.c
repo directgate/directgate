@@ -308,6 +308,12 @@ int main(void)
     DirectGate_KeyAuth_Cleanse(&agentAuth);
     DirectGate_KeyAuth_Cleanse(&tamperAuth);
 
+    uint8_t tiny = 0;
+    char tinyHex[3];
+    size_t decoded = 0;
+    CHECK(!DirectGate_KeyAuth_HexToBytes("00", &tiny, SIZE_MAX, &decoded), "overflowing hex bound rejected");
+    CHECK(!DirectGate_KeyAuth_BytesToHex(&tiny, SIZE_MAX / 2 + 1, tinyHex, sizeof(tinyHex)),
+        "overflowing hex output length rejected before reading");
     printf("keyauth_smoke: OK\n");
     return 0;
 }

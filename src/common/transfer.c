@@ -45,7 +45,10 @@ static FILE* DirectGate_Transfer_OpenDestination(const char *pPath)
     FILE *pFile = _fdopen(nFd, "wb");
     if (pFile == NULL)
     {
+        int nError = errno;
         _close(nFd);
+        remove(pPath);
+        errno = nError;
         return NULL;
     }
 
@@ -70,7 +73,10 @@ static FILE* DirectGate_Transfer_OpenDestination(const char *pPath)
     FILE *pFile = fdopen(nFd, "wb");
     if (pFile == NULL)
     {
+        int nError = errno;
         close(nFd);
+        unlink(pPath);
+        errno = nError;
         return NULL;
     }
 
@@ -117,7 +123,8 @@ static FILE* DirectGate_Transfer_OpenSource(const char *pPath, uint64_t *pSize)
     if (pSize != NULL) *pSize = (uint64_t)st.st_size;
     return pFile;
 #else
-    int nFlags = O_RDONLY;
+    /* A FIFO must not block the event loop before fstat can reject it. */
+    int nFlags = O_RDONLY | O_NONBLOCK;
 #ifdef O_CLOEXEC
     nFlags |= O_CLOEXEC;
 #endif
@@ -242,7 +249,6 @@ void DirectGate_Transfer_Init(directgate_transfer_t *pFT)
 void DirectGate_Transfer_Destroy(directgate_transfer_t *pFT)
 {
     XCHECK_VOID_NL((pFT != NULL));
-    directgate_transfer_state_t eState = pFT->eState;
     char sPath[XFILE_PATH_SIZE];
     xstrncpy(sPath, sizeof(sPath), pFT->sPath);
 
@@ -252,7 +258,7 @@ void DirectGate_Transfer_Destroy(directgate_transfer_t *pFT)
         pFT->pFile = NULL;
     }
 
-    if (eState == XTRANSFER_STATE_RECEIVING && xstrused(sPath))
+    if (pFT->bRemoveOnDestroy && xstrused(sPath))
     {
         if (remove(sPath) != 0 && errno != ENOENT)
         {
@@ -288,6 +294,11 @@ XSTATUS DirectGate_Transfer_Send(directgate_transfer_t *pFT, const char *pPath,
     XCHECK((pPath != NULL), XSTDERR);
     XCHECK((sendFn != NULL), XSTDERR);
 
+    if (DirectGate_Transfer_IsActive(pFT)) return XSTDERR;
+    if (!xstrused(pPath) || strlen(pPath) >= sizeof(pFT->sPath)) return XSTDERR;
+
+    DirectGate_Transfer_Destroy(pFT);
+
     /* Open the source and validate it via fstat() on the resulting descriptor.
        Opening first, then checking the fd (rather than stat()'ing the path and
        re-opening it by name) closes the TOCTOU race where the path could be
@@ -310,8 +321,17 @@ XSTATUS DirectGate_Transfer_Send(directgate_transfer_t *pFT, const char *pPath,
 
     pFT->nSize = nSize;
     pFT->nChunkSize = XFILE_CHUNK_SIZE;
-    pFT->nTotalChunks = (uint32_t)((pFT->nSize + pFT->nChunkSize - 1) / pFT->nChunkSize);
 
+    uint64_t nChunks = nSize / pFT->nChunkSize + (nSize % pFT->nChunkSize != 0);
+    if (nChunks > UINT32_MAX)
+    {
+        fclose(pFT->pFile);
+        pFT->pFile = NULL;
+        pFT->eState = XTRANSFER_STATE_ERROR;
+        return XSTDERR;
+    }
+
+    pFT->nTotalChunks = (uint32_t)nChunks;
     pFT->nCurrentChunk = 0;
     pFT->nBytesXferred = 0;
     pFT->eState = XTRANSFER_STATE_SENDING;
@@ -367,6 +387,12 @@ XSTATUS DirectGate_Transfer_SendNext(directgate_transfer_t *pFT, directgate_file
 
     if (pFT->nCurrentChunk >= pFT->nTotalChunks)
     {
+        if (pFT->nBytesXferred != pFT->nSize)
+        {
+            pFT->eState = XTRANSFER_STATE_ERROR;
+            return XSTDERR;
+        }
+
         /* All chunks sent - send end message */
         char sSha256Hex[XSHA256_HEX_LENGTH];
         XSHA256_Final(&pFT->sha256Ctx, pFT->sha256);
@@ -407,9 +433,17 @@ XSTATUS DirectGate_Transfer_SendNext(directgate_transfer_t *pFT, directgate_file
 
     /* Read next chunk */
     uint8_t sBuf[XFILE_CHUNK_SIZE];
-    size_t nRead = fread(sBuf, 1, pFT->nChunkSize, pFT->pFile);
+    if (pFT->nBytesXferred >= pFT->nSize || !pFT->nChunkSize || pFT->nChunkSize > sizeof(sBuf))
+    {
+        pFT->eState = XTRANSFER_STATE_ERROR;
+        return XSTDERR;
+    }
 
-    if (nRead == 0)
+    uint64_t nRemaining = pFT->nSize - pFT->nBytesXferred;
+    size_t nWant = nRemaining < pFT->nChunkSize ? (size_t)nRemaining : pFT->nChunkSize;
+    size_t nRead = fread(sBuf, 1, nWant, pFT->pFile);
+
+    if (nRead != nWant)
     {
         if (ferror(pFT->pFile))
         {
@@ -421,9 +455,11 @@ XSTATUS DirectGate_Transfer_SendNext(directgate_transfer_t *pFT, directgate_file
             return XSTDERR;
         }
 
-        /* EOF reached before expected - treat as complete */
-        pFT->nCurrentChunk = pFT->nTotalChunks;
-        return DirectGate_Transfer_SendNext(pFT, sendFn, pCtx);
+        xloge("Transfer source shortened during read: id(%s), path(%s)",
+            DirectGate_Transfer_GetId(pFT), DirectGate_Transfer_GetPath(pFT));
+
+        pFT->eState = XTRANSFER_STATE_ERROR;
+        return XSTDERR;
     }
 
     /* Update SHA-256 */
@@ -466,6 +502,12 @@ XSTATUS DirectGate_Transfer_SendNext(directgate_transfer_t *pFT, directgate_file
 XSTATUS DirectGate_Transfer_HandleStartPath(directgate_transfer_t *pFT, const directgate_pkg_t *pPkg, const char *pPath)
 {
     XCHECK((pFT != NULL), XSTDERR);
+    if (DirectGate_Transfer_IsActive(pFT))
+    {
+        errno = EBUSY;
+        return XSTDERR;
+    }
+
     XCHECK((pPkg != NULL), XSTDERR);
     XCHECK((pPkg->pPackage != NULL), XSTDERR);
     XCHECK((xstrused(pPath)), XSTDERR);
@@ -478,6 +520,14 @@ XSTATUS DirectGate_Transfer_HandleStartPath(directgate_transfer_t *pFT, const di
         xloge("Inbound transfer start is missing transfer id or file name: path(%s)", pPath);
         return XSTDERR;
     }
+
+    if (strlen(pTransfer->pTransferId) >= sizeof(pFT->sId) ||
+        strlen(pTransfer->pFileName) >= sizeof(pFT->sName) ||
+        strlen(pPath) >= sizeof(pFT->sPath)) return XSTDERR;
+
+    size_t nChunkSize = pTransfer->nChunkSize ? pTransfer->nChunkSize : XFILE_CHUNK_SIZE;
+    uint64_t nChunks = pTransfer->nFileSize / nChunkSize + (pTransfer->nFileSize % nChunkSize != 0);
+    if (nChunks > UINT32_MAX || nChunks != pTransfer->nChunks) return XSTDERR;
 
     if (pTransfer->nChunks == 0 && pTransfer->nFileSize > 0)
     {
@@ -517,6 +567,7 @@ XSTATUS DirectGate_Transfer_HandleStartPath(directgate_transfer_t *pFT, const di
         pFT->nTotalChunks, pFT->nSize);
 
     pFT->eState = XTRANSFER_STATE_RECEIVING;
+    pFT->bRemoveOnDestroy = XTRUE;
     return XSTDOK;
 }
 
@@ -554,7 +605,8 @@ XSTATUS DirectGate_Transfer_HandleStart(directgate_transfer_t *pFT, const direct
     }
 
     char sPath[XFILE_PATH_SIZE];
-    snprintf(sPath, sizeof(sPath), "%s/%s", pDir, pName);
+    int nPathLen = snprintf(sPath, sizeof(sPath), "%s/%s", pDir, pName);
+    if (nPathLen < 0 || (size_t)nPathLen >= sizeof(sPath)) return XSTDERR;
 
     return DirectGate_Transfer_HandleStartPath(pFT, pPkg, sPath);
 }
@@ -572,6 +624,17 @@ XSTATUS DirectGate_Transfer_HandleChunk(directgate_transfer_t *pFT, const direct
             DirectGate_Transfer_GetId(pFT), DirectGate_Transfer_StateToString(pFT->eState),
             pFT->nCurrentChunk, pFT->nTotalChunks);
 
+        return XSTDERR;
+    }
+
+    if (!xstrcmp(pFilePkg->transfer.pTransferId, pFT->sId)) return XSTDERR;
+
+    if (pFT->nCurrentChunk >= pFT->nTotalChunks ||
+        pFT->nBytesXferred > pFT->nSize ||
+        pFilePkg->data.nPayloadLength > pFT->nChunkSize ||
+        pFilePkg->data.nPayloadLength > pFT->nSize - pFT->nBytesXferred)
+    {
+        pFT->eState = XTRANSFER_STATE_ERROR;
         return XSTDERR;
     }
 
@@ -643,6 +706,14 @@ XSTATUS DirectGate_Transfer_HandleEnd(directgate_transfer_t *pFT, const directga
         return XSTDERR;
     }
 
+    if (!xstrcmp(pFilePkg->transfer.pTransferId, pFT->sId)) return XSTDERR;
+
+    if (pFT->pFile == NULL || pFT->nCurrentChunk != pFT->nTotalChunks || pFT->nBytesXferred != pFT->nSize)
+    {
+        pFT->eState = XTRANSFER_STATE_ERROR;
+        return XSTDERR;
+    }
+
     if (pFT->pFile != NULL)
     {
         /* Buffered bytes reach the file here, so a full disk surfaces as a
@@ -701,13 +772,14 @@ XSTATUS DirectGate_Transfer_HandleEnd(directgate_transfer_t *pFT, const directga
     }
 
     pFT->eState = XTRANSFER_STATE_DONE;
+    pFT->bRemoveOnDestroy = XFALSE;
     return XSTDOK;
 }
 
 XSTATUS DirectGate_Transfer_HandleCancel(directgate_transfer_t *pFT)
 {
     XCHECK((pFT != NULL), XSTDERR);
-    xbool_t bReceiving = (pFT->eState == XTRANSFER_STATE_RECEIVING);
+    xbool_t bReceiving = pFT->bRemoveOnDestroy;
 
     xlogw("Transfer cancelled by remote peer: id(%s), path(%s), state(%s), direction(%s)",
         DirectGate_Transfer_GetId(pFT), DirectGate_Transfer_GetPath(pFT),
@@ -719,10 +791,12 @@ XSTATUS DirectGate_Transfer_HandleCancel(directgate_transfer_t *pFT)
         fclose(pFT->pFile);
         pFT->pFile = NULL;
 
-        /* Remove incomplete file only for inbound (receiving) transfers;
-         * for outbound (sending) transfers sPath is the original source file */
-        if (bReceiving && xstrused(pFT->sPath)) remove(pFT->sPath);
     }
+
+    /* The error state no longer tells us the direction. Retain ownership
+       until commit so failed writes and failed finalization also clean up. */
+    if (bReceiving && xstrused(pFT->sPath)) remove(pFT->sPath);
+    pFT->bRemoveOnDestroy = XFALSE;
 
     pFT->eState = XTRANSFER_STATE_CANCELLED;
     return XSTDOK;

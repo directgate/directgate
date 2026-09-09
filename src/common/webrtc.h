@@ -52,7 +52,8 @@ typedef enum {
     DIRECTGATE_WEBRTC_AUDIO_OPEN,
     DIRECTGATE_WEBRTC_AUDIO_CLOSED,
     DIRECTGATE_WEBRTC_PENDING_DIRECT,
-    DIRECTGATE_WEBRTC_PENDING_FAILED
+    DIRECTGATE_WEBRTC_PENDING_FAILED,
+    DIRECTGATE_WEBRTC_CALLBACK
 } directgate_webrtc_event_type_t;
 
 typedef struct directgate_webrtc_event_ {
@@ -61,6 +62,8 @@ typedef struct directgate_webrtc_event_ {
     int nSourceID;
     uint8_t *pData;
     size_t nLength;
+    int nValue;
+    void (*dispatch)(const struct directgate_webrtc_event_ *, void *);
 } directgate_webrtc_event_t;
 
 typedef struct directgate_pending_ice_ {
@@ -79,7 +82,7 @@ typedef struct directgate_webrtc_ {
     xbool_t bVideoEnabled;      /* Offer answers may include a desktop video track */
     xbool_t bVideoTrackOpen;    /* Outbound media track is open */
     xbool_t bVideoKeyframeRequested; /* new track or RTCP PLI/FIR needs an IDR */
-    volatile xbool_t bActiveRelay; /* selected active ICE pair uses TURN */
+    xbool_t bActiveRelay;       /* selected active ICE pair uses TURN (main thread) */
     uint32_t nSignalGeneration; /* Browser negotiation generation; rejects stale SDP/ICE */
 
     /* Background P2P candidate. The active TURN peer remains untouched until
@@ -114,6 +117,12 @@ typedef struct directgate_webrtc_ {
     directgate_webrtc_event_t *pQueueHead;
     directgate_webrtc_event_t *pQueueTail;
     xsync_mutex_t queueLock;
+    size_t nQueuedBytes;
+    size_t nQueuedEvents;
+    xbool_t bQueueFailed;       /* guarded by queueLock; close on overflow/OOM */
+    /* Main-thread dispatch guard. Destroy invalidates the stack flag before
+       a user callback can release the containing session. */
+    xbool_t *pDispatchAlive;
 
     /* [0]=read (main loop), [1]=write (callback).
        POSIX: a pipe (XSOCKET == int there). Windows: a private socket
@@ -140,10 +149,9 @@ typedef struct directgate_webrtc_ {
     char sVideoMid[DIRECTGATE_RTC_VIDEO_MID_SIZE];
 
     /* Latest RTCP receiver-report loss signal (fraction lost, 0..255).
-     * Written by the libdatachannel callback thread, consumed once by the
-     * main-loop bitrate controller via TakeVideoLossReport. */
-    volatile int nVideoFractionLost;
-    volatile xbool_t bVideoLossUpdated;
+     * Received through the callback queue and consumed on the main thread. */
+    int nVideoFractionLost;
+    xbool_t bVideoLossUpdated;
 
     /* Outbound desktop audio (Opus) track. Strictly additive to the video
      * track: it rides the same DTLS-SRTP connection with an identical

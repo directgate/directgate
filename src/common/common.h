@@ -73,6 +73,10 @@ size_t DirectGate_GetUserName(char *pBuf, size_t nSize);
  * rather than a path (see XSock_LoadWinRootCerts in libxutils). */
 void DirectGate_InitTrustStore(void);
 
+/* Nonblocking, non-inherited notification descriptors, or two invalid FDs
+ * on failure. Windows uses a socket pair so WSAPoll can watch it. */
+XSTATUS DirectGate_CreateNotifyPair(XSOCKET pFds[2]);
+
 xbool_t DirectGate_PromptBool(const char *pLabel, xbool_t *pValue);
 xbool_t DirectGate_PromptU16(const char *pLabel, uint16_t *pValue);
 xbool_t DirectGate_PromptU32(const char *pLabel, uint32_t *pValue);

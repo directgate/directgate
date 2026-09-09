@@ -142,6 +142,7 @@ static float DirectGate_WASAPI_Sample(const BYTE *pData, uint32_t nFrame, uint32
 
 static int16_t DirectGate_WASAPI_ClampS16(float fSample)
 {
+    if (fSample != fSample) return 0; /* NaN must not reach float-to-int conversion. */
     float fScaled = fSample * 32767.0f;
     if (fScaled > 32767.0f) fScaled = 32767.0f;
     else if (fScaled < -32768.0f) fScaled = -32768.0f;
@@ -271,8 +272,7 @@ static void DirectGate_WASAPI_WorkerInit(directgate_wasapi_t *pCtx)
     pCtx->bWorkerInit = XTRUE;
     HANDLE hThread = GetCurrentThread();
 
-    /* Join the process MTA so the worker can call the capture client that the
-     * main thread created. No CoUninitialize: balanced by the thread exit. */
+    /* Join the process MTA; BackendWorkerDone balances this on this thread. */
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     pCtx->bWorkerCom = (hr == S_OK || hr == S_FALSE) ? XTRUE : XFALSE;
 
@@ -344,8 +344,7 @@ static void DirectGate_WASAPI_PollWait(directgate_wasapi_t *pCtx)
 
 void* DirectGate_Audio_BackendOpen(uint32_t nSampleRate, uint32_t nChannels, char *pErr, size_t nErrSize)
 {
-    (void)nSampleRate; /* always resampled to DIRECTGATE_AUDIO_SAMPLE_RATE */
-    (void)nChannels;
+    XCHECK((nSampleRate == DIRECTGATE_AUDIO_SAMPLE_RATE && nChannels == DIRECTGATE_AUDIO_CHANNELS), NULL);
 
     directgate_wasapi_t *pCtx = (directgate_wasapi_t*)calloc(1, sizeof(*pCtx));
     if (pCtx == NULL)
@@ -386,9 +385,11 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames
 {
     directgate_wasapi_t *pCtx = (directgate_wasapi_t*)pBackend;
     XCHECK((pCtx != NULL && pBuf != NULL), XSTDERR);
-    XCHECK((nFrames > 0 && nChannels > 0), XSTDERR);
+    XCHECK((nFrames > 0 && nFrames <= DIRECTGATE_AUDIO_FRAME_SAMPLES &&
+        nChannels == DIRECTGATE_AUDIO_CHANNELS), XSTDERR);
 
     if (!pCtx->bWorkerInit) DirectGate_WASAPI_WorkerInit(pCtx);
+    if (!pCtx->bWorkerCom) return XSTDERR;
 
     uint32_t nNeeded = nFrames * nChannels;
     uint32_t nMaxBacklog = nNeeded * DIRECTGATE_WASAPI_MAX_BACKLOG_FRAMES;
@@ -399,6 +400,7 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames
      * stretches - matching how a PulseAudio monitor paces silence. */
     LONGLONG nFrameTicks = pCtx->nQpcFreq ? (pCtx->nQpcFreq * (LONGLONG)DIRECTGATE_AUDIO_FRAME_MS) / 1000LL : 0;
     LONGLONG nNow = pCtx->nQpcFreq ? DirectGate_WASAPI_QpcNow() : 0;
+    ULONGLONG nDeadlineMs = GetTickCount64() + DIRECTGATE_AUDIO_FRAME_MS;
 
     if (nFrameTicks > 0 && (pCtx->nNextDueQpc == 0 || pCtx->nNextDueQpc > nNow + 4 * nFrameTicks))
         pCtx->nNextDueQpc = nNow + nFrameTicks; /* (re)anchor the clock */
@@ -408,15 +410,18 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames
     for (;;)
     {
         UINT32 nPacket = 0;
-        while (SUCCEEDED(pCtx->pCapture->lpVtbl->GetNextPacketSize(pCtx->pCapture, &nPacket)) && nPacket > 0)
+        for (;;)
         {
+            if (FAILED(pCtx->pCapture->lpVtbl->GetNextPacketSize(pCtx->pCapture, &nPacket))) return XSTDERR;
+            if (!nPacket) break;
             BYTE *pData = NULL;
             UINT32 nAvail = 0;
             DWORD nFlags = 0;
 
-            if (FAILED(pCtx->pCapture->lpVtbl->GetBuffer(pCtx->pCapture, &pData, &nAvail, &nFlags, NULL, NULL))) break;
+            if (FAILED(pCtx->pCapture->lpVtbl->GetBuffer(pCtx->pCapture, &pData, &nAvail, &nFlags, NULL, NULL))) return XSTDERR;
             if (nAvail > 0) DirectGate_WASAPI_Resample(pCtx, pData, nAvail, (nFlags & AUDCLNT_BUFFERFLAGS_SILENT) ? XTRUE : XFALSE);
-            pCtx->pCapture->lpVtbl->ReleaseBuffer(pCtx->pCapture, nAvail);
+            if (FAILED(pCtx->pCapture->lpVtbl->ReleaseBuffer(pCtx->pCapture, nAvail))) return XSTDERR;
+            if (GetTickCount64() >= nDeadlineMs) break;
         }
 
         /* Keep only the freshest audio so latency never accumulates. */
@@ -430,7 +435,7 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames
         if (nFrameTicks <= 0)
         {
             /* No high-res clock: fall back to data-or-one-frame-timeout. */
-            if (pCtx->nCarryCount >= nNeeded) break;
+            if (pCtx->nCarryCount >= nNeeded || GetTickCount64() >= nDeadlineMs) break;
         }
         else
         {
@@ -439,6 +444,7 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames
         }
 
         DirectGate_WASAPI_PollWait(pCtx);
+        if (GetTickCount64() >= nDeadlineMs) break;
         if (nFrameTicks <= 0 && pCtx->nCarryCount >= nNeeded) break;
     }
 
@@ -453,12 +459,22 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames
 
     uint32_t nGot = (pCtx->nCarryCount < nNeeded) ? pCtx->nCarryCount : nNeeded;
     memcpy(pBuf, pCtx->pCarry, (size_t)nGot * sizeof(int16_t));
-    if (pCtx->nCarryCount > nGot)
-        memmove(pCtx->pCarry, pCtx->pCarry + nGot, (size_t)(pCtx->nCarryCount - nGot) * sizeof(int16_t));
+
+    if (pCtx->nCarryCount > nGot) memmove(pCtx->pCarry, pCtx->pCarry + nGot, (size_t)(pCtx->nCarryCount - nGot) * sizeof(int16_t));
     pCtx->nCarryCount -= nGot;
 
     for (uint32_t i = nGot; i < nNeeded; i++) pBuf[i] = 0; /* silence pad */
     return XSTDOK;
+}
+
+void DirectGate_Audio_BackendWorkerDone(void *pBackend)
+{
+    directgate_wasapi_t *pCtx = pBackend;
+    if (pCtx != NULL && pCtx->bWorkerCom)
+    {
+        CoUninitialize();
+        pCtx->bWorkerCom = XFALSE;
+    }
 }
 
 void DirectGate_Audio_BackendClose(void *pBackend)

@@ -866,15 +866,11 @@ static int DirectGate_SendControlFrame(xapi_session_t *pApiSession, xws_frame_ty
         DirectGate_Conn_GetFD(pConn, pApiSession),
         frame.buffer.nUsed);
 
-    XByteBuffer_AddBuff(&pApiSession->txBuffer, &frame.buffer);
+    int nAdded = XByteBuffer_AddBuff(&pApiSession->txBuffer, &frame.buffer);
     XWebFrame_Clear(&frame);
+    if (nAdded <= 0) return XAPI_DISCONNECT;
 
     return XAPI_EnableEvent(pApiSession, XPOLLOUT);
-}
-
-static int DirectGate_SendPong(xapi_session_t *pApiSession)
-{
-    return DirectGate_SendControlFrame(pApiSession, XWS_PONG);
 }
 
 static int DirectGate_SendPing(xapi_session_t *pApiSession)
@@ -2432,7 +2428,7 @@ int DirectGate_HandleFrame(xapi_ctx_t *pCtx, xapi_session_t *pApiSession)
         XWS_FrameTypeStr(pFrame->eType), pFrame->bFin ? "true" : "false",
         pFrame->nHeaderSize, pFrame->nPayloadLength, pFrame->buffer.nUsed);
 
-    if (pFrame->eType == XWS_PING) return DirectGate_SendPong(pApiSession);
+    if (pFrame->eType == XWS_PING) return DirectGate_WebSock_SendPong(pApiSession, pFrame);
     if (pFrame->eType == XWS_CLOSE) return XAPI_DISCONNECT;
 
     const uint8_t* pPayload = XWebFrame_GetPayload(pFrame);

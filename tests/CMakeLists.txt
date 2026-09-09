@@ -72,7 +72,12 @@ foreach(test
         crypto_smoke
         srp_smoke
         transfer_smoke
+        transfer_bounds_smoke
         webrtc_config_smoke
+        webrtc_lifecycle_smoke
+        webrtc_peer_smoke
+        webrtc_queue_smoke
+        webrtc_static_smoke
         webrtc_rtcp_smoke
         webrtc_audio_smoke
         api_invalid_role_smoke
@@ -83,16 +88,23 @@ foreach(test
         log_privpath_smoke
         hash_vectors_smoke
         json_smoke
+        json_limits_smoke
         proto_crypt_smoke
         protocol_builders_smoke
         siv_smoke
         sockpair_events_smoke
         sock_timeout_smoke
         str_buf_smoke
+        xutils_bounds_smoke
         websock_frame_smoke
+        websock_entropy_smoke
         term_priv_smoke)
     directgate_smoke(${test})
 endforeach()
+
+# The peer round trip also executes the unmodified libdatachannel dependency.
+# Keep it in the default suite and separately selectable for sanitizer reports.
+set_tests_properties(webrtc_peer_smoke PROPERTIES LABELS "external-webrtc")
 
 # OpenSSL 3 exposes AES-SIV through EVP. When available, use it as an
 # independent differential oracle for the bundled portable implementation.
@@ -112,6 +124,15 @@ directgate_smoke(keyfile_apply_smoke ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c
 directgate_smoke(search_smoke        ${AGENT_DIR}/search.c ${AGENT_DIR}/files.c)
 directgate_smoke(yuv_smoke   ${AGENT_DIR}/yuv.c)
 if(UNIX AND NOT APPLE)
+    directgate_smoke(thread_failure_smoke)
+    directgate_smoke(api_worker_failure_smoke)
+    directgate_smoke(audio_linux_smoke)
+    directgate_smoke(audio_lifecycle_smoke)
+    target_link_libraries(audio_linux_smoke PRIVATE ${CMAKE_DL_LIBS})
+    directgate_smoke(audio_linux_connection_smoke)
+    target_link_libraries(audio_linux_connection_smoke PRIVATE ${CMAKE_DL_LIBS})
+    set_tests_properties(audio_linux_connection_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 10)
+
     directgate_smoke(openh264_smoke ${AGENT_DIR}/desktop/openh264.c)
     target_include_directories(openh264_smoke PRIVATE ${AGENT_DIR}/openh264)
     target_link_libraries(openh264_smoke PRIVATE ${CMAKE_DL_LIBS})
@@ -209,4 +230,21 @@ directgate_smoke_desktop(connection_lifecycle_smoke)
 target_compile_definitions(connection_lifecycle_smoke PRIVATE DIRECTGATE_TESTING)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(connection_lifecycle_smoke PRIVATE -Wno-unused-function)
+endif()
+
+# Optional coverage-guided parser fuzzing. Recompile only the parser units
+# with libFuzzer coverage; xcommon supplies their ordinary dependencies.
+option(DIRECTGATE_BUILD_FUZZERS "Build Clang libFuzzer wire parser target" OFF)
+if(DIRECTGATE_BUILD_FUZZERS)
+    if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang" OR NOT DIRECTGATE_ENABLE_SANITIZERS)
+        message(FATAL_ERROR "Fuzzing requires Clang and DIRECTGATE_ENABLE_SANITIZERS=ON")
+    endif()
+    add_executable(fuzz_wire fuzz_wire.c
+        ${COMMON_DIR}/protocol.c ${COMMON_DIR}/webrtc.c
+        ${CMAKE_SOURCE_DIR}/libxutils/src/data/json.c
+        ${CMAKE_SOURCE_DIR}/libxutils/src/net/ws.c)
+    target_include_directories(fuzz_wire PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(fuzz_wire PRIVATE xcommon)
+    target_compile_options(fuzz_wire PRIVATE -fsanitize=fuzzer-no-link)
+    target_link_options(fuzz_wire PRIVATE -fsanitize=fuzzer)
 endif()

@@ -67,6 +67,7 @@ xbool_t DirectGate_KeyAuth_HexToBytes(const char *pHex, uint8_t *pOut,
 {
     XCHECK_NL((pHex != NULL), XFALSE);
     XCHECK_NL((pOut != NULL), XFALSE);
+    XCHECK_NL((nOutSize <= (SIZE_MAX - 1) / 2), XFALSE);
 
     size_t nHexLen = strnlen(pHex, nOutSize * 2 + 1);
     if (!nHexLen || (nHexLen & 1U)) return XFALSE;
@@ -91,7 +92,7 @@ xbool_t DirectGate_KeyAuth_BytesToHex(const uint8_t *pData, size_t nLen,
 {
     XCHECK_NL((pData != NULL), XFALSE);
     XCHECK_NL((pHex != NULL), XFALSE);
-    if (nHexSize < nLen * 2 + 1) return XFALSE;
+    if (!nHexSize || nLen > (nHexSize - 1) / 2) return XFALSE;
 
     for (size_t i = 0; i < nLen; i++)
         sprintf(&pHex[i * 2], "%02x", pData[i]);

@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
 
 #include "libxutils/src/crypt/sha256.h"
 #include "libxutils/src/crypt/sha1.h"
@@ -35,6 +37,34 @@ static int hex_equals(const uint8_t *pDigest, size_t nLen, const char *pHex)
 
 int main(void)
 {
+    uint8_t key[131], input[257], expected[32], actual[32];
+    memset(key, 0xaa, sizeof(key));
+    for (size_t i = 0; i < sizeof(input); i++) input[i] = (uint8_t)i;
+    const size_t keyLengths[] = {0, 1, 64, 65, 131};
+    for (size_t n = 0; n < sizeof(input); n++)
+    {
+        unsigned int length;
+        CHECK(EVP_Digest(input, n, expected, &length, EVP_md5(), NULL) == 1, "MD5 reference");
+        CHECK(XMD5_Compute(actual, sizeof(actual), input, n) == XSTDOK && !memcmp(actual, expected, 16),
+            "MD5 padding boundaries match OpenSSL");
+        for (size_t k = 0; k < sizeof(keyLengths)/sizeof(*keyLengths); k++)
+        {
+            CHECK(HMAC(EVP_sha256(), key, (int)keyLengths[k], input, n, expected, &length), "HMAC reference");
+            CHECK(XHMAC_SHA256(actual, sizeof(actual), input, n, key, keyLengths[k]) == XSTDOK &&
+                !memcmp(actual, expected, 32), "HMAC-SHA256 empty/long keys match OpenSSL");
+            char hex[33];
+            CHECK(HMAC(EVP_md5(), key, (int)keyLengths[k], input, n, expected, &length), "HMAC MD5 reference");
+            CHECK(XHMAC_MD5(hex, sizeof(hex), input, n, key, keyLengths[k]) == XSTDOK &&
+                hex_equals(expected, 16, hex), "HMAC-MD5 empty/long keys match OpenSSL");
+        }
+    }
+    char badHex[65]; size_t badLen = 123;
+    CHECK(XHMAC_SHA256_HEX(badHex, sizeof(badHex), NULL, 1, key, 1) != XSTDOK && !badHex[0], "HMAC hex rejects invalid input");
+    CHECK(!XHMAC_SHA256_NEW(NULL, 1, key, 1) && !XHMAC_MD5_NEW(NULL, 1, key, 1), "HMAC alloc helpers propagate failure");
+    CHECK(!XHMAC_SHA256_B64(NULL, 1, key, 1, &badLen) && !badLen, "HMAC base64 propagates failure");
+    CHECK(XMD5_Compute(actual, sizeof(actual), input, SIZE_MAX) != XSTDOK &&
+        !XMD5_Sum(input, SIZE_MAX) && !XMD5_Encrypt(input, SIZE_MAX), "MD5 rejects size overflow");
+
     /* ---- SHA-256 (FIPS 180-4 / NIST CAVS vectors) ---- */
     uint8_t digest[XSHA256_DIGEST_SIZE];
 

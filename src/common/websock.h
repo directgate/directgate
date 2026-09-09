@@ -30,6 +30,7 @@ extern "C" {
 
 int DirectGate_WebSock_Send(xapi_session_t *pSession, const uint8_t *pPkg, size_t nLen);
 int DirectGate_WebSock_SendBuff(xapi_session_t *pSession, const xbyte_buffer_t *pPkg);
+int DirectGate_WebSock_SendPong(xapi_session_t *pSession, xws_frame_t *pPing);
 
 #ifdef __cplusplus
 }

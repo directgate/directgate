@@ -30,6 +30,7 @@
 #include "login.h"
 #include "relay.h"
 #include "webrtc.h"
+#include "websock.h"
 #include "e2e.h"
 #include "srp.h"
 
@@ -382,12 +383,6 @@ static int DirectGate_Client_SendFrame(xapi_session_t *pSession, const uint8_t *
 
     XWebFrame_Clear(&frame);
     return XAPI_EnableEvent(pSession, XPOLLOUT);
-}
-
-static int DirectGate_Client_SendPong(xapi_session_t *pSession)
-{
-    xlogd("Sending WS PONG: fd(%d)", (int)pSession->sock.nFD);
-    return DirectGate_Client_SendFrame(pSession, NULL, 0, XWS_PONG);
 }
 
 static int DirectGate_Client_SendMsg(directgate_ctx_t *pCli, xjson_obj_t *pHeader,
@@ -1473,7 +1468,7 @@ static int DirectGate_Client_HandleFrame(xapi_ctx_t *pCtx, xapi_session_t *pSess
         pFrame->nHeaderSize, pFrame->nPayloadLength, pFrame->buffer.nUsed);
 
     if (pFrame->eType == XWS_PING)
-        return DirectGate_Client_SendPong(pSession);
+        return DirectGate_WebSock_SendPong(pSession, pFrame);
 
     if (pFrame->eType == XWS_CLOSE)
         return XAPI_DISCONNECT;

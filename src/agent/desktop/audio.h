@@ -57,6 +57,11 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames
 
 void DirectGate_Audio_BackendClose(void *pBackend);
 
+#ifdef _WIN32
+/* Balance COM initialization on the capture thread before it exits. */
+void DirectGate_Audio_BackendWorkerDone(void *pBackend);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

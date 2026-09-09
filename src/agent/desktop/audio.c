@@ -48,7 +48,8 @@ typedef struct directgate_audio_ {
     void *pBackend;                /* platform capture handle */
     xthread_t thread;              /* capture + encode worker */
     xbool_t bThreadRunning;
-    volatile xbool_t bStop;        /* worker exit request */
+    xvolatile_t nStop;             /* accessed with XSYNC_ATOMIC_* */
+    xvolatile_t nFinished;         /* worker exit, observed by the main loop */
 
     xsync_mutex_t lock;            /* guards the ring below */
     directgate_audio_packet_t ring[DIRECTGATE_AUDIO_RING_FRAMES];
@@ -120,7 +121,7 @@ static void* DirectGate_Audio_Worker(void *pArg)
     int16_t pcm[DIRECTGATE_AUDIO_FRAME_SAMPLES * DIRECTGATE_AUDIO_CHANNELS];
     uint8_t packet[DIRECTGATE_AUDIO_MAX_PACKET];
 
-    while (!pAudio->bStop)
+    while (!XSYNC_ATOMIC_GET(&pAudio->nStop))
     {
         /* Blocking read of exactly one 20 ms frame; returns each frame period,
          * so the stop flag is observed within ~20 ms. */
@@ -145,6 +146,11 @@ static void* DirectGate_Audio_Worker(void *pArg)
         pAudio->nFramesEncoded++;
     }
 
+#ifdef _WIN32
+    DirectGate_Audio_BackendWorkerDone(pAudio->pBackend);
+#endif
+
+    XSYNC_ATOMIC_SET(&pAudio->nFinished, 1);
     return NULL;
 }
 
@@ -155,8 +161,14 @@ int DirectGate_Desktop_AudioStart(directgate_session_t *pSession)
 
     if (pDesktop->pAudio != NULL)
     {
-        pDesktop->bAudioReady = XTRUE;
-        return XSTDOK; /* already capturing */
+        directgate_audio_t *pAudio = pDesktop->pAudio;
+        if (!XSYNC_ATOMIC_GET(&pAudio->nFinished))
+        {
+            pDesktop->bAudioReady = XTRUE;
+            return XSTDOK;
+        }
+
+        DirectGate_Desktop_AudioStop(pDesktop);
     }
 
     char sErr[DIRECTGATE_DESKTOP_REASON_LEN];
@@ -191,7 +203,7 @@ int DirectGate_Desktop_AudioStart(directgate_session_t *pSession)
     }
 
     XSync_Init(&pAudio->lock);
-    pAudio->bStop = XFALSE;
+    XSYNC_ATOMIC_SET(&pAudio->nStop, 0);
 
     if (XThread_Create(&pAudio->thread, DirectGate_Audio_Worker, pAudio, 0) != XSTDOK)
     {
@@ -226,7 +238,7 @@ void DirectGate_Desktop_AudioStop(directgate_desktop_t *pDesktop)
     /* Detach first so a concurrent drain on the main loop (same thread as this
      * call) never touches a half-freed instance. */
     pDesktop->pAudio = NULL;
-    pAudio->bStop = XTRUE;
+    XSYNC_ATOMIC_SET(&pAudio->nStop, 1);
 
     if (pAudio->bThreadRunning)
     {
@@ -250,6 +262,13 @@ void DirectGate_Desktop_AudioDrainMain(directgate_session_t *pSession)
     XCHECK_VOID((pSession != NULL));
     directgate_audio_t *pAudio = (directgate_audio_t*)pSession->desktop.pAudio;
     if (pAudio == NULL) return;
+
+    if (XSYNC_ATOMIC_GET(&pAudio->nFinished))
+    {
+        DirectGate_Desktop_AudioStop(&pSession->desktop);
+        DirectGate_Audio_SetReason(&pSession->desktop, "System audio capture stopped after a source error.");
+        return;
+    }
 
     /* Only send once the browser's Opus track is open. While it is not, drain
      * and discard so a burst of stale frames never lands the moment it opens. */

@@ -20,11 +20,12 @@
  */
 
 #include "webrtc.h"
+#include "common.h"
 #include "protocol.h"
 
-#include <openssl/rand.h>
-#include <strings.h>
-#include <time.h>
+#define DIRECTGATE_RTC_QUEUE_MAX_BYTES (32U * 1024U * 1024U)
+#define DIRECTGATE_RTC_QUEUE_MAX_EVENTS 4096U
+#define DIRECTGATE_RTC_MAX_PENDING_ICE 256U
 
 #define DIRECTGATE_RTC_DEFAULT_MID  "0"
 #define DIRECTGATE_RTC_VIDEO_CLOCK_RATE 90000U
@@ -117,6 +118,7 @@ static char *DirectGate_JSON_Unescape(const char *pSrc)
 {
     XCHECK(xstrused(pSrc), NULL);
     size_t nLen = strlen(pSrc);
+    XCHECK((nLen <= (SIZE_MAX - 1) / 2), NULL);
 
     char *pDst = (char*)malloc(nLen + 1);
     XCHECK((pDst != NULL), NULL);
@@ -154,6 +156,7 @@ static char *DirectGate_JSON_Escape(const char *pSrc)
 {
     XCHECK(xstrused(pSrc), NULL);
     size_t nLen = strlen(pSrc);
+    XCHECK((nLen <= (SIZE_MAX - 1) / 2), NULL);
 
     char *pDst = (char*)malloc(nLen * 2 + 1);
     XCHECK((pDst != NULL), NULL);
@@ -202,6 +205,25 @@ static void DirectGate_WebRTC_CopySdpLine(char *pDst, size_t nDstSize,
     pDst[nLineLen] = '\0';
 }
 
+/* SDP payload types are decimal bytes, not arbitrary integers. Parse within
+ * the line so malformed/overflowing input cannot wrap into a supported PT. */
+static xbool_t DirectGate_WebRTC_ParsePayload(const char *p, const char *pEnd, uint32_t *pValue)
+{
+    uint32_t nValue = 0;
+    if (p == pEnd || *p < '0' || *p > '9') return XFALSE;
+
+    while (p < pEnd && *p >= '0' && *p <= '9')
+    {
+        nValue = nValue * 10U + (uint32_t)(*p++ - '0');
+        if (nValue > 127U) return XFALSE;
+    }
+
+    if (p == pEnd || *p != ' ') return XFALSE;
+    *pValue = nValue;
+
+    return XTRUE;
+}
+
 static xbool_t DirectGate_WebRTC_ParseRemoteH264(const char *pSdp,
                                                  uint8_t *pPayloadType,
                                                  char *pMid,
@@ -230,7 +252,10 @@ static xbool_t DirectGate_WebRTC_ParseRemoteH264(const char *pSdp,
 
         if (nLineLen >= 2 && !strncmp(pLine, "m=", 2))
         {
-            bInVideo = (nLineLen >= 8 && !strncmp(pLine, "m=video", 7)) ? XTRUE : XFALSE;
+            if (bFound) break;
+            pMid[0] = '\0';
+            pProfile[0] = '\0';
+            bInVideo = (nLineLen >= 8 && !strncmp(pLine, "m=video ", 8)) ? XTRUE : XFALSE;
             continue;
         }
 
@@ -248,20 +273,17 @@ static xbool_t DirectGate_WebRTC_ParseRemoteH264(const char *pSdp,
             if (pCodec == NULL) continue;
 
             size_t nCodecLen = nLineLen - (size_t)(pCodec - pLine) - 1U;
-            if (nCodecLen >= 10 && !strncasecmp(pCodec + 1, "H264/90000", 10))
-            {
-                nPayload = (uint32_t)atoi(pLine + 9);
-                if (nPayload > 0 && nPayload <= 127U)
-                    bFound = XTRUE;
-            }
+            if (nCodecLen == 10 && !strncasecmp(pCodec + 1, "H264/90000", 10))
+                bFound = DirectGate_WebRTC_ParsePayload(pLine + 9, pLine + nLineLen, &nPayload);
 
             continue;
         }
 
         if (bFound && nLineLen > 7 && !strncmp(pLine, "a=fmtp:", 7))
         {
-            uint32_t nFmtpPayload = (uint32_t)atoi(pLine + 7);
-            if (nFmtpPayload != nPayload) continue;
+            uint32_t nFmtpPayload;
+            if (!DirectGate_WebRTC_ParsePayload(pLine + 7, pLine + nLineLen, &nFmtpPayload) ||
+                nFmtpPayload != nPayload) continue;
 
             const char *pSpace = memchr(pLine, ' ', nLineLen);
             if (pSpace != NULL)
@@ -286,9 +308,9 @@ static xbool_t DirectGate_WebRTC_ParseRemoteH264(const char *pSdp,
  * transceiver. Mirrors DirectGate_WebRTC_ParseRemoteH264 for the m=audio
  * section; matches "opus/48000/2" case-insensitively. Exposed for tests. */
 xbool_t DirectGate_WebRTC_ParseRemoteOpus(const char *pSdp,
-                                                 uint8_t *pPayloadType,
-                                                 char *pMid,
-                                                 size_t nMidSize)
+                                          uint8_t *pPayloadType,
+                                          char *pMid,
+                                          size_t nMidSize)
 {
     XCHECK_NL(xstrused(pSdp), XFALSE);
     XCHECK_NL((pPayloadType != NULL), XFALSE);
@@ -309,7 +331,9 @@ xbool_t DirectGate_WebRTC_ParseRemoteOpus(const char *pSdp,
 
         if (nLineLen >= 2 && !strncmp(pLine, "m=", 2))
         {
-            bInAudio = (nLineLen >= 8 && !strncmp(pLine, "m=audio", 7)) ? XTRUE : XFALSE;
+            if (bFound) break;
+            pMid[0] = '\0';
+            bInAudio = (nLineLen >= 8 && !strncmp(pLine, "m=audio ", 8)) ? XTRUE : XFALSE;
             continue;
         }
 
@@ -327,12 +351,8 @@ xbool_t DirectGate_WebRTC_ParseRemoteOpus(const char *pSdp,
             if (pCodec == NULL) continue;
 
             size_t nCodecLen = nLineLen - (size_t)(pCodec - pLine) - 1U;
-            if (nCodecLen >= 12 && !strncasecmp(pCodec + 1, "opus/48000/2", 12))
-            {
-                nPayload = (uint32_t)atoi(pLine + 9);
-                if (nPayload > 0 && nPayload <= 127U)
-                    bFound = XTRUE;
-            }
+            if (nCodecLen == 12 && !strncasecmp(pCodec + 1, "opus/48000/2", 12))
+                bFound = DirectGate_WebRTC_ParsePayload(pLine + 9, pLine + nLineLen, &nPayload);
         }
     }
 
@@ -350,7 +370,7 @@ static const uint8_t *DirectGate_WebRTC_FindStartCode(const uint8_t *pData,
                                                       size_t *pStartLen)
 {
     const uint8_t *p = pData;
-    while (p + 3 <= pEnd)
+    while ((size_t)(pEnd - p) >= 3U)
     {
         if (p[0] == 0 && p[1] == 0 && p[2] == 1)
         {
@@ -358,7 +378,7 @@ static const uint8_t *DirectGate_WebRTC_FindStartCode(const uint8_t *pData,
             return p;
         }
 
-        if (p + 4 <= pEnd && p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1)
+        if ((size_t)(pEnd - p) >= 4U && p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1)
         {
             if (pStartLen != NULL) *pStartLen = 4U;
             return p;
@@ -422,24 +442,45 @@ static directgate_webrtc_event_t* XSell_WebRTC_DetachQueue(directgate_webrtc_t *
     directgate_webrtc_event_t *pHead = pRTC->pQueueHead;
     pRTC->pQueueHead = NULL;
     pRTC->pQueueTail = NULL;
+    pRTC->nQueuedBytes = 0;
+    pRTC->nQueuedEvents = 0;
     XSync_Unlock(&pRTC->queueLock);
     return pHead;
 }
 
-static void DirectGate_WebRTC_Enqueue(directgate_webrtc_t *pRTC, directgate_webrtc_event_type_t eType,
-                                      int nSourceID, const uint8_t *pData, size_t nLen)
+static void DirectGate_WebRTC_QueueFailed(directgate_webrtc_t *pRTC)
 {
-    XCHECK_VOID((pRTC != NULL));
-    directgate_webrtc_event_t *pEvt;
+    XSync_Lock(&pRTC->queueLock);
+    pRTC->bQueueFailed = XTRUE;
+    XSync_Unlock(&pRTC->queueLock);
+    DirectGate_WebRTC_NotifyPipe(pRTC);
+}
 
-    pEvt = (directgate_webrtc_event_t*)malloc(sizeof(*pEvt));
-    XCHECK_VOID((pEvt != NULL));
+static xbool_t DirectGate_WebRTC_EnqueueCallback(directgate_webrtc_t *pRTC, directgate_webrtc_event_type_t eType,
+                                                 int nSourceID, const uint8_t *pData, size_t nLen, int nValue,
+                                                 void (*dispatch)(const directgate_webrtc_event_t *, void *))
+{
+    XCHECK((pRTC != NULL), XFALSE);
+    if (nLen > DIRECTGATE_RTC_QUEUE_MAX_BYTES)
+    {
+        DirectGate_WebRTC_QueueFailed(pRTC);
+        return XFALSE;
+    }
+
+    directgate_webrtc_event_t *pEvt = (directgate_webrtc_event_t*)malloc(sizeof(*pEvt));
+    if (pEvt == NULL)
+    {
+        DirectGate_WebRTC_QueueFailed(pRTC);
+        return XFALSE;
+    }
 
     pEvt->nSourceID = nSourceID;
     pEvt->eType = eType;
     pEvt->pNext = NULL;
     pEvt->pData = NULL;
     pEvt->nLength = 0;
+    pEvt->nValue = nValue;
+    pEvt->dispatch = dispatch;
 
     if (pData != NULL && nLen > 0)
     {
@@ -447,11 +488,12 @@ static void DirectGate_WebRTC_Enqueue(directgate_webrtc_t *pRTC, directgate_webr
         if (pEvt->pData == NULL)
         {
             xloge("Failed to allocate WebRTC event buffer: pc(%d), dc(%d), pipefd(%d), bytes(%zu), errno(%d)",
-                DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC),
+                -1, nSourceID,
                 DirectGate_WebRTC_GetPipe(pRTC), nLen, errno);
 
             free(pEvt);
-            return;
+            DirectGate_WebRTC_QueueFailed(pRTC);
+            return XFALSE;
         }
 
         memcpy(pEvt->pData, pData, nLen);
@@ -459,6 +501,20 @@ static void DirectGate_WebRTC_Enqueue(directgate_webrtc_t *pRTC, directgate_webr
     }
 
     XSync_Lock(&pRTC->queueLock);
+
+    if (pRTC->bQueueFailed || pRTC->nQueuedEvents >= DIRECTGATE_RTC_QUEUE_MAX_EVENTS ||
+        pEvt->nLength > DIRECTGATE_RTC_QUEUE_MAX_BYTES - pRTC->nQueuedBytes)
+    {
+        pRTC->bQueueFailed = XTRUE;
+        XSync_Unlock(&pRTC->queueLock);
+        free(pEvt->pData);
+        free(pEvt);
+        DirectGate_WebRTC_NotifyPipe(pRTC);
+        return XFALSE;
+    }
+
+    pRTC->nQueuedBytes += pEvt->nLength;
+    pRTC->nQueuedEvents++;
 
     if (pRTC->pQueueTail != NULL)
         pRTC->pQueueTail->pNext = pEvt;
@@ -468,7 +524,123 @@ static void DirectGate_WebRTC_Enqueue(directgate_webrtc_t *pRTC, directgate_webr
     XSync_Unlock(&pRTC->queueLock);
 
     DirectGate_WebRTC_NotifyPipe(pRTC);
+    return XTRUE;
 }
+
+static void DirectGate_WebRTC_Enqueue(directgate_webrtc_t *pRTC, directgate_webrtc_event_type_t eType,
+                                      int nSourceID, const uint8_t *pData, size_t nLen)
+{
+    DirectGate_WebRTC_EnqueueCallback(pRTC, eType, nSourceID, pData, nLen, 0, NULL);
+}
+
+/* libdatachannel callbacks only copy their arguments to the queue. All peer,
+   track, generation and loss-report state belongs to the main loop. Callback
+   detachment waits for running callbacks in libdatachannel before Clear frees
+   the queue and notification descriptors. */
+#define DG_RTC_CALLBACK_SIMPLE(name) \
+    static void DirectGate_WebRTC_On##name(int, void *); \
+    static void DirectGate_WebRTC_Dispatch##name(const directgate_webrtc_event_t *e, void *ctx) \
+    { DirectGate_WebRTC_On##name(e->nSourceID, ctx); } \
+    static void DirectGate_WebRTC_Queue##name(int id, void *ctx) \
+    { DirectGate_WebRTC_EnqueueCallback(ctx, DIRECTGATE_WEBRTC_CALLBACK, id, NULL, 0, 0, \
+        DirectGate_WebRTC_Dispatch##name); }
+
+#define DG_RTC_CALLBACK_VALUE(name, type) \
+    static void DirectGate_WebRTC_On##name(int, type, void *); \
+    static void DirectGate_WebRTC_Dispatch##name(const directgate_webrtc_event_t *e, void *ctx) \
+    { DirectGate_WebRTC_On##name(e->nSourceID, (type)e->nValue, ctx); } \
+    static void DirectGate_WebRTC_Queue##name(int id, type value, void *ctx) \
+    { DirectGate_WebRTC_EnqueueCallback(ctx, DIRECTGATE_WEBRTC_CALLBACK, id, NULL, 0, (int)value, \
+        DirectGate_WebRTC_Dispatch##name); }
+
+#define DG_RTC_CALLBACK_TEXT(name) \
+    static void DirectGate_WebRTC_On##name(int, const char *, void *); \
+    static void DirectGate_WebRTC_Dispatch##name(const directgate_webrtc_event_t *e, void *ctx) \
+    { DirectGate_WebRTC_On##name(e->nSourceID, (const char *)e->pData, ctx); } \
+    static void DirectGate_WebRTC_Queue##name(int id, const char *text, void *ctx) \
+    { DirectGate_WebRTC_EnqueueCallback(ctx, DIRECTGATE_WEBRTC_CALLBACK, id, \
+        (const uint8_t *)text, text ? strlen(text) + 1 : 0, 0, DirectGate_WebRTC_Dispatch##name); }
+
+#define DG_RTC_CALLBACK_MESSAGE(name) \
+    static void DirectGate_WebRTC_On##name(int, const char *, int, void *); \
+    static void DirectGate_WebRTC_Dispatch##name(const directgate_webrtc_event_t *e, void *ctx) \
+    { DirectGate_WebRTC_On##name(e->nSourceID, (const char *)e->pData, (int)e->nLength, ctx); } \
+    static void DirectGate_WebRTC_Queue##name(int id, const char *data, int size, void *ctx) \
+    { if (data && size > 0) DirectGate_WebRTC_EnqueueCallback(ctx, DIRECTGATE_WEBRTC_CALLBACK, id, \
+        (const uint8_t *)data, (size_t)size, 0, DirectGate_WebRTC_Dispatch##name); }
+
+static void DirectGate_WebRTC_QueueStrings(int id, const char *first, const char *second, void *ctx,
+                                          void (*dispatch)(const directgate_webrtc_event_t *, void *))
+{
+    if (ctx == NULL || first == NULL) return;
+    if (second == NULL) second = "";
+    size_t a = strlen(first) + 1, b = strlen(second) + 1;
+
+    if (a > DIRECTGATE_RTC_QUEUE_MAX_BYTES || b > DIRECTGATE_RTC_QUEUE_MAX_BYTES - a)
+    {
+        DirectGate_WebRTC_QueueFailed(ctx);
+        return;
+    }
+
+    uint8_t *data = malloc(a + b);
+    if (data == NULL)
+    {
+        DirectGate_WebRTC_QueueFailed(ctx);
+        return;
+    }
+
+    memcpy(data, first, a);
+    memcpy(data + a, second, b);
+
+    DirectGate_WebRTC_EnqueueCallback(ctx, DIRECTGATE_WEBRTC_CALLBACK, id, data, a + b, 0, dispatch);
+    free(data);
+}
+
+#define DG_RTC_CALLBACK_STRINGS(name) \
+    static void DirectGate_WebRTC_On##name(int, const char *, const char *, void *); \
+    static void DirectGate_WebRTC_Dispatch##name(const directgate_webrtc_event_t *e, void *ctx) \
+    { const char *first = (const char *)e->pData; \
+      DirectGate_WebRTC_On##name(e->nSourceID, first, first + strlen(first) + 1, ctx); } \
+    static void DirectGate_WebRTC_Queue##name(int id, const char *first, const char *second, void *ctx) \
+    { DirectGate_WebRTC_QueueStrings(id, first, second, ctx, DirectGate_WebRTC_Dispatch##name); }
+
+DG_RTC_CALLBACK_STRINGS(LocalDescription)
+DG_RTC_CALLBACK_STRINGS(LocalCandidate)
+DG_RTC_CALLBACK_VALUE(GatheringStateChange, rtcGatheringState)
+DG_RTC_CALLBACK_VALUE(StateChange, rtcState)
+DG_RTC_CALLBACK_VALUE(IceStateChange, rtcIceState)
+DG_RTC_CALLBACK_VALUE(SignalingStateChange, rtcSignalingState)
+
+static void DirectGate_WebRTC_CloseDataChannel(int nDC);
+static void DirectGate_WebRTC_OnDataChannel(int nPC, int nDC, void *pCtx);
+
+DG_RTC_CALLBACK_SIMPLE(DataChannelOpen)
+DG_RTC_CALLBACK_SIMPLE(DataChannelClosed)
+DG_RTC_CALLBACK_TEXT(DataChannelError)
+DG_RTC_CALLBACK_MESSAGE(DataChannelMessage)
+DG_RTC_CALLBACK_SIMPLE(VideoTrackOpen)
+DG_RTC_CALLBACK_SIMPLE(VideoTrackClosed)
+DG_RTC_CALLBACK_TEXT(VideoTrackError)
+DG_RTC_CALLBACK_MESSAGE(VideoTrackMessage)
+DG_RTC_CALLBACK_SIMPLE(AudioTrackOpen)
+DG_RTC_CALLBACK_SIMPLE(AudioTrackClosed)
+
+static void DirectGate_WebRTC_DispatchDataChannel(const directgate_webrtc_event_t *pEvt, void *pCtx)
+{
+    DirectGate_WebRTC_OnDataChannel(pEvt->nSourceID, pEvt->nValue, pCtx);
+}
+
+static void DirectGate_WebRTC_QueueDataChannel(int nPC, int nDC, void *pCtx)
+{
+    if (!DirectGate_WebRTC_EnqueueCallback(pCtx, DIRECTGATE_WEBRTC_CALLBACK, nPC, NULL, 0,
+        nDC, DirectGate_WebRTC_DispatchDataChannel)) DirectGate_WebRTC_CloseDataChannel(nDC);
+}
+
+#undef DG_RTC_CALLBACK_SIMPLE
+#undef DG_RTC_CALLBACK_VALUE
+#undef DG_RTC_CALLBACK_TEXT
+#undef DG_RTC_CALLBACK_MESSAGE
+#undef DG_RTC_CALLBACK_STRINGS
 
 static void DirectGate_WebRTC_DetachDataChannel(int nDC)
 {
@@ -486,6 +658,19 @@ static void DirectGate_WebRTC_CloseDataChannel(int nDC)
     DirectGate_WebRTC_DetachDataChannel(nDC);
     rtcClose(nDC);
     rtcDelete(nDC);
+}
+
+/* Incoming channels are owned by their queued notification until dispatch
+ * attaches them to the RTC. libdatachannel's C handle table owns them even
+ * after their peer is deleted. */
+static void DirectGate_WebRTC_DiscardEvent(directgate_webrtc_event_t *pEvt)
+{
+    if (pEvt->eType == DIRECTGATE_WEBRTC_CALLBACK &&
+        pEvt->dispatch == DirectGate_WebRTC_DispatchDataChannel)
+        DirectGate_WebRTC_CloseDataChannel(pEvt->nValue);
+
+    free(pEvt->pData);
+    free(pEvt);
 }
 
 static void DirectGate_WebRTC_DetachVideoTrack(int nTrack)
@@ -527,43 +712,52 @@ static void DirectGate_WebRTC_DrainQueue(directgate_webrtc_t *pRTC)
     while (pHead != NULL)
     {
         directgate_webrtc_event_t *pNext = pHead->pNext;
-        free(pHead->pData);
-        free(pHead);
+        DirectGate_WebRTC_DiscardEvent(pHead);
         pHead = pNext;
     }
+
+    XSync_Lock(&pRTC->queueLock);
+    pRTC->bQueueFailed = XFALSE;
+    XSync_Unlock(&pRTC->queueLock);
 }
 
-static void DirectGate_WebRTC_BufferIce(directgate_webrtc_t *pRTC,
-                                        const char *pCandidate,
-                                        const char *pMid,
-                                        uint32_t nGeneration)
+static XSTATUS DirectGate_WebRTC_BufferIce(directgate_webrtc_t *pRTC,
+                                           const char *pCandidate,
+                                           const char *pMid,
+                                           uint32_t nGeneration)
 {
-    XCHECK_VOID((pRTC != NULL));
-    XCHECK_VOID(xstrused(pCandidate));
-
-    directgate_pending_ice_t *pIce = (directgate_pending_ice_t*)malloc(sizeof(*pIce));
-    XCHECK_VOID((pIce != NULL));
+    XCHECK((pRTC != NULL), XSTDERR);
+    XCHECK(xstrused(pCandidate), XSTDERR);
 
     const char *pUseMid = xstrused(pMid) ? pMid : DIRECTGATE_RTC_DEFAULT_MID;
+    if (strlen(pCandidate) >= sizeof(((directgate_pending_ice_t*)0)->sCandidate) ||
+        strlen(pUseMid) >= sizeof(((directgate_pending_ice_t*)0)->sMid)) return XSTDERR;
+
+    size_t nCount = 0;
+    directgate_pending_ice_t **pTail = &pRTC->pPendingIce;
+
+    while (*pTail != NULL)
+    {
+        if (++nCount >= DIRECTGATE_RTC_MAX_PENDING_ICE) return XSTDERR;
+        if ((*pTail)->nGeneration == nGeneration && !strcmp((*pTail)->sCandidate, pCandidate) &&
+            !strcmp((*pTail)->sMid, pUseMid)) return XSTDOK;
+
+        pTail = &(*pTail)->pNext;
+    }
+
+    directgate_pending_ice_t *pIce = (directgate_pending_ice_t*)malloc(sizeof(*pIce));
+    XCHECK((pIce != NULL), XSTDERR);
+
     xstrncpy(pIce->sCandidate, sizeof(pIce->sCandidate), pCandidate);
     xstrncpy(pIce->sMid, sizeof(pIce->sMid), pUseMid);
     pIce->nGeneration = nGeneration;
     pIce->pNext = NULL;
-
-    /* Append to the end of pending list */
-    if (pRTC->pPendingIce == NULL)
-    {
-        pRTC->pPendingIce = pIce;
-    }
-    else
-    {
-        directgate_pending_ice_t *pTail = pRTC->pPendingIce;
-        while (pTail->pNext != NULL) pTail = pTail->pNext;
-        pTail->pNext = pIce;
-    }
+    *pTail = pIce;
 
     xlogd("Buffered remote ICE candidate: dc(%d), generation(%u)",
         DirectGate_WebRTC_GetDC(pRTC), nGeneration);
+
+    return XSTDOK;
 }
 
 static void DirectGate_WebRTC_FlushPendingIce(directgate_webrtc_t *pRTC)
@@ -734,36 +928,8 @@ void DirectGate_WebRTC_Init(directgate_webrtc_t *pRTC)
     pRTC->bAllowTCP = XFALSE;
     XSync_Init(&pRTC->queueLock);
 
-#ifdef _WIN32
-    /* WSAPoll handles only sockets, so the notification channel is a
-       private loopback socket pair instead of an anonymous pipe */
-    if (XSock_CreatePair(pRTC->nPipeFds) < 0)
-    {
-        xloge("Failed to create WebRTC notification socket pair: pc(%d), dc(%d), error(%d)",
-            DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC), WSAGetLastError());
-
-        pRTC->nPipeFds[0] = XSOCK_INVALID;
-        pRTC->nPipeFds[1] = XSOCK_INVALID;
-        return;
-    }
-
-    u_long nNonBlock = 1;
-    ioctlsocket(pRTC->nPipeFds[0], FIONBIO, &nNonBlock);
-    ioctlsocket(pRTC->nPipeFds[1], FIONBIO, &nNonBlock);
-#else
-    if (pipe(pRTC->nPipeFds) < 0)
-    {
-        xloge("Failed to create WebRTC notification pipe: pc(%d), dc(%d), errno(%d)",
-            DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC), errno);
-
-        pRTC->nPipeFds[0] = -1;
-        pRTC->nPipeFds[1] = -1;
-        return;
-    }
-
-    fcntl(pRTC->nPipeFds[0], F_SETFL, O_NONBLOCK);
-    fcntl(pRTC->nPipeFds[1], F_SETFL, O_NONBLOCK);
-#endif
+    if (DirectGate_CreateNotifyPair(pRTC->nPipeFds) != XSTDOK)
+        xloge("Failed to create nonblocking notification descriptors");
 }
 
 xbool_t DirectGate_WebRTC_LoadIceServers(directgate_ice_server_t *pServers, uint8_t *pCount, xjson_obj_t *pRoot)
@@ -980,6 +1146,11 @@ static void DirectGate_WebRTC_PromotePending(directgate_webrtc_t *pRTC)
 void DirectGate_WebRTC_Destroy(directgate_webrtc_t *pRTC)
 {
     XCHECK_VOID_NL((pRTC != NULL));
+    if (pRTC->pDispatchAlive != NULL)
+    {
+        *pRTC->pDispatchAlive = XFALSE;
+        pRTC->pDispatchAlive = NULL;
+    }
 
     DirectGate_WebRTC_DestroyPending(pRTC);
 
@@ -1444,8 +1615,11 @@ static void DirectGate_WebRTC_OnDataChannelMessage(int nDC, const char *pMessage
 static void DirectGate_WebRTC_OnDataChannel(int nPC, int nDC, void *pPtr)
 {
     directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
-    XCHECK_VOID((pRTC != NULL));
-    XCHECK_VOID_NL(DirectGate_WebRTC_IsKnownPeerConnection(pRTC, nPC));
+    if (pRTC == NULL || !DirectGate_WebRTC_IsKnownPeerConnection(pRTC, nPC))
+    {
+        DirectGate_WebRTC_CloseDataChannel(nDC);
+        return;
+    }
 
     xbool_t bPending = DirectGate_WebRTC_IsPendingPeerConnection(pRTC, nPC);
     int *pInputID = bPending ? &pRTC->nPendingInputDataChannelID : &pRTC->nInputDataChannelID;
@@ -1490,10 +1664,10 @@ static void DirectGate_WebRTC_OnDataChannel(int nPC, int nDC, void *pPtr)
         nPC, nDC, sLabel, DirectGate_WebRTC_GetPipe(pRTC));
 
     rtcSetUserPointer(nDC, pRTC);
-    rtcSetOpenCallback(nDC, DirectGate_WebRTC_OnDataChannelOpen);
-    rtcSetClosedCallback(nDC, DirectGate_WebRTC_OnDataChannelClosed);
-    rtcSetErrorCallback(nDC, DirectGate_WebRTC_OnDataChannelError);
-    rtcSetMessageCallback(nDC, DirectGate_WebRTC_OnDataChannelMessage);
+    rtcSetOpenCallback(nDC, DirectGate_WebRTC_QueueDataChannelOpen);
+    rtcSetClosedCallback(nDC, DirectGate_WebRTC_QueueDataChannelClosed);
+    rtcSetErrorCallback(nDC, DirectGate_WebRTC_QueueDataChannelError);
+    rtcSetMessageCallback(nDC, DirectGate_WebRTC_QueueDataChannelMessage);
 }
 
 void DirectGate_WebRTC_ParseRtcp(const uint8_t *pData, size_t nSize,
@@ -1684,8 +1858,7 @@ static void DirectGate_WebRTC_OnVideoTrackMessage(int nTrack, const char *pMessa
 
     if (nFractionLost >= 0 && pRTC->nVideoTrackID == nTrack)
     {
-        /* Single writer (libdatachannel thread), single reader (main loop);
-         * a torn read of an int is not possible on supported targets. */
+        /* The callback arguments have been marshalled onto the main loop. */
         pRTC->nVideoFractionLost = nFractionLost;
         pRTC->bVideoLossUpdated = XTRUE;
     }
@@ -1765,10 +1938,10 @@ static XSTATUS DirectGate_WebRTC_AddDesktopVideoTrack(directgate_webrtc_t *pRTC,
     }
 
     rtcSetUserPointer(nTrack, pRTC);
-    rtcSetOpenCallback(nTrack, DirectGate_WebRTC_OnVideoTrackOpen);
-    rtcSetClosedCallback(nTrack, DirectGate_WebRTC_OnVideoTrackClosed);
-    rtcSetErrorCallback(nTrack, DirectGate_WebRTC_OnVideoTrackError);
-    rtcSetMessageCallback(nTrack, DirectGate_WebRTC_OnVideoTrackMessage);
+    rtcSetOpenCallback(nTrack, DirectGate_WebRTC_QueueVideoTrackOpen);
+    rtcSetClosedCallback(nTrack, DirectGate_WebRTC_QueueVideoTrackClosed);
+    rtcSetErrorCallback(nTrack, DirectGate_WebRTC_QueueVideoTrackError);
+    rtcSetMessageCallback(nTrack, DirectGate_WebRTC_QueueVideoTrackMessage);
 
     /* Cache outgoing RTP so browser NACKs are answered with retransmissions.
      * Without this the browser waits for a retransmission that never comes,
@@ -1859,8 +2032,8 @@ static XSTATUS DirectGate_WebRTC_AddDesktopAudioTrack(directgate_webrtc_t *pRTC,
     }
 
     rtcSetUserPointer(nTrack, pRTC);
-    rtcSetOpenCallback(nTrack, DirectGate_WebRTC_OnAudioTrackOpen);
-    rtcSetClosedCallback(nTrack, DirectGate_WebRTC_OnAudioTrackClosed);
+    rtcSetOpenCallback(nTrack, DirectGate_WebRTC_QueueAudioTrackOpen);
+    rtcSetClosedCallback(nTrack, DirectGate_WebRTC_QueueAudioTrackClosed);
 
     xlogi("Added WebRTC Opus audio track: pc(%d), track(%d), pt(%u), ssrc(%u), mid(%s)",
         nPC, nTrack, nPayloadType, init.ssrc, sMid);
@@ -1906,12 +2079,12 @@ XSTATUS DirectGate_WebRTC_CreateOffer(directgate_webrtc_t *pRTC)
 
     /* Set callbacks */
     rtcSetUserPointer(pRTC->nPeerConnectionID, pRTC);
-    rtcSetLocalDescriptionCallback(pRTC->nPeerConnectionID, DirectGate_WebRTC_OnLocalDescription);
-    rtcSetLocalCandidateCallback(pRTC->nPeerConnectionID, DirectGate_WebRTC_OnLocalCandidate);
-    rtcSetStateChangeCallback(pRTC->nPeerConnectionID, DirectGate_WebRTC_OnStateChange);
-    rtcSetIceStateChangeCallback(pRTC->nPeerConnectionID, DirectGate_WebRTC_OnIceStateChange);
-    rtcSetGatheringStateChangeCallback(pRTC->nPeerConnectionID, DirectGate_WebRTC_OnGatheringStateChange);
-    rtcSetSignalingStateChangeCallback(pRTC->nPeerConnectionID, DirectGate_WebRTC_OnSignalingStateChange);
+    rtcSetLocalDescriptionCallback(pRTC->nPeerConnectionID, DirectGate_WebRTC_QueueLocalDescription);
+    rtcSetLocalCandidateCallback(pRTC->nPeerConnectionID, DirectGate_WebRTC_QueueLocalCandidate);
+    rtcSetStateChangeCallback(pRTC->nPeerConnectionID, DirectGate_WebRTC_QueueStateChange);
+    rtcSetIceStateChangeCallback(pRTC->nPeerConnectionID, DirectGate_WebRTC_QueueIceStateChange);
+    rtcSetGatheringStateChangeCallback(pRTC->nPeerConnectionID, DirectGate_WebRTC_QueueGatheringStateChange);
+    rtcSetSignalingStateChangeCallback(pRTC->nPeerConnectionID, DirectGate_WebRTC_QueueSignalingStateChange);
 
     /* Create data channel - triggers offer SDP generation */
     pRTC->nDataChannelID = rtcCreateDataChannel(pRTC->nPeerConnectionID, "directgate");
@@ -1923,10 +2096,10 @@ XSTATUS DirectGate_WebRTC_CreateOffer(directgate_webrtc_t *pRTC)
     }
 
     rtcSetUserPointer(pRTC->nDataChannelID, pRTC);
-    rtcSetOpenCallback(pRTC->nDataChannelID, DirectGate_WebRTC_OnDataChannelOpen);
-    rtcSetClosedCallback(pRTC->nDataChannelID, DirectGate_WebRTC_OnDataChannelClosed);
-    rtcSetErrorCallback(pRTC->nDataChannelID, DirectGate_WebRTC_OnDataChannelError);
-    rtcSetMessageCallback(pRTC->nDataChannelID, DirectGate_WebRTC_OnDataChannelMessage);
+    rtcSetOpenCallback(pRTC->nDataChannelID, DirectGate_WebRTC_QueueDataChannelOpen);
+    rtcSetClosedCallback(pRTC->nDataChannelID, DirectGate_WebRTC_QueueDataChannelClosed);
+    rtcSetErrorCallback(pRTC->nDataChannelID, DirectGate_WebRTC_QueueDataChannelError);
+    rtcSetMessageCallback(pRTC->nDataChannelID, DirectGate_WebRTC_QueueDataChannelMessage);
 
     xlogi("Initiated WebRTC offer, waiting for SDP generation: pc(%d), dc(%d)",
         DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC));
@@ -2060,13 +2233,13 @@ XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSd
 
     /* Set callbacks */
     rtcSetUserPointer(nPC, pRTC);
-    rtcSetLocalDescriptionCallback(nPC, DirectGate_WebRTC_OnLocalDescription);
-    rtcSetLocalCandidateCallback(nPC, DirectGate_WebRTC_OnLocalCandidate);
-    rtcSetStateChangeCallback(nPC, DirectGate_WebRTC_OnStateChange);
-    rtcSetDataChannelCallback(nPC, DirectGate_WebRTC_OnDataChannel);
-    rtcSetIceStateChangeCallback(nPC, DirectGate_WebRTC_OnIceStateChange);
-    rtcSetGatheringStateChangeCallback(nPC, DirectGate_WebRTC_OnGatheringStateChange);
-    rtcSetSignalingStateChangeCallback(nPC, DirectGate_WebRTC_OnSignalingStateChange);
+    rtcSetLocalDescriptionCallback(nPC, DirectGate_WebRTC_QueueLocalDescription);
+    rtcSetLocalCandidateCallback(nPC, DirectGate_WebRTC_QueueLocalCandidate);
+    rtcSetStateChangeCallback(nPC, DirectGate_WebRTC_QueueStateChange);
+    rtcSetDataChannelCallback(nPC, DirectGate_WebRTC_QueueDataChannel);
+    rtcSetIceStateChangeCallback(nPC, DirectGate_WebRTC_QueueIceStateChange);
+    rtcSetGatheringStateChangeCallback(nPC, DirectGate_WebRTC_QueueGatheringStateChange);
+    rtcSetSignalingStateChangeCallback(nPC, DirectGate_WebRTC_QueueSignalingStateChange);
 
     /* Unescape JSON string (xutils parser does not unescape \r\n etc.) */
     char *pUnescaped = DirectGate_JSON_Unescape(pSdp);
@@ -2164,10 +2337,7 @@ XSTATUS DirectGate_WebRTC_HandleIceCandidate(directgate_webrtc_t *pRTC,
                                      pRTC->nSignalGeneration : pRTC->nPendingSignalGeneration;
 
         if (!nLatestGeneration || nGeneration > nLatestGeneration)
-        {
-            DirectGate_WebRTC_BufferIce(pRTC, pCandidate, pMid, nGeneration);
-            return XSTDOK;
-        }
+            return DirectGate_WebRTC_BufferIce(pRTC, pCandidate, pMid, nGeneration);
 
         xlogd("Dropping stale remote ICE candidate: pc(%d), currentGeneration(%u), candidateGeneration(%u)",
             DirectGate_WebRTC_GetPC(pRTC), nLatestGeneration, nGeneration);
@@ -2178,8 +2348,7 @@ XSTATUS DirectGate_WebRTC_HandleIceCandidate(directgate_webrtc_t *pRTC,
     if (nTargetPC < 0)
     {
         /* Buffer the candidate as it arrived before the offer was processed */
-        DirectGate_WebRTC_BufferIce(pRTC, pCandidate, pMid, nGeneration);
-        return XSTDOK;
+        return DirectGate_WebRTC_BufferIce(pRTC, pCandidate, pMid, nGeneration);
     }
 
     /* Use DIRECTGATE_RTC_DEFAULT_MID as fallback when sdpMid is NULL or empty */
@@ -2224,7 +2393,7 @@ XSTATUS DirectGate_WebRTC_Send(directgate_webrtc_t *pRTC, const uint8_t *pData, 
 {
     XCHECK((pRTC != NULL), XSTDERR);
     XCHECK((pData != NULL), XSTDERR);
-    XCHECK((nLen > 0), XSTDERR);
+    XCHECK((nLen > 0 && nLen <= INT_MAX), XSTDERR);
 
     XCHECK_NL((pRTC->nPeerConnectionID >= 0), XSTDERR);
     XCHECK_NL(pRTC->bConnected, XSTDERR);
@@ -2611,9 +2780,25 @@ static void DirectGate_WebRTC_DispatchSignalCb(directgate_webrtc_t *pRTC, direct
 void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
 {
     XCHECK_VOID((pRTC != NULL));
+    if (pRTC->pDispatchAlive != NULL) return;
+    xbool_t bAlive = XTRUE;
+    pRTC->pDispatchAlive = &bAlive;
 
     /* Drain notification bytes from pipe */
     DirectGate_WebRTC_DrainPipe(pRTC);
+
+    XSync_Lock(&pRTC->queueLock);
+    xbool_t bQueueFailed = pRTC->bQueueFailed;
+    XSync_Unlock(&pRTC->queueLock);
+
+    if (bQueueFailed)
+    {
+        /* Reliable messages cannot be silently dropped. Fail this transport
+         * and let the normal session/reconnect path handle the interruption. */
+        xloge("Closing WebRTC transport after event queue overflow or allocation failure");
+        DirectGate_WebRTC_Destroy(pRTC);
+        return;
+    }
 
     directgate_webrtc_event_t *pHead;
     pHead = XSell_WebRTC_DetachQueue(pRTC);
@@ -2623,6 +2808,15 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
     {
         directgate_webrtc_event_t *pEvt = pHead;
         pHead = pHead->pNext;
+
+        if (pEvt->eType == DIRECTGATE_WEBRTC_CALLBACK)
+        {
+            if (pEvt->dispatch != NULL) pEvt->dispatch(pEvt, pRTC);
+            free(pEvt->pData);
+            free(pEvt);
+            continue;
+        }
+
         xbool_t bPendingSource = XFALSE;
 
         if (pEvt->nSourceID >= 0 && pEvt->eType != DIRECTGATE_WEBRTC_SIGNAL)
@@ -2726,7 +2920,10 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
                     DirectGate_WebRTC_GetPC(pRTC), pEvt->nSourceID, DirectGate_WebRTC_GetPipe(pRTC));
 
                 if (pRTC->nDataChannelID == pEvt->nSourceID)
+                {
+                    DirectGate_WebRTC_CloseDataChannel(pRTC->nDataChannelID);
                     pRTC->nDataChannelID = -1;
+                }
 
                 break;
             }
@@ -2744,7 +2941,11 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
                 if (bPendingSource)
                 {
                     if (pRTC->nPendingInputDataChannelID == pEvt->nSourceID)
+                    {
+                        DirectGate_WebRTC_CloseDataChannel(pRTC->nPendingInputDataChannelID);
                         pRTC->nPendingInputDataChannelID = -1;
+                    }
+
                     break;
                 }
 
@@ -2752,7 +2953,10 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
                     DirectGate_WebRTC_GetPC(pRTC), pEvt->nSourceID);
 
                 if (pRTC->nInputDataChannelID == pEvt->nSourceID)
+                {
+                    DirectGate_WebRTC_CloseDataChannel(pRTC->nInputDataChannelID);
                     pRTC->nInputDataChannelID = -1;
+                }
 
                 break;
             }
@@ -2791,7 +2995,10 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
                     DirectGate_WebRTC_GetPC(pRTC), pEvt->nSourceID);
 
                 if (pRTC->nVideoTrackID == pEvt->nSourceID)
+                {
+                    DirectGate_WebRTC_CloseVideoTrack(pRTC->nVideoTrackID);
                     pRTC->nVideoTrackID = -1;
+                }
 
                 break;
             }
@@ -2822,7 +3029,11 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
                      * expected. Just forget the pending audio track. */
                     pRTC->bPendingAudioOpen = XFALSE;
                     if (pRTC->nPendingAudioTrackID == pEvt->nSourceID)
+                    {
+                        DirectGate_WebRTC_CloseVideoTrack(pRTC->nPendingAudioTrackID);
                         pRTC->nPendingAudioTrackID = -1;
+                    }
+
                     break;
                 }
 
@@ -2831,7 +3042,10 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
                     DirectGate_WebRTC_GetPC(pRTC), pEvt->nSourceID);
 
                 if (pRTC->nAudioTrackID == pEvt->nSourceID)
+                {
+                    DirectGate_WebRTC_CloseVideoTrack(pRTC->nAudioTrackID);
                     pRTC->nAudioTrackID = -1;
+                }
 
                 break;
             }
@@ -2862,11 +3076,29 @@ void DirectGate_WebRTC_ProcessQueue(directgate_webrtc_t *pRTC)
                 if (!bPendingSource) pRTC->bVideoKeyframeRequested = XTRUE;
                 break;
             }
+            case DIRECTGATE_WEBRTC_CALLBACK:
+                break; /* dispatched above, before channel-event filtering */
         }
 
         free(pEvt->pData);
         free(pEvt);
+
+        if (!bAlive)
+        {
+            /* A data/signaling callback destroyed this RTC, possibly freeing
+               its session too. Only the detached list and stack flag survive. */
+            while (pHead != NULL)
+            {
+                directgate_webrtc_event_t *pNext = pHead->pNext;
+                DirectGate_WebRTC_DiscardEvent(pHead);
+                pHead = pNext;
+            }
+
+            return;
+        }
     }
+
+    pRTC->pDispatchAlive = NULL;
 }
 
 int DirectGate_WebRTC_GetPipeFd(const directgate_webrtc_t *pRTC)
