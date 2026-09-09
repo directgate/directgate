@@ -43,6 +43,8 @@ set(CMAKE_C_STANDARD 11)
 # ---- Security and diagnostics --------------------------------------------
 option(DIRECTGATE_ENABLE_HARDENING "Enable compiler and linker hardening" ON)
 option(DIRECTGATE_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(DIRECTGATE_SANITIZER_PICOHASH_WORKAROUND
+    "Ignore the known upstream picohash function-pointer mismatch in Clang sanitizer builds" ON)
 option(DIRECTGATE_DEBUG "Enable DirectGate debug mode" OFF)
 
 # ---- Build tag -------------------------------------------------------------
@@ -178,6 +180,22 @@ foreach(_juice_target juice juice-static)
         target_compile_definitions(${_juice_target} PRIVATE ICE_MAX_CANDIDATES_COUNT=48)
     endif()
 endforeach()
+
+# The pinned libjuice picohash calls typed hash functions through void* context
+# callbacks. Keep the real peer test running while upstream owns that defect:
+# exclude only Clang's function-type check in this header, on libjuice targets.
+# All other ASan/UBSan checks (including those in picohash) remain enabled.
+# Set DIRECTGATE_SANITIZER_PICOHASH_WORKAROUND=OFF to reproduce the upstream UB.
+if(DIRECTGATE_ENABLE_SANITIZERS AND DIRECTGATE_SANITIZER_PICOHASH_WORKAROUND
+        AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+    foreach(_juice_target juice juice-static)
+        if(TARGET ${_juice_target})
+            target_compile_options(${_juice_target} PRIVATE
+                "-fsanitize-ignorelist=${CMAKE_CURRENT_SOURCE_DIR}/cmake/sanitizer-ignorelist.txt")
+        endif()
+    endforeach()
+    message(STATUS "Sanitizers: ignoring only picohash.h function-type mismatches in libjuice (known upstream UB)")
+endif()
 
 # ---- libxutils (submodule) ------------------------------------------------
 # Built from its own CMakeLists (target name: xutils). EXCLUDE_FROM_ALL keeps

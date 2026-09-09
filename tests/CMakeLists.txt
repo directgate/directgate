@@ -131,7 +131,9 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(audio_linux_smoke PRIVATE ${CMAKE_DL_LIBS})
     directgate_smoke(audio_linux_connection_smoke)
     target_link_libraries(audio_linux_connection_smoke PRIVATE ${CMAKE_DL_LIBS})
-    set_tests_properties(audio_linux_connection_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 10)
+    # Leave room for libpulse's first-use initialization under Valgrind. The
+    # backend's handshake deadline is still 3s; the test must also bound hangs.
+    set_tests_properties(audio_linux_connection_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 
     directgate_smoke(openh264_smoke ${AGENT_DIR}/desktop/openh264.c)
     target_include_directories(openh264_smoke PRIVATE ${AGENT_DIR}/openh264)
