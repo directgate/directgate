@@ -684,36 +684,56 @@ int main(void)
         }
     }
 
-    /* Device-to-device copies used to announce two full chunks for a short
-       second chunk. Keep exact-size validation and report the actual mismatch,
-       even when the event loop left EAGAIN in errno. */
-    for (int nRoundedSize = 0; nRoundedSize <= 1; nRoundedSize++)
+    /* Old browser sessions announce full chunks even when the last is short.
+       Support that wire format without accepting missing chunks, a short
+       non-final chunk, an arbitrary size mismatch, or a bad source hash. */
+    const struct {
+        const char *pName;
+        uint64_t nAnnounced;
+        size_t nFirst;
+        size_t nLast;
+        xbool_t bValidHash;
+        xbool_t bAccepted;
+    } sizeCases[] = {
+        {"exact", 73636, 65536, 8100, XTRUE, XTRUE},
+        {"legacy", 131072, 65536, 8100, XTRUE, XTRUE},
+        {"legacy-one-byte-tail", 131072, 65536, 1, XTRUE, XTRUE},
+        {"exact-mismatch", 73637, 65536, 8100, XTRUE, XFALSE},
+        {"legacy-bad-hash", 131072, 65536, 8100, XFALSE, XFALSE},
+        {"legacy-missing-chunk", 131072, 65536, 0, XTRUE, XFALSE},
+        {"legacy-short-first", 131072, 65535, 8101, XTRUE, XFALSE},
+        {"legacy-short-first-full-last", 131072, 8100, 65536, XTRUE, XFALSE},
+    };
+    for (size_t nCase = 0; nCase < sizeof(sizeCases) / sizeof(*sizeCases); nCase++)
     {
         uint8_t body[73636];
-        memset(body, 0x5a, sizeof(body));
+        for (size_t i = 0; i < sizeof(body); i++) body[i] = (uint8_t)i;
+        size_t nBody = sizeCases[nCase].nFirst + sizeCases[nCase].nLast;
         uint8_t digest[XSHA256_DIGEST_SIZE];
         char sSha[XSHA256_DIGEST_SIZE * 2 + 1], sUpload[512];
-        XSHA256_Compute(digest, sizeof(digest), body, sizeof(body));
+        XSHA256_Compute(digest, sizeof(digest), body, nBody);
         for (size_t i = 0; i < sizeof(digest); i++)
             snprintf(sSha + i * 2, sizeof(sSha) - i * 2, "%02x", digest[i]);
-        snprintf(sUpload, sizeof(sUpload), "%s/size-%d.bin", sRoot, nRoundedSize);
+        if (!sizeCases[nCase].bValidHash) sSha[0] = sSha[0] == '0' ? '1' : '0';
+        snprintf(sUpload, sizeof(sUpload), "%s/size-%s.bin", sRoot, sizeCases[nCase].pName);
         CHECK(deliver(&fix, manager_header("save", sUpload, NULL, 11, XFALSE)) == XAPI_CONTINUE,
             "prepare two-chunk upload");
         CHECK(expect_manager(&fix, "save", "ok"), "two-chunk save accepted");
         char sTemp[XFILE_PATH_SIZE];
         xstrncpy(sTemp, sizeof(sTemp), fix.pSession->sSaveTempPath);
         xjson_obj_t *pStart = DirectGate_Proto_BuildFileStart("sized", "stream.c",
-            nRoundedSize ? 131072 : sizeof(body), 2, 65536);
+            sizeCases[nCase].nAnnounced, 2, 65536);
         CHECK(pStart != NULL, "two-chunk start header");
         XJSON_AddU32(pStart, "sessionId", 11);
         CHECK(deliver(&fix, pStart) == XAPI_CONTINUE, "two-chunk start");
         for (uint32_t i = 0; i < 2; i++)
         {
+            size_t nOffset = i == 0 ? 0 : sizeCases[nCase].nFirst;
+            size_t nBytes = i == 0 ? sizeCases[nCase].nFirst : sizeCases[nCase].nLast;
+            if (!nBytes) break;
             xjson_obj_t *pChunk = DirectGate_Proto_BuildFileChunk("sized", i);
             CHECK(pChunk != NULL, "two-chunk data header");
             XJSON_AddU32(pChunk, "sessionId", 11);
-            size_t nOffset = i * 65536;
-            size_t nBytes = i == 0 ? 65536 : sizeof(body) - nOffset;
             CHECK(deliver_payload(&fix, pChunk, body + nOffset, nBytes) == XAPI_CONTINUE,
                 "two-chunk data");
         }
@@ -726,24 +746,26 @@ int main(void)
         CHECK(take_packet(&fix, &reply), "two-chunk upload reply");
         xjson_obj_t *pHeader = reply.jsonHeader.pRootObj;
         const char *pAction = XJSON_GetString(XJSON_GetObject(pHeader, "action"));
-        if (nRoundedSize)
+        if (!sizeCases[nCase].bAccepted)
         {
-            CHECK(xstrcmp(pAction, "cancel"), "rounded size is rejected");
+            CHECK(xstrcmp(pAction, "cancel"), "invalid transfer is rejected");
             const char *pReason = XJSON_GetString(XJSON_GetObject(pHeader, "reason"));
-            CHECK(strstr(pReason, "received 73636 of 131072 bytes, 2 of 2 chunks") != NULL,
-                "size mismatch reaches the client instead of stale errno");
+            CHECK(xstrused(pReason) && strstr(pReason, "Resource temporarily unavailable") == NULL,
+                "validation failure does not report stale errno");
             CHECK(!XPath_Exists(sUpload) && !XPath_Exists(sTemp), "incomplete upload cleaned");
         }
         else
         {
-            CHECK(xstrcmp(pAction, "ack"), "exact size is acknowledged");
+            CHECK(xstrcmp(pAction, "ack"), "exact and legacy rounded sizes are acknowledged");
             FILE *f = fopen(sUpload, "rb");
             uint8_t received[sizeof(body)];
             CHECK(f != NULL, "open committed two-chunk upload");
-            CHECK(fread(received, 1, sizeof(received), f) == sizeof(received) && fgetc(f) == EOF,
+            CHECK(fread(received, 1, sizeof(received), f) == nBody && fgetc(f) == EOF,
                 "committed size is exact");
             fclose(f);
-            CHECK(memcmp(body, received, sizeof(body)) == 0, "committed bytes are exact");
+            CHECK(memcmp(body, received, nBody) == 0, "committed bytes are exact");
+            CHECK(fix.pSession->transfer.nSize == nBody, "completed transfer records actual size");
+            CHECK(!XPath_Exists(sTemp), "successful upload leaves no partial file");
         }
         DirectGate_Package_Clear(&reply);
         drain(&fix);

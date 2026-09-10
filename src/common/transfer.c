@@ -679,6 +679,22 @@ XSTATUS DirectGate_Transfer_HandleChunk(directgate_transfer_t *pFT, const direct
         return XSTDERR;
     }
 
+    /* Older frontends estimate size as firstChunk.length * totalChunks.
+       Recognize only that layout: all preceding chunks were full and this
+       is the final, nonempty short chunk. Correct the estimate so existing
+       browser sessions still work after an agent upgrade. HandleEnd must
+       still validate every chunk and the source SHA-256 before committing. */
+    if (pFT->nTotalChunks > 1 && pFT->nCurrentChunk == pFT->nTotalChunks - 1 &&
+        pFT->nSize == (uint64_t)pFT->nTotalChunks * pFT->nChunkSize &&
+        pFT->nBytesXferred == (uint64_t)pFT->nCurrentChunk * pFT->nChunkSize &&
+        pFilePkg->data.nPayloadLength < pFT->nChunkSize)
+    {
+        uint64_t nActualSize = pFT->nBytesXferred + pFilePkg->data.nPayloadLength;
+        xlogd("Corrected legacy inbound transfer size estimate: id(%s), announced(%" PRIu64 "), actual(%" PRIu64 ")",
+            DirectGate_Transfer_GetId(pFT), pFT->nSize, nActualSize);
+        pFT->nSize = nActualSize;
+    }
+
     XSHA256_Update(&pFT->sha256Ctx, pFilePkg->data.pPayload, pFilePkg->data.nPayloadLength);
     pFT->nBytesXferred += pFilePkg->data.nPayloadLength;
     pFT->nCurrentChunk++;
