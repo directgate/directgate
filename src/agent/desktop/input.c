@@ -25,6 +25,7 @@
 
 #ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
 #include "wayland.h"
+#include <math.h>
 #endif
 
 #if defined(_WIN32)
@@ -839,6 +840,32 @@ static void DirectGate_Desktop_X11TypeText(directgate_desktop_t *pDesktop, const
 }
 
 #ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+static double DirectGate_Desktop_WaylandWheelDelta(xjson_obj_t *pValue)
+{
+    /* WheelEvent deltas can be fractional (or use exponent notation in
+     * JSON). XJSON_GetInt rejects those, dropping smooth-scroll samples. */
+    if (pValue == NULL || pValue->pData == NULL ||
+        (pValue->nType != XJSON_TYPE_NUMBER && pValue->nType != XJSON_TYPE_FLOAT))
+        return 0.0;
+
+    const char *pText = (const char*)pValue->pData;
+    char *pEnd;
+    int nSavedErrno = errno;
+    double nDelta = strtod(pText, &pEnd);
+    errno = nSavedErrno;
+    if (pEnd == pText || *pEnd != '\0' || !isfinite(nDelta)) return 0.0;
+
+    if (nDelta > DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA) nDelta = DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA;
+    else if (nDelta < -DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA) nDelta = -DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA;
+
+    /* The wire uses ~100 browser pixels per notch (as WheelNotches above),
+     * while the portal forwards native axis units: Mutter defines 10 per
+     * notch. Passing browser pixels through produced tenfold scrolling.
+     * Keep the result continuous so small samples do not turn into clicks.
+     * https://gitlab.gnome.org/GNOME/mutter/-/blob/main/data/dbus-interfaces/org.gnome.Mutter.RemoteDesktop.xml */
+    return nDelta / 10.0;
+}
+
 /* Input on Wayland goes back through the same portal session the screen is
  * being captured from. Nothing here can reach the compositor directly - that
  * is the point of the design - so every event is a D-Bus notification against
@@ -1044,11 +1071,8 @@ static int DirectGate_Desktop_WaylandHandleInput(directgate_session_t *pSession,
         }
         else if (xstrcmp(pEvent, "wheel"))
         {
-            /* The portal takes scroll distance, not the wheel-button clicks
-             * X11 emulates, so the notch accumulator is bypassed and the
-             * deltas go through as they arrived. */
-            double nDx = (double)DirectGate_Desktop_WheelDelta(XJSON_GetInt(XJSON_GetObject(pRoot, "deltaX")));
-            double nDy = (double)DirectGate_Desktop_WheelDelta(XJSON_GetInt(XJSON_GetObject(pRoot, "deltaY")));
+            double nDx = DirectGate_Desktop_WaylandWheelDelta(XJSON_GetObject(pRoot, "deltaX"));
+            double nDy = DirectGate_Desktop_WaylandWheelDelta(XJSON_GetObject(pRoot, "deltaY"));
             if (nDx != 0.0 || nDy != 0.0) DirectGate_WL_PortalPointerAxis(pPortal, nDx, nDy);
         }
 

@@ -169,6 +169,21 @@ if(UNIX AND NOT APPLE)
     target_include_directories(desktop_input_smoke PRIVATE ${X11_INCLUDE_DIR})
     target_link_libraries(desktop_input_smoke PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
 
+    # Exercise the Wayland input branch even on X11-only CI runners. The
+    # portal boundary is stubbed, so no compositor or PipeWire is needed.
+    directgate_smoke(wayland_input_smoke)
+    target_compile_definitions(wayland_input_smoke PRIVATE DIRECTGATE_DESKTOP_HAS_WAYLAND=1)
+    target_include_directories(wayland_input_smoke PRIVATE ${X11_INCLUDE_DIR})
+    target_link_libraries(wayland_input_smoke PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
+
+    if(DBUS_FOUND)
+        # Serialize actual portal messages, without connecting to a desktop.
+        directgate_smoke(wayland_portal_smoke)
+        target_compile_definitions(wayland_portal_smoke PRIVATE DIRECTGATE_DESKTOP_HAS_WAYLAND=1)
+        target_include_directories(wayland_portal_smoke SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
+        target_link_libraries(wayland_portal_smoke PRIVATE ${DBUS_LIBRARIES} ${CMAKE_DL_LIBS})
+    endif()
+
     # Same idea for the adaptive bitrate controller: compiles desktop.c and
     # drives the policy with synthetic receiver reports, no encoder involved.
     directgate_smoke(desktop_abr_smoke)
