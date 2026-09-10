@@ -34,6 +34,11 @@ static int handles(void)
     directgate_webrtc_t rtc;
     DirectGate_WebRTC_Init(&rtc);
     rtcConfiguration cfg = {0};
+    /* This fixture checks C handle ownership. Automatic negotiation starts
+     * an ICE worker while we immediately close/recreate those handles, which
+     * makes teardown depend on upstream network-thread scheduling. The real
+     * negotiation path is covered separately by webrtc_peer_smoke. */
+    cfg.disableAutoNegotiation = true;
     int pc = rtcCreatePeerConnection(&cfg);
     CHECK(pc >= 0, "create peer");
     int dc = rtcCreateDataChannel(pc, "directgate");

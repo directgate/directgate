@@ -34,6 +34,26 @@ int main(void)
     DirectGate_WebRTC_Init(&rtc);
     rtc.nDataChannelID = 1000000;
     rtc.dataCb = receive;
+    /* A wheel event must reach the application on this pipe wakeup, without
+     * being queued again until another main-loop/capture iteration. */
+    rtc.nInputDataChannelID = 1000001;
+    unsigned input[] = {0, 0};
+    DirectGate_WebRTC_QueueDataChannelMessage(rtc.nInputDataChannelID,
+        (const char*)input, sizeof(input), &rtc);
+    if (received) return 1; /* Library callbacks must not dispatch off-thread. */
+    DirectGate_WebRTC_ProcessQueue(&rtc);
+    if (failed || received != 1)
+    {
+        rtc.nInputDataChannelID = rtc.nDataChannelID = -1;
+        DirectGate_WebRTC_Clear(&rtc);
+        fprintf(stderr, "webrtc_queue_smoke: input was delayed past the first queue dispatch\n");
+        return 1;
+    }
+    DirectGate_WebRTC_QueueDataChannelMessage(1000002, (const char*)input, sizeof(input), &rtc);
+    DirectGate_WebRTC_ProcessQueue(&rtc);
+    if (received != 1) return 1; /* Stale channels are still filtered on main. */
+    rtc.nInputDataChannelID = -1;
+    next[0] = received = 0;
     producer_t producers[PRODUCERS] = {0};
     xthread_t threads[PRODUCERS];
     for (unsigned i = 0; i < PRODUCERS; i++)
@@ -51,7 +71,6 @@ int main(void)
         xusleep(100);
     } while (done < PRODUCERS);
     for (unsigned i = 0; i < PRODUCERS; i++) XThread_Join(&threads[i]);
-    DirectGate_WebRTC_ProcessQueue(&rtc);
     DirectGate_WebRTC_ProcessQueue(&rtc);
     rtc.nDataChannelID = -1;
     DirectGate_WebRTC_Clear(&rtc);

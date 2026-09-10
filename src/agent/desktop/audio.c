@@ -123,10 +123,14 @@ static void* DirectGate_Audio_Worker(void *pArg)
 
     while (!XSYNC_ATOMIC_GET(&pAudio->nStop))
     {
-        /* Blocking read of exactly one 20 ms frame; returns each frame period,
-         * so the stop flag is observed within ~20 ms. */
-        if (DirectGate_Audio_BackendRead(pAudio->pBackend, pcm,
-            DIRECTGATE_AUDIO_FRAME_SAMPLES, DIRECTGATE_AUDIO_CHANNELS) != XSTDOK)
+        /* Each bounded read lets us observe Stop, even when the source has
+         * not supplied a complete frame yet. Pending reads produce no packet
+         * and do not advance the source sample clock. */
+        int nStatus = DirectGate_Audio_BackendRead(pAudio->pBackend, pcm,
+            DIRECTGATE_AUDIO_FRAME_SAMPLES, DIRECTGATE_AUDIO_CHANNELS);
+
+        if (nStatus == XSTDNON) continue;
+        if (nStatus != XSTDOK)
         {
             xlogw("Desktop audio capture read failed; stopping audio thread");
             break;

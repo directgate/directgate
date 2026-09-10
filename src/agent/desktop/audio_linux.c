@@ -85,6 +85,8 @@ typedef struct directgate_pulse_ {
     const void *pFragment;
     size_t nFragmentSize;
     size_t nFragmentOffset;
+    uint8_t pending[DIRECTGATE_AUDIO_FRAME_SAMPLES * DIRECTGATE_AUDIO_CHANNELS * sizeof(int16_t)];
+    size_t nPendingBytes;
 } directgate_pulse_t;
 
 static void DirectGate_Audio_SetError(char *pErr, size_t nErrSize, const char *pReason)
@@ -239,7 +241,8 @@ void* DirectGate_Audio_BackendOpen(uint32_t nSampleRate, uint32_t nChannels, cha
         pa_buffer_attr attr = { UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
             DIRECTGATE_AUDIO_FRAME_SAMPLES * nChannels * (uint32_t)sizeof(int16_t) };
 
-        attr.maxlength = attr.fragsize * 4U;
+        /* Keep the server's maximum buffer default, as pa_simple did, so a
+         * short scheduling stall does not discard captured audio. */
         pCtx->pStream = g_pulse.stream_new(pCtx->pContext, "desktop", &spec, NULL);
 
         if (pCtx->pStream == NULL ||
@@ -280,10 +283,10 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames
     uint64_t nNow = DirectGate_Audio_MonotonicUs();
     if (!nNow) return XSTDERR;
 
-    size_t nBytes = (size_t)nFrames * nChannels * sizeof(int16_t), nDone = 0;
+    size_t nBytes = (size_t)nFrames * nChannels * sizeof(int16_t);
     uint64_t nDeadline = nNow + (uint64_t)nFrames * 1000000ULL / DIRECTGATE_AUDIO_SAMPLE_RATE;
 
-    while (nDone < nBytes)
+    while (pCtx->nPendingBytes < nBytes)
     {
         if (g_pulse.context_get_state(pCtx->pContext) != DG_PA_CONTEXT_READY ||
             g_pulse.stream_get_state(pCtx->pStream) != DG_PA_STREAM_READY) return XSTDERR;
@@ -298,20 +301,23 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames
             {
                 int nRet = DirectGate_Audio_PulseStep(pCtx, nDeadline);
                 if (nRet == XSTDERR) return XSTDERR;
-                if (nRet == XSTDNON) break;
+                /* The poll deadline bounds Stop's join, not the source's
+                 * packet cadence. Keep partial PCM and retry; manufacturing
+                 * silence here inserts gaps when PulseAudio delivers bursts. */
+                if (nRet == XSTDNON) return XSTDNON;
                 continue;
             }
         }
 
         size_t nTake = pCtx->nFragmentSize - pCtx->nFragmentOffset;
-        if (nTake > nBytes - nDone) nTake = nBytes - nDone;
+        if (nTake > nBytes - pCtx->nPendingBytes) nTake = nBytes - pCtx->nPendingBytes;
 
         if (pCtx->pFragment != NULL)
-            memcpy((uint8_t*)pBuf + nDone, (const uint8_t*)pCtx->pFragment + pCtx->nFragmentOffset, nTake);
+            memcpy(pCtx->pending + pCtx->nPendingBytes, (const uint8_t*)pCtx->pFragment + pCtx->nFragmentOffset, nTake);
         else
-            memset((uint8_t*)pBuf + nDone, 0, nTake); /* PulseAudio holes represent silence and must also be dropped. */
+            memset(pCtx->pending + pCtx->nPendingBytes, 0, nTake); /* Actual PulseAudio holes are silence. */
 
-        nDone += nTake;
+        pCtx->nPendingBytes += nTake;
         pCtx->nFragmentOffset += nTake;
 
         if (pCtx->nFragmentOffset == pCtx->nFragmentSize)
@@ -322,7 +328,12 @@ int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames
         }
     }
 
-    memset((uint8_t*)pBuf + nDone, 0, nBytes - nDone);
+    memcpy(pBuf, pCtx->pending, nBytes);
+    pCtx->nPendingBytes -= nBytes;
+
+    if (pCtx->nPendingBytes)
+        memmove(pCtx->pending, pCtx->pending + nBytes, pCtx->nPendingBytes);
+
     return XSTDOK;
 }
 

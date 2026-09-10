@@ -617,7 +617,6 @@ static void DirectGate_WebRTC_OnDataChannel(int nPC, int nDC, void *pCtx);
 DG_RTC_CALLBACK_SIMPLE(DataChannelOpen)
 DG_RTC_CALLBACK_SIMPLE(DataChannelClosed)
 DG_RTC_CALLBACK_TEXT(DataChannelError)
-DG_RTC_CALLBACK_MESSAGE(DataChannelMessage)
 DG_RTC_CALLBACK_SIMPLE(VideoTrackOpen)
 DG_RTC_CALLBACK_SIMPLE(VideoTrackClosed)
 DG_RTC_CALLBACK_TEXT(VideoTrackError)
@@ -1587,27 +1586,17 @@ static void DirectGate_WebRTC_OnDataChannelError(int nDC, const char *pError, vo
 }
 
 /* Callback: data channel message received (libdatachannel thread) */
-static void DirectGate_WebRTC_OnDataChannelMessage(int nDC, const char *pMessage, int nSize, void *pPtr)
+static void DirectGate_WebRTC_QueueDataChannelMessage(int nDC, const char *pMessage, int nSize, void *pPtr)
 {
     directgate_webrtc_t *pRTC = (directgate_webrtc_t*)pPtr;
     XCHECK_VOID((pRTC != NULL));
     XCHECK_VOID((pMessage != NULL));
     XCHECK_VOID((nSize > 0));
 
-    if (pRTC->nDataChannelID != nDC && pRTC->nInputDataChannelID != nDC &&
-        pRTC->nPendingDataChannelID != nDC && pRTC->nPendingInputDataChannelID != nDC)
-    {
-        xlogd("Ignoring stale WebRTC data channel message: pc(%d), dc(%d), current(%d), bytes(%d)",
-            DirectGate_WebRTC_GetPC(pRTC), nDC, DirectGate_WebRTC_GetDC(pRTC), nSize);
-
-        return;
-    }
-
-    xlogd("Received WebRTC data channel message: pc(%d), dc(%d), fast(%d), bytes(%d)",
-        DirectGate_WebRTC_GetPC(pRTC), nDC,
-        (nDC == pRTC->nInputDataChannelID || nDC == pRTC->nPendingInputDataChannelID) ? 1 : 0,
-        nSize);
-
+    /* DATA already has a main-thread dispatcher and stale-channel filtering.
+     * Wrapping it in another queued callback adds a second event-loop turn
+     * (and potentially a capture/encode tick) to every input message. Only
+     * copy here: peer/channel state is still read exclusively on main. */
     DirectGate_WebRTC_Enqueue(pRTC, DIRECTGATE_WEBRTC_DATA, nDC, (const uint8_t*)pMessage, (size_t)nSize);
 }
 
