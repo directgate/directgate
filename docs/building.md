@@ -152,6 +152,16 @@ The script configures the build with `-DDIRECTGATE_BUILD_TESTS=ON`, builds the t
 For coverage-guided fuzzing of JSON, protocol, WebSocket, RTCP and SDP parsers:
 
 ```sh
+./tests/run-fuzz.sh
+```
+
+`FUZZ_TIME` is the wall clock budget in seconds (default 60), `FUZZ_CORPUS` the corpus directory to grow (default `build-fuzz/corpus`) and `FUZZ_ARTIFACTS` where crash, leak and timeout reproducers are written (default `build-fuzz/artifacts`). Replay one with `build-fuzz/tests/fuzz_wire <file>`. After each run the corpus is minimized with `-merge=1`, so it can be carried from run to run without growing without bound.
+
+CI runs the script on every push and pull request for 10 minutes against a corpus cached from earlier runs (`.github/workflows/fuzz.yml`); a reproducer from a failing run is uploaded as a workflow artifact. A longer budget can be requested by dispatching the workflow manually.
+
+The same build and run by hand:
+
+```sh
 cmake -S . -B build-fuzz -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DDIRECTGATE_BUILD_TESTS=ON -DDIRECTGATE_ENABLE_SANITIZERS=ON \
   -DDIRECTGATE_BUILD_FUZZERS=ON -DCMAKE_BUILD_TYPE=Debug

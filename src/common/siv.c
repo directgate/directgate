@@ -280,6 +280,7 @@ uint8_t* DirectGate_SIV_Decrypt(const uint8_t *pCmacKey, const uint8_t *pCtrKey,
     if (pOutLen != NULL) *pOutLen = 0;
     XCHECK((nKeyBits == 128 || nKeyBits == 192 || nKeyBits == 256), NULL);
     XCHECK((pCmacKey != NULL && pCtrKey != NULL), NULL);
+
     /* Need nonce + tag + at least one ciphertext byte. */
     XCHECK((pData != NULL && nLength > XSIV_NONCE_SIZE + XSIV_TAG_SIZE), NULL);
     XCHECK((pOutLen != NULL), NULL);

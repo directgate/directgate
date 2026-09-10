@@ -1,0 +1,76 @@
+name: Fuzzing
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Seconds to fuzz for'
+        required: false
+        default: '900'
+
+jobs:
+  fuzz-wire:
+    runs-on: ubuntu-latest
+    # Bounds a wedged run: 10 minutes of fuzzing plus the submodule build, and
+    # room for a longer manual budget, all well inside this.
+    timeout-minutes: 45
+
+    env:
+      # Every push and pull request gets the full budget; a manual run can ask
+      # for a longer hunt through the workflow_dispatch input.
+      FUZZ_TIME: ${{ inputs.duration || '600' }}
+      FUZZ_CORPUS: ${{ github.workspace }}/corpus
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Same set as the sanitizer job: the fuzz target is built out of the
+      # ASan/UBSan configuration of the whole project, so configure still needs
+      # the desktop streaming headers.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential clang pkg-config \
+            libssl-dev libx11-dev libxrandr-dev libxext-dev libopus-dev \
+            libavcodec-dev libavutil-dev libpipewire-0.3-dev libdbus-1-dev
+
+      # Cache entries are immutable, so each run saves under its own key and
+      # restores the newest earlier one by prefix. Without this every run would
+      # spend its budget rediscovering the wire format from zero instead of
+      # building on what earlier runs already reached.
+      - name: Restore corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: corpus
+          key: fuzz-wire-corpus-${{ github.run_id }}
+          restore-keys: fuzz-wire-corpus-
+
+      - name: Build and run the wire parser fuzzer
+        run: sh ./tests/run-fuzz.sh
+
+      # Kept even when the run failed: the inputs found on the way to a crash
+      # are worth carrying forward, and the reproducer itself is uploaded
+      # below. Pull requests only read the cache - a fork has no write access
+      # to it, and a PR-scoped entry could not be read from main anyway.
+      - name: Save corpus
+        if: always() && github.event_name != 'pull_request'
+        uses: actions/cache/save@v4
+        with:
+          path: corpus
+          key: fuzz-wire-corpus-${{ github.run_id }}
+
+      # The failing input, replayable with:
+      #   build-fuzz/tests/fuzz_wire <file>
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-wire-artifacts-${{ github.run_id }}
+          path: build-fuzz/artifacts/
+          if-no-files-found: ignore

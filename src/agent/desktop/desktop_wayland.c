@@ -564,7 +564,7 @@ int DirectGate_WL_SourceSelect(directgate_wl_source_t *pSource, uint32_t nNodeId
 
 directgate_wl_portal_t* DirectGate_WL_SourcePortal(directgate_wl_source_t *pSource)
 {
-    XCHECK_NL((pSource != NULL), NULL);    
+    XCHECK_NL((pSource != NULL), NULL);
     return pSource->pPortal;
 }
 

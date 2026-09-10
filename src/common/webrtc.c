@@ -108,6 +108,7 @@ static int DirectGate_WebRTC_GetDataChannelForPeer(const directgate_webrtc_t *pR
 {
     if (DirectGate_WebRTC_IsPendingPeerConnection(pRTC, nPC))
         return pRTC->nPendingDataChannelID;
+
     return DirectGate_WebRTC_GetDC(pRTC);
 }
 
@@ -247,6 +248,7 @@ static xbool_t DirectGate_WebRTC_ParseRemoteH264(const char *pSdp,
     {
         const char *pLine = p;
         while (*p && *p != '\r' && *p != '\n') p++;
+
         size_t nLineLen = (size_t)(p - pLine);
         while (*p == '\r' || *p == '\n') p++;
 
@@ -631,8 +633,8 @@ static void DirectGate_WebRTC_DispatchDataChannel(const directgate_webrtc_event_
 
 static void DirectGate_WebRTC_QueueDataChannel(int nPC, int nDC, void *pCtx)
 {
-    if (!DirectGate_WebRTC_EnqueueCallback(pCtx, DIRECTGATE_WEBRTC_CALLBACK, nPC, NULL, 0,
-        nDC, DirectGate_WebRTC_DispatchDataChannel)) DirectGate_WebRTC_CloseDataChannel(nDC);
+    if (!DirectGate_WebRTC_EnqueueCallback(pCtx, DIRECTGATE_WEBRTC_CALLBACK, nPC, NULL, 0, nDC,
+        DirectGate_WebRTC_DispatchDataChannel)) DirectGate_WebRTC_CloseDataChannel(nDC);
 }
 
 #undef DG_RTC_CALLBACK_SIMPLE
@@ -1058,7 +1060,10 @@ static void DirectGate_WebRTC_PromotePending(directgate_webrtc_t *pRTC)
     XCHECK_VOID_NL(pRTC->bPendingDirect);
 
     if (pRTC->bVideoEnabled)
-        XCHECK_VOID_NL((pRTC->bPendingVideoOpen && pRTC->nPendingVideoTrackID >= 0));
+    {
+        XCHECK_VOID_NL(pRTC->bPendingVideoOpen);
+        XCHECK_VOID_NL((pRTC->nPendingVideoTrackID >= 0));
+    }
 
     int nOldPC = pRTC->nPeerConnectionID;
     int nOldDC = pRTC->nDataChannelID;

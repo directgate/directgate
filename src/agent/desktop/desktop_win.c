@@ -832,7 +832,7 @@ static int DirectGate_Desktop_WinEnc_InitPipeline(directgate_winenc_t *pEnc)
 
     /*
         Neither duplication nor GDI is a requirement when the helper is here.
-        
+
         On the secure desktop - a logon screen, the lock screen, a UAC prompt
         that was already up before this pipeline started - this process can
         capture nothing at all: duplication will not initialise and GDI reads

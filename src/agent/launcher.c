@@ -150,7 +150,7 @@ void DirectGate_WinLauncher_BoostPriority(void)
         xlogw("Failed to disable agent power throttling: err(%lu)", (unsigned long)GetLastError());
 }
 
-/* Resolve an account name (accepts "user", "DOMAIN\user" or ".\user") 
+/* Resolve an account name (accepts "user", "DOMAIN\user" or ".\user")
    to a SID copied into pSidBuf (SECURITY_MAX_SID_SIZE bytes). */
 static XSTATUS DirectGate_WinLauncher_LookupSid(const char *pShellUser, PSID pSidBuf)
 {

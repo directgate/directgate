@@ -692,6 +692,7 @@ XSTATUS DirectGate_Transfer_HandleChunk(directgate_transfer_t *pFT, const direct
         uint64_t nActualSize = pFT->nBytesXferred + pFilePkg->data.nPayloadLength;
         xlogd("Corrected legacy inbound transfer size estimate: id(%s), announced(%" PRIu64 "), actual(%" PRIu64 ")",
             DirectGate_Transfer_GetId(pFT), pFT->nSize, nActualSize);
+
         pFT->nSize = nActualSize;
     }
 
