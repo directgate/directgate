@@ -22,6 +22,25 @@
 #include "websock.h"
 #include "protocol.h"
 
+int DirectGate_WebSock_SendPong(xapi_session_t *pSession, xws_frame_t *pPing)
+{
+    XCHECK((pSession != NULL && pPing != NULL), XAPI_DISCONNECT);
+    XCHECK((pPing->eType == XWS_PING && pPing->bFin && pPing->nPayloadLength <= 125), XAPI_DISCONNECT);
+
+    xws_frame_t pong;
+    xbool_t bMask = pSession->eRole == XAPI_CLIENT ? XTRUE : XFALSE;
+
+    /* RFC 6455 section 5.5.3 requires the ping's application data verbatim. */
+    if (XWebFrame_Create(&pong, XWebFrame_GetPayload(pPing), XWebFrame_GetPayloadLength(pPing),
+        XWS_PONG, bMask, XTRUE) != XWS_ERR_NONE) return XAPI_DISCONNECT;
+
+    int nAdded = XByteBuffer_AddBuff(&pSession->txBuffer, &pong.buffer);
+    XWebFrame_Clear(&pong);
+
+    if (nAdded <= 0) return XAPI_DISCONNECT;
+    return XAPI_EnableEvent(pSession, XPOLLOUT);
+}
+
 int DirectGate_WebSock_Send(xapi_session_t *pSession, const uint8_t *pPkg, size_t nLen)
 {
     XCHECK((pSession != NULL), XAPI_DISCONNECT);

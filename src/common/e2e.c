@@ -119,7 +119,8 @@ xbool_t DirectGate_E2E_DeriveFromSRP(directgate_e2e_t *pE2E, const uint8_t *pSes
 
     /* Salt = agentNonce || clientNonce */
     uint8_t salt[DIRECTGATE_SRP_NONCE_SIZE * 2];
-    XCHECK((nNonceSize * 2 <= sizeof(salt)), XFALSE);
+    XCHECK((nNonceSize <= sizeof(salt) / 2), XFALSE);
+
     memcpy(salt, pagentNonce, nNonceSize);
     memcpy(salt + nNonceSize, pClientNonce, nNonceSize);
 
@@ -154,7 +155,8 @@ xbool_t DirectGate_E2E_DeriveFromKey(directgate_e2e_t *pE2E, const uint8_t *pSha
 
     /* Salt layout matches SRP path: agentNonce || clientNonce. */
     uint8_t salt[DIRECTGATE_SRP_NONCE_SIZE * 2];
-    XCHECK((nNonceSize * 2 <= sizeof(salt)), XFALSE);
+    XCHECK((nNonceSize <= sizeof(salt) / 2), XFALSE);
+
     memcpy(salt, pagentNonce, nNonceSize);
     memcpy(salt + nNonceSize, pClientNonce, nNonceSize);
 

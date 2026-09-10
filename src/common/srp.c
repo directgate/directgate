@@ -57,6 +57,7 @@ xbool_t DirectGate_SRP_HexToBytes(const char *pHex, uint8_t *pOut,
 {
     XCHECK((pHex != NULL), XFALSE);
     XCHECK((pOut != NULL), XFALSE);
+    XCHECK_NL((nOutSize <= (SIZE_MAX - 1) / 2), XFALSE);
 
     size_t nHexLen = strnlen(pHex, nOutSize * 2 + 1);
     if (!nHexLen || (nHexLen & 1U)) return XFALSE;
@@ -81,9 +82,7 @@ static xbool_t DirectGate_SRP_BytesToHex(const uint8_t *pData, size_t nLen,
 {
     XCHECK((pData != NULL), XFALSE);
     XCHECK((pHex != NULL), XFALSE);
-
-    size_t nRequiredSize = nLen * 2 + 1;
-    if (nHexSize < nRequiredSize) return XFALSE;
+    if (!nHexSize || nLen > (nHexSize - 1) / 2) return XFALSE;
 
     for (size_t i = 0; i < nLen; i++)
         sprintf(&pHex[i * 2], "%02x", pData[i]);

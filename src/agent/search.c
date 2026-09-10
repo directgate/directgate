@@ -20,6 +20,7 @@
  */
 
 #include "search.h"
+#include "common.h"
 #include "files.h"
 #include "session.h"
 
@@ -59,6 +60,8 @@ static void DirectGate_Search_ClearEvents(directgate_search_t *pSearch)
 
     pSearch->pEventHead = NULL;
     pSearch->pEventTail = NULL;
+    pSearch->nQueuedBytes = 0;
+    pSearch->nQueuedEvents = 0;
     pSearch->bPending = XFALSE;
 }
 
@@ -151,6 +154,16 @@ static int DirectGate_Search_QueueEventUnlocked(directgate_search_t *pSearch,
 {
     XCHECK((pSearch != NULL), XSTDERR);
 
+    /* A broad search can outrun the main loop indefinitely. Stop producing
+     * results at a bounded backlog; leave room for the terminal error event. */
+    if (nPayloadLen && (pSearch->nQueuedEvents >= 1024U ||
+        nPayloadLen > 16U * 1024U * 1024U - pSearch->nQueuedBytes))
+    {
+        free(pPayload);
+        errno = ENOBUFS;
+        return XSTDERR;
+    }
+
     directgate_search_event_t *pEvent = (directgate_search_event_t*)calloc(1, sizeof(*pEvent));
     if (pEvent == NULL)
     {
@@ -168,6 +181,8 @@ static int DirectGate_Search_QueueEventUnlocked(directgate_search_t *pSearch,
     else pSearch->pEventHead = pEvent;
 
     pSearch->pEventTail = pEvent;
+    pSearch->nQueuedBytes += nPayloadLen;
+    pSearch->nQueuedEvents++;
     pSearch->bPending = XTRUE;
     return XSTDOK;
 }
@@ -604,34 +619,8 @@ void DirectGate_Search_Init(directgate_search_t *pSearch)
     pSearch->nPipeFds[1] = XSOCK_INVALID;
     pSearch->bRecursive = XTRUE;
 
-#ifdef _WIN32
-    /* WSAPoll handles only sockets, so the notification channel is a
-       private loopback socket pair instead of an anonymous pipe */
-    if (XSock_CreatePair(pSearch->nPipeFds) == XSTDOK)
-    {
-        u_long nNonBlock = 1;
-        ioctlsocket(pSearch->nPipeFds[0], FIONBIO, &nNonBlock);
-        ioctlsocket(pSearch->nPipeFds[1], FIONBIO, &nNonBlock);
-    }
-    else
-    {
-        xloge("Failed to create search socket pair: error(%d)", WSAGetLastError());
-        pSearch->nPipeFds[0] = XSOCK_INVALID;
-        pSearch->nPipeFds[1] = XSOCK_INVALID;
-    }
-#else
-    if (pipe(pSearch->nPipeFds) == 0)
-    {
-        fcntl(pSearch->nPipeFds[0], F_SETFL, O_NONBLOCK);
-        fcntl(pSearch->nPipeFds[1], F_SETFL, O_NONBLOCK);
-    }
-    else
-    {
-        xloge("Failed to create search pipe: errno(%d)", errno);
-        pSearch->nPipeFds[0] = -1;
-        pSearch->nPipeFds[1] = -1;
-    }
-#endif
+    if (DirectGate_CreateNotifyPair(pSearch->nPipeFds) != XSTDOK)
+        xloge("Failed to create nonblocking notification descriptors");
 }
 
 void DirectGate_Search_Clear(directgate_search_t *pSearch)
@@ -813,6 +802,8 @@ int DirectGate_Search_Process(directgate_session_t *pSession)
         if (pSearch->pEventHead == NULL)
             pSearch->pEventTail = NULL;
 
+        pSearch->nQueuedBytes -= pEvent->nPayloadLen;
+        pSearch->nQueuedEvents--;
         pSearch->bPending = (pSearch->pEventHead != NULL);
         XSync_Unlock(&pSearch->lock);
 
@@ -858,7 +849,11 @@ int DirectGate_Search_Process(directgate_session_t *pSession)
         if (nStatus < 0) break;
     }
 
-    if (!pSearch->bRunning)
+    XSync_Lock(&pSearch->lock);
+    xbool_t bRunning = pSearch->bRunning;
+    XSync_Unlock(&pSearch->lock);
+
+    if (!bRunning)
         DirectGate_Search_JoinWorker(pSearch);
 
     return nStatus;

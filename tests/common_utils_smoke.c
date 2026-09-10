@@ -257,6 +257,17 @@ int main(void)
     CHECK(XTime_GetMonthDays(2024, 2) == 29 && XTime_GetMonthDays(2023, 2) == 28,
         "February day count");
 
+    XSOCKET notify[2];
+    CHECK(DirectGate_CreateNotifyPair(notify) == XSTDOK, "notification descriptors created");
+    for (int i = 0; i < 2; i++)
+    {
+        CHECK(fcntl(notify[i], F_GETFD) & FD_CLOEXEC, "notification descriptors close on exec");
+        CHECK(fcntl(notify[i], F_GETFL) & O_NONBLOCK, "notification descriptors nonblocking");
+    }
+    char byte;
+    CHECK(read(notify[0], &byte, 1) == -1 && errno == EAGAIN, "empty notification read does not block");
+    CHECK(write(notify[1], "x", 1) == 1 && read(notify[0], &byte, 1) == 1 && byte == 'x', "notification round trip");
+    close(notify[0]); close(notify[1]);
     puts("common_utils_smoke: OK");
     return 0;
 }

@@ -242,6 +242,7 @@ int DirectGate_Desktop_SetDisplayResolution(directgate_desktop_t *pDesktop,
                                             const directgate_desktop_monitor_t *pMonitor,
                                             uint32_t nWidth, uint32_t nHeight)
 {
+    if (pDesktop == NULL) return XSTDERR;
 #ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
     /* Checked before anything else: on a Wayland session nNativeId is the
      * PipeWire node the portal granted, not an XRandR output, so it must

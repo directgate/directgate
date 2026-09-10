@@ -778,6 +778,27 @@ int main(void)
         CHECK(expect_manager(&fix, "save", "failed"),
             "a save is refused while a transfer is active");
 
+        FILE *pActiveFile = fix.pSession->transfer.pFile;
+        char sPendingPath[sizeof(fix.pSession->sSaveTempPath)];
+        strcpy(sPendingPath, fix.pSession->sSaveTempPath);
+        xjson_obj_t *pStale[] = {
+            DirectGate_Proto_BuildFileStart("up-old", "other.txt", 4, 1, 65536),
+            DirectGate_Proto_BuildFileChunk("up-old", 0),
+            DirectGate_Proto_BuildFileEnd("up-old", "invalid"),
+            DirectGate_Proto_BuildFileCancel("up-old", "late cancellation")
+        };
+        for (size_t i = 0; i < sizeof(pStale) / sizeof(*pStale); i++)
+        {
+            CHECK(pStale[i] != NULL, "build delayed transfer message");
+            XJSON_AddU32(pStale[i], "sessionId", 11);
+            CHECK(deliver(&fix, pStale[i]) == XAPI_CONTINUE, "deliver delayed transfer message");
+            CHECK(fix.pSession->transfer.pFile == pActiveFile &&
+                fix.pSession->transfer.eState == XTRANSFER_STATE_RECEIVING &&
+                !strcmp(fix.pSession->sSaveTempPath, sPendingPath),
+                "delayed transfer message preserves current upload and destination");
+            drain(&fix);
+        }
+
         xjson_obj_t *pCancel = DirectGate_Proto_BuildFileCancel("up-4", "user aborted");
         CHECK(pCancel != NULL, "build file/cancel");
         XJSON_AddU32(pCancel, "sessionId", 11);

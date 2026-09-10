@@ -10,7 +10,7 @@ If your platform is not covered by the [package repositories](../README.md#insta
 
 - Linux or macOS
 - A C/C++ toolchain (GCC or Clang)
-- CMake ≥ 3.16
+- CMake ≥ 3.21
 - OpenSSL development headers (`libssl-dev` / `openssl-devel`, or `brew install openssl`)
 - On Linux: X11 development headers for desktop streaming - `libx11-dev`, `libxrandr-dev`, `libxext-dev` (Debian/Ubuntu) or `libX11-devel`, `libXrandr-devel`, `libXext-devel` (Fedora/RHEL)
 - `git` (the build pulls two submodules)
@@ -146,6 +146,31 @@ AddressSanitizer and UndefinedBehaviorSanitizer can be used to run the tests und
 ```
 
 The script configures the build with `-DDIRECTGATE_BUILD_TESTS=ON`, builds the test executables, and runs them through `ctest`.
+
+`webrtc_peer_smoke` creates two local peers and is labeled `external-webrtc`. It remains part of the default suite. At the pinned dependency revisions it exposes sanitizer defects in the unmodified `libdatachannel` dependency tree; see [the C audit](c-audit-2026-09-09.md). To report the other tests separately, use `ctest --test-dir build-sanitizers -LE external-webrtc --output-on-failure`. An excluded peer test is not evidence that the full transport is sanitizer clean.
+
+For coverage-guided fuzzing of JSON, protocol, WebSocket, RTCP and SDP parsers:
+
+```sh
+cmake -S . -B build-fuzz -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DDIRECTGATE_BUILD_TESTS=ON -DDIRECTGATE_ENABLE_SANITIZERS=ON \
+  -DDIRECTGATE_BUILD_FUZZERS=ON -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-fuzz --target fuzz_wire -j4
+mkdir -p build-fuzz/corpus
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+  build-fuzz/tests/fuzz_wire build-fuzz/corpus -max_total_time=60 -max_len=65536
+```
+
+ThreadSanitizer needs a separate build, without AddressSanitizer:
+
+```sh
+cmake -S . -B build-tsan -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DDIRECTGATE_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_C_FLAGS=-fsanitize=thread -DCMAKE_CXX_FLAGS=-fsanitize=thread
+cmake --build build-tsan --target webrtc_queue_smoke search_smoke audio_lifecycle_smoke -j4
+TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure \
+  -R '^(webrtc_queue_smoke|search_smoke|audio_lifecycle_smoke)$'
+```
 
 ## Repository layout
 

@@ -202,6 +202,18 @@ int main(void)
         "copy directory into itself should fail");
     CHECK(errno == EINVAL, "copy directory into itself should report EINVAL");
 
+    char sAlias[512], sAliasTarget[1024];
+    snprintf(sAlias, sizeof(sAlias), "%s/dir-alias", sRoot);
+    CHECK(symlink(sDir, sAlias) == 0, "create directory alias");
+    snprintf(sAliasTarget, sizeof(sAliasTarget), "%s/nested", sAlias);
+    CHECK(DirectGate_Files_CopyPath(sDir, sAliasTarget) == XSTDERR && errno == EINVAL,
+        "copy into a symlink alias of itself is rejected");
+    CHECK(!XPath_Exists(sNestedTarget), "alias rejection leaves no partial tree");
+    snprintf(sAliasTarget, sizeof(sAliasTarget), "%s/../dir/nested", sDir);
+    CHECK(DirectGate_Files_CopyPath(sDir, sAliasTarget) == XSTDERR && errno == EINVAL,
+        "copy into itself through dot-dot is rejected");
+    unlink(sAlias);
+
     /* An empty file is a valid thing to copy. The library used to treat "no
        bytes" as a failed stat and refuse it, leaving an empty destination
        behind and reporting an error. */

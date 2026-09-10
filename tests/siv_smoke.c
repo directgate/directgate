@@ -65,6 +65,13 @@ static int roundtrip(const uint8_t *pCmacKey, const uint8_t *pCtrKey,
 
 int main(void)
 {
+    uint8_t dummy[33] = {0};
+    size_t invalidLen = 123;
+    CHECK(DirectGate_SIV_Encrypt(dummy, dummy, SIZE_MAX, dummy, 1, &invalidLen) == NULL && invalidLen == 0,
+        "invalid SIV encryption key size rejected with zero output length");
+    invalidLen = 123;
+    CHECK(DirectGate_SIV_Decrypt(dummy, dummy, 129, dummy, sizeof(dummy), &invalidLen) == NULL && invalidLen == 0,
+        "invalid SIV decryption key size rejected with zero output length");
     uint8_t cmacKey[SIV_KEY_SIZE];
     uint8_t ctrKey[SIV_KEY_SIZE];
     uint8_t otherKey[SIV_KEY_SIZE];

@@ -222,6 +222,8 @@ int DirectGate_WL_PortalPointerButton(directgate_wl_portal_t *pPortal, int32_t n
  * it - which is what makes it the only way to reach a part of the screen the
  * absolute call cannot address. See the caller for why one exists. */
 int DirectGate_WL_PortalPointerMotionRelative(directgate_wl_portal_t *pPortal, double nDx, double nDy);
+/* Native smooth-axis units, positive right/down. Backend-specific sign
+ * differences are normalized by the portal wrapper. */
 int DirectGate_WL_PortalPointerAxis(directgate_wl_portal_t *pPortal, double nDx, double nDy);
 int DirectGate_WL_PortalKeysym(directgate_wl_portal_t *pPortal, int32_t nKeysym, xbool_t bPressed);
 

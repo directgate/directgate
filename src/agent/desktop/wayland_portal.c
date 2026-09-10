@@ -126,6 +126,7 @@ struct directgate_wl_portal_ {
     uint32_t nDevices;        /* device types the portal actually granted */
     uint32_t nInputErrors;    /* refused input events already reported */
     xbool_t bKeysymRefused;   /* this portal will not type by character */
+    xbool_t bInvertScrollY;   /* KDE's portal negates vertical smooth scrolling */
     /* The last absolute pointer coordinate that went out. Refusals come back
      * on the bus after the event that caused them, so this is the closest
      * thing to "which coordinate was refused", near enough to tell an
@@ -487,6 +488,47 @@ static uint32_t DirectGate_WL_PortalPropertyUint(directgate_wl_portal_t *pPortal
 
     g_dbus.msgUnref(pReply);
     return nValue;
+}
+
+static xbool_t DirectGate_WL_PortalHasBusName(directgate_wl_portal_t *pPortal, const char *pName)
+{
+    /* NameHasOwner does not activate an installed but unused backend. Keep
+     * this probe bounded and outside the input path. */
+    DBusMessage *pCall = g_dbus.newCall(DBUS_SERVICE_DBUS, DBUS_PATH_DBUS, DBUS_INTERFACE_DBUS, "NameHasOwner");
+    if (pCall == NULL) return XFALSE;
+
+    DBusMessageIter args;
+    g_dbus.iterInitAppend(pCall, &args);
+    if (!g_dbus.iterAppend(&args, DBUS_TYPE_STRING, &pName))
+    {
+        g_dbus.msgUnref(pCall);
+        return XFALSE;
+    }
+
+    DBusError error;
+    g_dbus.errorInit(&error);
+    DBusMessage *pReply = g_dbus.sendBlock(pPortal->pConn, pCall, 1000, &error);
+    g_dbus.msgUnref(pCall);
+    if (g_dbus.errorFree != NULL) g_dbus.errorFree(&error);
+    if (pReply == NULL) return XFALSE;
+
+    DBusMessageIter iter;
+    dbus_bool_t bOwned = FALSE;
+    if (g_dbus.iterInit(pReply, &iter) && g_dbus.iterArgType(&iter) == DBUS_TYPE_BOOLEAN)
+        g_dbus.iterGet(&iter, &bOwned);
+
+    g_dbus.msgUnref(pReply);
+    return bOwned ? XTRUE : XFALSE;
+}
+
+static void DirectGate_WL_PortalInitScroll(directgate_wl_portal_t *pPortal)
+{
+    /* A KDE file-picker portal can also run on GNOME. Require KWin as well
+     * before compensating KDE's axis convention. Probe after Start, when
+     * the input backend is active; service processes may lack desktop env. */
+    pPortal->bInvertScrollY =
+        DirectGate_WL_PortalHasBusName(pPortal, "org.freedesktop.impl.portal.desktop.kde") &&
+        DirectGate_WL_PortalHasBusName(pPortal, "org.kde.KWin");
 }
 
 /* Options a caller wants added to a portal request, beyond handle_token. */
@@ -1060,6 +1102,10 @@ directgate_wl_portal_t* DirectGate_WL_PortalOpen(const char *pRestoreToken,
 
     g_dbus.msgUnref(pResponse);
 
+    DirectGate_WL_PortalInitScroll(pPortal);
+    if (pPortal->bInvertScrollY)
+        xlogi("Desktop portal scroll direction: compensating KDE's vertical axis inversion");
+
     for (uint32_t i = 0; i < pPortal->nStreamCount; i++)
     {
         xlogi("Desktop sharing allowed: screen(%u/%u), node(%u), size(%ux%u), at(%d,%d)",
@@ -1276,7 +1322,12 @@ int DirectGate_WL_PortalPointerMotionRelative(directgate_wl_portal_t *pPortal, d
 
 int DirectGate_WL_PortalPointerAxis(directgate_wl_portal_t *pPortal, double nDx, double nDy)
 {
-    directgate_wl_axis_t axis = { nDx, nDy };
+    XCHECK((pPortal != NULL), XSTDERR);
+    /* KDE's requestPointerAxis sends -y to KWin, but leaves x unchanged.
+     * GNOME forwards both signs unchanged. Compensate only the affected
+     * backend/axis; relative pointer motion uses the same argument writer.
+     * https://invent.kde.org/plasma/xdg-desktop-portal-kde/-/blob/master/src/waylandintegration.cpp */
+    directgate_wl_axis_t axis = { nDx, pPortal->bInvertScrollY ? -nDy : nDy };
     return DirectGate_WL_PortalNotify(pPortal, "NotifyPointerAxis", DirectGate_WL_AxisArgs, &axis);
 }
 

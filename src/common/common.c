@@ -19,8 +19,50 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include "includes.h"
 #include "common.h"
+
+XSTATUS DirectGate_CreateNotifyPair(XSOCKET pFds[2])
+{
+    XCHECK((pFds != NULL), XSTDERR);
+    pFds[0] = pFds[1] = XSOCK_INVALID;
+#ifdef _WIN32
+    if (XSock_CreatePair(pFds) != XSTDOK) return XSTDERR;
+#elif defined(__linux__)
+    return pipe2(pFds, O_NONBLOCK | O_CLOEXEC) == 0 ? XSTDOK : XSTDERR;
+#else
+    if (pipe(pFds) != 0) return XSTDERR;
+#endif
+#if !defined(__linux__) || defined(_WIN32)
+    do
+    {
+        int i = 0;
+        for (; i < 2; i++)
+        {
+#ifdef _WIN32
+            u_long nNonBlock = 1;
+            if (ioctlsocket(pFds[i], FIONBIO, &nNonBlock) != 0 ||
+                !SetHandleInformation((HANDLE)(uintptr_t)pFds[i], HANDLE_FLAG_INHERIT, 0)) break;
+#else
+            int nFlags = fcntl(pFds[i], F_GETFL);
+            if (nFlags < 0 || fcntl(pFds[i], F_SETFL, nFlags | O_NONBLOCK) < 0 ||
+                fcntl(pFds[i], F_SETFD, FD_CLOEXEC) < 0) break;
+#endif
+        }
+
+        if (i != 2) break;
+        return XSTDOK;
+    } while (0);
+
+    xclosesock(pFds[0]);
+    xclosesock(pFds[1]);
+    pFds[0] = pFds[1] = XSOCK_INVALID;
+    return XSTDERR;
+#endif
+}
 
 size_t DirectGate_GetQueryValue(const char *pUri, const char *pKey, char *pBuffer, size_t nSize)
 {

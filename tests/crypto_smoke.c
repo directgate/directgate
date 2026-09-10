@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <openssl/kdf.h>
 
 #include "src/common/e2e.h"
 #include "src/common/hkdf.h"
@@ -62,6 +64,29 @@ int main(void)
         "HKDF RFC5869 OKM");
     CHECK(!DirectGate_HKDF_Expand(prk, sizeof(prk), "too-long", okm,
         (size_t)255 * XHKDF_SHA256_LEN + 1), "HKDF max output guard");
+    /* Exercise the last legal block against OpenSSL, including a partial
+       block 255. An eight-bit loop counter used to wrap here and never exit. */
+    uint8_t maxOkm[255 * XHKDF_SHA256_LEN];
+    uint8_t reference[sizeof(maxOkm)];
+    EVP_PKEY_CTX *kdf = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
+    size_t referenceLen = sizeof(reference);
+    CHECK(kdf != NULL && EVP_PKEY_derive_init(kdf) > 0 &&
+        EVP_PKEY_CTX_hkdf_mode(kdf, EVP_PKEY_HKDEF_MODE_EXPAND_ONLY) > 0 &&
+        EVP_PKEY_CTX_set_hkdf_md(kdf, EVP_sha256()) > 0 &&
+        EVP_PKEY_CTX_set1_hkdf_key(kdf, prk, sizeof(prk)) > 0 &&
+        EVP_PKEY_derive(kdf, reference, &referenceLen) > 0,
+        "OpenSSL maximum HKDF output");
+    EVP_PKEY_CTX_free(kdf);
+    CHECK(DirectGate_HKDF_Expand(prk, sizeof(prk), NULL, maxOkm, sizeof(maxOkm)),
+        "HKDF maximum output terminates");
+    CHECK(referenceLen == sizeof(maxOkm) && !memcmp(maxOkm, reference, sizeof(maxOkm)),
+        "HKDF maximum output matches OpenSSL");
+    CHECK(DirectGate_HKDF_Expand(prk, sizeof(prk), NULL, maxOkm, sizeof(maxOkm) - 1) &&
+        !memcmp(maxOkm, reference, sizeof(maxOkm) - 1), "HKDF partial last block");
+    CHECK(!DirectGate_HKDF_Extract(salt, (size_t)INT_MAX + 1, ikm, sizeof(ikm), prk),
+        "HKDF rejects salt lengths that do not fit OpenSSL int");
+    CHECK(!DirectGate_HKDF_Expand(prk, (size_t)INT_MAX + 1, NULL, okm, sizeof(okm)),
+        "HKDF rejects PRK lengths that do not fit OpenSSL int");
     CHECK(!DirectGate_HKDF_Extract(NULL, 0, NULL, 0, prk), "HKDF extract NULL IKM");
     CHECK(!DirectGate_HKDF_Extract(NULL, 0, ikm, 0, prk), "HKDF extract empty IKM");
     CHECK(!DirectGate_HKDF_Extract(NULL, 0, ikm, sizeof(ikm), NULL),
@@ -109,6 +134,12 @@ int main(void)
     CHECK(!DirectGate_E2E_DeriveFromKey(&keyE2E, secret, sizeof(secret),
         agentNonce, clientNonce, sizeof(agentNonce) + 1, "dev-crypto", 1),
         "derive rejects oversized nonce");
+    CHECK(!DirectGate_E2E_DeriveFromKey(&keyE2E, secret, sizeof(secret),
+        agentNonce, clientNonce, SIZE_MAX / 2 + 1, "dev-crypto", 1),
+        "key derivation rejects overflowing nonce length");
+    CHECK(!DirectGate_E2E_DeriveFromSRP(&srpE2E, secret, sizeof(secret),
+        agentNonce, clientNonce, SIZE_MAX / 2 + 1, "dev-crypto", 1),
+        "SRP derivation rejects overflowing nonce length");
     /* keyE2E is the agent side, keyE2E2 the client side of the same channel. */
     CHECK(DirectGate_E2E_DeriveFromKey(&keyE2E, secret, sizeof(secret),
         agentNonce, clientNonce, sizeof(agentNonce), "dev-crypto", 1),

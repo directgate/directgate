@@ -74,6 +74,8 @@ typedef struct directgate_search_ {
     xbool_t bMatchOnly;
     directgate_search_event_t *pEventHead;
     directgate_search_event_t *pEventTail;
+    size_t nQueuedBytes;
+    size_t nQueuedEvents;
     char sReason[XSTR_MID];
 } directgate_search_t;
 

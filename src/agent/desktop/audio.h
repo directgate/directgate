@@ -49,13 +49,19 @@ extern "C" {
  * default output device's mix (never a microphone). */
 void* DirectGate_Audio_BackendOpen(uint32_t nSampleRate, uint32_t nChannels, char *pErr, size_t nErrSize);
 
-/* Blocking read of exactly nFrames samples per channel (interleaved S16) into
- * pBuf. Returns XSTDOK on a full frame, or XSTDERR on a fatal source error
- * (the capture thread then exits and audio is marked unavailable). Should
- * return roughly every frame period so the thread can observe a stop request. */
+/* Bounded read of nFrames samples per channel (interleaved S16) into pBuf.
+ * XSTDOK publishes a full frame; XSTDNON retains partial source samples for
+ * the next call and publishes nothing. XSTDERR is a fatal source error.
+ * Return roughly every frame period so the worker can observe Stop even
+ * when a source stalls; a poll timeout must not manufacture silent samples. */
 int DirectGate_Audio_BackendRead(void *pBackend, int16_t *pBuf, uint32_t nFrames, uint32_t nChannels);
 
 void DirectGate_Audio_BackendClose(void *pBackend);
+
+#ifdef _WIN32
+/* Balance COM initialization on the capture thread before it exits. */
+void DirectGate_Audio_BackendWorkerDone(void *pBackend);
+#endif
 
 #ifdef __cplusplus
 }

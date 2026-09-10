@@ -25,6 +25,10 @@
 #include "directgate.h"
 #include "files.h"
 
+#ifdef __linux__
+#include <linux/fs.h> /* RENAME_NOREPLACE, also when GNU stdio extensions are off */
+#endif
+
 #define DIRECTGATE_UPLOAD_TEMP_RANDOM_SIZE 16
 #define DIRECTGATE_UPLOAD_TEMP_ATTEMPTS    16
 
@@ -180,19 +184,87 @@ static xbool_t DirectGate_Files_PathStartsWith(const char *pPath, const char *pP
     XCHECK_NL((xstrused(pPath) && xstrused(pPrefix)), XFALSE);
 
     size_t nPrefixLen = strlen(pPrefix);
+#ifdef _WIN32
+    if (strncasecmp(pPath, pPrefix, nPrefixLen) != 0) return XFALSE;
+    return pPath[nPrefixLen] == '\0' || pPath[nPrefixLen] == '\\' ||
+           pPath[nPrefixLen] == '/' || pPrefix[nPrefixLen - 1] == '\\' ||
+           pPrefix[nPrefixLen - 1] == '/';
+#else
     if (strncmp(pPath, pPrefix, nPrefixLen) != 0) return XFALSE;
-
     if (pPath[nPrefixLen] == '\0') return XTRUE;
     if (nPrefixLen == 1 && pPrefix[0] == '/') return XTRUE;
-
     return pPath[nPrefixLen] == '/';
+#endif
+}
+
+static char* DirectGate_Files_CanonicalDirectory(const char *pPath)
+{
+#ifdef _WIN32
+    HANDLE hDir = CreateFileA(pPath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (hDir == INVALID_HANDLE_VALUE) return NULL;
+
+    DWORD nSize = GetFinalPathNameByHandleA(hDir, NULL, 0, FILE_NAME_NORMALIZED);
+    char *pResult = nSize ? malloc((size_t)nSize + 1) : NULL;
+
+    if (pResult != NULL)
+    {
+        DWORD nGot = GetFinalPathNameByHandleA(hDir, pResult, nSize + 1, FILE_NAME_NORMALIZED);
+        if (!nGot || nGot > nSize) { free(pResult); pResult = NULL; }
+    }
+
+    CloseHandle(hDir);
+    return pResult;
+#else
+    return realpath(pPath, NULL);
+#endif
 }
 
 static xbool_t DirectGate_Files_IsNestedTarget(const char *pPath, const char *pTargetPath)
 {
     XCHECK_NL((xstrused(pPath) && xstrused(pTargetPath)), XFALSE);
     if (xstrcmp(pPath, pTargetPath)) return XFALSE;
-    return DirectGate_Files_PathStartsWith(pTargetPath, pPath);
+    if (DirectGate_Files_PathStartsWith(pTargetPath, pPath)) return XTRUE;
+
+    /* The new entry does not exist yet. Resolve its existing parent to catch
+     * relative paths, '..', and directory symlink/junction aliases of source. */
+    char *pParent = strdup(pTargetPath);
+    char *pSource = DirectGate_Files_CanonicalDirectory(pPath);
+    if (pParent == NULL || pSource == NULL)
+    {
+        free(pParent);
+        free(pSource);
+        return XTRUE; /* Fail closed if alias safety cannot be established. */
+    }
+
+    size_t nLen = strlen(pParent);
+    while (nLen > 1 && (pParent[nLen - 1] == '/'
+#ifdef _WIN32
+        || pParent[nLen - 1] == '\\'
+#endif
+        )) pParent[--nLen] = '\0';
+    char *pSlash = strrchr(pParent, '/');
+#ifdef _WIN32
+    char *pBackslash = strrchr(pParent, '\\');
+    if (pBackslash != NULL && (pSlash == NULL || pBackslash > pSlash)) pSlash = pBackslash;
+#endif
+    if (pSlash != NULL)
+    {
+        if (pSlash == pParent) pSlash[1] = '\0';
+#ifdef _WIN32
+        else if (pSlash == pParent + 2 && pParent[1] == ':') pSlash[1] = '\0';
+#endif
+        else *pSlash = '\0';
+    }
+
+    char *pResolved = DirectGate_Files_CanonicalDirectory(pSlash != NULL ? pParent : ".");
+    xbool_t bNested = pResolved != NULL && DirectGate_Files_PathStartsWith(pResolved, pSource);
+
+    free(pResolved);
+    free(pSource);
+    free(pParent);
+
+    return bNested;
 }
 
 static int DirectGate_Files_ResolvePasteTarget(char *pOutput, size_t nSize, const char *pTargetPath)
@@ -459,14 +531,30 @@ static XSTATUS DirectGate_Files_RenameNoReplace(const char *pPath, const char *p
         return XSTDERR;
 #endif
 
+#if defined(_WIN32)
+    /* The Windows CRT rename refuses an existing destination atomically. */
+    return rename(pPath, pTargetPath) == 0 ? XSTDOK : XSTDERR;
+#elif defined(__APPLE__)
+    return renamex_np(pPath, pTargetPath, RENAME_EXCL) == 0 ? XSTDOK : XSTDERR;
+#else
+    /* A stat followed by rename can overwrite a concurrently created target.
+     * link creates the destination exclusively, including for symlink entries.
+     * Directories require a native no-replace rename; fail safely otherwise. */
     xstat_t st;
-    if (xstat(pTargetPath, &st) == XSTDOK)
+    if (xstat(pPath, &st) != XSTDOK) return XSTDERR;
+
+    if (S_ISDIR(st.st_mode))
     {
-        errno = EEXIST;
+        errno = ENOTSUP;
         return XSTDERR;
     }
 
-    return rename(pPath, pTargetPath) == 0 ? XSTDOK : XSTDERR;
+    if (link(pPath, pTargetPath) != 0) return XSTDERR;
+
+    /* If unlink fails, retain both names rather than risking removal of an
+     * entry another process may have replaced at the destination. */
+    return unlink(pPath) == 0 ? XSTDOK : XSTDERR;
+#endif
 }
 
 #ifdef _WIN32
@@ -1506,6 +1594,12 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
     if (xstrcmp(pFilePkg->pAction, "start"))
     {
         const char *pTransferId = pFilePkg->transfer.pTransferId;
+        if (DirectGate_Transfer_IsActive(pFT))
+        {
+            DirectGate_Files_SendTransferCancel(pSession, pTransferId, "Another file transfer is active.");
+            return XAPI_CONTINUE;
+        }
+
         const char *pSavePath = xstrused(pSession->sSaveTempPath)
             ? pSession->sSaveTempPath
             : (xstrused(pSession->sSavePath) ? pSession->sSavePath : NULL);
@@ -1521,6 +1615,12 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
             DirectGate_Files_SendTransferCancel(pSession, pTransferId, DirectGate_Files_LastError());
             DirectGate_Files_ClearPendingSave(pSession);
         }
+    }
+    else if (!xstrused(pFilePkg->transfer.pTransferId) || !xstrcmp(pFT->sId, pFilePkg->transfer.pTransferId))
+    {
+        /* A delayed message from a previous transfer must not cancel
+         * the current upload or clear its pending commit path. */
+        return XAPI_CONTINUE;
     }
     else if (xstrcmp(pFilePkg->pAction, "chunk"))
     {
@@ -1554,7 +1654,7 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
 
             if (bReceiving)
             {
-                if (xstrused(pFT->sPath)) remove(pFT->sPath);
+                DirectGate_Transfer_HandleCancel(pFT);
                 DirectGate_Files_ClearPendingSave(pSession);
             }
         }

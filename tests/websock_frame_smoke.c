@@ -58,6 +58,14 @@ static int check_frame(xapi_session_t *pSession, const uint8_t *pPayload,
 
 int main(void)
 {
+    uint8_t byte = 1;
+    size_t frameSize = 123;
+    CHECK(!XWS_CreateFrame(&byte, SIZE_MAX, 2, XTRUE, &frameSize) && !frameSize,
+        "frame allocation size overflow rejected");
+    CHECK(!XWS_CreateFrame(NULL, 1, 2, XTRUE, &frameSize), "missing payload rejected");
+    CHECK(!XWS_CreateFrame(&byte, 126, 9, XTRUE, &frameSize), "oversized control frame rejected");
+    CHECK(!XWS_CreateFrame(&byte, 1, 9, XFALSE, &frameSize), "fragmented control frame rejected");
+
     xapi_session_t session;
     memset(&session, 0, sizeof(session));
     XByteBuffer_Init(&session.txBuffer, XSTDNON, XFALSE);
@@ -108,6 +116,30 @@ int main(void)
     CHECK(XByteBuffer_Add(&pkgBuf, small, sizeof(small)) > 0, "fill pkg buffer");
     DirectGate_WebSock_SendBuff(&session, &pkgBuf);
     CHECK(session.txBuffer.nUsed > sizeof(small), "sendbuff produced a frame");
+
+    uint8_t pingData[125];
+    for (size_t i = 0; i < sizeof(pingData); i++) pingData[i] = (uint8_t)i;
+    const size_t lengths[] = {0, 1, 125};
+    for (size_t role = 0; role < 2; role++)
+    for (size_t i = 0; i < sizeof(lengths)/sizeof(*lengths); i++)
+    {
+        session.eRole = role ? XAPI_PEER : XAPI_CLIENT;
+        XByteBuffer_Reset(&session.txBuffer);
+        xws_frame_t ping, pong;
+        CHECK(XWebFrame_Create(&ping, pingData, lengths[i], XWS_PING, XFALSE, XTRUE) == XWS_ERR_NONE,
+            "create payload-bearing ping");
+        /* No event loop is attached in this framing fixture; scheduling can
+         * fail after the response has been appended successfully. */
+        DirectGate_WebSock_SendPong(&session, &ping);
+        CHECK(session.txBuffer.nUsed >= 2, "reply to ping");
+        CHECK(((session.txBuffer.pData[1] & 0x80) != 0) == !role, "pong masking follows role");
+        CHECK(XWebFrame_ParseData(&pong, session.txBuffer.pData, session.txBuffer.nUsed) == XWS_FRAME_COMPLETE,
+            "parse pong response");
+        CHECK(pong.eType == XWS_PONG && XWebFrame_GetPayloadLength(&pong) == lengths[i], "pong type and size");
+        CHECK(!lengths[i] || !memcmp(XWebFrame_GetPayload(&pong), pingData, lengths[i]), "pong echoes binary ping payload");
+        XWebFrame_Clear(&ping);
+        XWebFrame_Clear(&pong);
+    }
 
     XByteBuffer_Clear(&pkgBuf);
     XByteBuffer_Clear(&session.txBuffer);

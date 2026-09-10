@@ -34,6 +34,9 @@ static void bytes_to_hex(const uint8_t *pData, size_t nLen,
 
 int main(void)
 {
+    uint8_t tiny;
+    size_t decoded;
+    CHECK(!DirectGate_SRP_HexToBytes("00", &tiny, SIZE_MAX, &decoded), "overflowing hex bound rejected");
     uint8_t salt[DIRECTGATE_SRP_SALT_SIZE];
     for (size_t i = 0; i < sizeof(salt); i++) salt[i] = (uint8_t)i;
 

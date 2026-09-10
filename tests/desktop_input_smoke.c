@@ -69,6 +69,9 @@ static uint16_t PhysKey(const char *pKey, const char *pCode)
 
 int main(void)
 {
+    CHECK(DirectGate_Desktop_WheelDelta(INT_MIN) == -DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA &&
+        DirectGate_Desktop_WheelDelta(INT_MAX) == DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA,
+        "wheel bounds prevent INT_MIN negation on pixel-scroll platforms");
     /* UTF-8 decoding. */
     uint32_t nCodepoint = 0;
     CHECK(DirectGate_Desktop_UTF8Decode(".", &nCodepoint) == 1 && nCodepoint == 0x2EU,

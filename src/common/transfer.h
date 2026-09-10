@@ -60,6 +60,7 @@ typedef struct xfile_transfer_ {
     char sPath[XFILE_PATH_SIZE];
 
     FILE *pFile;
+    xbool_t bRemoveOnDestroy;           /* owns an uncommitted inbound file */
     uint64_t nSize;                     /* total file size in bytes */
     uint32_t nTotalChunks;              /* total number of chunks */
     uint32_t nCurrentChunk;             /* next chunk index to send / last written */
