@@ -43,8 +43,10 @@ int main(void)
     file.transfer.pSha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     CHECK(DirectGate_Transfer_HandleStartPath(&rx, &pkg, path) == XSTDOK, "start");
+    errno = EAGAIN; /* A drained nonblocking socket commonly leaves this behind. */
     CHECK(DirectGate_Transfer_HandleEnd(&rx, &pkg, send_packet, NULL) < 0,
         "matching hash of empty data cannot finalize a four-byte file");
+    CHECK(errno == EINVAL, "incomplete transfer must not report stale socket errno");
     DirectGate_Transfer_Destroy(&rx);
     CHECK(access(path, F_OK) < 0, "destroy removes failed inbound file");
 

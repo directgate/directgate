@@ -1644,13 +1644,28 @@ int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *p
            first end had just saved. */
         xbool_t bReceiving = (pFT->eState == XTRANSFER_STATE_RECEIVING);
 
+        errno = 0;
         if (DirectGate_Transfer_HandleEnd(pFT, pPkg, NULL, NULL) < 0)
         {
-            int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
-            xloge("Failed to finalize inbound file transfer: sid(%u), wsfd(%d), transferId(%s), receiving(%s)",
-                pSession->nSessionId, nWsFd, pFilePkg->transfer.pTransferId, bReceiving ? "true" : "false");
+            int nError = errno;
+            char sReason[256];
 
-            DirectGate_Files_SendTransferCancel(pSession, pFilePkg->transfer.pTransferId, DirectGate_Files_LastError());
+            if (bReceiving && (pFT->nCurrentChunk != pFT->nTotalChunks || pFT->nBytesXferred != pFT->nSize))
+            {
+                snprintf(sReason, sizeof(sReason), "Incomplete file transfer: received %" PRIu64
+                    " of %" PRIu64 " bytes, %u of %u chunks", pFT->nBytesXferred, pFT->nSize,
+                    pFT->nCurrentChunk, pFT->nTotalChunks);
+            }
+            else
+            {
+                xstrncpy(sReason, sizeof(sReason), nError ? strerror(nError) : "File transfer validation failed");
+            }
+
+            int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;
+            xloge("Failed to finalize inbound file transfer: sid(%u), wsfd(%d), transferId(%s), receiving(%s), reason(%s)",
+                pSession->nSessionId, nWsFd, pFilePkg->transfer.pTransferId, bReceiving ? "true" : "false", sReason);
+
+            DirectGate_Files_SendTransferCancel(pSession, pFilePkg->transfer.pTransferId, sReason);
 
             if (bReceiving)
             {

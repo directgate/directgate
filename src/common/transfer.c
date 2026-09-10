@@ -703,14 +703,30 @@ XSTATUS DirectGate_Transfer_HandleEnd(directgate_transfer_t *pFT, const directga
         xlogw("Received transfer end while state is not receiving: id(%s), state(%s)",
             DirectGate_Transfer_GetId(pFT), DirectGate_Transfer_StateToString(pFT->eState));
 
+        errno = EINVAL;
         return XSTDERR;
     }
 
-    if (!xstrcmp(pFilePkg->transfer.pTransferId, pFT->sId)) return XSTDERR;
+    if (!xstrcmp(pFilePkg->transfer.pTransferId, pFT->sId))
+    {
+        errno = EINVAL;
+        return XSTDERR;
+    }
 
-    if (pFT->pFile == NULL || pFT->nCurrentChunk != pFT->nTotalChunks || pFT->nBytesXferred != pFT->nSize)
+    if (pFT->pFile == NULL)
     {
         pFT->eState = XTRANSFER_STATE_ERROR;
+        errno = EBADF;
+        return XSTDERR;
+    }
+
+    if (pFT->nCurrentChunk != pFT->nTotalChunks || pFT->nBytesXferred != pFT->nSize)
+    {
+        xloge("Inbound transfer is incomplete: id(%s), chunks(%u/%u), bytes(%" PRIu64 "/%" PRIu64 ")",
+            DirectGate_Transfer_GetId(pFT), pFT->nCurrentChunk, pFT->nTotalChunks, pFT->nBytesXferred, pFT->nSize);
+
+        pFT->eState = XTRANSFER_STATE_ERROR;
+        errno = EINVAL;
         return XSTDERR;
     }
 
@@ -724,10 +740,12 @@ XSTATUS DirectGate_Transfer_HandleEnd(directgate_transfer_t *pFT, const directga
 
         if (nClosed != 0)
         {
+            int nError = errno ? errno : EIO;
             xloge("Failed to close inbound transfer destination: id(%s), path(%s), errno(%d)",
-                DirectGate_Transfer_GetId(pFT), DirectGate_Transfer_GetPath(pFT), errno);
+                DirectGate_Transfer_GetId(pFT), DirectGate_Transfer_GetPath(pFT), nError);
 
             pFT->eState = XTRANSFER_STATE_ERROR;
+            errno = nError;
             return XSTDERR;
         }
     }
@@ -743,6 +761,7 @@ XSTATUS DirectGate_Transfer_HandleEnd(directgate_transfer_t *pFT, const directga
             DirectGate_Transfer_GetId(pFT), DirectGate_Transfer_GetPath(pFT));
 
         pFT->eState = XTRANSFER_STATE_ERROR;
+        errno = EINVAL;
         return XSTDERR;
     }
 
@@ -753,6 +772,7 @@ XSTATUS DirectGate_Transfer_HandleEnd(directgate_transfer_t *pFT, const directga
             pFilePkg->transfer.pSha256, sRecvHex);
 
         pFT->eState = XTRANSFER_STATE_ERROR;
+        errno = EINVAL;
         return XSTDERR;
     }
 

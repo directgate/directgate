@@ -684,6 +684,71 @@ int main(void)
         }
     }
 
+    /* Device-to-device copies used to announce two full chunks for a short
+       second chunk. Keep exact-size validation and report the actual mismatch,
+       even when the event loop left EAGAIN in errno. */
+    for (int nRoundedSize = 0; nRoundedSize <= 1; nRoundedSize++)
+    {
+        uint8_t body[73636];
+        memset(body, 0x5a, sizeof(body));
+        uint8_t digest[XSHA256_DIGEST_SIZE];
+        char sSha[XSHA256_DIGEST_SIZE * 2 + 1], sUpload[512];
+        XSHA256_Compute(digest, sizeof(digest), body, sizeof(body));
+        for (size_t i = 0; i < sizeof(digest); i++)
+            snprintf(sSha + i * 2, sizeof(sSha) - i * 2, "%02x", digest[i]);
+        snprintf(sUpload, sizeof(sUpload), "%s/size-%d.bin", sRoot, nRoundedSize);
+        CHECK(deliver(&fix, manager_header("save", sUpload, NULL, 11, XFALSE)) == XAPI_CONTINUE,
+            "prepare two-chunk upload");
+        CHECK(expect_manager(&fix, "save", "ok"), "two-chunk save accepted");
+        char sTemp[XFILE_PATH_SIZE];
+        xstrncpy(sTemp, sizeof(sTemp), fix.pSession->sSaveTempPath);
+        xjson_obj_t *pStart = DirectGate_Proto_BuildFileStart("sized", "stream.c",
+            nRoundedSize ? 131072 : sizeof(body), 2, 65536);
+        CHECK(pStart != NULL, "two-chunk start header");
+        XJSON_AddU32(pStart, "sessionId", 11);
+        CHECK(deliver(&fix, pStart) == XAPI_CONTINUE, "two-chunk start");
+        for (uint32_t i = 0; i < 2; i++)
+        {
+            xjson_obj_t *pChunk = DirectGate_Proto_BuildFileChunk("sized", i);
+            CHECK(pChunk != NULL, "two-chunk data header");
+            XJSON_AddU32(pChunk, "sessionId", 11);
+            size_t nOffset = i * 65536;
+            size_t nBytes = i == 0 ? 65536 : sizeof(body) - nOffset;
+            CHECK(deliver_payload(&fix, pChunk, body + nOffset, nBytes) == XAPI_CONTINUE,
+                "two-chunk data");
+        }
+        xjson_obj_t *pEnd = DirectGate_Proto_BuildFileEnd("sized", sSha);
+        CHECK(pEnd != NULL, "two-chunk end header");
+        XJSON_AddU32(pEnd, "sessionId", 11);
+        errno = EAGAIN;
+        CHECK(deliver(&fix, pEnd) == XAPI_CONTINUE, "two-chunk end");
+        directgate_pkg_t reply;
+        CHECK(take_packet(&fix, &reply), "two-chunk upload reply");
+        xjson_obj_t *pHeader = reply.jsonHeader.pRootObj;
+        const char *pAction = XJSON_GetString(XJSON_GetObject(pHeader, "action"));
+        if (nRoundedSize)
+        {
+            CHECK(xstrcmp(pAction, "cancel"), "rounded size is rejected");
+            const char *pReason = XJSON_GetString(XJSON_GetObject(pHeader, "reason"));
+            CHECK(strstr(pReason, "received 73636 of 131072 bytes, 2 of 2 chunks") != NULL,
+                "size mismatch reaches the client instead of stale errno");
+            CHECK(!XPath_Exists(sUpload) && !XPath_Exists(sTemp), "incomplete upload cleaned");
+        }
+        else
+        {
+            CHECK(xstrcmp(pAction, "ack"), "exact size is acknowledged");
+            FILE *f = fopen(sUpload, "rb");
+            uint8_t received[sizeof(body)];
+            CHECK(f != NULL, "open committed two-chunk upload");
+            CHECK(fread(received, 1, sizeof(received), f) == sizeof(received) && fgetc(f) == EOF,
+                "committed size is exact");
+            fclose(f);
+            CHECK(memcmp(body, received, sizeof(body)) == 0, "committed bytes are exact");
+        }
+        DirectGate_Package_Clear(&reply);
+        drain(&fix);
+    }
+
     /* A bad hash must be refused and the partial file must not survive. */
     {
         char sBad[512];
