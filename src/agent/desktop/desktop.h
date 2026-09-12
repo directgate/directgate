@@ -189,9 +189,9 @@ typedef struct directgate_desktop_ {
     uint32_t nPointerSequence;
     /* Browsers report wheel motion in pixels (trackpads emit many small
      * samples); the accumulators collect them into whole wheel notches on
-     * the platforms that inject discrete wheel clicks (X11 / Windows). */
-    int32_t nWheelAccumX;
-    int32_t nWheelAccumY;
+     * X11 / Windows, or whole pixels on macOS. Preserve subpixel remainders. */
+    double nWheelAccumX;
+    double nWheelAccumY;
     /* Wayland: where the agent last put the pointer, in capture-local pixels.
      * The other platforms ask the display server where the pointer is; a
      * Wayland client is never told, so mouse capture integrates the browser's

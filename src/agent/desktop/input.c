@@ -22,10 +22,10 @@
 #include "desktop.h"
 #include "session.h"
 #include "priv.h"
+#include <math.h>
 
 #ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
 #include "wayland.h"
-#include <math.h>
 #endif
 
 #if defined(_WIN32)
@@ -79,26 +79,43 @@ static int DirectGate_Desktop_FrameToScreenY(const directgate_desktop_t *pDeskto
  * that was never going to be a scroll. */
 #define DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA 100000
 
-static int DirectGate_Desktop_WheelDelta(int nDelta)
+static double DirectGate_Desktop_WheelDelta(double nDelta)
 {
+    if (!isfinite(nDelta)) return 0.0;
     if (nDelta > DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA) return DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA;
     if (nDelta < -DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA) return -DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA;
     return nDelta;
 }
 
-#if defined(__linux__) || defined(_WIN32)
+static double DirectGate_Desktop_WheelDeltaFromJson(xjson_obj_t *pValue)
+{
+    /* XJSON_GetInt rejects decimal and exponential JSON numbers entirely,
+     * including values above one pixel. Preserve them on every backend. */
+    if (pValue == NULL || pValue->pData == NULL ||
+        (pValue->nType != XJSON_TYPE_NUMBER &&
+         pValue->nType != XJSON_TYPE_FLOAT))
+            return 0.0;
+
+    const char *pText = (const char*)pValue->pData;
+    char *pEnd;
+
+    int nSavedErrno = errno;
+    double nDelta = strtod(pText, &pEnd);
+    errno = nSavedErrno;
+
+    if (pEnd == pText || *pEnd != '\0') return 0.0;
+    return DirectGate_Desktop_WheelDelta(nDelta);
+}
 
 /* Browsers report wheel motion in pixels: a discrete mouse notch is ~100px
- * while trackpads emit a stream of 1-10px samples. Platforms that inject
+ * while trackpads can emit fractional pixels. Platforms that inject
  * discrete wheel clicks (X11 buttons 4-7, Windows WHEEL_DELTA) accumulate
  * the pixels and emit whole notches, so a trackpad swipe no longer turns
- * every sample into a full click. (macOS scrolls in pixel units natively.) */
-static int DirectGate_Desktop_WheelNotches(int32_t *pAccum, int nDelta)
+ * every sample into a full click. macOS uses a one-pixel step instead. */
+static int DirectGate_Desktop_WheelSteps(double *pAccum, double nDelta, int nPixelsPerStep)
 {
-    /* The delta arrives straight off the wire, so it cannot be trusted to be
-     * a plausible scroll: accumulating an arbitrary int overflows the counter,
-     * which is undefined behaviour and traps on a hardened build. A single
-     * event is never worth more than a few hundred notches. */
+    /* Bound untrusted input before accumulation and the integer conversion.
+     * The remainder stays smaller than one step (100px or 1px). */
     nDelta = DirectGate_Desktop_WheelDelta(nDelta);
 
     /* A direction flip discards the leftover from the previous direction
@@ -106,11 +123,10 @@ static int DirectGate_Desktop_WheelNotches(int32_t *pAccum, int nDelta)
     if ((nDelta > 0 && *pAccum < 0) || (nDelta < 0 && *pAccum > 0)) *pAccum = 0;
     *pAccum += nDelta;
 
-    int nNotches = *pAccum / 100;
-    *pAccum -= nNotches * 100;
-    return nNotches;
+    int nSteps = (int)(*pAccum / nPixelsPerStep);
+    *pAccum -= nSteps * nPixelsPerStep;
+    return nSteps;
 }
-#endif /* __linux__ || _WIN32 */
 
 static xbool_t DirectGate_Desktop_TrackPointerButton(directgate_desktop_t *pDesktop, uint32_t nButton, xbool_t bDown)
 {
@@ -842,28 +858,11 @@ static void DirectGate_Desktop_X11TypeText(directgate_desktop_t *pDesktop, const
 #ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
 static double DirectGate_Desktop_WaylandWheelDelta(xjson_obj_t *pValue)
 {
-    /* WheelEvent deltas can be fractional (or use exponent notation in
-     * JSON). XJSON_GetInt rejects those, dropping smooth-scroll samples. */
-    if (pValue == NULL || pValue->pData == NULL ||
-        (pValue->nType != XJSON_TYPE_NUMBER && pValue->nType != XJSON_TYPE_FLOAT))
-        return 0.0;
-
-    const char *pText = (const char*)pValue->pData;
-    char *pEnd;
-    int nSavedErrno = errno;
-    double nDelta = strtod(pText, &pEnd);
-    errno = nSavedErrno;
-    if (pEnd == pText || *pEnd != '\0' || !isfinite(nDelta)) return 0.0;
-
-    if (nDelta > DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA) nDelta = DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA;
-    else if (nDelta < -DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA) nDelta = -DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA;
-
-    /* The wire uses ~100 browser pixels per notch (as WheelNotches above),
+    /* The wire uses ~100 browser pixels per notch (as WheelSteps above),
      * while the portal forwards native axis units: Mutter defines 10 per
      * notch. Passing browser pixels through produced tenfold scrolling.
-     * Keep the result continuous so small samples do not turn into clicks.
-     * https://gitlab.gnome.org/GNOME/mutter/-/blob/main/data/dbus-interfaces/org.gnome.Mutter.RemoteDesktop.xml */
-    return nDelta / 10.0;
+     * Keep the result continuous so small samples do not turn into clicks. */
+    return DirectGate_Desktop_WheelDeltaFromJson(pValue) / 10.0;
 }
 
 /* Input on Wayland goes back through the same portal session the screen is
@@ -1280,10 +1279,10 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         else if (xstrcmp(pEvent, "wheel"))
         {
             directgate_xtest_button_fn pButtonFn = (directgate_xtest_button_fn)pDesktop->pFakeButton;
-            int nDeltaY = XJSON_GetInt(XJSON_GetObject(pRoot, "deltaY"));
-            int nDeltaX = XJSON_GetInt(XJSON_GetObject(pRoot, "deltaX"));
-            int nNotchesY = DirectGate_Desktop_WheelNotches(&pDesktop->nWheelAccumY, nDeltaY);
-            int nNotchesX = DirectGate_Desktop_WheelNotches(&pDesktop->nWheelAccumX, nDeltaX);
+            double nDeltaY = DirectGate_Desktop_WheelDeltaFromJson(XJSON_GetObject(pRoot, "deltaY"));
+            double nDeltaX = DirectGate_Desktop_WheelDeltaFromJson(XJSON_GetObject(pRoot, "deltaX"));
+            int nNotchesY = DirectGate_Desktop_WheelSteps(&pDesktop->nWheelAccumY, nDeltaY, 100);
+            int nNotchesX = DirectGate_Desktop_WheelSteps(&pDesktop->nWheelAccumX, nDeltaX, 100);
 
             uint32_t nButtonY = nNotchesY < 0 ? 4U : 5U;
             for (int i = 0; i < abs(nNotchesY); i++)
@@ -1710,10 +1709,14 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         }
         else if (xstrcmp(pEvent, "wheel"))
         {
-            int nDeltaY = XJSON_GetInt(XJSON_GetObject(pRoot, "deltaY"));
-            int nDeltaX = XJSON_GetInt(XJSON_GetObject(pRoot, "deltaX"));
-            CGEventRef event = CGEventCreateScrollWheelEvent(NULL, kCGScrollEventUnitPixel, 2,
-                -DirectGate_Desktop_WheelDelta(nDeltaY), -DirectGate_Desktop_WheelDelta(nDeltaX));
+            double nDeltaY = DirectGate_Desktop_WheelDeltaFromJson(XJSON_GetObject(pRoot, "deltaY"));
+            double nDeltaX = DirectGate_Desktop_WheelDeltaFromJson(XJSON_GetObject(pRoot, "deltaX"));
+            int nPixelsY = DirectGate_Desktop_WheelSteps(&pDesktop->nWheelAccumY, nDeltaY, 1);
+            int nPixelsX = DirectGate_Desktop_WheelSteps(&pDesktop->nWheelAccumX, nDeltaX, 1);
+
+            CGEventRef event = (nPixelsY != 0 || nPixelsX != 0)
+                ? CGEventCreateScrollWheelEvent(NULL, kCGScrollEventUnitPixel, 2, -nPixelsY, -nPixelsX) : NULL;
+
             if (event != NULL)
             {
                 CGEventPost(kCGHIDEventTap, event);
@@ -2121,10 +2124,10 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
         else if (xstrcmp(pEvent, "wheel"))
         {
             /* Same pixel->notch accumulation as the X11 button-4..7 mapping. */
-            int nDeltaY = XJSON_GetInt(XJSON_GetObject(pRoot, "deltaY"));
-            int nDeltaX = XJSON_GetInt(XJSON_GetObject(pRoot, "deltaX"));
-            int nNotchesY = DirectGate_Desktop_WheelNotches(&pDesktop->nWheelAccumY, nDeltaY);
-            int nNotchesX = DirectGate_Desktop_WheelNotches(&pDesktop->nWheelAccumX, nDeltaX);
+            double nDeltaY = DirectGate_Desktop_WheelDeltaFromJson(XJSON_GetObject(pRoot, "deltaY"));
+            double nDeltaX = DirectGate_Desktop_WheelDeltaFromJson(XJSON_GetObject(pRoot, "deltaX"));
+            int nNotchesY = DirectGate_Desktop_WheelSteps(&pDesktop->nWheelAccumY, nDeltaY, 100);
+            int nNotchesX = DirectGate_Desktop_WheelSteps(&pDesktop->nWheelAccumX, nDeltaX, 100);
 
             if (nNotchesY != 0)
             {
