@@ -169,6 +169,10 @@ if(UNIX AND NOT APPLE)
     target_include_directories(desktop_input_smoke PRIVATE ${X11_INCLUDE_DIR})
     target_link_libraries(desktop_input_smoke PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
 
+    directgate_smoke(desktop_wheel_smoke)
+    target_include_directories(desktop_wheel_smoke PRIVATE ${X11_INCLUDE_DIR})
+    target_link_libraries(desktop_wheel_smoke PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
+
     # Exercise the Wayland input branch even on X11-only CI runners. The
     # portal boundary is stubbed, so no compositor or PipeWire is needed.
     directgate_smoke(wayland_input_smoke)

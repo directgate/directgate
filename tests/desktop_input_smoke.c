@@ -241,14 +241,50 @@ int main(void)
         "held-key table overflowed its bound");
 
     /* Wheel accumulation: trackpad samples collect into whole notches. */
-    int32_t nAccum = 0;
+    double nAccum = 0;
     int nTotal = 0;
-    for (int i = 0; i < 25; i++) nTotal += DirectGate_Desktop_WheelNotches(&nAccum, 8);
+    for (int i = 0; i < 25; i++) nTotal += DirectGate_Desktop_WheelSteps(&nAccum, 8, 100);
     CHECK(nTotal == 2, "trackpad accumulation produced wrong notch count");
 
     nAccum = 0;
-    CHECK(DirectGate_Desktop_WheelNotches(&nAccum, 120) == 1, "mouse notch did not pass through");
-    CHECK(DirectGate_Desktop_WheelNotches(&nAccum, -120) == -1, "direction flip lost a notch");
+    CHECK(DirectGate_Desktop_WheelSteps(&nAccum, 120, 100) == 1, "mouse notch did not pass through");
+    CHECK(DirectGate_Desktop_WheelSteps(&nAccum, -120, 100) == -1, "direction flip lost a notch");
+
+    nAccum = 0;
+    CHECK(DirectGate_Desktop_WheelSteps(&nAccum, 99.75, 100) == 0 && nAccum == 99.75,
+        "fractional remainder was rounded or emitted early");
+    CHECK(DirectGate_Desktop_WheelSteps(&nAccum, 0, 100) == 0 && nAccum == 99.75,
+        "zero sample discarded the remainder");
+    CHECK(DirectGate_Desktop_WheelSteps(&nAccum, 0.5, 100) == 1 && nAccum == 0.25,
+        "notch lost its fractional remainder");
+    CHECK(DirectGate_Desktop_WheelSteps(&nAccum, -0.5, 100) == 0 && nAccum == -0.5,
+        "direction change consumed the new fractional input");
+    CHECK(DirectGate_Desktop_WheelSteps(&nAccum, -99.5, 100) == -1 && nAccum == 0,
+        "negative fractions did not accumulate to a notch");
+
+    /* The macOS pixel API requires ints too; retain its subpixel samples
+     * without changing whole-pixel mouse input or creating zero events. */
+    CHECK(DirectGate_Desktop_WheelSteps(&nAccum, 0.25, 1) == 0 && nAccum == 0.25,
+        "macOS subpixel input was lost");
+    CHECK(DirectGate_Desktop_WheelSteps(&nAccum, 0.875, 1) == 1 && nAccum == 0.125,
+        "macOS fractional input did not accumulate to a pixel");
+    CHECK(DirectGate_Desktop_WheelSteps(&nAccum, -120, 1) == -120 && nAccum == 0,
+        "macOS integer scroll changed");
+
+    for (int nStep = 1; nStep <= 100; nStep *= 100)
+    {
+        nAccum = 0.5;
+        CHECK(DirectGate_Desktop_WheelSteps(&nAccum, NAN, nStep) == 0 && nAccum == 0.5,
+            "NaN poisoned the wheel remainder");
+        CHECK(DirectGate_Desktop_WheelSteps(&nAccum, INFINITY, nStep) == 0 && nAccum == 0.5,
+            "infinity reached the integer conversion");
+        CHECK(DirectGate_Desktop_WheelSteps(&nAccum, -INFINITY, nStep) == 0 && nAccum == 0.5,
+            "invalid negative input reset the remainder");
+        CHECK(DirectGate_Desktop_WheelSteps(&nAccum, 1e100, nStep) == 100000 / nStep && nAccum == 0.5,
+            "large finite input escaped the wheel bound");
+        CHECK(DirectGate_Desktop_WheelSteps(&nAccum, -1e100, nStep) == -100000 / nStep && nAccum == 0,
+            "large negative input escaped the wheel bound");
+    }
 
     /* Scratch keycodes for keysyms outside the host layout. Only the paths
      * that resolve without rewriting the keymap are reachable here: an actual
