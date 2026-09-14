@@ -124,6 +124,7 @@ int main(void)
     CHECK(!DirectGate_ParseI64((const uint8_t*)"+", 1, &nValue),
         "reject sign without digits");
     CHECK(!DirectGate_ParseI64((const uint8_t*)"", 0, &nValue), "reject empty int64");
+    CHECK(!DirectGate_ParseI64((const uint8_t*)"1\0junk", 6, &nValue), "reject a NUL hiding trailing integer bytes");
 
     CHECK(DirectGate_IsAPIEndpointAllowed("https://api.example.test"),
         "HTTPS API endpoint should be allowed");

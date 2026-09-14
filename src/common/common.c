@@ -174,7 +174,7 @@ xbool_t DirectGate_ParseI64(const uint8_t *pData, size_t nLength, int64_t *pValu
     errno = 0;
     char *pEnd = NULL;
     long long nParsed = strtoll(sNumber, &pEnd, 10);
-    XCHECK_NL((errno != ERANGE && pEnd != NULL && pEnd != sNumber && *pEnd == XSTR_NUL), XFALSE);
+    XCHECK_NL((errno != ERANGE && pEnd == sNumber + nLength), XFALSE);
 
     *pValue = (int64_t)nParsed;
     return XTRUE;
