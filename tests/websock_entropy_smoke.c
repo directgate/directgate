@@ -10,7 +10,12 @@ static int test_random(unsigned char *data, int len)
     return 1;
 }
 #define RAND_bytes test_random
+/* ws.c only reaches for entropy on its SSL branch, and that branch is what the
+   stub above replaces. The xutils target supplies this wherever OpenSSL was
+   found; defining it here keeps the test self-contained without redefining it. */
+#ifndef _XUTILS_USE_SSL
 #define _XUTILS_USE_SSL
+#endif
 #include "libxutils/src/net/ws.c"
 #undef RAND_bytes
 int main(void)
