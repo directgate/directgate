@@ -820,7 +820,6 @@ void DirectGate_Term_Clear(directgate_term_t *pTerm)
     XCHECK_VOID_NL(pTerm);
     XByteBuffer_Clear(&pTerm->txBuffer);
     pTerm->nMasterFd = (int)XSOCK_INVALID;
-    pTerm->bHaveWinSize = XFALSE;
     pTerm->bRunning = XFALSE;
     pTerm->pPTYSession = NULL;
     pTerm->pWsSession = NULL;
@@ -1048,11 +1047,11 @@ XSTATUS DirectGate_Term_UpdateWinSize(directgate_term_t *pTerm, const struct win
     XCHECK((pTerm != NULL), XSTDINV);
     XCHECK((pSize != NULL), XSTDINV);
 
-    XCHECK_NL(pTerm->bRunning, XSTDOK);
-    XCHECK_NL((pTerm->nMasterFd >= 0) , XSTDOK);
-
     pTerm->winSize = *pSize;
     pTerm->bHaveWinSize = XTRUE;
+
+    XCHECK_NL(pTerm->bRunning, XSTDOK);
+    XCHECK_NL((pTerm->nMasterFd >= 0) , XSTDOK);
 
 #ifdef _WIN32
     XCHECK_NL((pTerm->hPC != NULL), XSTDOK);

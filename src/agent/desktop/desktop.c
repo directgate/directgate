@@ -1014,6 +1014,8 @@ void DirectGate_Desktop_AddMonitor(directgate_desktop_t *pDesktop,
     XCHECK_VOID_NL((nWidth > 0 && nHeight > 0));
 
     directgate_desktop_monitor_t *pMonitor = &pDesktop->monitors[pDesktop->nMonitorCount++];
+    memset(pMonitor, 0, sizeof(*pMonitor));
+
 #if defined(__linux__)
     xstrncpy(pMonitor->sId, sizeof(pMonitor->sId), xstrused(pId) ? pId : "monitor");
 #else

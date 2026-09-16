@@ -33,6 +33,61 @@ int main(void)
         "default flags");
     CHECK(cfg.log.bToScreen == XTRUE, "client logs to screen by default");
     CHECK(xstrused(cfg.sCfgPath) && xstrused(cfg.sDeviceList), "default paths");
+    /* The leading verb selects the command; everything else is a device name,
+       so a verb that is not one must not swallow the argument. */
+    directgate_cmd_t eCommand = (directgate_cmd_t)0xFF;
+    CHECK(DirectGate_ParseCommand("login", &eCommand) && eCommand == DIRECTGATE_CMD_LOGIN,
+        "login selects the login command");
+    CHECK(DirectGate_ParseCommand("logout", &eCommand) && eCommand == DIRECTGATE_CMD_LOGOUT,
+        "logout selects the logout command");
+    CHECK(DirectGate_ParseCommand("devices", &eCommand) && eCommand == DIRECTGATE_CMD_DEVICES,
+        "devices selects the device list command");
+    CHECK(DirectGate_ParseCommand("ls", &eCommand) && eCommand == DIRECTGATE_CMD_DEVICES,
+        "ls is an alias for the device list command");
+    CHECK(DirectGate_ParseCommand("whoami", &eCommand) && eCommand == DIRECTGATE_CMD_WHOAMI,
+        "whoami selects the identity command");
+
+    eCommand = DIRECTGATE_CMD_WHOAMI;
+    CHECK(!DirectGate_ParseCommand("Login", &eCommand),
+        "a differently-cased verb is a device name, not a command");
+    CHECK(!DirectGate_ParseCommand("laptop", &eCommand),
+        "a device name is not a command");
+    CHECK(!DirectGate_ParseCommand("", &eCommand), "an empty argument is not a command");
+    CHECK(!DirectGate_ParseCommand(NULL, &eCommand), "a missing argument is not a command");
+    CHECK(!DirectGate_ParseCommand("login", NULL), "a missing output is refused");
+    CHECK(eCommand == DIRECTGATE_CMD_WHOAMI,
+        "an argument that is not a command leaves the selected one alone");
+
+    /* The environment overrides the config file but not the command line, and
+       an empty variable is not an override. */
+    directgate_cfg_t envCfg;
+    DirectGate_InitConfig(&envCfg);
+    xstrncpy(envCfg.sApiUrl, sizeof(envCfg.sApiUrl), "https://from-config.example.test");
+    xstrncpy(envCfg.sWebUrl, sizeof(envCfg.sWebUrl), "https://web-from-config.example.test");
+
+    unsetenv("DIRECTGATE_API_URL");
+    unsetenv("DIRECTGATE_WEB_URL");
+    DirectGate_ApplyEnvConfig(&envCfg);
+    CHECK(strcmp(envCfg.sApiUrl, "https://from-config.example.test") == 0,
+        "an unset variable leaves the configured API URL alone");
+
+    setenv("DIRECTGATE_API_URL", "", 1);
+    DirectGate_ApplyEnvConfig(&envCfg);
+    CHECK(strcmp(envCfg.sApiUrl, "https://from-config.example.test") == 0,
+        "an empty variable is not an override");
+
+    setenv("DIRECTGATE_API_URL", "https://from-env.example.test", 1);
+    setenv("DIRECTGATE_WEB_URL", "https://web-from-env.example.test", 1);
+    DirectGate_ApplyEnvConfig(&envCfg);
+    CHECK(strcmp(envCfg.sApiUrl, "https://from-env.example.test") == 0,
+        "the environment overrides the configured API URL");
+    CHECK(strcmp(envCfg.sWebUrl, "https://web-from-env.example.test") == 0,
+        "the environment overrides the configured web URL");
+
+    unsetenv("DIRECTGATE_API_URL");
+    unsetenv("DIRECTGATE_WEB_URL");
+    DirectGate_ApplyEnvConfig(NULL);
+
     CHECK(!DirectGate_LoadConfig(NULL, "unused"), "load NULL config");
     CHECK(!DirectGate_LoadConfig(&cfg, NULL), "load NULL path");
     CHECK(!DirectGate_LoadConfig(&cfg, ""), "load empty path");

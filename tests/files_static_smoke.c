@@ -594,6 +594,82 @@ int main(void)
         "read-only Windows file chmod projection");
 #endif
 
+    /* ---- path containment ---------------------------------------------- *
+     * Copying or moving a directory into itself does not fail loudly - it
+     * recurses until the disk or the path length runs out, on the operator's
+     * own machine. The containment check is the only thing that stops it, and
+     * it has to hold through "..", a trailing slash and a symlink alias, since
+     * all three name the same place without looking like it. */
+    {
+        char sInside[512], sAlias[512], sAliasInside[512], sSibling[512], sDots[512], sTrail[512];
+        snprintf(sInside, sizeof(sInside), "%s/dir/deeper", sRoot);
+        snprintf(sAlias, sizeof(sAlias), "%s/dir-alias", sRoot);
+        snprintf(sAliasInside, sizeof(sAliasInside), "%s/dir-alias/deeper", sRoot);
+        snprintf(sSibling, sizeof(sSibling), "%s/elsewhere", sRoot);
+        snprintf(sDots, sizeof(sDots), "%s/dir/../dir/deeper", sRoot);
+        snprintf(sTrail, sizeof(sTrail), "%s/dir/", sRoot);
+
+        CHECK(DirectGate_Files_PathStartsWith("/a/b/c", "/a/b"),
+            "a path under a prefix is recognised");
+        CHECK(DirectGate_Files_PathStartsWith("/a/b", "/a/b"),
+            "a path equal to the prefix is recognised");
+        CHECK(DirectGate_Files_PathStartsWith("/a", "/"),
+            "every absolute path is under the root");
+        CHECK(!DirectGate_Files_PathStartsWith("/a/bc", "/a/b"),
+            "a sibling that merely shares a name prefix is not under it");
+        CHECK(!DirectGate_Files_PathStartsWith("/a", "/a/b"),
+            "a parent is not under its own child");
+        CHECK(!DirectGate_Files_PathStartsWith(NULL, "/a"),
+            "a missing path is under nothing");
+        CHECK(!DirectGate_Files_PathStartsWith("/a", NULL),
+            "a missing prefix contains nothing");
+
+        CHECK(!DirectGate_Files_IsNestedTarget(sDir, sDir),
+            "a directory copied onto itself is handled as a same-path no-op, not as nesting");
+        CHECK(DirectGate_Files_IsNestedTarget(sDir, sInside),
+            "a target directly inside the source is refused");
+        CHECK(DirectGate_Files_IsNestedTarget(sDir, sDots),
+            "a target that reaches back inside the source through .. is refused");
+        CHECK(DirectGate_Files_IsNestedTarget(sDir, sDirChild),
+            "an existing entry inside the source is refused");
+        CHECK(!DirectGate_Files_IsNestedTarget(sDir, sSibling),
+            "a target outside the source is allowed");
+        /* The same directory written with a trailing slash is not spelled the
+         * same, so the equality shortcut misses it and containment catches it.
+         * Refusing is the safe answer either way: there is nothing to copy. */
+        CHECK(DirectGate_Files_IsNestedTarget(sDir, sTrail),
+            "the source written with a trailing slash is refused rather than copied into itself");
+
+        CHECK(symlink(sDir, sAlias) == 0, "make a symlink alias of the source directory");
+        CHECK(DirectGate_Files_IsNestedTarget(sDir, sAliasInside),
+            "a target inside a symlink alias of the source is refused");
+        CHECK(unlink(sAlias) == 0, "remove the alias");
+
+        /* A source that cannot be resolved cannot be proved to contain
+         * anything, so containment is assumed rather than waved through. */
+        CHECK(DirectGate_Files_IsNestedTarget("/no/such/source", sInside),
+            "a source that cannot be resolved fails closed");
+
+        /* A target whose parent does not exist cannot be inside the source,
+         * and the copy itself is what reports the missing parent. */
+        CHECK(!DirectGate_Files_IsNestedTarget(sDir, "/no/such/parent/here"),
+            "a target whose parent does not exist is not treated as nested");
+        CHECK(!DirectGate_Files_IsNestedTarget(NULL, sInside),
+            "a missing source is not nested");
+        CHECK(!DirectGate_Files_IsNestedTarget(sDir, NULL),
+            "a missing target is not nested");
+
+        /* Deleting a populated directory without force must be refused, and
+         * that decision rests on this check. */
+        CHECK(DirectGate_Files_DirectoryHasEntries(sDir),
+            "a directory holding entries reports them");
+        CHECK(XDir_Create(sSibling, 0755) > 0, "make an empty directory");
+        CHECK(!DirectGate_Files_DirectoryHasEntries(sSibling),
+            "an empty directory reports no entries");
+        CHECK(!DirectGate_Files_DirectoryHasEntries("/no/such/directory"),
+            "a directory that is not there reports no entries");
+    }
+
     CHECK(DirectGate_Files_Delete(sDirCopy, XTRUE) == XSTDOK,
         "cleanup copied directory");
     CHECK(DirectGate_Files_Delete(sRoot, XTRUE) == XSTDOK,

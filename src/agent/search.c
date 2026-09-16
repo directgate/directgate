@@ -328,6 +328,17 @@ static int DirectGate_Search_ParsePermissions(const char *pPerm)
 {
     XCHECK((xstrused(pPerm)), XSTDERR);
 
+    /* XPath_PermToMode reads any nine characters and treats everything that is
+       not the expected letter as a cleared bit, so a string that is not a mode
+       at all parses as 000 - and 000 is how the search spells "no permission
+       filter". A browser typo would silently widen the result set, so the shape
+       is checked here, where the value arrives from the wire. */
+    static const char sLetters[XPERM_LEN] = { 'r', 'w', 'x', 'r', 'w', 'x', 'r', 'w', 'x' };
+    XCHECK_NL((strlen(pPerm) == XPERM_LEN), XSTDERR);
+
+    for (size_t i = 0; i < XPERM_LEN; i++)
+        XCHECK_NL((pPerm[i] == sLetters[i] || pPerm[i] == '-'), XSTDERR);
+
     xmode_t nMode = 0;
     char sChmod[XSTR_MICRO];
 
@@ -342,10 +353,12 @@ static int DirectGate_Search_ParseCount(const char *pValue, int *pOutput)
     XCHECK((xstrused(pValue)), XSTDERR);
 
     char *pEnd = NULL;
+    errno = 0;
     long nValue = strtol(pValue, &pEnd, 10);
 
     while (pEnd != NULL && *pEnd && isspace((unsigned char)*pEnd)) ++pEnd;
     if (pEnd == pValue || (pEnd != NULL && *pEnd != '\0')) return XSTDERR;
+    if (errno == ERANGE || nValue < INT_MIN || nValue > INT_MAX) return XSTDERR;
 
     *pOutput = (int)nValue;
     return XSTDOK;
@@ -358,23 +371,33 @@ static int DirectGate_Search_ParseSize(const char *pValue, size_t *pOutput)
     XCHECK((isdigit((unsigned char)*pValue)), XSTDERR);
 
     char *pEnd = NULL;
+    errno = 0;
     unsigned long long nValue = strtoull(pValue, &pEnd, 10);
 
     while (pEnd != NULL && *pEnd && isspace((unsigned char)*pEnd)) ++pEnd;
-    if (pEnd == pValue) return XSTDERR;
+    if (pEnd == pValue || errno == ERANGE) return XSTDERR;
 
     if (pEnd != NULL && *pEnd)
     {
         char cSize = (char)tolower((unsigned char)*pEnd);
-        if (cSize == 'k') nValue *= 1024ULL;
-        else if (cSize == 'm') nValue *= 1024ULL * 1024ULL;
-        else if (cSize == 'g') nValue *= 1024ULL * 1024ULL * 1024ULL;
+        unsigned long long nUnit;
+
+        if (cSize == 'k') nUnit = 1024ULL;
+        else if (cSize == 'm') nUnit = 1024ULL * 1024ULL;
+        else if (cSize == 'g') nUnit = 1024ULL * 1024ULL * 1024ULL;
         else return XSTDERR;
+
+        if (nValue > ULLONG_MAX / nUnit) return XSTDERR;
+        nValue *= nUnit;
 
         ++pEnd;
         while (pEnd != NULL && *pEnd && isspace((unsigned char)*pEnd)) ++pEnd;
         if (pEnd != NULL && *pEnd != '\0') return XSTDERR;
     }
+
+    /* Same reason on the 32-bit packages, where size_t is narrower than the
+       value strtoull just produced. */
+    if (nValue > (unsigned long long)SIZE_MAX) return XSTDERR;
 
     *pOutput = (size_t)nValue;
     return XSTDOK;
@@ -488,6 +511,7 @@ static int DirectGate_Search_ApplyCriteria(directgate_search_t *pSearch, xsearch
         if (DirectGate_Search_ParseSize(pSearch->sFileSize, &nFileSize) < 0)
             return XSTDERR;
 
+        if (nFileSize > (size_t)INT_MAX) return XSTDERR;
         pSearchCtx->nFileSize = (int)nFileSize;
     }
 

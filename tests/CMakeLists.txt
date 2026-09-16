@@ -70,6 +70,7 @@ foreach(test
         common_prompt_smoke
         protocol_smoke
         crypto_smoke
+        e2e_ccwin_smoke
         srp_smoke
         transfer_smoke
         transfer_bounds_smoke
@@ -98,7 +99,8 @@ foreach(test
         xutils_bounds_smoke
         websock_frame_smoke
         websock_entropy_smoke
-        term_priv_smoke)
+        term_priv_smoke
+        term_io_smoke)
     directgate_smoke(${test})
 endforeach()
 
@@ -122,6 +124,7 @@ directgate_smoke(config_extra_smoke  ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c
 directgate_smoke(config_args_smoke   ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(keyfile_apply_smoke ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(search_smoke        ${AGENT_DIR}/search.c ${AGENT_DIR}/files.c)
+directgate_smoke(search_criteria_smoke)
 directgate_smoke(yuv_smoke   ${AGENT_DIR}/yuv.c)
 if(UNIX AND NOT APPLE)
     directgate_smoke(thread_failure_smoke)
@@ -193,6 +196,20 @@ if(UNIX AND NOT APPLE)
     directgate_smoke(desktop_abr_smoke)
     target_include_directories(desktop_abr_smoke PRIVATE ${X11_INCLUDE_DIR})
     target_link_libraries(desktop_abr_smoke PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
+
+    # Encode geometry, presets and the monitor table, from the same desktop.c.
+    directgate_smoke(desktop_frame_smoke)
+    target_include_directories(desktop_frame_smoke PRIVATE ${X11_INCLUDE_DIR})
+    target_link_libraries(desktop_frame_smoke PRIVATE ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
+
+    # The browser-facing desktop control channel. Links the real capture module
+    # set, then keeps the pipeline on raw RGBA so no display server is needed.
+    directgate_smoke(desktop_control_smoke
+        ${AGENT_DIR}/desktop/desktop.c
+        ${AGENT_DIR}/desktop/display.c
+        ${AGENT_DIR}/desktop/input.c
+        ${AGENT_DIR}/desktop/stream.c)
+    directgate_smoke_desktop(desktop_control_smoke)
 endif()
 directgate_smoke(enroll_prompt_smoke ${AGENT_DIR}/enroll.c)
 directgate_smoke(files_smoke         ${AGENT_DIR}/files.c)
@@ -200,6 +217,7 @@ directgate_smoke(session_smoke       ${AGENT_DIR}/session.c)
 
 # Client utility tests that compile the client-only implementation files.
 directgate_smoke(client_devices_smoke ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/webapi.c)
+directgate_smoke(client_pick_smoke    ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/webapi.c)
 directgate_smoke(client_config_smoke  ${CLIENT_DIR}/config.c ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/webapi.c)
 directgate_smoke(client_login_smoke   ${CLIENT_DIR}/login.c ${CLIENT_DIR}/webapi.c)
 directgate_smoke(client_relay_smoke   ${CLIENT_DIR}/relay.c ${CLIENT_DIR}/webapi.c)
@@ -208,6 +226,7 @@ directgate_smoke(client_webapi_smoke  ${CLIENT_DIR}/webapi.c)
 # The client sources include their neighbour headers by bare name
 foreach(test
         client_devices_smoke
+        client_pick_smoke
         client_config_smoke
         client_login_smoke
         client_relay_smoke
@@ -233,6 +252,24 @@ directgate_smoke_desktop(session_files_smoke)
 target_compile_definitions(session_files_smoke PRIVATE DIRECTGATE_TESTING)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(session_files_smoke PRIVATE -Wno-unused-function)
+endif()
+
+directgate_smoke(auth_flow_smoke
+    ${AGENT_DIR}/config.c
+    ${AGENT_DIR}/desktop/desktop.c
+    ${AGENT_DIR}/desktop/display.c
+    ${AGENT_DIR}/desktop/input.c
+    ${AGENT_DIR}/desktop/stream.c
+    ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/files.c
+    ${AGENT_DIR}/search.c
+    ${AGENT_DIR}/session.c
+    ${AGENT_DIR}/term.c
+    ${AGENT_DIR}/directgate.c)
+directgate_smoke_desktop(auth_flow_smoke)
+target_compile_definitions(auth_flow_smoke PRIVATE DIRECTGATE_TESTING)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(auth_flow_smoke PRIVATE -Wno-unused-function)
 endif()
 
 directgate_smoke(connection_lifecycle_smoke
