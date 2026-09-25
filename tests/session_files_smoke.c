@@ -394,8 +394,10 @@ int main(void)
     /* Before a mode is started every file-manager message is refused with an
        error rather than acted on. */
     {
+        /* Not XAPI_CONTINUE: that is XSTDOK under another name, and a refusal equal to the pass value is
+           exactly how every handler behind this gate used to run anyway. */
         CHECK(DirectGate_Session_EnsureMode(fix.pSession,
-            DIRECTGATE_SESSION_MODE_FILE_MANAGER, "not started") == XAPI_CONTINUE,
+            DIRECTGATE_SESSION_MODE_FILE_MANAGER, "not started") != XSTDOK,
             "an unstarted mode is refused");
 
         directgate_pkg_t pkg;

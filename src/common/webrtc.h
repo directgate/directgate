@@ -216,6 +216,12 @@ XSTATUS DirectGate_WebRTC_Send(directgate_webrtc_t *pRTC, const uint8_t *pData, 
 
 /* Check if the data channel is connected */
 xbool_t DirectGate_WebRTC_IsConnected(const directgate_webrtc_t *pRTC);
+
+/* Records that a data channel send failed. The session only stops preferring the
+ * channel when it is really gone: a message above the peer's max-message-size
+ * fails the same way, and one oversized reply must not move every later message
+ * of the session onto the relay until the channel happens to be renegotiated. */
+void DirectGate_WebRTC_NoteSendFailure(directgate_webrtc_t *pRTC);
 xbool_t DirectGate_WebRTC_IsRelay(const directgate_webrtc_t *pRTC);
 int DirectGate_WebRTC_GetBufferedAmount(const directgate_webrtc_t *pRTC);
 

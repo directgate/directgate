@@ -43,13 +43,44 @@ static void DirectGate_YUV_FillTap(directgate_yuv_tap_t *pTap, uint32_t nDstPos,
     pTap->nFrac = (uint32_t)(nPos & 0xFFU);
 }
 
+/* Exactly half size on both axes: 4K to 1080p, 1440p to 720p, a 2880x1800
+ * panel to 1440x900. The bilinear taps land on the same 2x2 block with equal
+ * weights there, so every output pixel is simply that block's mean - the
+ * general path's result to within one rounding step, at about half its cost
+ * on a path that runs for every captured frame. */
+static void DirectGate_YUV_ScaleHalfBGRA(uint8_t *pDst,
+                                         uint32_t nDstWidth,
+                                         uint32_t nDstHeight,
+                                         const uint8_t *pSrc,
+                                         size_t nSrcStride)
+{
+    for (uint32_t y = 0; y < nDstHeight; y++)
+    {
+        const uint8_t *pRow0 = pSrc + (size_t)y * 2U * nSrcStride;
+        const uint8_t *pRow1 = pRow0 + nSrcStride;
+        uint8_t *pOut = pDst + (size_t)y * nDstWidth * 4U;
+
+        for (uint32_t x = 0; x < nDstWidth; x++)
+        {
+            const uint8_t *pTop = pRow0 + (size_t)x * 8U;
+            const uint8_t *pBottom = pRow1 + (size_t)x * 8U;
+
+            pOut[0] = (uint8_t)((pTop[0] + pTop[4] + pBottom[0] + pBottom[4] + 2U) >> 2);
+            pOut[1] = (uint8_t)((pTop[1] + pTop[5] + pBottom[1] + pBottom[5] + 2U) >> 2);
+            pOut[2] = (uint8_t)((pTop[2] + pTop[6] + pBottom[2] + pBottom[6] + 2U) >> 2);
+            pOut[3] = 255U;
+            pOut += 4;
+        }
+    }
+}
+
 void DirectGate_YUV_ScaleBGRA(uint8_t *pDst,
-                          uint32_t nDstWidth,
-                          uint32_t nDstHeight,
-                          const uint8_t *pSrc,
-                          uint32_t nSrcWidth,
-                          uint32_t nSrcHeight,
-                          size_t nSrcStride)
+                              uint32_t nDstWidth,
+                              uint32_t nDstHeight,
+                              const uint8_t *pSrc,
+                              uint32_t nSrcWidth,
+                              uint32_t nSrcHeight,
+                              size_t nSrcStride)
 {
     XCHECK_VOID_NL((pDst != NULL && pSrc != NULL));
     XCHECK_VOID_NL((nDstWidth > 0 && nDstHeight > 0));
@@ -59,6 +90,13 @@ void DirectGate_YUV_ScaleBGRA(uint8_t *pDst,
         nSrcStride == (size_t)nSrcWidth * 4U)
     {
         memcpy(pDst, pSrc, (size_t)nDstWidth * nDstHeight * 4U);
+        return;
+    }
+
+    if ((uint64_t)nDstWidth * 2U == nSrcWidth && (uint64_t)nDstHeight * 2U == nSrcHeight &&
+        nSrcStride >= (size_t)nSrcWidth * 4U)
+    {
+        DirectGate_YUV_ScaleHalfBGRA(pDst, nDstWidth, nDstHeight, pSrc, nSrcStride);
         return;
     }
 
@@ -122,13 +160,13 @@ static inline uint8_t DirectGate_YUV_Clamp(int32_t nValue)
  * byte per sample (nChromaStep 1), NV12 interleaves Cb,Cr pairs in a single
  * plane (nChromaStep 2, pV = pU + 1). */
 static void DirectGate_YUV_BGRAToYCbCr(uint8_t *pY,
-                                   uint8_t *pU,
-                                   uint8_t *pV,
-                                   size_t nChromaStep,
-                                   size_t nChromaRowStride,
-                                   const uint8_t *pBGRA,
-                                   uint32_t nWidth,
-                                   uint32_t nHeight)
+                                       uint8_t *pU,
+                                       uint8_t *pV,
+                                       size_t nChromaStep,
+                                       size_t nChromaRowStride,
+                                       const uint8_t *pBGRA,
+                                       uint32_t nWidth,
+                                       uint32_t nHeight)
 {
     XCHECK_VOID_NL((pY != NULL && pU != NULL && pV != NULL && pBGRA != NULL));
     XCHECK_VOID_NL((nWidth > 1 && nHeight > 1));
@@ -172,21 +210,21 @@ static void DirectGate_YUV_BGRAToYCbCr(uint8_t *pY,
 }
 
 void DirectGate_YUV_BGRAToI420(uint8_t *pY,
-                           uint8_t *pU,
-                           uint8_t *pV,
-                           const uint8_t *pBGRA,
-                           uint32_t nWidth,
-                           uint32_t nHeight)
+                               uint8_t *pU,
+                               uint8_t *pV,
+                               const uint8_t *pBGRA,
+                               uint32_t nWidth,
+                               uint32_t nHeight)
 {
     DirectGate_YUV_BGRAToYCbCr(pY, pU, pV, 1U, (size_t)nWidth / 2U,
         pBGRA, nWidth, nHeight);
 }
 
 void DirectGate_YUV_BGRAToNV12(uint8_t *pY,
-                           uint8_t *pUV,
-                           const uint8_t *pBGRA,
-                           uint32_t nWidth,
-                           uint32_t nHeight)
+                               uint8_t *pUV,
+                               const uint8_t *pBGRA,
+                               uint32_t nWidth,
+                               uint32_t nHeight)
 {
     XCHECK_VOID_NL((pUV != NULL));
     DirectGate_YUV_BGRAToYCbCr(pY, pUV, pUV + 1U, 2U, (size_t)nWidth,

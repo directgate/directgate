@@ -79,6 +79,23 @@ static int DirectGate_Desktop_FrameToScreenY(const directgate_desktop_t *pDeskto
  * that was never going to be a scroll. */
 #define DIRECTGATE_DESKTOP_MAX_WHEEL_DELTA 100000
 
+/* Longest text one "text" action may carry. The browser sends a single character per action, and every character
+ * is at least a key press and release - on X11 possibly a keymap change too - all on the event loop, so the cap
+ * keeps a misbehaving viewer from parking every other session on this agent behind one message. */
+#define DIRECTGATE_DESKTOP_MAX_TEXT_BYTES 1024
+
+static const char* DirectGate_Desktop_TextFromJson(xjson_obj_t *pRoot)
+{
+    const char *pText = XJSON_GetString(XJSON_GetObject(pRoot, "text"));
+    if (!xstrused(pText)) return NULL;
+
+    size_t nLength = strnlen(pText, DIRECTGATE_DESKTOP_MAX_TEXT_BYTES + 1);
+    if (nLength <= DIRECTGATE_DESKTOP_MAX_TEXT_BYTES) return pText;
+
+    xlogw("Dropped oversized desktop text input: limit(%d)", DIRECTGATE_DESKTOP_MAX_TEXT_BYTES);
+    return NULL;
+}
+
 static double DirectGate_Desktop_WheelDelta(double nDelta)
 {
     if (!isfinite(nDelta)) return 0.0;
@@ -1148,8 +1165,8 @@ static int DirectGate_Desktop_WaylandHandleInput(directgate_session_t *pSession,
      * dropped without a trace, and the keyboard looked dead. */
     if (xstrcmp(pAction, "text"))
     {
-        const char *pText = XJSON_GetString(XJSON_GetObject(pRoot, "text"));
-        if (!xstrused(pText)) return XAPI_CONTINUE;
+        const char *pText = DirectGate_Desktop_TextFromJson(pRoot);
+        if (pText == NULL) return XAPI_CONTINUE;
 
         for (size_t i = 0; pText[i] != '\0'; )
         {
@@ -1328,8 +1345,8 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
     }
     else if (xstrcmp(pAction, "text"))
     {
-        const char *pText = XJSON_GetString(XJSON_GetObject(pRoot, "text"));
-        if (xstrused(pText)) DirectGate_Desktop_X11TypeText(pDesktop, pText);
+        const char *pText = DirectGate_Desktop_TextFromJson(pRoot);
+        if (pText != NULL) DirectGate_Desktop_X11TypeText(pDesktop, pText);
     }
     else if (xstrcmp(pAction, "lock"))
     {
@@ -1759,8 +1776,8 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
     }
     else if (xstrcmp(pAction, "text"))
     {
-        const char *pText = XJSON_GetString(XJSON_GetObject(pRoot, "text"));
-        if (xstrused(pText)) DirectGate_Desktop_MacTypeText(pText);
+        const char *pText = DirectGate_Desktop_TextFromJson(pRoot);
+        if (pText != NULL) DirectGate_Desktop_MacTypeText(pText);
     }
 
     XJSON_Destroy(&json);
@@ -2195,8 +2212,8 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
     }
     else if (xstrcmp(pAction, "text"))
     {
-        const char *pText = XJSON_GetString(XJSON_GetObject(pRoot, "text"));
-        if (xstrused(pText)) DirectGate_Desktop_WinTypeText(pText);
+        const char *pText = DirectGate_Desktop_TextFromJson(pRoot);
+        if (pText != NULL) DirectGate_Desktop_WinTypeText(pText);
     }
     else if (xstrcmp(pAction, "lock"))
     {

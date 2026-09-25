@@ -37,6 +37,8 @@ struct winsize {
     unsigned short ws_xpixel;
     unsigned short ws_ypixel;
 };
+#else
+#include <poll.h>
 #endif
 
 #include "sys/log.h"

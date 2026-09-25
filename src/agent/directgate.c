@@ -65,6 +65,11 @@
 #define DIRECTGATE_RELAY_KA_TIMEOUT_MS      60000ULL
 #define DIRECTGATE_RELAY_KA_PROBE_MS        20000ULL
 
+/* In-session refresh retry: doubled from the base after every failed attempt. */
+#define DIRECTGATE_TOKEN_REFRESH_RETRY_MS     5000U
+#define DIRECTGATE_TOKEN_REFRESH_RETRY_MAX_MS 30000U
+#define DIRECTGATE_CONFIG_SAVE_RETRY_MS       10000U
+
 #define DIRECTGATE_NO_ANSWER                "N/A"
 
 xbool_t g_bFinish = XFALSE;
@@ -143,6 +148,21 @@ static xbool_t DirectGate_Session_IsTransferWritable(const directgate_session_t 
     return pSession->pWsSession->txBuffer.nUsed < DIRECTGATE_TRANSFER_WS_BUFFER_MAX;
 }
 
+/* Shell output paused behind a backed-up transport (see DirectGate_Term_OnRead). */
+static xbool_t DirectGate_Conn_HasPausedTerminals(const directgate_conn_t *pConn)
+{
+    XCHECK_NL((pConn != NULL), XFALSE);
+    unsigned int i;
+
+    for (i = 0; i < DIRECTGATE_MAX_SESSIONS; i++)
+    {
+        const directgate_session_t *pSession = pConn->mgr.pSessions[i];
+        if (pSession != NULL && DirectGate_Term_IsReadPaused(&pSession->term)) return XTRUE;
+    }
+
+    return XFALSE;
+}
+
 static void DirectGate_PumpOutboundTransfers(directgate_conn_t *pConn)
 {
     XCHECK_VOID_NL((pConn != NULL));
@@ -151,6 +171,8 @@ static void DirectGate_PumpOutboundTransfers(directgate_conn_t *pConn)
     for (i = 0; i < DIRECTGATE_MAX_SESSIONS; i++)
     {
         directgate_session_t *pSession = pConn->mgr.pSessions[i];
+        if (pSession != NULL) DirectGate_Term_ResumeRead(&pSession->term);
+
         if (!DirectGate_Session_HasOutboundTransfer(pSession)) continue;
         unsigned int j;
 
@@ -165,7 +187,7 @@ static void DirectGate_PumpOutboundTransfers(directgate_conn_t *pConn)
 
 static uint32_t DirectGate_GetServiceWaitMs(const directgate_conn_t *pConn)
 {
-    return DirectGate_Conn_HasOutboundTransfers(pConn) ?
+    return (DirectGate_Conn_HasOutboundTransfers(pConn) || DirectGate_Conn_HasPausedTerminals(pConn)) ?
                         DIRECTGATE_TRANSFER_WAIT_MS :
                         DIRECTGATE_EVENT_LOOP_WAIT_MS;
 }
@@ -313,11 +335,8 @@ static xbool_t DirectGate_HandleRefreshStatus(directgate_conn_t *pConn,
         DirectGate_Conn_GetFD(pConn, pConn->pWsSession),
         pReasonStr);
 
-    if (bDisconnectSocket && pConn->pWsSession != NULL)
-    {
-        xstrncpy(pConn->sDisconnectReason, sizeof(pConn->sDisconnectReason), pReasonStr);
-        XAPI_Disconnect(pConn->pWsSession);
-    }
+    xstrncpy(pConn->sDisconnectReason, sizeof(pConn->sDisconnectReason), pReasonStr);
+    if (bDisconnectSocket && pConn->pWsSession != NULL) XAPI_Disconnect(pConn->pWsSession);
 
     return XFALSE;
 }
@@ -364,15 +383,13 @@ static xbool_t DirectGate_PrepareEndpoint(directgate_conn_t *pConn, xapi_endpoin
     * debug or production build, allowing users to verify that transport
     * security requirements have not been relaxed.
     */
-#ifndef DIRECTGATE_DEBUG
-    if (!pEndpt->bTLS)
+    if (!DirectGate_IsRelayEndpointAllowed(pRelayUrl))
     {
         xloge("Unencrypted relay connection not allowed in production mode: id(%u), fd(%d), relayUrl(%s)",
             DirectGate_Conn_GetID(pConn, NULL), DirectGate_Conn_GetFD(pConn, NULL), pRelayUrl);
 
         return XFALSE;
     }
-#endif
 
     return XTRUE;
 }
@@ -597,6 +614,9 @@ static int DirectGate_HandleCustomRead(xapi_session_t *pApiSession)
     if ((int)pApiSession->sock.nFD == nDesktopFd)
         return DirectGate_Desktop_Process(pSession);
 
+    if ((int)pApiSession->sock.nFD == DirectGate_Files_GetOpFd(pSession))
+        return DirectGate_Files_ProcessOp(pSession);
+
     XCHECK(DirectGate_Term_IsRunning(&pSession->term), XAPI_DISCONNECT);
     return DirectGate_Term_OnRead(&pSession->term);
 }
@@ -613,6 +633,7 @@ static int DirectGate_HandleCustomWrite(xapi_session_t *pApiSession)
     int nDesktopFd = DirectGate_Desktop_GetTimerFd(&pSession->desktop);
     if ((int)pApiSession->sock.nFD == nPipeFd) return XAPI_CONTINUE;
     if ((int)pApiSession->sock.nFD == nDesktopFd) return XAPI_CONTINUE;
+    if ((int)pApiSession->sock.nFD == DirectGate_Files_GetOpFd(pSession)) return XAPI_CONTINUE;
 
     XCHECK(DirectGate_Term_IsRunning(&pSession->term), XAPI_DISCONNECT);
     return DirectGate_Term_OnWrite(&pSession->term);
@@ -649,6 +670,12 @@ static int DirectGate_HandleRegistered(xapi_session_t *pApiSession)
         return XAPI_CONTINUE;
     }
 
+    if ((int)pApiSession->sock.nFD == DirectGate_Files_GetOpFd(pSession))
+    {
+        pSession->pFileOpSession = pApiSession;
+        return XAPI_CONTINUE;
+    }
+
     DirectGate_Term_AttachEvent(&pSession->term, pApiSession);
     return XAPI_CONTINUE;
 }
@@ -673,13 +700,11 @@ static int DirectGate_HandleClosed(xapi_session_t *pApiSession)
 
     if ((int)pApiSession->sock.nFD == nSearchFd)
     {
+        /* Only the read end belonged to the event loop. The write end stays open until
+           DirectGate_Search_Clear() has joined the worker: closing it here, while a search
+           may still be running, let the worker's next notification land on whatever
+           descriptor had reused that number. A write to a pipe without a reader just fails. */
         pSession->search.nPipeFds[0] = XSOCK_INVALID;
-        if (pSession->search.nPipeFds[1] != XSOCK_INVALID)
-        {
-            xclosesock(pSession->search.nPipeFds[1]);
-            pSession->search.nPipeFds[1] = XSOCK_INVALID;
-        }
-
         pSession->pSearchSession = NULL;
         return XAPI_NO_ACTION;
     }
@@ -692,6 +717,9 @@ static int DirectGate_HandleClosed(xapi_session_t *pApiSession)
             DirectGate_Session_Close(pSession, "desktop stopped");
         return XAPI_NO_ACTION;
     }
+
+    if ((int)pApiSession->sock.nFD == DirectGate_Files_GetOpFd(pSession))
+        return DirectGate_Files_OnOpClosed(pSession);
 
     // Detach terminal events to avoid use-after-free
     DirectGate_Term_DetachEvent(&pSession->term);
@@ -729,9 +757,11 @@ int DirectGate_HandshakeRequest(xapi_ctx_t *pCtx, xapi_session_t *pApiSession)
         xlogi("Refreshing access token before role send: id(%u), fd(%d)",
             DirectGate_Conn_GetID(pConn, pApiSession), DirectGate_Conn_GetFD(pConn, pApiSession));
 
+        /* Never let the status handler disconnect the socket here: this runs inside the session's own upgrade
+           callback, and libxutils keeps using the session after it returns. XAPI_DISCONNECT tears it down. */
         char sReason[XSTR_TINY];
         directgate_enroll_status_t eStatus = DirectGate_Enroll_Refresh((directgate_cfg_t*)pCfg, sReason, sizeof(sReason));
-        if (!DirectGate_HandleRefreshStatus(pConn, eStatus, sReason, "pre-role token refresh", XTRUE)) return XAPI_DISCONNECT;
+        if (!DirectGate_HandleRefreshStatus(pConn, eStatus, sReason, "pre-role token refresh", XFALSE)) return XAPI_DISCONNECT;
     }
 
     XCHECK(xstrused(pCfg->enroll.sAccessToken),
@@ -763,7 +793,10 @@ int DirectGate_HandshakeRequest(xapi_ctx_t *pCtx, xapi_session_t *pApiSession)
     XByteBuffer_Clear(&pHandle->rawData);
     pHandle->nComplete = XFALSE;
 
-    XCHECK((XHTTP_Assemble(pHandle, pBuffer, nLength) != NULL),
+    xbool_t bAssembled = XHTTP_Assemble(pHandle, pBuffer, nLength) != NULL;
+    free(pBuffer);
+
+    XCHECK((bAssembled),
         xthrowr(XAPI_DISCONNECT, "Failed to assemble handshake request: id(%u), fd(%d), uri(%s)",
             DirectGate_Conn_GetID(pConn, pApiSession), DirectGate_Conn_GetFD(pConn, pApiSession), pHandle->sUri));
 
@@ -1062,9 +1095,11 @@ static int DirectGate_HandleCmd(xapi_session_t *pApiSession, directgate_pkg_t *p
             if (pSession->eActiveMode == DIRECTGATE_SESSION_MODE_DESKTOP)
                 return DirectGate_Session_Close(pSession, "desktop stopped");
 
-            DirectGate_Term_RequestStop(&pSession->term);
+            /* Last access: stopping a running shell closes its PTY endpoint, and the close
+               callback ends - and frees - the whole session before RequestStop returns. */
             pSession->eActiveMode = DIRECTGATE_SESSION_MODE_NONE;
             pSession->eRequestedMode = DIRECTGATE_SESSION_MODE_NONE;
+            DirectGate_Term_RequestStop(&pSession->term);
         }
 
         return XAPI_CONTINUE;
@@ -2344,15 +2379,18 @@ static int DirectGate_HandleTransportMessage(xapi_session_t *pApiSession,
     int nStatus = XAPI_CONTINUE;
     directgate_pkg_t pkg;
 
+    /* Dropped, not fatal. Every message is its own WebSocket frame or data channel message,
+       so a bad one leaves the stream in sync - while disconnecting would end the session of
+       every client on this device over one message the relay's parser and ours disagree on. */
     if (!DirectGate_Package_Parse(&pkg, pPayload, nPayload))
     {
-        xlogw("Invalid protocol message from %s: id(%u), fd(%d), bytes(%zu)",
+        xlogw("Dropped invalid protocol message from %s: id(%u), fd(%d), bytes(%zu)",
             xstrused(pTransport) ? pTransport : "transport",
             DirectGate_Conn_GetID(pConn, pApiSession),
             DirectGate_Conn_GetFD(pConn, pApiSession),
             nPayload);
 
-        return XAPI_DISCONNECT;
+        return XAPI_CONTINUE;
     }
 
     if (!xstrused(pkg.header.pType))
@@ -2539,12 +2577,16 @@ static void DirectGate_InitialConnect(xapi_t *pApi, xapi_endpoint_t *pEndpt, dir
             continue;
         }
 
+        /* Retried like any failed connect rather than given up on: after a few attempts the
+           re-probe asks the API again, which is what hands out a usable relay. Returning here
+           left the agent running with nothing scheduled, offline until somebody restarted it. */
         if (!DirectGate_PrepareEndpoint(pSessData, pEndpt))
         {
             xloge("Relay endpoint is incomplete, missing target, key, or token: id(%u), fd(%d)",
                 DirectGate_Conn_GetID(pSessData, NULL), DirectGate_Conn_GetFD(pSessData, NULL));
 
-            return;
+            DirectGate_ScheduleReconnect(pSessData, "relay endpoint unusable");
+            continue;
         }
 
         if (XAPI_AddEndpoint(pApi, pEndpt) >= 0) break;
@@ -2593,7 +2635,15 @@ static xbool_t DirectGate_CheckTokenRefresh(directgate_conn_t *pConn)
     directgate_cfg_t *pCfg = pConn->pCfg;
     XCHECK_NL((pCfg->enroll.bEnrolled), XFALSE);
 
-    if (!DirectGate_Enroll_NeedsRefresh(pCfg)) return XTRUE;
+    if (!DirectGate_Enroll_NeedsRefresh(pCfg))
+    {
+        pConn->nTokenRefreshFailures = 0;
+        pConn->nNextTokenRefreshMs = 0;
+        return XTRUE;
+    }
+
+    uint64_t nNowMs = XTime_GetMs();
+    if (nNowMs < pConn->nNextTokenRefreshMs) return XTRUE;
 
     xlogi("Refreshing access token for active relay session: id(%u), fd(%d), relay(%s)",
         DirectGate_Conn_GetID(pConn, pConn->pWsSession),
@@ -2606,13 +2656,23 @@ static xbool_t DirectGate_CheckTokenRefresh(directgate_conn_t *pConn)
     eStatus = DirectGate_Enroll_Refresh(pCfg, sReason, sizeof(sReason));
     if (eStatus != DIRECTGATE_ENROLL_REFRESH_OK)
     {
-        xlogw("Token refresh failed: id(%u), fd(%d), status(%d), reason(%s)",
+        uint32_t nShift = pConn->nTokenRefreshFailures < 3U ? pConn->nTokenRefreshFailures : 3U;
+        uint32_t nDelayMs = DIRECTGATE_TOKEN_REFRESH_RETRY_MS << nShift;
+        if (nDelayMs > DIRECTGATE_TOKEN_REFRESH_RETRY_MAX_MS) nDelayMs = DIRECTGATE_TOKEN_REFRESH_RETRY_MAX_MS;
+
+        if (pConn->nTokenRefreshFailures < UINT32_MAX) pConn->nTokenRefreshFailures++;
+        pConn->nNextTokenRefreshMs = XTime_GetMs() + nDelayMs;
+
+        xlogw("Token refresh failed: id(%u), fd(%d), status(%d), reason(%s), retryMs(%u)",
             DirectGate_Conn_GetID(pConn, pConn->pWsSession),
             DirectGate_Conn_GetFD(pConn, pConn->pWsSession),
-            eStatus, sReason);
+            eStatus, sReason, nDelayMs);
 
         return DirectGate_HandleRefreshStatus(pConn, eStatus, sReason, "active-session token refresh", XTRUE);
     }
+
+    pConn->nTokenRefreshFailures = 0;
+    pConn->nNextTokenRefreshMs = 0;
 
     if (DirectGate_SendVerifyUpdate(pConn) < 0)
     {
@@ -2628,6 +2688,25 @@ static xbool_t DirectGate_CheckTokenRefresh(directgate_conn_t *pConn)
         DirectGate_Conn_GetFD(pConn, pConn->pWsSession));
 
     return XTRUE;
+}
+
+static void DirectGate_RetryPendingSave(directgate_conn_t *pConn)
+{
+    XCHECK_VOID_NL((pConn != NULL && pConn->pCfg != NULL));
+    XCHECK_VOID_NL((pConn->pCfg->bSavePending));
+
+    uint64_t nNowMs = XTime_GetMs();
+    if (nNowMs < pConn->nNextSaveRetryMs) return;
+
+    if (!DirectGate_SaveConfig(pConn->pCfg))
+    {
+        pConn->nNextSaveRetryMs = nNowMs + DIRECTGATE_CONFIG_SAVE_RETRY_MS;
+        return;
+    }
+
+    pConn->pCfg->bSavePending = XFALSE;
+    pConn->nNextSaveRetryMs = 0;
+    xlogn("Persisted refreshed tokens after an earlier failure: cfg(%s)", pConn->pCfg->sCfgPath);
 }
 
 static void DirectGate_CheckRelayKeepalive(directgate_conn_t *pConn)
@@ -2720,8 +2799,10 @@ static void DirectGate_CheckWebRTCKeepalive(directgate_conn_t *pConn)
             continue;
         }
 
-        uint64_t nSincePing = nNowMs - pSession->nLastKAPingMs;
-        uint64_t nSincePong = nNowMs - pSession->nLastKAPongMs;
+        /* Saturating: the first ping stamp is placed in the future by the jitter above, and an
+           unsigned wrap there read as a stalled loop, resynced to now and threw the stagger away. */
+        uint64_t nSincePing = nNowMs > pSession->nLastKAPingMs ? nNowMs - pSession->nLastKAPingMs : 0;
+        uint64_t nSincePong = nNowMs > pSession->nLastKAPongMs ? nNowMs - pSession->nLastKAPongMs : 0;
 
         /* If event loop was stalled, resync ping schedule */
         if (nSincePing > nTimeoutMs * 2ULL)
@@ -2753,6 +2834,16 @@ static void DirectGate_CheckWebRTCKeepalive(directgate_conn_t *pConn)
 void DirectGate_TestCheckWebRTCKeepalive(directgate_conn_t *pConn)
 {
     DirectGate_CheckWebRTCKeepalive(pConn);
+}
+
+xbool_t DirectGate_TestCheckTokenRefresh(directgate_conn_t *pConn)
+{
+    return DirectGate_CheckTokenRefresh(pConn);
+}
+
+void DirectGate_TestRetryPendingSave(directgate_conn_t *pConn)
+{
+    DirectGate_RetryPendingSave(pConn);
 }
 #endif
 
@@ -2787,6 +2878,8 @@ static void DirectGate_RunService(xapi_t *pApi, xapi_endpoint_t *pEndpt, directg
         DirectGate_CheckAuthTimeouts(pSessData);
         DirectGate_CheckRelayKeepalive(pSessData);
         DirectGate_CheckWebRTCKeepalive(pSessData);
+        DirectGate_RetryPendingSave(pSessData);
+        DirectGate_Term_ReapPending();
 
         if (pSessData->pWsSession == NULL &&
             !pSessData->bReconnectSuppressed &&
@@ -2808,7 +2901,7 @@ static void DirectGate_RunService(xapi_t *pApi, xapi_endpoint_t *pEndpt, directg
                     xloge("Reconnect target is no longer valid: id(%u), fd(%d)",
                         DirectGate_Conn_GetID(pSessData, NULL), DirectGate_Conn_GetFD(pSessData, NULL));
 
-                    pSessData->nNextReconnectMs = 0;
+                    DirectGate_ScheduleReconnect(pSessData, "relay endpoint unusable");
                     continue;
                 }
 
@@ -3126,6 +3219,12 @@ static xbool_t DirectGate_ConfigIsPrivilegedSafe(const directgate_cfg_t *pCfg)
 }
 
 #ifndef DIRECTGATE_TESTING
+static void DirectGate_ReapPending_Term()
+{
+    /* Shells hung up by the teardown above get their grace, and the SIGKILL after it, before the agent goes. */
+    for (int nWait = 0; nWait < 20 && DirectGate_Term_ReapPending() > 0; nWait++) xusleep(50000);
+}
+
 int DirectGate_RunAgent(int argc, char* argv[])
 {
     xlog_defaults();
@@ -3221,6 +3320,7 @@ int DirectGate_RunAgent(int argc, char* argv[])
     DirectGate_RunService(&api, &endpt, &conn);
 
     DirectGate_SessionMgr_Destroy(&conn.mgr);
+    DirectGate_ReapPending_Term();
     DirectGate_WebRTC_Cleanup();
     XAPI_Destroy(&api);
     XLog_Destroy();

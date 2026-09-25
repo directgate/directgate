@@ -96,6 +96,16 @@ xbool_t DirectGate_WebRTC_IsConnected(const directgate_webrtc_t *pRTC)
     return pRTC != NULL ? pRTC->bConnected : XFALSE;
 }
 
+void DirectGate_Files_ReleaseOp(directgate_session_t *pSession)
+{
+    (void)pSession;
+}
+
+void DirectGate_WebRTC_NoteSendFailure(directgate_webrtc_t *pRTC)
+{
+    if (pRTC != NULL) pRTC->bConnected = XFALSE;
+}
+
 XSTATUS DirectGate_WebRTC_Send(directgate_webrtc_t *pRTC, const uint8_t *pData, size_t nLen)
 {
     (void)pRTC;

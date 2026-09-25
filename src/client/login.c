@@ -95,6 +95,7 @@ xbool_t DirectGate_Account_Load(directgate_account_t *pAccount, const char *pPat
     if (!XJSON_Parse(&json, NULL, (const char*)buffer.pData, buffer.nUsed))
     {
         xlogw("Account file is not valid JSON, ignoring it: %s", pPath);
+        OPENSSL_cleanse(buffer.pData, buffer.nUsed);
         XByteBuffer_Clear(&buffer);
         XJSON_Destroy(&json);
         return XFALSE;
@@ -114,6 +115,8 @@ xbool_t DirectGate_Account_Load(directgate_account_t *pAccount, const char *pPat
     xjson_obj_t *pExpires = XJSON_GetObject(pRoot, "expiresAt");
     if (pExpires != NULL) pAccount->nExpiresAt = XJSON_GetU64(pExpires);
 
+    /* The file holds the account's tokens; don't leave them in freed heap */
+    OPENSSL_cleanse(buffer.pData, buffer.nUsed);
     XByteBuffer_Clear(&buffer);
     XJSON_Destroy(&json);
 
@@ -330,6 +333,25 @@ static xbool_t DirectGate_Login_Header(const char *pRequest, const char *pName, 
     return XFALSE;
 }
 
+/* The code is spliced into the JSON body of the token request as is, and it arrives from whatever posts to the
+ * loopback port or gets pasted. No authorization code needs a quote, a backslash or a control byte, and any of them
+ * would let that input reach past the string it is meant to fill. */
+static xbool_t DirectGate_Login_CodeIsPlain(const char *pCode)
+{
+    XCHECK_NL((xstrused(pCode)), XFALSE);
+
+    for (const unsigned char *pIt = (const unsigned char*)pCode; *pIt != XSTR_NUL; pIt++)
+    {
+        if (*pIt < 0x20 || *pIt == 0x7F || *pIt == '"' || *pIt == '\\')
+        {
+            xloge("Sign-in code carries characters no authorization code has, refusing it");
+            return XFALSE;
+        }
+    }
+
+    return XTRUE;
+}
+
 /* The state the CLI generated must match the one that comes back. A callback without any state is left alone: the
  * hosted page does not echo it yet, and refusing those would break every sign-in before the page catches up. */
 static xbool_t DirectGate_Login_StateOk(const directgate_login_guard_t *pGuard, const char *pGot)
@@ -374,7 +396,7 @@ xbool_t DirectGate_Login_ParseRequest(const char *pRequest, const directgate_log
         {
             char sState[DIRECTGATE_PKCE_VERIFIER_SIZE];
             if (!DirectGate_Login_QueryValue(sQuery, "state", sState, sizeof(sState))) sState[0] = XSTR_NUL;
-            if (DirectGate_Login_StateOk(pGuard, sState)) return XTRUE;
+            if (DirectGate_Login_StateOk(pGuard, sState) && DirectGate_Login_CodeIsPlain(pCode)) return XTRUE;
 
             pCode[0] = XSTR_NUL;
             return XFALSE;
@@ -418,6 +440,12 @@ xbool_t DirectGate_Login_ParseRequest(const char *pRequest, const directgate_log
     xbool_t bFound = xstrused(pValue) ? XTRUE : XFALSE;
 
     if (bFound && !DirectGate_Login_StateOk(pGuard, XJSON_GetString(XJSON_GetObject(json.pRootObj, "state"))))
+    {
+        XJSON_Destroy(&json);
+        return XFALSE;
+    }
+
+    if (bFound && !DirectGate_Login_CodeIsPlain(pValue))
     {
         XJSON_Destroy(&json);
         return XFALSE;
@@ -671,7 +699,7 @@ static xbool_t DirectGate_Login_ReadPaste(char *pCode, size_t nCodeSize)
 
     xstrncpy(pCode, nCodeSize, pTrimmed);
     DirectGate_TrimStringRight(pCode);
-    return xstrused(pCode) ? XTRUE : XFALSE;
+    return DirectGate_Login_CodeIsPlain(pCode);
 }
 
 static xbool_t DirectGate_Login_Await(xsock_t *pListener, const directgate_login_guard_t *pGuard,
@@ -726,7 +754,9 @@ static xbool_t DirectGate_Login_Await(xsock_t *pListener, const directgate_login
 
         if (xstrused(sError))
         {
-            xloge("Sign-in was rejected by the provider: %s", sError);
+            char sShown[XSTR_TINY];
+            DirectGate_CopyDisplaySafe(sShown, sizeof(sShown), sError);
+            xloge("Sign-in was rejected by the provider: %s", sShown);
             return XFALSE;
         }
     }

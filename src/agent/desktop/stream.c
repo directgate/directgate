@@ -74,7 +74,8 @@ static void DirectGate_Desktop_AdaptBitrate(directgate_session_t *pSession)
     uint8_t nFractionLost = 0;
     xbool_t bHaveReport = DirectGate_WebRTC_TakeVideoLossReport(&pSession->webrtc, &nFractionLost);
     xbool_t bBackpressure = (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_H264_DC &&
-        DirectGate_Desktop_ShouldSkipForBackpressure(pSession)) ? XTRUE : XFALSE;
+        (DirectGate_Desktop_ShouldSkipForBackpressure(pSession) ||
+         DirectGate_Desktop_RelayIsBacklogged(pSession))) ? XTRUE : XFALSE;
 
     uint32_t nNext = DirectGate_Desktop_AbrStep(pDesktop, bHaveReport, nFractionLost, bBackpressure);
     if (!nNext || nNext == nCurrent) return;
@@ -412,7 +413,8 @@ static int DirectGate_Desktop_CaptureFrame(directgate_session_t *pSession)
      * arrive seconds-to-minutes behind live. Skipping the whole capture (no
      * XGetImage, no send) lets the channel drain and keeps the stream live at
      * an adaptive frame rate. */
-    if (DirectGate_Desktop_ShouldSkipForBackpressure(pSession)) return XAPI_CONTINUE;
+    if (DirectGate_Desktop_ShouldSkipForBackpressure(pSession) ||
+        DirectGate_Desktop_RelayIsBacklogged(pSession)) return XAPI_CONTINUE;
 
     int nScreen = DefaultScreen(pDisplay);
     Window root = RootWindow(pDisplay, nScreen);
@@ -894,6 +896,11 @@ static int DirectGate_Desktop_CaptureFrameRaw(directgate_session_t *pSession)
     directgate_desktop_t *pDesktop = &pSession->desktop;
     XCHECK_NL((pDesktop->bCaptureReady), XAPI_CONTINUE);
 
+    /* Transport backpressure (see the Linux raw path for the rationale). */
+    if (DirectGate_Desktop_ShouldSkipForBackpressure(pSession) ||
+        DirectGate_Desktop_RelayIsBacklogged(pSession))
+        return XAPI_CONTINUE;
+
     /* The Objective-C bridge uses ScreenCaptureKit on current macOS releases.
      * Keep the raw fallback here because it is also useful when H.264 setup
      * fails, but do not reference CoreGraphics' obsoleted capture API. */
@@ -1339,7 +1346,8 @@ static int DirectGate_Desktop_CaptureFrameRaw(directgate_session_t *pSession)
     XCHECK_NL((pDesktop->bCaptureReady), XAPI_CONTINUE);
 
     /* Transport backpressure (see the Linux raw path for the rationale). */
-    if (DirectGate_Desktop_ShouldSkipForBackpressure(pSession))
+    if (DirectGate_Desktop_ShouldSkipForBackpressure(pSession) ||
+        DirectGate_Desktop_RelayIsBacklogged(pSession))
         return XAPI_CONTINUE;
 
     uint32_t nFrameWidth = pDesktop->nFrameWidth ? pDesktop->nFrameWidth : 1U;

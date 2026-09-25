@@ -119,6 +119,8 @@ The `verify` protocol is connection-level authorization traffic exchanged direct
 
 These operational messages do not contain terminal output, file contents, session encryption keys, or other end-to-end session data. A compromised relay may forge, drop, or modify them, but their effects are limited to authorization failure, incorrect status reporting, or denial of service. A compromised relay already has the ability to delay packets or terminate connections.
 
+Both ends hold the relay to exactly that. Before authentication the relay is the only party that can speak, so `dgcli` accepts only the handshake's own messages from it - `auth`, the relay's `cmd` start, `status`, `error` and `keepalive` - and treats anything else (terminal data, a file transfer, WebRTC signaling, an `admin` verdict) as a protocol violation instead of writing it to the terminal or the working directory. After authentication every message from the host must be encrypted; only the relay's own `error` and `status` notices may still arrive in the clear. Text that reaches the screen from the relay or from another account - error reasons, the names and owners of shared devices - is shown with control characters replaced, so it cannot act as terminal escape sequences.
+
 ## Operational checklist
 
 - **TLS encryption** - all WebSocket connections use WSS

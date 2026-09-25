@@ -1,6 +1,7 @@
 /* Browser wheel JSON must reach the Wayland portal in native axis units,
  * including subpixel samples. No desktop session is needed for this test. */
 #include <math.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -64,9 +65,12 @@ int32_t DirectGate_WL_PortalButtonCode(uint32_t nButton)
     return 0;
 }
 
+static unsigned int g_nKeysymCalls;
+
 int DirectGate_WL_PortalKeysym(directgate_wl_portal_t *pPortal, int32_t nKeysym, xbool_t bPressed)
 {
     (void)pPortal; (void)nKeysym; (void)bPressed;
+    g_nKeysymCalls++;
     return XSTDOK;
 }
 
@@ -114,6 +118,28 @@ static int CheckWheel(directgate_session_t *pSession, const char *pDeltas, unsig
     return 0;
 }
 
+/* A text action types one key press and release per character, all on the event loop. The browser sends one
+ * character per action; anything past the cap is dropped whole rather than typed for seconds. */
+static int CheckText(directgate_session_t *pSession, size_t nChars, unsigned int nExpectCalls)
+{
+    char *pPayload = (char*)malloc(nChars + 64);
+    if (pPayload == NULL) return 1;
+
+    int nLength = snprintf(pPayload, 64, "{\"action\":\"text\",\"text\":\"");
+    memset(pPayload + nLength, 'a', nChars);
+    nLength += (int)nChars;
+    nLength += snprintf(pPayload + nLength, 64, "\"}");
+
+    g_nKeysymCalls = 0;
+    DirectGate_Desktop_HandleInput(pSession, (const uint8_t*)pPayload, (size_t)nLength);
+    free(pPayload);
+
+    if (g_nKeysymCalls == nExpectCalls) return 0;
+    fprintf(stderr, "wayland_input_smoke: text of %zu chars made %u key calls, expected %u\n",
+        nChars, g_nKeysymCalls, nExpectCalls);
+    return 1;
+}
+
 int main(void)
 {
     static directgate_session_t session;
@@ -143,6 +169,11 @@ int main(void)
         nFailures += CheckWheel(&session, "\"deltaY\":\"100\",\"deltaX\":true", 1, nRelative, 0, 0);
         nFailures += CheckWheel(&session, "\"deltaY\":null,\"deltaX\":{}", 1, nRelative, 0, 0);
     }
+
+    nFailures += CheckText(&session, 2, 4);
+    nFailures += CheckText(&session, DIRECTGATE_DESKTOP_MAX_TEXT_BYTES, DIRECTGATE_DESKTOP_MAX_TEXT_BYTES * 2);
+    nFailures += CheckText(&session, DIRECTGATE_DESKTOP_MAX_TEXT_BYTES + 1, 0);
+    nFailures += CheckText(&session, 1024 * 1024, 0);
 
     if (nFailures != 0) return 1;
     puts("wayland_input_smoke: OK");

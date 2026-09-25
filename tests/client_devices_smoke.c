@@ -139,6 +139,24 @@ static int test_account_list(void)
         "ambiguous prefix is refused");
     CHECK(DirectGate_Devices_Find(&list, "web-two") == 1, "exact name beats prefix");
 
+    /* A shared device's name and owner are another account's words. The API's JSON escapes C0 controls, but not
+       U+0080..U+009F: C1 CSI and OSC arrive as raw UTF-8 and some terminals act on them. */
+    const char *pHostile =
+        "{\"devices\":["
+          "{\"id\":\"id-evil\",\"name\":\"evil\xc2\x9b" "2Jname \xc4\x85\",\"status\":\"PAIRED\","
+           "\"enrollmentStatus\":\"ACTIVE\",\"requiresPairing\":false,\"isOwner\":false,"
+           "\"ownerEmail\":\"o\xc2\x9d" "52;c;eA==\xc2\x9c@example.test\"}"
+        "]}";
+
+    CHECK(XJSON_Parse(&json, NULL, pHostile, strlen(pHostile)), "parse hostile body");
+    CHECK(DirectGate_Devices_ParseList(&list, json.pRootObj), "map hostile list");
+    XJSON_Destroy(&json);
+
+    CHECK(list.nCount == 1 && strcmp(list.devices[0].sName, "evil?2Jname \xc4\x85") == 0,
+        "C1 controls in a device name never reach the terminal, real UTF-8 does");
+    CHECK(strcmp(list.devices[0].sOwner, "o?52;c;eA==?@example.test") == 0,
+        "C1 controls in an owner email never reach the terminal");
+
     const char *pEmpty = "{\"devices\":[]}";
     CHECK(XJSON_Parse(&json, NULL, pEmpty, strlen(pEmpty)), "parse empty body");
     CHECK(DirectGate_Devices_ParseList(&list, json.pRootObj), "map empty list");

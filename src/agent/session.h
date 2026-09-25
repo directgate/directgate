@@ -64,10 +64,12 @@ typedef struct directgate_session_ {
     directgate_session_mode_t eRequestedMode;
     directgate_session_mode_t eActiveMode;
     struct directgate_session_mgr_ *pMgr;
+    struct directgate_fileop_ *pFileOp;
     const directgate_cfg_t *pCfg;
     xapi_session_t *pPipeSession;
     xapi_session_t *pSearchSession;
     xapi_session_t *pDesktopSession;
+    xapi_session_t *pFileOpSession;
     xapi_session_t *pWsSession;
     directgate_transfer_t transfer;
     directgate_search_t search;
@@ -151,6 +153,11 @@ const char* DirectGate_SessionMode_ToString(directgate_session_mode_t eMode);
 void DirectGate_Session_SetPreLogon(xbool_t bPreLogon);
 xbool_t DirectGate_Session_IsPreLogon(void);
 
+/*!
+ * @brief Gate a handler on the session being authenticated and in @p eMode.
+ * @return XSTDOK to proceed. Anything else is a refusal the caller must return on without touching @p pSession
+ *         again: an unauthenticated session has already been closed and freed by the time this returns.
+ */
 int DirectGate_Session_EnsureMode(directgate_session_t *pSession, directgate_session_mode_t eMode, const char *pReason);
 int DirectGate_Session_StartMode(directgate_session_t *pSession, directgate_session_mode_t eMode);
 int DirectGate_Session_StartTerminal(directgate_session_t *pSession);

@@ -140,6 +140,36 @@ int main(void)
     CHECK(!DirectGate_IsAPIEndpointAllowed("https://"),
         "API endpoint without host must be rejected");
 
+    /* dgcli used to dial whatever the envelope or its flags named, and send the relay access token over ws:// */
+    CHECK(DirectGate_IsRelayEndpointAllowed("wss://relay.example.test/websock"), "WSS relay should be allowed");
+#ifdef DIRECTGATE_DEBUG
+    CHECK(DirectGate_IsRelayEndpointAllowed("ws://127.0.0.1:6969/websock"), "WS relay should be allowed in debug mode");
+#else
+    CHECK(!DirectGate_IsRelayEndpointAllowed("ws://127.0.0.1:6969/websock"), "WS relay must be rejected in production");
+#endif
+    CHECK(!DirectGate_IsRelayEndpointAllowed("https://relay.example.test/websock"), "non-WebSocket relay must be rejected");
+    CHECK(!DirectGate_IsRelayEndpointAllowed("wss://"), "relay without host must be rejected");
+    CHECK(!DirectGate_IsRelayEndpointAllowed(NULL), "missing relay must be rejected");
+
+    /* Peer and other-account text shown on a terminal: controls become '?', real UTF-8 survives - including
+       characters whose continuation bytes fall in the C1 range, like U+0105 (C4 85). */
+    {
+        char sShown[64];
+        CHECK(DirectGate_CopyDisplaySafe(sShown, sizeof(sShown), "lab-01") == 6 && strcmp(sShown, "lab-01") == 0,
+            "plain text is copied unchanged");
+        DirectGate_CopyDisplaySafe(sShown, sizeof(sShown), "a\x1b]52;c;eA==\x07" "b");
+        CHECK(strcmp(sShown, "a?]52;c;eA==?b") == 0, "ESC and BEL are neutralised");
+        DirectGate_CopyDisplaySafe(sShown, sizeof(sShown), "x\x9b" "2Jy");
+        CHECK(strcmp(sShown, "x?2Jy") == 0, "raw 8-bit CSI is neutralised");
+        DirectGate_CopyDisplaySafe(sShown, sizeof(sShown), "x\xc2\x9b" "2Jy");
+        CHECK(strcmp(sShown, "x?2Jy") == 0, "UTF-8 encoded CSI is neutralised");
+        DirectGate_CopyDisplaySafe(sShown, sizeof(sShown), "\xc4\x85\xe1\x83\x90\xf0\x9f\x98\x80\x7f");
+        CHECK(strcmp(sShown, "\xc4\x85\xe1\x83\x90\xf0\x9f\x98\x80?") == 0, "UTF-8 text survives, DEL does not");
+        DirectGate_CopyDisplaySafe(sShown, 4, "abcdef");
+        CHECK(strcmp(sShown, "abc") == 0, "output is bounded and terminated");
+        CHECK(DirectGate_CopyDisplaySafe(sShown, sizeof(sShown), NULL) == 0 && sShown[0] == '\0', "NULL gives empty");
+    }
+
     char sTrim[] = "abc \t\r\n";
     DirectGate_TrimStringRight(sTrim);
     CHECK(strcmp(sTrim, "abc") == 0, "right trim");

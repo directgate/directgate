@@ -83,6 +83,10 @@ extern "C" {
 #define DIRECTGATE_ELEV_MAX_WIDTH     3840U
 #define DIRECTGATE_ELEV_MAX_HEIGHT    2160U
 
+/* Size of the section header, page-aligned so the pixel slot that follows starts on a page boundary. Both sides use
+ * this constant rather than the nHeaderBytes copy in the section, which is only informational. */
+#define DIRECTGATE_ELEV_HEADER_BYTES  4096U
+
 /* Helper start-up budget, and how long a frame wait may block the capture
  * thread before it gives up and reuses the previous picture. */
 #define DIRECTGATE_ELEV_ATTACH_WAIT_MS 5000U

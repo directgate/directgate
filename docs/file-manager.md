@@ -20,7 +20,9 @@ The `manager` message type exposes filesystem operations to the client:
 | `delete` | Delete a file or directory                    |
 | `search` | File search - streamed and cancelable         |
 
-Search is more than name matching: it supports **recursive** traversal and **advanced filters** - file name, text/content inside files, file type, size range, permissions, and link count, with case-insensitive matching. Results stream back incrementally, and a long-running search can be canceled mid-run.
+Search is more than name matching: it supports **recursive** traversal and **advanced filters** - file name, text/content inside files, file type, size range, permissions, and link count, with case-insensitive matching. Results stream back incrementally, in batches, and a long-running search can be canceled mid-run.
+
+Search, copy and delete all run off the agent's event loop, so a search over a whole disk or a copy of a large tree never freezes the session that asked for it - or the terminals and desktops other clients have open on the same device. One copy or delete runs per session at a time, and recursion stops at 256 directory levels. A second copy or delete sent before the first has answered fails at once with `another file operation is in progress`; see the [protocol specification](protocol.md).
 
 Together with the [chunked file transfer](#chunked-file-transfer-file) below, these primitives deliver a full file-manager experience in the web and mobile clients:
 

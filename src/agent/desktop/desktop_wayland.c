@@ -41,6 +41,7 @@ struct directgate_wl_source_ {
 
     xthread_t setupThread;
     xbool_t bThreadStarted;
+    xvolatile_t nCancel;      /* raised by SourceDestroy so the join does not wait out a portal prompt */
 
     /* Newest frame, published by the PipeWire thread and consumed by the
      * encoder worker. One slot, not a queue: a frame that has been overtaken
@@ -304,7 +305,7 @@ static void* DirectGate_WL_SetupWorker(void *pCtx)
 
     xbool_t bDeclined = XFALSE;
     pSource->pPortal = DirectGate_WL_PortalOpen(bHaveToken ? sOldToken : NULL,
-        sNewToken, sizeof(sNewToken), &bDeclined, sError, sizeof(sError));
+        sNewToken, sizeof(sNewToken), &bDeclined, &pSource->nCancel, sError, sizeof(sError));
 
     /* A remembered grant that cannot be restored is worse than having none:
      * the portal answers the restore with no stream at all, and because the
@@ -313,14 +314,15 @@ static void* DirectGate_WL_SetupWorker(void *pCtx)
      * still there. The screens it was granted for are gone, so the grant is
      * dropped and the prompt is put back up for the screens there are now.
      * Not after a refusal, though: answering "no" must not summon another. */
-    if (pSource->pPortal == NULL && bHaveToken && !bDeclined)
+    if (pSource->pPortal == NULL && bHaveToken && !bDeclined && !XSYNC_ATOMIC_GET(&pSource->nCancel))
     {
         xlogw("The remembered desktop sharing permission no longer works, asking again: reason(%s)", sError);
         DirectGate_WL_TokenForget(pSource->sTokenPath);
 
         sError[0] = '\0';
         sNewToken[0] = '\0';
-        pSource->pPortal = DirectGate_WL_PortalOpen(NULL, sNewToken, sizeof(sNewToken), &bDeclined, sError, sizeof(sError));
+        pSource->pPortal = DirectGate_WL_PortalOpen(NULL, sNewToken, sizeof(sNewToken), &bDeclined,
+            &pSource->nCancel, sError, sizeof(sError));
     }
 
     if (pSource->pPortal == NULL)
@@ -346,6 +348,13 @@ static void* DirectGate_WL_SetupWorker(void *pCtx)
               "the stored one is dropped and the next connection will ask again");
 
         DirectGate_WL_TokenForget(pSource->sTokenPath);
+    }
+
+    /* Granted, but nobody is waiting for it any more: the stream and its format wait are skipped too */
+    if (XSYNC_ATOMIC_GET(&pSource->nCancel))
+    {
+        DirectGate_WL_SourcePublish(pSource, DIRECTGATE_WL_FAILED, "The screen sharing request was abandoned.");
+        return NULL;
     }
 
     int nFd = DirectGate_WL_PortalOpenPipeWire(pSource->pPortal, sError, sizeof(sError));
@@ -706,7 +715,10 @@ void DirectGate_WL_SourceDestroy(directgate_wl_source_t *pSource)
 
     /* The worker can be sitting in the portal's two-minute grant wait, so it
      * is joined rather than abandoned: it writes into this struct, and there
-     * is no safe way to free memory a live thread still owns. */
+     * is no safe way to free memory a live thread still owns. The cancel flag
+     * ends that wait at its next 100ms step - this runs on the event loop,
+     * and every other session on the agent waits for the join. */
+    XSYNC_ATOMIC_SET(&pSource->nCancel, 1);
     if (pSource->bThreadStarted) XThread_Join(&pSource->setupThread);
 
     /* An exported buffer still in the slot belongs to the stream below and

@@ -49,6 +49,8 @@ The connection degrades gracefully through three tiers, and the client always sh
 
 The terminal session stays fully functional on every tier, and traffic remains end-to-end encrypted regardless of which one is in use - so you always know whether the connection is direct, TURN-relayed, or on the WebSocket relay.
 
+On the WebSocket relay tier the desktop stream is paced by the relay socket itself: while more than 1 MB is still waiting to go out on it, the agent skips capture and drops encoded frames instead of queueing them, and asks the encoder for a keyframe so the picture recovers the moment the backlog clears. Without that, a slow relay link let the queue - and the viewer's latency - grow without bound, and delayed the terminal and input traffic sharing the socket. A send that fails while the data channel still reports itself open no longer marks WebRTC as down; only a channel that is actually closed moves the session to the relay.
+
 ## Desktop video track
 
 Desktop sessions reuse the same authenticated WebRTC connection but add a send-only H.264 **media track** (host -> browser) on top of the `directgate` DataChannel. Negotiation happens only after SRP/key-auth succeeds and the browser starts a `desktop` session. The browser offer carries:

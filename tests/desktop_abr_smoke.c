@@ -31,6 +31,13 @@ void DirectGate_Desktop_LinuxEncoder_StopDesktop(directgate_desktop_t *pDesktop)
 void DirectGate_Desktop_RestoreDisplayMode(directgate_desktop_t *pDesktop) { (void)pDesktop; }
 void DirectGate_Desktop_ReleaseHeldKeys(directgate_desktop_t *pDesktop) { (void)pDesktop; }
 
+static int g_nKeyframeRequests = 0;
+void DirectGate_Desktop_LinuxEncoder_RequestKeyframe(directgate_session_t *pSession)
+{
+    (void)pSession;
+    g_nKeyframeRequests++;
+}
+
 int DirectGate_Session_Send(directgate_session_t *pSession, xjson_obj_t *pHeader,
                             const uint8_t *pPayload, size_t nPayloadLength)
 {

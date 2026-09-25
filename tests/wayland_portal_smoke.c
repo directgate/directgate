@@ -82,6 +82,73 @@ static int CheckAxis(directgate_wl_portal_t *pPortal, double nDx, double nDy, xb
     return 0;
 }
 
+/* A bus with nothing to say: every read-write waits out its timeout, which is what an unanswered prompt is. */
+static dbus_bool_t IdleReadWrite(DBusConnection *pConn, int nTimeoutMs)
+{
+    (void)pConn;
+    xusleep((uint32_t)nTimeoutMs * 1000U);
+    return TRUE;
+}
+
+static DBusMessage* NoMessage(DBusConnection *pConn)
+{
+    (void)pConn;
+    return NULL;
+}
+
+static void* RaiseCancel(void *pArg)
+{
+    xusleep(150000);
+    XSYNC_ATOMIC_SET((xvolatile_t*)pArg, 1);
+    return NULL;
+}
+
+/* The grant wait runs on the setup worker, and tearing a session down joins that worker on the event loop. Without
+ * a way to end the wait, a viewer who left while the prompt was up froze every other session for two minutes. */
+static int CheckCancel(directgate_wl_portal_t *pPortal)
+{
+    g_dbus.readWrite = IdleReadWrite;
+    g_dbus.pop = NoMessage;
+
+    xvolatile_t nCancel = 0;
+    pPortal->pCancel = &nCancel;
+
+    DBusMessage *pMessage = NULL;
+    DBusMessageIter results;
+    char sError[256];
+
+    /* Not raised: a short wait simply times out, as before */
+    uint64_t nStartMs = XTime_GetMs();
+    CHECK(DirectGate_WL_WaitResponse(pPortal, "/req", 250, &pMessage, &results, sError, sizeof(sError)) == XSTDERR,
+        "unanswered wait fails");
+    CHECK(strstr(sError, "did not answer in time") != NULL, "unanswered wait reports a timeout");
+    CHECK(XTime_GetMs() - nStartMs >= 200, "unanswered wait lasts its timeout");
+
+    /* Raised before: no wait at all */
+    XSYNC_ATOMIC_SET(&nCancel, 1);
+    nStartMs = XTime_GetMs();
+    CHECK(DirectGate_WL_WaitResponse(pPortal, "/req", 120000, &pMessage, &results, sError, sizeof(sError)) == XSTDERR,
+        "cancelled wait fails");
+    CHECK(strstr(sError, "abandoned") != NULL, "cancelled wait says so");
+    CHECK(XTime_GetMs() - nStartMs < 1000, "cancelled wait returns at once");
+
+    /* Raised from another thread mid-wait: the two-minute grant ends at the next step */
+    XSYNC_ATOMIC_SET(&nCancel, 0);
+    xthread_t thread;
+    CHECK(XThread_Create(&thread, RaiseCancel, (void*)&nCancel, XFALSE) >= 0, "cancel thread");
+
+    nStartMs = XTime_GetMs();
+    int nStatus = DirectGate_WL_WaitResponse(pPortal, "/req", 120000, &pMessage, &results, sError, sizeof(sError));
+    uint64_t nElapsedMs = XTime_GetMs() - nStartMs;
+    XThread_Join(&thread);
+
+    CHECK(nStatus == XSTDERR && pMessage == NULL, "wait cancelled mid-way fails");
+    CHECK(nElapsedMs < 2000, "wait cancelled mid-way ends within a step or two");
+
+    pPortal->pCancel = NULL;
+    return 0;
+}
+
 int main(void)
 {
     /* Use libdbus's message implementation, with no connection to the bus. */
@@ -132,6 +199,7 @@ int main(void)
     DirectGate_WL_PortalInitScroll(&portal);
     CHECK(CheckAxis(&portal, 1, 2, XFALSE) == 0, "probe failure preserves standard direction");
     CHECK(DirectGate_WL_PortalPointerAxis(NULL, 1, 2) == XSTDERR, "null portal guard");
+    CHECK(CheckCancel(&portal) == 0, "grant wait cancellation");
     dbus_message_unref(g_pSent);
     puts("wayland_portal_smoke: OK");
     return 0;

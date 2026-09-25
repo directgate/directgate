@@ -1106,22 +1106,24 @@ xbool_t DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
         return XFALSE;
     }
 
+    /* XFALSE, not XSTDERR: this returns xbool_t, where -1 becomes 255 and reads as success, and the agent then
+       ran on without credentials or enrollment, retrying a connection that could never be made. */
     if (!DirectGate_PromptAuth(pCfg, XFALSE))
     {
         xloge("Failed to prepare SRP auth credentials: cfg(%s), dev(%s)", pCfg->sCfgPath, pCfg->sDeviceId);
-        return XSTDERR;
+        return XFALSE;
     }
 
     if (!DirectGate_AuthIsConfigured(&pCfg->auth))
     {
         xloge("SRP auth is not configured: cfg(%s), dev(%s)", pCfg->sCfgPath, pCfg->sDeviceId);
-        return XSTDERR;
+        return XFALSE;
     }
 
     if (!DirectGate_Enroll_IsEnrolled(pCfg))
     {
         xloge("Agent is not enrolled or routing data is missing: dev(%s), cfg(%s)", pCfg->sDeviceId, pCfg->sCfgPath);
-        return XSTDERR;
+        return XFALSE;
     }
 
     return XTRUE;

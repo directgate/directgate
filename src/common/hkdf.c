@@ -124,7 +124,10 @@ xbool_t DirectGate_HKDF_SHA256(const uint8_t *pSalt, size_t nSaltLen,
     uint8_t prk[XHKDF_SHA256_LEN];
 
     if (!DirectGate_HKDF_Extract(pSalt, nSaltLen, pIKM, nIKMLen, prk))
+    {
+        OPENSSL_cleanse(prk, sizeof(prk));
         return XFALSE;
+    }
 
     xbool_t bOk = DirectGate_HKDF_Expand(prk, sizeof(prk), pInfo, pOKM, nOKMLen);
     OPENSSL_cleanse(prk, sizeof(prk));

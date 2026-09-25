@@ -45,9 +45,6 @@
    logoff, short enough that a genuine crash loop still recovers promptly. */
 #define DIRECTGATE_WIN_LAUNCHER_SETTLE_MS  6000
 
-/* Page-aligned so the pixel slot that follows starts on a page boundary. */
-#define DIRECTGATE_WIN_ELEV_HEADER_BYTES   4096U
-
 /* Sanity bound on the capture rectangle an agent may ask a section for; the
    per-axis caps in elevated.h already keep the slot itself in check. */
 #define DIRECTGATE_WIN_ELEV_MAX_EDGE       16384U
@@ -552,7 +549,7 @@ static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid
     uint32_t nSlotWidth = (nCaptureWidth < DIRECTGATE_ELEV_MAX_WIDTH) ? nCaptureWidth : DIRECTGATE_ELEV_MAX_WIDTH;
     uint32_t nSlotHeight = (nCaptureHeight < DIRECTGATE_ELEV_MAX_HEIGHT) ? nCaptureHeight : DIRECTGATE_ELEV_MAX_HEIGHT;
     uint64_t nSlotBytes = (uint64_t)nSlotWidth * nSlotHeight * 4ULL;
-    uint64_t nTotalBytes = DIRECTGATE_WIN_ELEV_HEADER_BYTES + nSlotBytes;
+    uint64_t nTotalBytes = DIRECTGATE_ELEV_HEADER_BYTES + nSlotBytes;
 
     SECURITY_ATTRIBUTES sa;
     memset(&sa, 0, sizeof(sa));
@@ -596,7 +593,7 @@ static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid
 
         memset(pShm, 0, sizeof(*pShm));
         pShm->nMagic = DIRECTGATE_ELEV_SHM_MAGIC;
-        pShm->nHeaderBytes = DIRECTGATE_WIN_ELEV_HEADER_BYTES;
+        pShm->nHeaderBytes = DIRECTGATE_ELEV_HEADER_BYTES;
         pShm->nSlotBytes = (uint32_t)nSlotBytes;
         pShm->nMaxWidth = nSlotWidth;
         pShm->nMaxHeight = nSlotHeight;
@@ -632,12 +629,13 @@ static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid
            on the command line is enough; the values mean nothing anywhere else. */
         char sCmd[XPATH_MAX * 2 + 512];
         xstrncpyf(sCmd, sizeof(sCmd),
-            "\"%s\" %s --cmd %llu --shm %llu --shm-bytes %llu --ready %llu --taken %llu "
-            "--agent %llu --agent-pid %lu --allow-lock %d --log-flags %u --log-file %d",
+            "\"%s\" %s --cmd %llu --shm %llu --shm-bytes %llu --slot-width %u --slot-height %u --ready %llu "
+            "--taken %llu --agent %llu --agent-pid %lu --allow-lock %d --log-flags %u --log-file %d",
             sSelf, DIRECTGATE_ELEV_HELPER_FLAG,
             (unsigned long long)(uintptr_t)hCmdRead,
             (unsigned long long)(uintptr_t)hSection,
             (unsigned long long)nTotalBytes,
+            nSlotWidth, nSlotHeight,
             (unsigned long long)(uintptr_t)hReady,
             (unsigned long long)(uintptr_t)hTaken,
             (unsigned long long)(uintptr_t)hAgentInherit,
@@ -677,13 +675,16 @@ static XSTATUS DirectGate_WinLauncher_SpawnHelper(HANDLE hAgent, DWORD nAgentPid
         CloseHandle(pi.hThread);
         g_hElevHelper = pi.hProcess;
 
-        /* Hand the agent its ends. DUPLICATE_SAME_ACCESS from these full-access
-           handles is what grants the agent use of objects whose DACL would
-           otherwise keep it out - the handle, not the DACL, is the grant. */
+        /* Hand the agent its ends. Duplicating these handles is what grants the
+           agent use of objects whose DACL would otherwise keep it out - the
+           handle, not the DACL, is the grant. The section goes over read-only:
+           it is where a SYSTEM process writes pixels, and a writable view in the
+           user's process - or in any process of that user that duplicates the
+           handle out of it - could rewrite what the helper reads there. */
         HANDLE hAgentCmd = NULL, hAgentSection = NULL, hAgentReady = NULL, hAgentTaken = NULL;
 
         if (!DuplicateHandle(GetCurrentProcess(), hCmdWrite, hAgent, &hAgentCmd, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
-            !DuplicateHandle(GetCurrentProcess(), hSection, hAgent, &hAgentSection, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
+            !DuplicateHandle(GetCurrentProcess(), hSection, hAgent, &hAgentSection, FILE_MAP_READ, FALSE, 0) ||
             !DuplicateHandle(GetCurrentProcess(), hReady, hAgent, &hAgentReady, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
             !DuplicateHandle(GetCurrentProcess(), hTaken, hAgent, &hAgentTaken, 0, FALSE, DUPLICATE_SAME_ACCESS))
         {

@@ -287,6 +287,38 @@ int main(void)
             "unknown type is not sendable");
     }
 
+    /*
+     * What a client takes in the clear. dgcli used to gate only data, file, manager, resize, webrtc and admin, and
+     * only once authenticated and only when the header carried a session id - so before auth the relay could write
+     * to the terminal, drop a file into the working directory or answer add-key with "ok", and after auth a sid of
+     * 0 got the same through, as did an unencrypted auth that restarts the handshake.
+     */
+    {
+        struct { directgate_pkg_type_t eType; xbool_t bPreAuth; xbool_t bPostAuth; const char *pName; } cases[] = {
+            { DIRECTGATE_PKG_ERROR, XTRUE, XTRUE, "error" },
+            { DIRECTGATE_PKG_STATUS, XTRUE, XTRUE, "status" },
+            { DIRECTGATE_PKG_AUTH, XTRUE, XFALSE, "auth" },
+            { DIRECTGATE_PKG_CMD, XTRUE, XFALSE, "cmd" },
+            { DIRECTGATE_PKG_KEEPALIVE, XTRUE, XFALSE, "keepalive" },
+            { DIRECTGATE_PKG_DATA, XFALSE, XFALSE, "data" },
+            { DIRECTGATE_PKG_FILE, XFALSE, XFALSE, "file" },
+            { DIRECTGATE_PKG_WEBRTC, XFALSE, XFALSE, "webrtc" },
+            { DIRECTGATE_PKG_ADMIN, XFALSE, XFALSE, "admin" },
+            { DIRECTGATE_PKG_MANAGER, XFALSE, XFALSE, "manager" },
+            { DIRECTGATE_PKG_RESIZE, XFALSE, XFALSE, "resize" },
+            { DIRECTGATE_PKG_ROLE, XFALSE, XFALSE, "role" },
+            { DIRECTGATE_PKG_VERIFY, XFALSE, XFALSE, "verify" },
+            { DIRECTGATE_PKG_NONE, XFALSE, XFALSE, "none" },
+        };
+
+        size_t nCases = sizeof(cases) / sizeof(cases[0]);
+        for (size_t i = 0; i < nCases; i++)
+        {
+            CHECK(DirectGate_Proto_ClientAcceptsPlain(cases[i].eType, XFALSE) == cases[i].bPreAuth, cases[i].pName);
+            CHECK(DirectGate_Proto_ClientAcceptsPlain(cases[i].eType, XTRUE) == cases[i].bPostAuth, cases[i].pName);
+        }
+    }
+
     /* ---- malformed wire: must be rejected, never crash ---- */
 
     /* Keep one valid packet around to mutate */

@@ -114,6 +114,11 @@ typedef struct directgate_cfg_ {
     xbool_t bAllowTCP;
     xbool_t bHelp;
     xbool_t bInit;
+
+    /* Runtime only, never persisted: refreshed tokens that are live in memory but
+     * could not be written out yet. The event loop keeps retrying the save,
+     * because a rotated refresh token lost at the next restart revokes the device. */
+    xbool_t bSavePending;
 } directgate_cfg_t;
 
 void DirectGate_DisplayUsage(const char *pName);

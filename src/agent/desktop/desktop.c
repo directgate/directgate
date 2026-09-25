@@ -46,6 +46,12 @@
  * without letting the fallback path accumulate a second of latency. */
 #define DIRECTGATE_DESKTOP_ENCODED_BUFFER_LIMIT (256U * 1024U)
 
+/* The same for a stream that fell back to the relay WebSocket, which every
+ * session on the device shares. Nothing bounded that queue before: a relay
+ * slower than the encoder collected frames without limit, and the raw RGBA
+ * fallback adds several megabytes per tick. */
+#define DIRECTGATE_DESKTOP_RELAY_BUFFER_LIMIT   (1024U * 1024U)
+
 /* Adaptive bitrate bounds: never throttle below this floor, and step back up
  * toward the preset target when the link stays clean. */
 #define DIRECTGATE_DESKTOP_MIN_BITRATE_KBPS     1000U
@@ -158,6 +164,26 @@ void DirectGate_Desktop_ApplyPreset(directgate_desktop_t *pDesktop, directgate_d
     pDesktop->bRequestKeyframe = XTRUE;
 }
 
+xbool_t DirectGate_Desktop_RelayIsBacklogged(const directgate_session_t *pSession)
+{
+    XCHECK_NL((pSession != NULL && pSession->pWsSession != NULL), XFALSE);
+    if (DirectGate_WebRTC_IsConnected(&pSession->webrtc)) return XFALSE;
+    return (pSession->pWsSession->txBuffer.nUsed > DIRECTGATE_DESKTOP_RELAY_BUFFER_LIMIT) ? XTRUE : XFALSE;
+}
+
+static void DirectGate_Desktop_RequestEncoderKeyframe(directgate_session_t *pSession)
+{
+#if defined(__linux__)
+    DirectGate_Desktop_LinuxEncoder_RequestKeyframe(pSession);
+#elif defined(__APPLE__)
+    DirectGate_Desktop_MacEncoder_RequestKeyframe(pSession);
+#elif defined(_WIN32)
+    DirectGate_Desktop_WinEncoder_RequestKeyframe(pSession);
+#else
+    (void)pSession;
+#endif
+}
+
 int DirectGate_Desktop_SendEncodedFrame(directgate_session_t *pSession,
                                         const uint8_t *pPayload,
                                         size_t nPayloadLength,
@@ -189,6 +215,15 @@ int DirectGate_Desktop_SendEncodedFrame(directgate_session_t *pSession,
             "WebRTC video track send failed; using encrypted H.264 data channel." :
             "WebRTC video track is reconnecting; using encrypted H.264 data channel.");
         DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
+    }
+
+    /* Behind on the relay: drop this frame rather than queue it, and restart the
+     * picture from a keyframe once the link has caught up, since everything
+     * after a dropped frame references it. */
+    if (DirectGate_Desktop_RelayIsBacklogged(pSession))
+    {
+        DirectGate_Desktop_RequestEncoderKeyframe(pSession);
+        return XAPI_CONTINUE;
     }
 
     uint64_t nFrameId = ++pDesktop->nFrameId;
@@ -732,16 +767,14 @@ void DirectGate_Desktop_Clear(directgate_desktop_t *pDesktop)
     xstrncpy(pDesktop->sResolution, sizeof(pDesktop->sResolution), "original");
 }
 
+/* The event loop owns the read end it was registered with and closes it
+ * with the endpoint, on every backend: epoll and poll alike end in
+ * XSock_Close(). Clear still stops the timer thread and closes the write
+ * end on macOS and Windows; closing this one a second time could hit a
+ * descriptor another thread opened in the meantime. */
 void DirectGate_Desktop_DetachEvent(directgate_desktop_t *pDesktop)
 {
     XCHECK_VOID_NL((pDesktop != NULL));
-
-    #if defined(__APPLE__) || defined(_WIN32)
-    /* poll-backed events do not own the pipe fd; Clear stops the timer thread
-     * and closes both pipe ends after the session is torn down. */
-    return;
-#endif
-
     pDesktop->nTimerFd = XSOCK_INVALID;
 }
 

@@ -223,6 +223,12 @@ directgate_smoke(client_login_smoke   ${CLIENT_DIR}/login.c ${CLIENT_DIR}/webapi
 directgate_smoke(client_relay_smoke   ${CLIENT_DIR}/relay.c ${CLIENT_DIR}/webapi.c)
 directgate_smoke(client_webapi_smoke  ${CLIENT_DIR}/webapi.c)
 
+# Compiles client.c itself (its main renamed away) to drive the static terminal I/O and inbound message gate.
+if(NOT WIN32)
+    directgate_smoke(client_io_smoke ${CLIENT_DIR}/config.c ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/login.c
+        ${CLIENT_DIR}/relay.c ${CLIENT_DIR}/webapi.c)
+endif()
+
 # The client sources include their neighbour headers by bare name
 foreach(test
         client_devices_smoke
@@ -288,6 +294,26 @@ directgate_smoke_desktop(connection_lifecycle_smoke)
 target_compile_definitions(connection_lifecycle_smoke PRIVATE DIRECTGATE_TESTING)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(connection_lifecycle_smoke PRIVATE -Wno-unused-function)
+endif()
+
+# Messages that end a session inside their own handler; needs the whole
+# dispatch layer, and one case runs a real shell behind a PTY endpoint.
+directgate_smoke(session_lifetime_smoke
+    ${AGENT_DIR}/config.c
+    ${AGENT_DIR}/desktop/desktop.c
+    ${AGENT_DIR}/desktop/display.c
+    ${AGENT_DIR}/desktop/input.c
+    ${AGENT_DIR}/desktop/stream.c
+    ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/files.c
+    ${AGENT_DIR}/search.c
+    ${AGENT_DIR}/session.c
+    ${AGENT_DIR}/term.c
+    ${AGENT_DIR}/directgate.c)
+directgate_smoke_desktop(session_lifetime_smoke)
+target_compile_definitions(session_lifetime_smoke PRIVATE DIRECTGATE_TESTING)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(session_lifetime_smoke PRIVATE -Wno-unused-function)
 endif()
 
 # Optional coverage-guided parser fuzzing. Recompile only the parser units
