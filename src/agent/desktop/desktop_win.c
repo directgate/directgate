@@ -82,6 +82,14 @@ typedef struct directgate_winenc_ {
     directgate_session_t *pSession;   /* backpressure checks only (thread-safe) */
     directgate_desktop_t *pDesktop;
 
+    /* The capture thread's own copies of session state. A wedged driver call can outlast the 10s join in
+     * DirectGate_Desktop_WinEnc_Free, after which the session is freed while this thread still runs, so what it
+     * reads once it returns - the encoder settings a stall recreates the MFT with, the id it logs - has to live
+     * here. pendingQuality is written by the main thread under mailboxLock and copied over on bApplyQuality. */
+    uint32_t nSessionId;
+    directgate_desktop_quality_t quality;
+    directgate_desktop_quality_t pendingQuality;
+
     int32_t nCaptureX;
     int32_t nCaptureY;
     uint32_t nCaptureWidth;
@@ -664,6 +672,9 @@ static int DirectGate_Desktop_WinEnc_CaptureBridged(directgate_winenc_t *pEnc)
 
 static void DirectGate_Desktop_WinEnc_WakeMainLoop(directgate_winenc_t *pEnc)
 {
+    /* Stopped means the main loop may already have given up on this thread and freed the session */
+    if (!InterlockedCompareExchange(&pEnc->bRunning, 0, 0)) return;
+
     XSOCKET nWriteFd = pEnc->pDesktop->nTimerWriteFd;
     if (nWriteFd == XSOCK_INVALID) return;
 
@@ -713,7 +724,7 @@ static int DirectGate_Desktop_WinEnc_SwapEncoder(directgate_winenc_t *pEnc)
     pEnc->pEncoder = NULL;
 
     pEnc->pEncoder = DirectGate_MFEnc_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
-        &pEnc->pDesktop->quality, &pEnc->encoderRejects, pEnc->pDevice, sError, sizeof(sError));
+        &pEnc->quality, &pEnc->encoderRejects, pEnc->pDevice, sError, sizeof(sError));
 
     if (pEnc->pEncoder == NULL)
     {
@@ -805,7 +816,7 @@ static int DirectGate_Desktop_WinEnc_InitPipeline(directgate_winenc_t *pEnc)
     memset(&pEnc->encoderRejects, 0, sizeof(pEnc->encoderRejects));
 
     pEnc->pEncoder = DirectGate_MFEnc_Create(pEnc->nEncodeWidth, pEnc->nEncodeHeight,
-        &pEnc->pDesktop->quality, &pEnc->encoderRejects, pEnc->pDevice, sError, sizeof(sError));
+        &pEnc->quality, &pEnc->encoderRejects, pEnc->pDevice, sError, sizeof(sError));
     if (pEnc->pEncoder == NULL)
     {
         DirectGate_Desktop_WinEnc_SetError(pEnc, sError[0] ? sError : "Media Foundation H.264 encoder initialization failed.");
@@ -869,7 +880,7 @@ static int DirectGate_Desktop_WinEnc_InitPipeline(directgate_winenc_t *pEnc)
         pEnc->bNoLocalCapture = XTRUE;
 
         xlogn("Local screen capture is unavailable, starting on the elevated helper: sid(%u), encode(%ux%u)",
-              pEnc->pDesktop->nSessionId, pEnc->nEncodeWidth, pEnc->nEncodeHeight);
+              pEnc->nSessionId, pEnc->nEncodeWidth, pEnc->nEncodeHeight);
     }
 
     return XSTDOK;
@@ -882,7 +893,11 @@ static void DirectGate_Desktop_WinEnc_ApplyPendingControls(directgate_winenc_t *
 
     if (InterlockedExchange(&pEnc->bApplyQuality, 0))
     {
-        DirectGate_MFEnc_ApplyQuality(pEnc->pEncoder, &pEnc->pDesktop->quality);
+        AcquireSRWLockExclusive(&pEnc->mailboxLock);
+        pEnc->quality = pEnc->pendingQuality;
+        ReleaseSRWLockExclusive(&pEnc->mailboxLock);
+
+        DirectGate_MFEnc_ApplyQuality(pEnc->pEncoder, &pEnc->quality);
         InterlockedExchange(&pEnc->bForceKeyframe, 1);
     }
 }
@@ -935,6 +950,9 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
     while (pEnc->bInitOk && InterlockedCompareExchange(&pEnc->bRunning, 0, 0))
     {
         DirectGate_Desktop_WinEnc_ApplyPendingControls(pEnc);
+
+        /* Those are encoder calls too, and the backpressure check below reads the session */
+        if (!InterlockedCompareExchange(&pEnc->bRunning, 0, 0)) break;
 
         /* Mailbox still occupied or transport backed up: skip the capture
          * entirely. Nothing entered the encoder, so its reference chain is
@@ -991,8 +1009,7 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
             {
                 /* Helper gone: back to our own capture and let the normal
                  * recovery paths deal with whatever they find. */
-                xlogw("Elevated helper stopped delivering frames, resuming local capture: sid(%u)",
-                    pEnc->pDesktop->nSessionId);
+                xlogw("Elevated helper stopped delivering frames, resuming local capture: sid(%u)", pEnc->nSessionId);
 
                 DirectGate_Desktop_WinEnc_LeaveBridge(pEnc);
                 if (bForceKeyframe) InterlockedExchange(&pEnc->bForceKeyframe, 1);
@@ -1031,7 +1048,7 @@ static DWORD WINAPI DirectGate_Desktop_WinEnc_Thread(LPVOID pArg)
 
                 if (++pEnc->nDxgiReinitFails >= (pEnc->nFps ? pEnc->nFps : 30U) * DIRECTGATE_WINENC_REINIT_SECONDS)
                 {
-                    xlogw("Desktop Duplication lost for good, switching to GDI capture: sid(%u)", pEnc->pDesktop->nSessionId);
+                    xlogw("Desktop Duplication lost for good, switching to GDI capture: sid(%u)", pEnc->nSessionId);
                     DirectGate_Desktop_WinEnc_ReleaseDxgi(pEnc);
                     pEnc->bUseGdi = XTRUE;
                 }
@@ -1158,9 +1175,7 @@ static void DirectGate_Desktop_WinEnc_Free(directgate_winenc_t *pEnc)
          * forever would freeze every session on the main loop. */
         if (WaitForSingleObject(pEnc->hThread, 10000) != WAIT_OBJECT_0)
         {
-            xloge("Desktop capture thread is not responding, leaking its pipeline: sid(%u)",
-                pEnc->pDesktop != NULL ? pEnc->pDesktop->nSessionId : 0U);
-
+            xloge("Desktop capture thread is not responding, leaking its pipeline: sid(%u)", pEnc->nSessionId);
             CloseHandle(pEnc->hThread);
             return;
         }
@@ -1248,6 +1263,9 @@ int DirectGate_Desktop_WinEncoder_Start(directgate_session_t *pSession,
     pEnc->bElevAttached = bElevAttached;
     pEnc->pSession = pSession;
     pEnc->pDesktop = pDesktop;
+    pEnc->nSessionId = pSession->nSessionId;
+    pEnc->pendingQuality = pDesktop->quality;
+    pEnc->quality = pDesktop->quality;
     pEnc->nCaptureX = nX;
     pEnc->nCaptureY = nY;
     pEnc->nCaptureWidth = nWidth;
@@ -1333,6 +1351,10 @@ void DirectGate_Desktop_WinEncoder_ApplyQuality(directgate_session_t *pSession)
 
         return;
     }
+
+    AcquireSRWLockExclusive(&pEnc->mailboxLock);
+    pEnc->pendingQuality = pDesktop->quality;
+    ReleaseSRWLockExclusive(&pEnc->mailboxLock);
 
     InterlockedExchange(&pEnc->bApplyQuality, 1);
 }

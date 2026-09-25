@@ -188,10 +188,15 @@ int DirectGate_WL_DBusLoad(char *pErrBuf, size_t nErrSize);
  * so a caller can retry the second without putting a second prompt in front
  * of someone who already refused the first.
  *
+ * @p pCancel (may be NULL) abandons the request once raised: the grant wait
+ * checks it every 100ms, so the thread that has to be joined before a session
+ * is torn down is not held for the length of an unanswered prompt. It must
+ * outlive the portal.
+ *
  * Returns NULL on failure or refusal with the reason in pErrBuf. */
 directgate_wl_portal_t* DirectGate_WL_PortalOpen(const char *pRestoreToken,
                                                  char *pNewToken, size_t nTokenSize,
-                                                 xbool_t *pDeclined,
+                                                 xbool_t *pDeclined, xvolatile_t *pCancel,
                                                  char *pErrBuf, size_t nErrSize);
 
 /* PipeWire node id of the granted stream, and a descriptor connected to the

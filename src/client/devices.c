@@ -256,9 +256,11 @@ xbool_t DirectGate_Devices_ParseList(directgate_device_list_t *pList, xjson_obj_
         directgate_device_t *pDevice = &pList->devices[pList->nCount++];
         memset(pDevice, 0, sizeof(*pDevice));
 
+        /* Names are free text, and a shared device's is written by its owner, not by the user this prints for:
+           keep it from reaching the terminal as escape sequences. */
         const char *pName = XJSON_GetString(XJSON_GetObject(pItem, "name"));
         xstrncpy(pDevice->sId, sizeof(pDevice->sId), pId);
-        xstrncpy(pDevice->sName, sizeof(pDevice->sName), xstrused(pName) ? pName : pId);
+        DirectGate_CopyDisplaySafe(pDevice->sName, sizeof(pDevice->sName), xstrused(pName) ? pName : pId);
 
         xjson_obj_t *pOnline = XJSON_GetObject(pItem, "isOnline");
         xjson_obj_t *pOwner = XJSON_GetObject(pItem, "isOwner");
@@ -269,7 +271,7 @@ xbool_t DirectGate_Devices_ParseList(directgate_device_list_t *pList, xjson_obj_
         if (!pDevice->bOwned)
         {
             const char *pOwnerEmail = XJSON_GetString(XJSON_GetObject(pItem, "ownerEmail"));
-            if (xstrused(pOwnerEmail)) xstrncpy(pDevice->sOwner, sizeof(pDevice->sOwner), pOwnerEmail);
+            if (xstrused(pOwnerEmail)) DirectGate_CopyDisplaySafe(pDevice->sOwner, sizeof(pDevice->sOwner), pOwnerEmail);
         }
 
         /* Served over TLS by the API, so this is the authoritative host

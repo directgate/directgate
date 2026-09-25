@@ -63,6 +63,13 @@ typedef struct directgate_conn_ {
      * sustained connect failures. Set to "now + cooldown" right after a
      * probe so we don't hammer the API on every backoff tick. */
     uint64_t nNextRefreshProbeMs;
+    /* Back-off for the in-session token refresh. It is a blocking HTTP call on the
+     * event loop, so while the API cannot answer it must not be retried on every
+     * loop tick: that stalled every live session and hammered the API. */
+    uint64_t nNextTokenRefreshMs;
+    uint32_t nTokenRefreshFailures;
+    /* Next retry of a config save that failed after a token refresh. */
+    uint64_t nNextSaveRetryMs;
     xstr_tiny_t sDisconnectReason;
     xbool_t bReconnectSuppressed;
     /* A relay error frame claimed this device is no longer enrolled.
@@ -80,6 +87,8 @@ int DirectGate_TestHandleTransportMessage(xapi_session_t *pApiSession,
                                           const uint8_t *pPayload,
                                           size_t nPayload);
 void DirectGate_TestCheckWebRTCKeepalive(directgate_conn_t *pConn);
+xbool_t DirectGate_TestCheckTokenRefresh(directgate_conn_t *pConn);
+void DirectGate_TestRetryPendingSave(directgate_conn_t *pConn);
 #endif
 
 #ifdef __cplusplus

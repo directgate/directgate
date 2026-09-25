@@ -31,10 +31,19 @@ void DirectGate_Desktop_LinuxEncoder_StopDesktop(directgate_desktop_t *pDesktop)
 void DirectGate_Desktop_RestoreDisplayMode(directgate_desktop_t *pDesktop) { (void)pDesktop; }
 void DirectGate_Desktop_ReleaseHeldKeys(directgate_desktop_t *pDesktop) { (void)pDesktop; }
 
+static int g_nKeyframeRequests = 0;
+void DirectGate_Desktop_LinuxEncoder_RequestKeyframe(directgate_session_t *pSession)
+{
+    (void)pSession;
+    g_nKeyframeRequests++;
+}
+
+static int g_nSends = 0;
 int DirectGate_Session_Send(directgate_session_t *pSession, xjson_obj_t *pHeader,
                             const uint8_t *pPayload, size_t nPayloadLength)
 {
     (void)pSession; (void)pHeader; (void)pPayload; (void)nPayloadLength;
+    g_nSends++;
     return 0;
 }
 
@@ -543,6 +552,37 @@ static int test_backpressure(void)
     CHECK(!DirectGate_Desktop_ShouldSkipForBackpressure(&session),
         "a closed data channel never skips a frame");
 
+    /* Without a data channel the frames go out on the shared relay socket,
+       whose queue nothing used to bound. Behind on it, a frame is dropped and
+       the picture restarts from a keyframe once the relay has caught up. */
+    xapi_session_t relay;
+    memset(&relay, 0, sizeof(relay));
+    XByteBuffer_Init(&relay.txBuffer, XSTDNON, XFALSE);
+    session.pWsSession = &relay;
+
+    const uint8_t sFrame[] = { 0, 0, 0, 1, 0x65, 0x88 };
+    CHECK(!DirectGate_Desktop_RelayIsBacklogged(&session), "an empty relay queue is not backlogged");
+
+    g_nSends = 0;
+    g_nKeyframeRequests = 0;
+    CHECK(DirectGate_Desktop_SendEncodedFrame(&session, sFrame, sizeof(sFrame), 64, 64, XTRUE, 1) == XAPI_CONTINUE,
+        "a frame goes out on a relay that keeps up");
+    CHECK(g_nSends == 1 && g_nKeyframeRequests == 0, "a relay that keeps up gets every frame");
+
+    size_t nBacklog = 2U * 1024U * 1024U;
+    uint8_t *pBacklog = (uint8_t*)calloc(1, nBacklog);
+    CHECK(pBacklog != NULL, "allocate a stand-in relay backlog");
+    CHECK(XByteBuffer_Add(&relay.txBuffer, pBacklog, nBacklog) > 0, "back the relay socket up");
+    free(pBacklog);
+
+    CHECK(DirectGate_Desktop_RelayIsBacklogged(&session), "a relay two megabytes behind is backlogged");
+    CHECK(DirectGate_Desktop_SendEncodedFrame(&session, sFrame, sizeof(sFrame), 64, 64, XFALSE, 2) == XAPI_CONTINUE,
+        "a frame for a backlogged relay is not an error");
+    CHECK(g_nSends == 1, "nothing more is queued behind a backlogged relay");
+    CHECK(g_nKeyframeRequests == 1, "a dropped frame asks the encoder for a fresh keyframe");
+
+    XByteBuffer_Clear(&relay.txBuffer);
+    session.pWsSession = NULL;
     return 0;
 }
 

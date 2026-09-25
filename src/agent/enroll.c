@@ -884,7 +884,16 @@ directgate_enroll_status_t DirectGate_Enroll_Refresh(directgate_cfg_t *pCfg, cha
         xlogi("Tokens refreshed successfully: dev(%s), relay(%s)",
             DirectGate_Enroll_GetDeviceId(pCfg), DirectGate_Enroll_GetRelayUrl(pCfg));
 
-        DirectGate_SaveConfig(pCfg);
+        /* The session keeps working on the tokens in memory either way. But a rotated
+           refresh token that never reached the disk is gone at the next restart, and
+           presenting the old one is refresh-token reuse: the API revokes the device. */
+        pCfg->bSavePending = DirectGate_SaveConfig(pCfg) ? XFALSE : XTRUE;
+        if (pCfg->bSavePending)
+        {
+            xloge("Failed to persist refreshed tokens, will keep retrying: dev(%s), cfg(%s), errno(%d)",
+                DirectGate_Enroll_GetDeviceId(pCfg), pCfg->sCfgPath, errno);
+        }
+
         return DIRECTGATE_ENROLL_REFRESH_OK;
     }
 

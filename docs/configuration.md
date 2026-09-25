@@ -86,7 +86,15 @@ The default log directory is platform-specific: `/var/log/directgate` on Linux a
 | `auth.key.agentIdentity.pub`  | string   | Agent Ed25519 public identity for key auth |
 | `auth.key.authorizedKeys`     | string[] | Authorized client Ed25519 public keys      |
 
+### Terminal sessions
+
+The terminal runs `shell.user`'s login shell from the account database, unless that shell is `nologin`, `false` or missing, in which case the agent falls back to its own `$SHELL`, then `bash`, then `sh`. `HOME`, `USER`, `LOGNAME`, `SHELL` and `TERM` are set for that account rather than inherited from the agent, and the shell starts in `shell.home` when it is set, otherwise in the account's home directory.
+
+Output is paced to the client: when more than 4 MB is waiting to be sent, the agent stops reading the terminal until the backlog drops below 1 MB, and the program writing to it simply blocks, the way it would on a slow terminal. Input that would push the backlog towards the shell past 8 MB is refused. Closing a session hangs the shell up and, if it has not exited half a second later, kills its process group - without the agent waiting for it.
+
 ## Running the agent
+
+The agent exits with an error at start-up when its configuration has not been paired, or has no usable SRP password record: pair it first (see [Command-line options](#command-line-options)).
 
 Run the installed binary directly:
 
@@ -181,6 +189,8 @@ The picker marks each device online (green), offline (yellow) or unavailable (re
 Once a device is chosen the CLI calls `POST /api/v1/sessions/connect`, which returns the relay URL, the short-lived browser JWT, the routing key and the ICE servers in one round trip. The routing key becomes the `?rk=` query parameter on the relay WebSocket handshake; without it the relay has no route to the agent and drops the connection.
 
 The device password is prompted for after the device is chosen and is never written to disk.
+
+A production build of `dgcli` connects only to a `wss://` relay, whether the URL came from the API or from its own configuration: the first relay message carries the access token, so a plaintext relay would hand it to the network. Debug builds also accept `ws://` for local development.
 
 ### Key authentication
 

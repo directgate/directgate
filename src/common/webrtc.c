@@ -2402,6 +2402,13 @@ xbool_t DirectGate_WebRTC_IsConnected(const directgate_webrtc_t *pRTC)
     return pRTC->bConnected && pRTC->nDataChannelID >= 0;
 }
 
+void DirectGate_WebRTC_NoteSendFailure(directgate_webrtc_t *pRTC)
+{
+    XCHECK_VOID_NL((pRTC != NULL));
+    if (pRTC->nDataChannelID >= 0 && rtcIsOpen(pRTC->nDataChannelID)) return;
+    pRTC->bConnected = XFALSE;
+}
+
 xbool_t DirectGate_WebRTC_IsRelay(const directgate_webrtc_t *pRTC)
 {
     XCHECK_NL((pRTC != NULL), XFALSE);

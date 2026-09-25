@@ -34,6 +34,15 @@ int DirectGate_RemoveNewLine(char *pStr, size_t *pLen);
 xbool_t DirectGate_FindCRLF(const uint8_t *pData, size_t nSize, size_t *pOffset);
 xbool_t DirectGate_ParseI64(const uint8_t *pData, size_t nLength, int64_t *pValue);
 xbool_t DirectGate_IsAPIEndpointAllowed(const char *pUrl);
+
+/* Copies text that came from a peer or another account for display on a terminal, replacing every control
+ * character - C0, DEL, C1 (raw or UTF-8 encoded) and stray bytes that are not part of a UTF-8 sequence - with '?'.
+ * Such text must never reach the terminal as an escape sequence. Returns the length written. */
+size_t DirectGate_CopyDisplaySafe(char *pOut, size_t nSize, const char *pIn);
+
+/* The relay counterpart: wss only in production, ws as well in debug builds. The relay socket carries the access
+ * token in its first message, so the agent and dgcli refuse a plaintext relay through the same rule. */
+xbool_t DirectGate_IsRelayEndpointAllowed(const char *pUrl);
 xbool_t DirectGate_EnsurePrivateFileParent(const char *pPath);
 xbool_t DirectGate_WritePrivateFile(const char *pPath, const uint8_t *pData, size_t nSize);
 

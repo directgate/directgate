@@ -960,11 +960,15 @@ static XSTATUS DirectGate_Files_CopyRegularFile(const char *pPath, const char *p
     return XSTDOK;
 }
 
+/* Directory levels a copy descends. It runs on a worker thread's stack, and the
+   deepest tree a path of XFILE_PATH_SIZE can name would still outrun that. */
+#define DIRECTGATE_FILES_COPY_MAX_DEPTH 256U
+
 /* Takes the source stat the caller already has: the recursive walk below has
    to classify every entry anyway, and re-reading it here would put a second
    lstat on the path of every file in the tree. */
 static XSTATUS DirectGate_Files_CopyEntry(const char *pPath, const char *pTargetPath,
-                                          const xstat_t *pSrcStat)
+                                          const xstat_t *pSrcStat, size_t nDepth)
 {
     XCHECK(xstrused(pPath), xthrowr(XSTDERR, "Source path is empty"));
     XCHECK(xstrused(pTargetPath), xthrowr(XSTDERR, "Target path is empty"));
@@ -1005,33 +1009,48 @@ static XSTATUS DirectGate_Files_CopyEntry(const char *pPath, const char *pTarget
             return XSTDERR;
         }
 
+        if (nDepth >= DIRECTGATE_FILES_COPY_MAX_DEPTH)
+        {
+            errno = ELOOP;
+            return XSTDERR;
+        }
+
+        /* Both child paths on the heap, one block per level: in the frame they were
+           8 KB a level, which a worker thread's stack cannot carry far. */
+        char *pChildPaths = (char*)malloc(XFILE_PATH_SIZE * 2);
+        if (pChildPaths == NULL) return XSTDERR;
+
         /* Created writable and traversable for us first: a source directory
            without the owner write bit (say r-xr-xr-x) would otherwise refuse
            the children about to be copied into it. mkdir is also subject to
            the umask, so the source mode is applied by hand once the directory
            is populated. */
         if (XDir_Create(pTargetPath, (st.st_mode & 0777) | 0700) <= 0)
+        {
+            free(pChildPaths);
             return XSTDERR;
+        }
 
         xdir_t dir;
         if (XDir_Open(&dir, pPath) < 0)
         {
             int nSavedErrno = errno;
             XPath_Remove(pTargetPath);
+            free(pChildPaths);
             errno = nSavedErrno;
             return XSTDERR;
         }
 
         char sName[XNAME_MAX];
-        char sSrcChild[XFILE_PATH_SIZE];
-        char sDstChild[XFILE_PATH_SIZE];
+        char *sSrcChild = pChildPaths;
+        char *sDstChild = pChildPaths + XFILE_PATH_SIZE;
 
         while (XDir_Read(&dir, sName, sizeof(sName)) > 0)
         {
-            int nSrcLen = snprintf(sSrcChild, sizeof(sSrcChild), "%s/%s", pPath, sName);
-            int nDstLen = snprintf(sDstChild, sizeof(sDstChild), "%s/%s", pTargetPath, sName);
-            int nTruncated = (nSrcLen <= 0 || (size_t)nSrcLen >= sizeof(sSrcChild) ||
-                              nDstLen <= 0 || (size_t)nDstLen >= sizeof(sDstChild));
+            int nSrcLen = snprintf(sSrcChild, XFILE_PATH_SIZE, "%s/%s", pPath, sName);
+            int nDstLen = snprintf(sDstChild, XFILE_PATH_SIZE, "%s/%s", pTargetPath, sName);
+            int nTruncated = (nSrcLen <= 0 || (size_t)nSrcLen >= XFILE_PATH_SIZE ||
+                              nDstLen <= 0 || (size_t)nDstLen >= XFILE_PATH_SIZE);
 
             /* A truncated child path names something else entirely, so it is
                a failure rather than an entry to skip over. */
@@ -1047,10 +1066,11 @@ static XSTATUS DirectGate_Files_CopyEntry(const char *pPath, const char *pTarget
                 continue;
             }
 
-            if (nTruncated || DirectGate_Files_CopyEntry(sSrcChild, sDstChild, &childSt) < 0)
+            if (nTruncated || DirectGate_Files_CopyEntry(sSrcChild, sDstChild, &childSt, nDepth + 1) < 0)
             {
                 int nSavedErrno = errno;
                 XDir_Close(&dir);
+                free(pChildPaths);
 
                 /* Recursive: the target was created by this copy and nothing
                    else has written to it, and the plain rmdir left every
@@ -1062,6 +1082,8 @@ static XSTATUS DirectGate_Files_CopyEntry(const char *pPath, const char *pTarget
         }
 
         XDir_Close(&dir);
+        free(pChildPaths);
+
         DirectGate_Files_ApplyMode(pTargetPath, st.st_mode);
         return XSTDOK;
     }
@@ -1108,7 +1130,7 @@ static XSTATUS DirectGate_Files_CopyPath(const char *pPath, const char *pTargetP
     xstat_t st;
     if (xstat(pPath, &st) < 0) return XSTDERR;
 
-    return DirectGate_Files_CopyEntry(pPath, pTargetPath, &st);
+    return DirectGate_Files_CopyEntry(pPath, pTargetPath, &st, 0);
 }
 
 XSTATUS DirectGate_Files_Rename(const char *pPath, const char *pTargetPath)
@@ -1268,6 +1290,243 @@ void DirectGate_Files_ProcessTransfer(directgate_session_t *pSession)
         DirectGate_Files_SendTransferCancel(pSession, sTransferId, "file transfer failed");
 
     DirectGate_Transfer_Destroy(&pSession->transfer);
+}
+
+/* Shared by the session and the worker thread, freed by whichever lets go last,
+   so a session that ends mid-copy neither waits for the disk nor frees what the
+   worker still uses. The worker is detached for the same reason. */
+typedef struct directgate_fileop_ {
+    xsync_mutex_t lock;
+    uint32_t nRefs;         /* guarded by lock */
+    xbool_t bOrphaned;      /* guarded by lock: the read end is closed or about to be */
+    xbool_t bDone;          /* guarded by lock, as are the two results */
+    int nResult;
+    int nErrno;
+    xbool_t bCopy;
+    xbool_t bForce;
+    XSOCKET nReadFd;        /* the event loop's once registered */
+    XSOCKET nNotifyFd;      /* the worker's, closed with the last reference */
+    char sPath[XFILE_PATH_SIZE];
+    char sTargetPath[XFILE_PATH_SIZE];
+} directgate_fileop_t;
+
+static void DirectGate_FileOp_Unref(directgate_fileop_t *pOp)
+{
+    XSync_Lock(&pOp->lock);
+    uint32_t nRefs = --pOp->nRefs;
+    XSync_Unlock(&pOp->lock);
+    if (nRefs) return;
+
+    if (pOp->nNotifyFd != XSOCK_INVALID) xclosesock(pOp->nNotifyFd);
+    XSync_Destroy(&pOp->lock);
+    free(pOp);
+}
+
+static int DirectGate_FileOp_Run(directgate_fileop_t *pOp)
+{
+    errno = 0;
+    return pOp->bCopy ?
+        DirectGate_Files_CopyPath(pOp->sPath, pOp->sTargetPath) :
+        DirectGate_Files_Delete(pOp->sPath, pOp->bForce);
+}
+
+static void* DirectGate_FileOp_Worker(void *pArg)
+{
+    directgate_fileop_t *pOp = (directgate_fileop_t*)pArg;
+    int nResult = DirectGate_FileOp_Run(pOp);
+    int nErrno = errno;
+
+    XSync_Lock(&pOp->lock);
+    pOp->nResult = nResult;
+    pOp->nErrno = nErrno;
+    pOp->bDone = XTRUE;
+
+    /* Under the lock the session takes before its read end can close, so this never
+       writes into a pipe without a reader - which is SIGPIPE, not an error code. */
+    if (!pOp->bOrphaned)
+    {
+        const char cDone = 1;
+#ifdef _WIN32
+        (void)send(pOp->nNotifyFd, &cDone, 1, 0);
+#else
+        ssize_t nWritten = write(pOp->nNotifyFd, &cDone, 1);
+        (void)nWritten;
+#endif
+    }
+
+    XSync_Unlock(&pOp->lock);
+    DirectGate_FileOp_Unref(pOp);
+    return NULL;
+}
+
+static int DirectGate_Files_SendOpResult(directgate_session_t *pSession, xbool_t bCopy, int nResult,
+                                         int nErrno, const char *pPath, const char *pTargetPath)
+{
+    const char *pAction = bCopy ? "copy" : "delete";
+    if (nResult >= 0) return DirectGate_Session_SendManagerResp(pSession, pAction, "ok", NULL, bCopy ? pTargetPath : pPath);
+
+    errno = nErrno;
+    return DirectGate_Session_SendManagerResp(pSession, pAction, "failed", DirectGate_Files_LastError(), pPath);
+}
+
+int DirectGate_Files_GetOpFd(const directgate_session_t *pSession)
+{
+    XCHECK_NL((pSession != NULL && pSession->pFileOp != NULL), XSTDERR);
+    return (int)pSession->pFileOp->nReadFd;
+}
+
+/* The event-loop side is gone: called from the endpoint's close callback and at
+   teardown. The read end went with the endpoint; the worker keeps its reference. */
+static void DirectGate_Files_OrphanOp(directgate_fileop_t *pOp)
+{
+    XSync_Lock(&pOp->lock);
+    pOp->bOrphaned = XTRUE;
+    XSync_Unlock(&pOp->lock);
+}
+
+static void DirectGate_Files_DetachOp(directgate_session_t *pSession)
+{
+    directgate_fileop_t *pOp = pSession->pFileOp;
+    XCHECK_VOID_NL((pOp != NULL));
+
+    DirectGate_Files_OrphanOp(pOp);
+    pSession->pFileOp = NULL;
+    pOp->nReadFd = XSOCK_INVALID;
+    DirectGate_FileOp_Unref(pOp);
+}
+
+void DirectGate_Files_ReleaseOp(directgate_session_t *pSession)
+{
+    XCHECK_VOID_NL((pSession != NULL));
+    if (pSession->pFileOp != NULL) DirectGate_Files_OrphanOp(pSession->pFileOp);
+
+    if (pSession->pFileOpSession != NULL)
+    {
+        xapi_session_t *pApiSession = pSession->pFileOpSession;
+        pSession->pFileOpSession = NULL;
+        XAPI_Disconnect(pApiSession);
+    }
+
+    /* Registered or not, the session's reference goes now; a running copy or delete
+       finishes on its own and the worker frees what is left. */
+    if (pSession->pFileOp != NULL && pSession->pFileOp->nReadFd != XSOCK_INVALID)
+    {
+        xclosesock(pSession->pFileOp->nReadFd);
+        pSession->pFileOp->nReadFd = XSOCK_INVALID;
+    }
+
+    DirectGate_Files_DetachOp(pSession);
+}
+
+int DirectGate_Files_OnOpClosed(directgate_session_t *pSession)
+{
+    XCHECK_NL((pSession != NULL), XAPI_NO_ACTION);
+    pSession->pFileOpSession = NULL;
+    DirectGate_Files_DetachOp(pSession);
+    return XAPI_NO_ACTION;
+}
+
+int DirectGate_Files_ProcessOp(directgate_session_t *pSession)
+{
+    XCHECK((pSession != NULL), XAPI_DISCONNECT);
+    directgate_fileop_t *pOp = pSession->pFileOp;
+    XCHECK_NL((pOp != NULL), XAPI_DISCONNECT);
+
+    char sDrain[16];
+#ifdef _WIN32
+    while (recv(pOp->nReadFd, sDrain, sizeof(sDrain), 0) > 0) {}
+#else
+    while (read(pOp->nReadFd, sDrain, sizeof(sDrain)) > 0) {}
+#endif
+
+    XSync_Lock(&pOp->lock);
+    xbool_t bDone = pOp->bDone;
+    int nResult = pOp->nResult;
+    int nErrno = pOp->nErrno;
+    XSync_Unlock(&pOp->lock);
+
+    if (!bDone) return XAPI_CONTINUE;
+
+    DirectGate_Files_SendOpResult(pSession, pOp->bCopy, nResult, nErrno, pOp->sPath, pOp->sTargetPath);
+
+    /* Done with the endpoint: disconnecting from its own callback is left to the event
+       loop, whose close callback then drops the session's reference. */
+    return XAPI_DISCONNECT;
+}
+
+/* Starts a copy (pTargetPath already resolved) or a delete off the event loop.
+   Answers right away when it cannot start one; otherwise the answer comes from
+   DirectGate_Files_ProcessOp once the worker is done. */
+static int DirectGate_Files_StartOp(directgate_session_t *pSession, xbool_t bCopy,
+                                    const char *pPath, const char *pTargetPath, xbool_t bForce)
+{
+    const char *pAction = bCopy ? "copy" : "delete";
+
+    if (pSession->pFileOp != NULL)
+        return DirectGate_Session_SendManagerResp(pSession, pAction, "failed", "another file operation is in progress", pPath);
+
+    directgate_fileop_t *pOp = (directgate_fileop_t*)calloc(1, sizeof(*pOp));
+    if (pOp == NULL) return DirectGate_Session_SendManagerResp(pSession, pAction, "failed", "out of memory", pPath);
+
+    XSync_Init(&pOp->lock);
+    pOp->nRefs = 1;
+    pOp->bCopy = bCopy;
+    pOp->bForce = bForce;
+    pOp->nReadFd = XSOCK_INVALID;
+    pOp->nNotifyFd = XSOCK_INVALID;
+    xstrncpy(pOp->sPath, sizeof(pOp->sPath), pPath);
+    if (xstrused(pTargetPath)) xstrncpy(pOp->sTargetPath, sizeof(pOp->sTargetPath), pTargetPath);
+
+    /* Without an event loop to report back on, or a descriptor pair to report through,
+       the operation runs in place as it always did. */
+    XSOCKET nFds[2] = { XSOCK_INVALID, XSOCK_INVALID };
+    xapi_t *pApi = pSession->pWsSession != NULL ? pSession->pWsSession->pApi : NULL;
+
+    if (pApi == NULL || !pApi->bHaveEvents || DirectGate_CreateNotifyPair(nFds) != XSTDOK)
+    {
+        int nResult = DirectGate_FileOp_Run(pOp);
+        int nErrno = errno;
+
+        int nStatus = DirectGate_Files_SendOpResult(pSession, bCopy, nResult, nErrno, pOp->sPath, pOp->sTargetPath);
+        DirectGate_FileOp_Unref(pOp);
+        return nStatus;
+    }
+
+    pOp->nReadFd = nFds[0];
+    pOp->nNotifyFd = nFds[1];
+    pSession->pFileOp = pOp;
+
+    xapi_endpoint_t endpt;
+    XAPI_InitEndpoint(&endpt);
+    endpt.eType = XAPI_EVENT;
+    endpt.eRole = XAPI_CUSTOM;
+    endpt.nEvents = XPOLLIN;
+    endpt.bUnix = XTRUE;
+    endpt.nFD = nFds[0];
+    endpt.pSessionData = pSession;
+
+    /* A failed registration closes the read end itself. */
+    if (XAPI_AddEndpoint(pApi, &endpt) < 0)
+    {
+        pOp->nReadFd = XSOCK_INVALID;
+        DirectGate_Files_DetachOp(pSession);
+        return DirectGate_Session_SendManagerResp(pSession, pAction, "failed", "failed to start file operation", pPath);
+    }
+
+    XSync_Lock(&pOp->lock);
+    pOp->nRefs++;
+    XSync_Unlock(&pOp->lock);
+
+    xthread_t thread;
+    if (XThread_Create(&thread, DirectGate_FileOp_Worker, pOp, 1) != XSTDOK)
+    {
+        DirectGate_FileOp_Unref(pOp);
+        DirectGate_Files_ReleaseOp(pSession);
+        return DirectGate_Session_SendManagerResp(pSession, pAction, "failed", "failed to start file operation", pPath);
+    }
+
+    xlogi("File operation started: sid(%u), action(%s), path(%s)", pSession->nSessionId, pAction, pPath);
+    return XAPI_CONTINUE;
 }
 
 int DirectGate_Files_HandleManager(xapi_session_t *pApiSession, directgate_pkg_t *pPkg)
@@ -1509,13 +1768,7 @@ int DirectGate_Files_HandleManager(xapi_session_t *pApiSession, directgate_pkg_t
                 "failed", DirectGate_Files_LastError(), pMgrPkg->pPath);
         }
 
-        if (DirectGate_Files_CopyPath(pMgrPkg->pPath, sResolvedTarget) < 0)
-        {
-            return DirectGate_Session_SendManagerResp(pSession, "copy",
-                "failed", DirectGate_Files_LastError(), pMgrPkg->pPath);
-        }
-
-        return DirectGate_Session_SendManagerResp(pSession, "copy", "ok", NULL, sResolvedTarget);
+        return DirectGate_Files_StartOp(pSession, XTRUE, pMgrPkg->pPath, sResolvedTarget, XFALSE);
     }
 
     if (xstrcmp(pMgrPkg->pAction, "move"))
@@ -1549,15 +1802,7 @@ int DirectGate_Files_HandleManager(xapi_session_t *pApiSession, directgate_pkg_t
     }
 
     if (xstrcmp(pMgrPkg->pAction, "delete"))
-    {
-        if (DirectGate_Files_Delete(pMgrPkg->pPath, pMgrPkg->bForce) < 0)
-        {
-            return DirectGate_Session_SendManagerResp(pSession, "delete",
-                "failed", DirectGate_Files_LastError(), pMgrPkg->pPath);
-        }
-
-        return DirectGate_Session_SendManagerResp(pSession, "delete", "ok", NULL, pMgrPkg->pPath);
-    }
+        return DirectGate_Files_StartOp(pSession, XFALSE, pMgrPkg->pPath, NULL, pMgrPkg->bForce);
 
     {
         int nWsFd = pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID;

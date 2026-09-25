@@ -225,6 +225,7 @@ xbool_t DirectGate_LoadConfig(directgate_cfg_t *pCfg, const char *pPath)
         XJSON_GetErrorStr(&json, sError, sizeof(sError));
         xloge("Failed to parse config: %s (%s)", pPath, sError);
 
+        OPENSSL_cleanse(buffer.pData, buffer.nUsed);
         XByteBuffer_Clear(&buffer);
         XJSON_Destroy(&json);
         return XFALSE;
@@ -262,6 +263,8 @@ xbool_t DirectGate_LoadConfig(directgate_cfg_t *pCfg, const char *pPath)
     DirectGate_AuthLoad(&pCfg->auth, pRoot);
     DirectGate_WebRTC_LoadIceServers(pCfg->sIceServers, &pCfg->nIceSrvCount, pRoot);
 
+    /* The file can hold access and API tokens; don't leave them in freed heap */
+    OPENSSL_cleanse(buffer.pData, buffer.nUsed);
     XByteBuffer_Clear(&buffer);
     XJSON_Destroy(&json);
     return XTRUE;
@@ -310,9 +313,15 @@ static xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
     char *pDump = XJSON_DumpObj(pRoot, 2, &nLength);
     XJSON_FreeObject(pRoot);
 
-    if (pDump == NULL || !nLength) return XFALSE;
+    if (pDump == NULL || !nLength)
+    {
+        free(pDump);
+        return XFALSE;
+    }
+
     xbool_t bOk = DirectGate_WritePrivateFile(pCfg->sCfgPath, (uint8_t*)pDump, nLength);
 
+    OPENSSL_cleanse(pDump, nLength);
     free(pDump);
     return bOk;
 }

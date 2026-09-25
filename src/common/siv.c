@@ -101,17 +101,6 @@ static uint8_t* DirectGate_SIV_XUtilsDecrypt(const uint8_t *pCmacKey, const uint
 /* ------------------------------------------------------------------------- */
 
 #ifdef XSIV_HAVE_OPENSSL
-static const char* DirectGate_SIV_CipherName(size_t nKeyBits)
-{
-    switch (nKeyBits)
-    {
-        case 128: return "AES-128-SIV";
-        case 192: return "AES-192-SIV";
-        case 256: return "AES-256-SIV";
-        default:  return NULL;
-    }
-}
-
 /* OpenSSL takes the SIV key as a single MAC||CTR buffer. */
 static xbool_t DirectGate_SIV_JoinKey(uint8_t *pFullKey, size_t nFullSize, const uint8_t *pCmacKey,
                                       const uint8_t *pCtrKey, size_t nKeyBits, size_t *pHalfLen)
@@ -126,15 +115,34 @@ static xbool_t DirectGate_SIV_JoinKey(uint8_t *pFullKey, size_t nFullSize, const
 
 /* OpenSSL >= 3.0 normally ships AES-SIV in the default provider. Publish the
    cached probe through OpenSSL's once primitive: unsynchronized reads/writes
-   of the cached integer are a data race even if both probes agree. */
+   of the cached integer are a data race even if both probes agree.
+
+   The fetched ciphers are kept for the life of the process. A fetch is a
+   provider lookup under a lock; doing one for every encrypt and every decrypt
+   was most of the cost of a small message - a keystroke, a pointer move -
+   and serialized every thread that encrypts. A fetched EVP_CIPHER is
+   immutable and reference counted, so sharing it between threads is safe. */
 static CRYPTO_ONCE sOpenSSLOnce = CRYPTO_ONCE_STATIC_INIT;
+static EVP_CIPHER *sOpenSSLCiphers[3] = { NULL, NULL, NULL };
 static int sOpenSSLReady = 0;
 
 static void DirectGate_SIV_ProbeOpenSSL(void)
 {
-    EVP_CIPHER *pProbe = EVP_CIPHER_fetch(NULL, "AES-256-SIV", NULL);
-    sOpenSSLReady = (pProbe != NULL);
-    EVP_CIPHER_free(pProbe);
+    sOpenSSLCiphers[0] = EVP_CIPHER_fetch(NULL, "AES-128-SIV", NULL);
+    sOpenSSLCiphers[1] = EVP_CIPHER_fetch(NULL, "AES-192-SIV", NULL);
+    sOpenSSLCiphers[2] = EVP_CIPHER_fetch(NULL, "AES-256-SIV", NULL);
+    sOpenSSLReady = (sOpenSSLCiphers[2] != NULL);
+}
+
+static EVP_CIPHER* DirectGate_SIV_Cipher(size_t nKeyBits)
+{
+    switch (nKeyBits)
+    {
+        case 128: return sOpenSSLCiphers[0];
+        case 192: return sOpenSSLCiphers[1];
+        case 256: return sOpenSSLCiphers[2];
+        default:  return NULL;
+    }
 }
 
 static xbool_t DirectGate_SIV_OpenSSLReady(void)
@@ -149,14 +157,13 @@ static xbool_t DirectGate_SIV_OpenSSLReady(void)
 static xbool_t DirectGate_SIV_OpenSSLEncrypt(const uint8_t *pCmacKey, const uint8_t *pCtrKey, size_t nKeyBits,
                                              const uint8_t *pNonce, const uint8_t *pData, size_t nLength, uint8_t *pDst)
 {
-    const char *pName = DirectGate_SIV_CipherName(nKeyBits);
-    XCHECK((pName != NULL && nLength <= INT_MAX), XFALSE);
+    EVP_CIPHER *pCipher = DirectGate_SIV_Cipher(nKeyBits);
+    XCHECK((pCipher != NULL && nLength <= INT_MAX), XFALSE);
 
     uint8_t fullKey[XSIV_MAX_HALF * 2];
     size_t nHalf = 0;
     XCHECK(DirectGate_SIV_JoinKey(fullKey, sizeof(fullKey), pCmacKey, pCtrKey, nKeyBits, &nHalf), XFALSE);
 
-    EVP_CIPHER *pCipher = EVP_CIPHER_fetch(NULL, pName, NULL);
     EVP_CIPHER_CTX *pCtx = EVP_CIPHER_CTX_new();
     int nWritten = 0, nFinal = 0, nAad = 0;
     xbool_t bOk = XFALSE;
@@ -173,7 +180,6 @@ static xbool_t DirectGate_SIV_OpenSSLEncrypt(const uint8_t *pCmacKey, const uint
     }
 
     EVP_CIPHER_CTX_free(pCtx);
-    EVP_CIPHER_free(pCipher);
     OPENSSL_cleanse(fullKey, sizeof(fullKey));
     return bOk;
 }
@@ -183,15 +189,14 @@ static xbool_t DirectGate_SIV_OpenSSLEncrypt(const uint8_t *pCmacKey, const uint
 static uint8_t* DirectGate_SIV_OpenSSLDecrypt(const uint8_t *pCmacKey, const uint8_t *pCtrKey, size_t nKeyBits,
                                               const uint8_t *pNonce, const uint8_t *pData, size_t nLength, size_t *pOutLen)
 {
-    const char *pName = DirectGate_SIV_CipherName(nKeyBits);
-    XCHECK((pName != NULL && nLength > XSIV_TAG_SIZE && nLength - XSIV_TAG_SIZE <= INT_MAX), NULL);
+    EVP_CIPHER *pCipher = DirectGate_SIV_Cipher(nKeyBits);
+    XCHECK((pCipher != NULL && nLength > XSIV_TAG_SIZE && nLength - XSIV_TAG_SIZE <= INT_MAX), NULL);
 
     uint8_t fullKey[XSIV_MAX_HALF * 2];
     size_t nHalf = 0;
     XCHECK(DirectGate_SIV_JoinKey(fullKey, sizeof(fullKey), pCmacKey, pCtrKey, nKeyBits, &nHalf), NULL);
 
     size_t nCipherLen = nLength - XSIV_TAG_SIZE;
-    EVP_CIPHER *pCipher = EVP_CIPHER_fetch(NULL, pName, NULL);
     EVP_CIPHER_CTX *pCtx = EVP_CIPHER_CTX_new();
     uint8_t *pOut = malloc(nCipherLen);
     int nWritten = 0, nFinal = 0, nAad = 0;
@@ -210,7 +215,6 @@ static uint8_t* DirectGate_SIV_OpenSSLDecrypt(const uint8_t *pCmacKey, const uin
     else *pOutLen = nCipherLen;
 
     EVP_CIPHER_CTX_free(pCtx);
-    EVP_CIPHER_free(pCipher);
     OPENSSL_cleanse(fullKey, sizeof(fullKey));
     return pOut;
 }

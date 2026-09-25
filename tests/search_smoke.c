@@ -21,6 +21,9 @@ typedef struct search_capture_ {
     int nOk;
     int nFailed;
     int nCancelled;
+    int nBadPayloads;
+    size_t nEntries;
+    size_t nLargestPayload;
     char sLastReason[XSTR_MID];
     char sPayload[16384];
 } search_capture_t;
@@ -62,6 +65,28 @@ int DirectGate_Session_SendManagerData(directgate_session_t *pSession, const cha
 
     if (xstrcmp(pStatus, "partial")) g_capture.nPartial++;
     if (xstrcmp(pStatus, "ok")) g_capture.nOk++;
+
+    /* Every payload is the shape the browser parses: {"path":..,"entries":[..]},
+       however many matches were joined into it. */
+    if (pPayload != NULL && nPayloadLen > 0)
+    {
+        xjson_t json;
+        xjson_obj_t *pEntries = NULL;
+
+        if (XJSON_Parse(&json, NULL, (const char*)pPayload, nPayloadLen))
+        {
+            pEntries = XJSON_GetObject(json.pRootObj, "entries");
+            if (pEntries != NULL && pEntries->nType == XJSON_TYPE_ARRAY &&
+                XJSON_GetString(XJSON_GetObject(json.pRootObj, "path")) != NULL)
+                g_capture.nEntries += XJSON_GetArrayLength(pEntries);
+            else
+                g_capture.nBadPayloads++;
+        }
+        else g_capture.nBadPayloads++;
+
+        XJSON_Destroy(&json);
+        if (nPayloadLen > g_capture.nLargestPayload) g_capture.nLargestPayload = nPayloadLen;
+    }
 
     if (pPayload != NULL && nPayloadLen > 0)
     {
@@ -193,7 +218,9 @@ int main(void)
         "filename search should finish");
     CHECK(g_capture.nFailed == 0, "filename search should not fail");
     CHECK(g_capture.nOk == 1, "filename search should complete once");
-    CHECK(g_capture.nPartial >= 2, "filename search should produce partial results");
+    CHECK(g_capture.nPartial >= 1, "filename search should produce partial results");
+    CHECK(g_capture.nEntries == 2 && g_capture.nBadPayloads == 0,
+        "every match arrives exactly once inside well-formed batches");
     CHECK(strstr(g_capture.sPayload, "alpha.txt") != NULL,
         "filename search should include alpha");
     CHECK(strstr(g_capture.sPayload, "GAMMA.TXT") != NULL,
@@ -236,6 +263,100 @@ int main(void)
     CHECK(g_capture.nFailed == 1, "invalid criteria should send failure");
     CHECK(strcmp(g_capture.sLastReason, "invalid search criteria") == 0,
         "invalid criteria failure reason");
+
+    /* A broad search outruns a busy main loop. The worker used to give up with
+       "failed to queue search results" once 1024 matches were waiting; it has
+       to wait for the loop instead and deliver every match, batched into
+       messages that still fit a data channel message. */
+    {
+        char sMany[600];
+        snprintf(sMany, sizeof(sMany), "%s/many", sRoot);
+        CHECK(mkdir(sMany, 0755) == 0, "mkdir many");
+
+        for (int i = 0; i < 5000; i++)
+        {
+            char sFile[700];
+            snprintf(sFile, sizeof(sFile), "%s/match-%04d.dat", sMany, i);
+            CHECK(write_file(sFile, "x"), "write one of many files");
+        }
+
+        reset_capture();
+        memset(&mgr, 0, sizeof(mgr));
+        mgr.pPath = sMany;
+        mgr.pFileName = "match-*";
+
+        CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDOK, "the broad search starts");
+
+        /* The loop only comes round every 30 ms - long enough for the worker
+           to fill any fixed backlog many times over. */
+        for (int i = 0; i < 1000 && g_capture.nOk == 0 && g_capture.nFailed == 0; i++)
+        {
+            usleep(30000);
+            DirectGate_Search_Process(&session);
+        }
+
+        CHECK(g_capture.nFailed == 0, "a broad search does not fail on a slow main loop");
+        CHECK(g_capture.nOk == 1, "a broad search completes");
+        CHECK(g_capture.nEntries == 5000, "every match of a broad search is delivered");
+        CHECK(g_capture.nBadPayloads == 0, "every batch is well-formed JSON");
+        CHECK(g_capture.nPartial < 5000, "matches are batched rather than sent one message each");
+        CHECK(g_capture.nLargestPayload <= 100U * 1024U, "a batch stays within a data channel message");
+    }
+
+    /* A deep tree, searched by the worker thread on the stack it really gets.
+       Two path buffers per level used to overflow it about forty directories
+       down and take the whole agent with it. */
+    {
+        char sDeep[4096];
+        size_t nLen = (size_t)snprintf(sDeep, sizeof(sDeep), "%s/deep", sRoot);
+        CHECK(mkdir(sDeep, 0755) == 0, "mkdir deep");
+
+        for (int i = 0; i < 240; i++)
+        {
+            nLen += (size_t)snprintf(sDeep + nLen, sizeof(sDeep) - nLen, "/d");
+            CHECK(mkdir(sDeep, 0755) == 0, "mkdir one deep level");
+        }
+
+        snprintf(sDeep + nLen, sizeof(sDeep) - nLen, "/bottom.dat");
+        CHECK(write_file(sDeep, "x"), "write the file at the bottom");
+
+        char sDeepRoot[600];
+        snprintf(sDeepRoot, sizeof(sDeepRoot), "%s/deep", sRoot);
+
+        reset_capture();
+        memset(&mgr, 0, sizeof(mgr));
+        mgr.pPath = sDeepRoot;
+        mgr.pFileName = "bottom.dat";
+        mgr.bRecursive = XTRUE;
+
+        CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDOK, "the deep search starts");
+        CHECK(wait_for_search(&session) == XSTDOK, "the deep search finishes");
+        CHECK(g_capture.nOk == 1 && g_capture.nEntries == 1, "the file at the bottom of a deep tree is found");
+    }
+
+    /* Cancelling while the worker is waiting for room ends the wait. */
+    {
+        char sMany[600];
+        snprintf(sMany, sizeof(sMany), "%s/many", sRoot);
+
+        reset_capture();
+        memset(&mgr, 0, sizeof(mgr));
+        mgr.pPath = sMany;
+        mgr.pFileName = "match-*";
+
+        CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDOK, "a search to cancel starts");
+        usleep(50000);
+        CHECK(DirectGate_Search_Cancel(&session.search) >= 0, "the search accepts a cancel");
+
+        for (int i = 0; i < 500 && g_capture.nOk == 0 && g_capture.nCancelled == 0 && g_capture.nFailed == 0; i++)
+        {
+            usleep(10000);
+            DirectGate_Search_Process(&session);
+        }
+
+        CHECK(g_capture.nCancelled == 1 || g_capture.nOk == 1, "a cancelled search reports how it ended");
+        CHECK(g_capture.nFailed == 0, "a cancelled search is not reported as a failure");
+    }
 
     DirectGate_Search_Clear(&session.search);
     CHECK(DirectGate_Search_GetPipeFd(&session.search) == XSTDERR,

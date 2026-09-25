@@ -52,6 +52,12 @@ typedef struct directgate_term_ {
     xbool_t bEncrypt;
     xbool_t bRunning;
 
+    /* Shell output is not read while the transport it goes out on is this far
+     * behind (see DirectGate_Term_ResumeRead). A shell printing faster than
+     * the link drains - `cat` of a large file, `yes` - otherwise grew the
+     * send queue without bound and starved every other session of the loop. */
+    xbool_t bReadPaused;
+
     /*
     * sShellHome defines the initial working directory for the PTY session after launch.
     * It is not a filesystem restriction or security boundary like a DOCUMENT_ROOT.
@@ -117,7 +123,21 @@ void DirectGate_Term_DetachEvent(directgate_term_t *pTerm);
 int DirectGate_Term_OnRead(directgate_term_t *pTerm);
 int DirectGate_Term_OnWrite(directgate_term_t *pTerm);
 
+/* Queues input for the shell. Fails once the shell has left DIRECTGATE_TERM_TX_MAX
+ * bytes unread, which ends the session rather than letting a stalled program grow
+ * the agent's memory without bound. */
 XSTATUS DirectGate_Term_Write(directgate_term_t *pTerm, const uint8_t *pData, size_t nLength);
+
+/* Re-arms reading shell output once the transport has drained. Called on every
+ * event loop pass; a no-op unless reading was paused. */
+void DirectGate_Term_ResumeRead(directgate_term_t *pTerm);
+xbool_t DirectGate_Term_IsReadPaused(const directgate_term_t *pTerm);
+
+/* Reaps shells that were hung up but had not exited yet, killing any that
+ * outstay the grace period. Never blocks: a shell stuck in the kernel (a dead
+ * NFS mount) is retried on the next call instead of freezing the agent. Called
+ * on every event loop pass. Returns how many are still outstanding. */
+size_t DirectGate_Term_ReapPending(void);
 XSTATUS DirectGate_Term_UpdateWinSize(directgate_term_t *pTerm, const struct winsize *pSize);
 XSTATUS DirectGate_Term_GetCwd(const directgate_term_t *pTerm, char *pBuf, size_t nBufSize);
 

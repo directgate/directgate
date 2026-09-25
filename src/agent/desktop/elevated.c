@@ -402,8 +402,11 @@ static int DirectGate_Elev_RequestHelper(uint32_t nCaptureWidth, uint32_t nCaptu
     g_elev.hFrameTaken = (HANDLE)(uintptr_t)ready.hFrameTaken;
     g_elev.nSectionBytes = ready.nSectionBytes;
 
-    g_elev.pShm = (directgate_elev_shm_t*)MapViewOfFile(g_elev.hSection, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, g_elev.nSectionBytes);
-    if (g_elev.pShm == NULL || g_elev.pShm->nMagic != DIRECTGATE_ELEV_SHM_MAGIC)
+    /* Read-only, as the handle is: the agent never writes the section, and the helper is SYSTEM */
+    g_elev.pShm = (directgate_elev_shm_t*)MapViewOfFile(g_elev.hSection, FILE_MAP_READ, 0, 0, g_elev.nSectionBytes);
+    if (g_elev.pShm == NULL ||
+        g_elev.pShm->nMagic != DIRECTGATE_ELEV_SHM_MAGIC ||
+        g_elev.nSectionBytes <= DIRECTGATE_ELEV_HEADER_BYTES)
     {
         DirectGate_Elev_SetReason("Failed to map the elevated desktop frame section.");
         DirectGate_Elev_CloseHelper();
@@ -580,8 +583,9 @@ xbool_t DirectGate_Elevated_GetCursorPos(int *pX, int *pY)
     XCHECK_NL((pX != NULL && pY != NULL), XFALSE);
     if (!DirectGate_Elevated_Ready() || g_elev.pShm == NULL) return XFALSE;
 
-    *pX = (int)InterlockedCompareExchange(&g_elev.pShm->nCursorX, 0, 0);
-    *pY = (int)InterlockedCompareExchange(&g_elev.pShm->nCursorY, 0, 0);
+    /* Plain aligned 32-bit loads are atomic here; an interlocked "read" would write to a read-only view */
+    *pX = (int)g_elev.pShm->nCursorX;
+    *pY = (int)g_elev.pShm->nCursorY;
     return XTRUE;
 }
 
@@ -648,13 +652,16 @@ int DirectGate_Elevated_ReadFrame(uint8_t *pDstBGRA, uint32_t nWidth, uint32_t n
     if (!DirectGate_Elevated_Ready()) return XSTDERR;
 
     directgate_elev_shm_t *pShm = g_elev.pShm;
-    const uint8_t *pSlot = (const uint8_t*)pShm + pShm->nHeaderBytes;
+    const uint8_t *pSlot = (const uint8_t*)pShm + DIRECTGATE_ELEV_HEADER_BYTES;
+    size_t nSlotBytes = (size_t)g_elev.nSectionBytes - DIRECTGATE_ELEV_HEADER_BYTES;
     uint32_t nSrcWidth = pShm->nWidth;
     uint32_t nSrcHeight = pShm->nHeight;
     uint32_t nSrcStride = pShm->nStride;
     int nStatus = XSTDOK;
 
-    if (nSrcWidth == 0 || nSrcHeight == 0 || (size_t)nSrcStride * nSrcHeight > pShm->nSlotBytes)
+    /* Bounded by the size the launcher reported, not by fields in the section itself */
+    if (nSrcWidth == 0 || nSrcHeight == 0 || (size_t)nSrcStride < (size_t)nSrcWidth * 4U ||
+        (size_t)nSrcStride * nSrcHeight > nSlotBytes)
     {
         nStatus = XSTDNON;
     }
@@ -687,6 +694,8 @@ typedef struct directgate_elev_helper_ {
     HANDLE hAgent;          /* agent process, waited on for lifetime */
     directgate_elev_shm_t *pShm;
     uint32_t nSectionBytes;
+    uint32_t nSlotWidth;    /* from the launcher's command line, never from the section */
+    uint32_t nSlotHeight;
     DWORD nAgentPid;
     DWORD nAgentIntegrity;
     xbool_t bAllowLockScreen;
@@ -1104,17 +1113,21 @@ static DWORD WINAPI DirectGate_Elev_CaptureThread(LPVOID pArg)
     directgate_elev_shm_t *pShm = g_helper.pShm;
     HRESULT hrCom = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
-    /* Clamp to what the slot can hold; the agent scales the remainder. */
+    /* Clamp to what the slot can hold; the agent scales the remainder. The limits are the launcher's, passed on
+       this process's command line: the section is shared with the agent, and nothing a lower-privileged process
+       could have touched may size a write made by SYSTEM. */
     uint32_t nDstW = capture.nEncodeWidth;
     uint32_t nDstH = capture.nEncodeHeight;
-    if (nDstW > pShm->nMaxWidth) nDstW = pShm->nMaxWidth;
-    if (nDstH > pShm->nMaxHeight) nDstH = pShm->nMaxHeight;
+    if (nDstW > g_helper.nSlotWidth) nDstW = g_helper.nSlotWidth;
+    if (nDstH > g_helper.nSlotHeight) nDstH = g_helper.nSlotHeight;
     nDstW &= ~1U;
     nDstH &= ~1U;
 
+    /* A 1-pixel request rounds down to nothing; there is no frame to capture into */
     size_t nFrameBytes = (size_t)nDstW * nDstH * 4U;
-    uint8_t *pFrame = (uint8_t*)malloc(nFrameBytes);
-    uint8_t *pPrev = (uint8_t*)malloc(nFrameBytes);
+    uint8_t *pFrame = nFrameBytes ? (uint8_t*)malloc(nFrameBytes) : NULL;
+    uint8_t *pPrev = nFrameBytes ? (uint8_t*)malloc(nFrameBytes) : NULL;
+
     directgate_elev_capsrc_t source;
     directgate_elev_deskref_t desktop;
     memset(&source, 0, sizeof(source));
@@ -1208,7 +1221,7 @@ static DWORD WINAPI DirectGate_Elev_CaptureThread(LPVOID pArg)
             continue;
         }
 
-        uint8_t *pSlot = (uint8_t*)pShm + pShm->nHeaderBytes;
+        uint8_t *pSlot = (uint8_t*)pShm + DIRECTGATE_ELEV_HEADER_BYTES;
         memcpy(pSlot, pFrame, nFrameBytes);
         pShm->nWidth = nDstW;
         pShm->nHeight = nDstH;
@@ -1342,12 +1355,19 @@ XSTATUS DirectGate_Elevated_HelperMain(int argc, char *argv[])
     g_helper.hFrameTaken = DirectGate_Elev_ArgHandle(argc, argv, "--taken");
     g_helper.hAgent = DirectGate_Elev_ArgHandle(argc, argv, "--agent");
     g_helper.nSectionBytes = (uint32_t)DirectGate_Elev_ArgNumber(argc, argv, "--shm-bytes", 0);
+    g_helper.nSlotWidth = (uint32_t)DirectGate_Elev_ArgNumber(argc, argv, "--slot-width", 0);
+    g_helper.nSlotHeight = (uint32_t)DirectGate_Elev_ArgNumber(argc, argv, "--slot-height", 0);
     g_helper.nAgentPid = (DWORD)DirectGate_Elev_ArgNumber(argc, argv, "--agent-pid", 0);
     g_helper.bAllowLockScreen = DirectGate_Elev_ArgNumber(argc, argv, "--allow-lock", 1) ? XTRUE : XFALSE;
 
+    uint64_t nSlotBytes = (uint64_t)g_helper.nSlotWidth * g_helper.nSlotHeight * 4ULL;
+
     if (g_helper.hCommand == NULL || g_helper.hSection == NULL ||
         g_helper.hFrameReady == NULL || g_helper.hFrameTaken == NULL ||
-        g_helper.nSectionBytes < sizeof(directgate_elev_shm_t) || g_helper.nAgentPid == 0)
+        g_helper.nSectionBytes < sizeof(directgate_elev_shm_t) || g_helper.nAgentPid == 0 ||
+        g_helper.nSlotWidth < 2 || g_helper.nSlotHeight < 2 ||
+        g_helper.nSlotWidth > DIRECTGATE_ELEV_MAX_WIDTH || g_helper.nSlotHeight > DIRECTGATE_ELEV_MAX_HEIGHT ||
+        DIRECTGATE_ELEV_HEADER_BYTES + nSlotBytes > g_helper.nSectionBytes)
     {
         xloge("helper: missing or invalid channel handles; this process is started by the "
               "DirectGate service and cannot be run by hand");

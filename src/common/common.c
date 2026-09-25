@@ -204,6 +204,64 @@ xbool_t DirectGate_IsAPIEndpointAllowed(const char *pUrl)
 #endif
 }
 
+size_t DirectGate_CopyDisplaySafe(char *pOut, size_t nSize, const char *pIn)
+{
+    XCHECK_NL((pOut != NULL && nSize > 0), XSTDNON);
+    pOut[0] = XSTR_NUL;
+    XCHECK_NL((pIn != NULL), XSTDNON);
+
+    const unsigned char *pIt = (const unsigned char*)pIn;
+    size_t nFollow = 0;
+    size_t nPosit = 0;
+
+    while (*pIt != XSTR_NUL && nPosit + 1 < nSize)
+    {
+        unsigned char nByte = *pIt++;
+
+        /* A continuation byte is only text inside the sequence its lead byte opened */
+        if (nFollow > 0 && (nByte & 0xC0) == 0x80)
+        {
+            pOut[nPosit++] = (char)nByte;
+            nFollow--;
+            continue;
+        }
+
+        nFollow = 0;
+
+        /* U+0080..U+009F: the C1 controls, CSI among them, spelled as UTF-8 */
+        if (nByte == 0xC2 && *pIt >= 0x80 && *pIt <= 0x9F)
+        {
+            pOut[nPosit++] = '?';
+            pIt++;
+            continue;
+        }
+
+        if (nByte >= 0xC2 && nByte <= 0xF4) nFollow = nByte >= 0xF0 ? 3 : nByte >= 0xE0 ? 2 : 1;
+        else if (nByte < 0x20 || nByte >= 0x7F) nByte = '?';
+
+        pOut[nPosit++] = (char)nByte;
+    }
+
+    pOut[nPosit] = XSTR_NUL;
+    return nPosit;
+}
+
+xbool_t DirectGate_IsRelayEndpointAllowed(const char *pUrl)
+{
+    XCHECK_NL((xstrused(pUrl)), XFALSE);
+
+    xlink_t link;
+    XCHECK_NL((XLink_Parse(&link, pUrl) >= 0), XFALSE);
+    XCHECK_NL((xstrused(link.sAddr) && link.nPort), XFALSE);
+
+#ifdef DIRECTGATE_DEBUG
+    return (xstrcmp(link.sProtocol, "ws") ||
+            xstrcmp(link.sProtocol, "wss"));
+#else
+    return xstrcmp(link.sProtocol, "wss");
+#endif
+}
+
 #ifdef _WIN32
 /*
     Windows counterpart of the POSIX 0600/0700 private-file model.
@@ -596,6 +654,25 @@ xbool_t DirectGate_WritePrivateFile(const char *pPath, const uint8_t *pData, siz
     {
         unlink(sTempPath);
         return XFALSE;
+    }
+
+    /* The rename is only durable once the directory entry is. Without this a power
+       cut can bring back the previous file - and for agent.json that is the refresh
+       token the API has already rotated away, which it then treats as reuse and
+       revokes the enrollment over. Best effort: the file itself is already safe. */
+    char sDir[XPATH_MAX];
+    xstrncpy(sDir, sizeof(sDir), pPath);
+
+    char *pSlash = strrchr(sDir, '/');
+    if (pSlash == NULL) xstrncpy(sDir, sizeof(sDir), ".");
+    else if (pSlash == sDir) sDir[1] = XSTR_NUL;
+    else *pSlash = XSTR_NUL;
+
+    int nDirFd = open(sDir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (nDirFd >= 0)
+    {
+        while (fsync(nDirFd) != 0 && errno == EINTR) {}
+        close(nDirFd);
     }
 
     return XTRUE;

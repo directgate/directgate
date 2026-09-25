@@ -164,6 +164,60 @@ static int check_scaler(void)
     return 0;
 }
 
+/* Exact halving (4K -> 1080p) takes a shortcut: each output pixel is the mean
+ * of its 2x2 source block. Checked on uneven content, on a width that is not a
+ * multiple of anything convenient, and on a padded stride, against the block
+ * means computed here - and against a non-half ratio still going the long way. */
+static int check_half_scaler(void)
+{
+    enum { SW = 10, SH = 6, DW = 5, DH = 3, STRIDE = SW * 4 + 12 };
+    uint8_t src[STRIDE * SH];
+    uint8_t dst[DW * DH * 4];
+
+    memset(src, 0xEE, sizeof(src));
+    for (uint32_t y = 0; y < SH; y++)
+    {
+        for (uint32_t x = 0; x < SW; x++)
+        {
+            uint8_t *p = src + y * STRIDE + x * 4U;
+            p[0] = (uint8_t)(x * 23U + y * 7U);
+            p[1] = (uint8_t)(x * 5U + y * 41U);
+            p[2] = (uint8_t)(x * y * 13U + 3U);
+            p[3] = 0U;
+        }
+    }
+
+    DirectGate_YUV_ScaleBGRA(dst, DW, DH, src, SW, SH, STRIDE);
+
+    for (uint32_t y = 0; y < DH; y++)
+    {
+        for (uint32_t x = 0; x < DW; x++)
+        {
+            const uint8_t *p00 = src + (y * 2U) * STRIDE + (x * 2U) * 4U;
+            const uint8_t *p01 = p00 + 4U;
+            const uint8_t *p10 = p00 + STRIDE;
+            const uint8_t *p11 = p10 + 4U;
+            const uint8_t *pOut = dst + (y * DW + x) * 4U;
+
+            for (int c = 0; c < 3; c++)
+            {
+                uint32_t nMean = (uint32_t)(p00[c] + p01[c] + p10[c] + p11[c] + 2U) >> 2;
+                CHECK(pOut[c] == nMean, "a halved pixel is the mean of its 2x2 source block");
+            }
+
+            CHECK(pOut[3] == 255U, "a halved pixel is opaque");
+        }
+    }
+
+    /* 10x6 -> 4x3 is not a halving on one axis and must not take the shortcut:
+       a shortcut applied there would read past the source rows it was given. */
+    uint8_t other[4 * 3 * 4];
+    DirectGate_YUV_ScaleBGRA(other, 4, 3, src, SW, SH, STRIDE);
+    CHECK(other[3] == 255U, "a non-halving scale still produces opaque output");
+
+    return 0;
+}
+
 int main(void)
 {
     /* BT.709 limited-range references:
@@ -177,6 +231,7 @@ int main(void)
 
     if (check_nv12()) return 1;
     if (check_scaler()) return 1;
+    if (check_half_scaler()) return 1;
 
     printf("yuv_smoke: OK\n");
     return 0;

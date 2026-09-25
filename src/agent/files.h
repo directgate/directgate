@@ -49,6 +49,16 @@ int DirectGate_Files_TransferSendCb(xjson_obj_t *pHeader, const uint8_t *pPayloa
                                     size_t nLen, void *pCtx);
 void DirectGate_Files_ProcessTransfer(directgate_session_t *pSession);
 
+/* Copy and recursive delete run on a worker thread: a large tree used to hold
+   the event loop for as long as the disk took, freezing every other session and
+   ending the relay link once its keepalive gave up. The session sees the answer
+   once the worker is done (DirectGate_Files_ProcessOp); a session that goes away
+   first lets the operation finish on its own (DirectGate_Files_ReleaseOp). */
+int DirectGate_Files_GetOpFd(const directgate_session_t *pSession);
+int DirectGate_Files_ProcessOp(directgate_session_t *pSession);
+void DirectGate_Files_ReleaseOp(directgate_session_t *pSession);
+int DirectGate_Files_OnOpClosed(directgate_session_t *pSession);
+
 /* Message handlers */
 int DirectGate_Files_HandleManager(xapi_session_t *pApiSession, directgate_pkg_t *pPkg);
 int DirectGate_Files_HandleFile(xapi_session_t *pApiSession, directgate_pkg_t *pPkg);

@@ -24,10 +24,24 @@
 #include "files.h"
 #include "session.h"
 
+/* Queue bounds between the worker and the main loop. A full queue makes the
+ * worker wait for the main loop rather than fail the search: a broad search
+ * outruns the loop as a matter of course. */
+#define DIRECTGATE_SEARCH_QUEUE_EVENTS  4096U
+#define DIRECTGATE_SEARCH_QUEUE_BYTES   (16U * 1024U * 1024U)
+#define DIRECTGATE_SEARCH_QUEUE_WAIT_US 2000U
+
+/* Matches are sent in batches of whatever queued up between two passes of the
+ * main loop, each message kept under this size so it still fits a data channel
+ * message (a browser accepts 256 KB) with room for framing and encryption. */
+#define DIRECTGATE_SEARCH_BATCH_BYTES   (96U * 1024U)
+
+/* Content search reads at most this much of each file: the whole file used to
+ * be loaded, and one multi-gigabyte file in the tree could exhaust memory. */
+#define DIRECTGATE_SEARCH_TEXT_MAX_BYTES (32U * 1024U * 1024U)
+
 typedef struct directgate_search_build_ {
     directgate_search_t *pSearch;
-    xjson_obj_t *pEntries;
-    size_t nEntryCount;
     char sWarning[XSTR_MID];
     char sError[XSTR_MID];
 } directgate_search_build_t;
@@ -154,16 +168,6 @@ static int DirectGate_Search_QueueEventUnlocked(directgate_search_t *pSearch,
 {
     XCHECK((pSearch != NULL), XSTDERR);
 
-    /* A broad search can outrun the main loop indefinitely. Stop producing
-     * results at a bounded backlog; leave room for the terminal error event. */
-    if (nPayloadLen && (pSearch->nQueuedEvents >= 1024U ||
-        nPayloadLen > 16U * 1024U * 1024U - pSearch->nQueuedBytes))
-    {
-        free(pPayload);
-        errno = ENOBUFS;
-        return XSTDERR;
-    }
-
     directgate_search_event_t *pEvent = (directgate_search_event_t*)calloc(1, sizeof(*pEvent));
     if (pEvent == NULL)
     {
@@ -187,14 +191,38 @@ static int DirectGate_Search_QueueEventUnlocked(directgate_search_t *pSearch,
     return XSTDOK;
 }
 
+static xbool_t DirectGate_Search_QueueFull(const directgate_search_t *pSearch, size_t nPayloadLen)
+{
+    return (pSearch->nQueuedEvents >= DIRECTGATE_SEARCH_QUEUE_EVENTS ||
+            nPayloadLen > DIRECTGATE_SEARCH_QUEUE_BYTES - pSearch->nQueuedBytes) ? XTRUE : XFALSE;
+}
+
 static int DirectGate_Search_QueueEvent(directgate_search_t *pSearch,
                                         directgate_search_event_type_t eType,
                                         char *pPayload, size_t nPayloadLen,
                                         const char *pReason, xbool_t bStopRunning)
 {
     XCHECK((pSearch != NULL), XSTDERR);
-
     XSync_Lock(&pSearch->lock);
+
+    /* Results wait for room; a cancel or a teardown ends the wait. The terminal
+       events carry no payload and always get in, so a search can always finish. */
+    while (nPayloadLen && DirectGate_Search_QueueFull(pSearch, nPayloadLen))
+    {
+        XSync_Unlock(&pSearch->lock);
+
+        if (XSYNC_ATOMIC_GET(&pSearch->nInterrupted))
+        {
+            free(pPayload);
+            errno = ECANCELED;
+            return XSTDERR;
+        }
+
+        DirectGate_Search_Notify(pSearch);
+        xusleep(DIRECTGATE_SEARCH_QUEUE_WAIT_US);
+        XSync_Lock(&pSearch->lock);
+    }
+
     if (bStopRunning) pSearch->bRunning = XFALSE;
     int nStatus = DirectGate_Search_QueueEventUnlocked(pSearch, eType, pPayload, nPayloadLen, pReason);
     XSync_Unlock(&pSearch->lock);
@@ -212,88 +240,6 @@ static void DirectGate_Search_Finish(directgate_search_t *pSearch,
 {
     XCHECK_VOID_NL((pSearch != NULL));
     DirectGate_Search_QueueEvent(pSearch, eType, pPayload, nPayloadLen, pReason, XTRUE);
-}
-
-static xjson_obj_t* DirectGate_Search_NewEntries(void)
-{
-    return XJSON_NewArray(NULL, "entries", XFALSE);
-}
-
-static int DirectGate_Search_CreatePayload(const char *pRootPath, xjson_obj_t *pEntries,
-                                           char **ppPayload, size_t *pPayloadLen)
-{
-    XCHECK((xstrused(pRootPath)), XSTDERR);
-    XCHECK((pEntries != NULL), XSTDERR);
-    XCHECK((ppPayload != NULL), XSTDERR);
-    XCHECK((pPayloadLen != NULL), XSTDERR);
-
-    xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, XFALSE);
-    if (pRoot == NULL)
-    {
-        xloge("Failed to create search payload: errno(%d)", errno);
-        XJSON_FreeObject(pEntries);
-        return XSTDERR;
-    }
-
-    XJSON_AddString(pRoot, "path", pRootPath);
-    XJSON_AddObject(pRoot, pEntries);
-
-    *ppPayload = XJSON_DumpObj(pRoot, 0, pPayloadLen);
-    XJSON_FreeObject(pRoot);
-
-    return *ppPayload != NULL ? XSTDOK : XSTDERR;
-}
-
-static int DirectGate_Search_FlushBuild(directgate_search_build_t *pBuild, xbool_t bFinal)
-{
-    XCHECK((pBuild != NULL), XSTDERR);
-    XCHECK((pBuild->pSearch != NULL), XSTDERR);
-    if (!bFinal && pBuild->nEntryCount == 0) return XSTDOK;
-
-    char *pPayload = NULL;
-    size_t nPayloadLen = 0;
-    directgate_search_event_type_t eType = bFinal ?
-        DIRECTGATE_SEARCH_EVENT_COMPLETE :
-        DIRECTGATE_SEARCH_EVENT_PARTIAL;
-
-    if (pBuild->nEntryCount > 0)
-    {
-        xjson_obj_t *pEntries = pBuild->pEntries;
-        pBuild->pEntries = NULL;
-        pBuild->nEntryCount = 0;
-
-        if (DirectGate_Search_CreatePayload(pBuild->pSearch->sRootPath, pEntries, &pPayload, &nPayloadLen) < 0)
-        {
-            xstrncpy(pBuild->sError, sizeof(pBuild->sError), "failed to serialize search results");
-            return XSTDERR;
-        }
-    }
-
-    if (DirectGate_Search_QueueEvent(pBuild->pSearch, eType, pPayload, nPayloadLen, NULL, XFALSE) < 0)
-    {
-        xstrncpy(pBuild->sError, sizeof(pBuild->sError), "failed to queue search results");
-        return XSTDERR;
-    }
-
-    if (!bFinal)
-    {
-        pBuild->pEntries = DirectGate_Search_NewEntries();
-        if (pBuild->pEntries == NULL)
-        {
-            xstrncpy(pBuild->sError, sizeof(pBuild->sError), "failed to allocate search payload");
-            return XSTDERR;
-        }
-    }
-    else
-    {
-        if (pBuild->pEntries != NULL)
-            XJSON_FreeObject(pBuild->pEntries);
-
-        pBuild->pEntries = NULL;
-    }
-
-    pBuild->nEntryCount = 0;
-    return XSTDOK;
 }
 
 static int DirectGate_Search_ParseFileTypes(const char *pTypes)
@@ -403,7 +349,10 @@ static int DirectGate_Search_ParseSize(const char *pValue, size_t *pOutput)
     return XSTDOK;
 }
 
-static int DirectGate_Search_BuildEntry(directgate_search_build_t *pBuild, xsearch_entry_t *pEntry)
+/* Queues one match on its own: serialized here, off the main loop, and joined
+   into batches there (DirectGate_Search_Process), so a match is on its way the
+   moment the loop next runs however slowly the rest of the tree follows. */
+static int DirectGate_Search_QueueEntry(directgate_search_build_t *pBuild, xsearch_entry_t *pEntry)
 {
     XCHECK((pBuild != NULL), XSTDERR);
     XCHECK((pEntry != NULL), XSTDERR);
@@ -423,8 +372,26 @@ static int DirectGate_Search_BuildEntry(directgate_search_build_t *pBuild, xsear
         return XSTDERR;
     }
 
-    XJSON_AddObject(pBuild->pEntries, pJson);
-    ++pBuild->nEntryCount;
+    size_t nLength = 0;
+    char *pPayload = XJSON_DumpObj(pJson, 0, &nLength);
+    XJSON_FreeObject(pJson);
+
+    if (pPayload == NULL || !nLength)
+    {
+        free(pPayload);
+        xstrncpy(pBuild->sError, sizeof(pBuild->sError), "failed to serialize search results");
+        return XSTDERR;
+    }
+
+    if (DirectGate_Search_QueueEvent(pBuild->pSearch, DIRECTGATE_SEARCH_EVENT_PARTIAL,
+        pPayload, nLength, NULL, XFALSE) < 0)
+    {
+        if (errno != ECANCELED)
+            xstrncpy(pBuild->sError, sizeof(pBuild->sError), "failed to queue search results");
+
+        return XSTDERR;
+    }
+
     return XSTDOK;
 }
 
@@ -446,13 +413,7 @@ static int DirectGate_Search_ResultCb(xsearch_t *pSearchCtx, xsearch_entry_t *pE
     if (pEntry == NULL)
         return XSTDNON;
 
-    if (DirectGate_Search_BuildEntry(pBuild, pEntry) != XSTDOK)
-        return XSTDERR;
-
-    if (DirectGate_Search_FlushBuild(pBuild, XFALSE) < 0)
-        return XSTDERR;
-
-    return XSTDNON;
+    return (DirectGate_Search_QueueEntry(pBuild, pEntry) == XSTDOK) ? XSTDNON : XSTDERR;
 }
 
 static int DirectGate_Search_HasCriteria(const directgate_search_t *pSearch)
@@ -478,6 +439,7 @@ static int DirectGate_Search_ApplyCriteria(directgate_search_t *pSearch, xsearch
     pSearchCtx->bInsensitive = pSearch->bInsensitive;
     pSearchCtx->bSearchLines = pSearch->bSearchLines;
     pSearchCtx->bMatchOnly = pSearch->bMatchOnly || xstrused(pSearch->sText);
+    pSearchCtx->nBufferSize = DIRECTGATE_SEARCH_TEXT_MAX_BYTES;
     pSearchCtx->pInterrupted = &pSearch->nInterrupted;
 
     if (xstrused(pSearch->sText))
@@ -533,13 +495,6 @@ static void* DirectGate_Search_Worker(void *pArg)
     directgate_search_build_t build;
     memset(&build, 0, sizeof(build));
     build.pSearch = pSearch;
-    build.pEntries = DirectGate_Search_NewEntries();
-
-    if (build.pEntries == NULL)
-    {
-        DirectGate_Search_Finish(pSearch, DIRECTGATE_SEARCH_EVENT_FAILED, NULL, 0, "failed to allocate search payload");
-        return NULL;
-    }
 
     xsearch_t searchCtx;
     XSearch_Init(&searchCtx, pSearch->sFileName);
@@ -549,7 +504,6 @@ static void* DirectGate_Search_Worker(void *pArg)
     if (DirectGate_Search_ApplyCriteria(pSearch, &searchCtx) < 0)
     {
         XSearch_Destroy(&searchCtx);
-        XJSON_FreeObject(build.pEntries);
         DirectGate_Search_Finish(pSearch, DIRECTGATE_SEARCH_EVENT_FAILED, NULL, 0, "invalid search criteria");
         return NULL;
     }
@@ -590,11 +544,6 @@ static void* DirectGate_Search_Worker(void *pArg)
 
     if (bCancelRequested)
     {
-        if (build.pEntries != NULL && build.nEntryCount > 0)
-            DirectGate_Search_FlushBuild(&build, XFALSE);
-        else if (build.pEntries != NULL)
-            XJSON_FreeObject(build.pEntries);
-
         DirectGate_Search_Finish(pSearch, DIRECTGATE_SEARCH_EVENT_CANCELLED, NULL, 0, "search cancelled");
         return NULL;
     }
@@ -604,29 +553,12 @@ static void* DirectGate_Search_Worker(void *pArg)
         if (xstrused(build.sError)) xstrncpy(sReason, sizeof(sReason), build.sError);
         else if (xstrused(build.sWarning)) xstrncpy(sReason, sizeof(sReason), build.sWarning);
 
-        if (!xstrused(build.sError) && build.pEntries != NULL && build.nEntryCount > 0)
-            DirectGate_Search_FlushBuild(&build, XFALSE);
-        else if (build.pEntries != NULL)
-            XJSON_FreeObject(build.pEntries);
-
         DirectGate_Search_Finish(pSearch, DIRECTGATE_SEARCH_EVENT_FAILED, NULL, 0, sReason);
         return NULL;
     }
 
-    XSync_Lock(&pSearch->lock);
-    pSearch->bRunning = XFALSE;
-    XSync_Unlock(&pSearch->lock);
-
-    if (DirectGate_Search_FlushBuild(&build, XTRUE) < 0)
-    {
-        if (build.pEntries != NULL)
-            XJSON_FreeObject(build.pEntries);
-
-        DirectGate_Search_Finish(pSearch, DIRECTGATE_SEARCH_EVENT_FAILED, NULL, 0,
-            xstrused(build.sError) ? build.sError : "failed to serialize search results");
-
-        return NULL;
-    }
+    /* Every match already went out as it was found; the completion carries none. */
+    DirectGate_Search_Finish(pSearch, DIRECTGATE_SEARCH_EVENT_COMPLETE, NULL, 0, NULL);
     return NULL;
 }
 
@@ -799,6 +731,47 @@ int DirectGate_Search_Cancel(directgate_search_t *pSearch)
     return XSTDNON;
 }
 
+/* Starts or extends the batch of matches the main loop is about to send. The
+   payload shape is the one a single message always had, {"path":..,"entries":[..]},
+   built by joining the entries the worker serialized. */
+static xbool_t DirectGate_Search_AppendBatch(xbyte_buffer_t *pBatch, const char *pRootPath,
+                                             const char *pEntry, size_t nEntryLen)
+{
+    if (!pBatch->nUsed)
+    {
+        xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, XFALSE);
+        if (pRoot == NULL) return XFALSE;
+
+        XJSON_AddString(pRoot, "path", pRootPath);
+        size_t nLength = 0;
+        char *pPrefix = XJSON_DumpObj(pRoot, 0, &nLength);
+        XJSON_FreeObject(pRoot);
+
+        /* {"path":"..."} without its closing brace, then the array. */
+        xbool_t bOk = (pPrefix != NULL && nLength > 1 &&
+            XByteBuffer_Add(pBatch, (const uint8_t*)pPrefix, nLength - 1) > 0 &&
+            XByteBuffer_Add(pBatch, (const uint8_t*)",\"entries\":[", 12) > 0);
+
+        free(pPrefix);
+        if (!bOk) return XFALSE;
+    }
+    else if (XByteBuffer_Add(pBatch, (const uint8_t*)",", 1) <= 0) return XFALSE;
+
+    return XByteBuffer_Add(pBatch, (const uint8_t*)pEntry, nEntryLen) > 0;
+}
+
+static int DirectGate_Search_SendBatch(directgate_session_t *pSession, xbyte_buffer_t *pBatch, const char *pPath)
+{
+    XCHECK_NL((pBatch->nUsed > 0), XAPI_CONTINUE);
+
+    int nStatus = XByteBuffer_Add(pBatch, (const uint8_t*)"]}", 2) > 0 ?
+        DirectGate_Session_SendManagerData(pSession, "search", "partial", pPath, pBatch->pData, pBatch->nUsed) :
+        DirectGate_Session_SendManagerResp(pSession, "search", "failed", "failed to serialize search results", pPath);
+
+    XByteBuffer_Reset(pBatch);
+    return nStatus;
+}
+
 int DirectGate_Search_Process(directgate_session_t *pSession)
 {
     XCHECK((pSession != NULL), XAPI_CONTINUE);
@@ -808,6 +781,9 @@ int DirectGate_Search_Process(directgate_session_t *pSession)
 
     char sPath[XFILE_PATH_SIZE];
     xstrncpy(sPath, sizeof(sPath), pSearch->sRootPath);
+
+    xbyte_buffer_t batch;
+    XByteBuffer_Init(&batch, XSTDNON, XFALSE);
 
     int nStatus = XAPI_CONTINUE;
     while (XTRUE)
@@ -831,14 +807,33 @@ int DirectGate_Search_Process(directgate_session_t *pSession)
         pSearch->bPending = (pSearch->pEventHead != NULL);
         XSync_Unlock(&pSearch->lock);
 
+        if (pEvent->eType == DIRECTGATE_SEARCH_EVENT_PARTIAL)
+        {
+            if (batch.nUsed && batch.nUsed + pEvent->nPayloadLen + 3 > DIRECTGATE_SEARCH_BATCH_BYTES)
+                nStatus = DirectGate_Search_SendBatch(pSession, &batch, sPath);
+
+            if (nStatus >= 0 && pEvent->pPayload != NULL && pEvent->nPayloadLen > 0 &&
+                !DirectGate_Search_AppendBatch(&batch, sPath, pEvent->pPayload, pEvent->nPayloadLen))
+            {
+                xloge("Failed to batch search results: sid(%u), bytes(%zu)", pSession->nSessionId, batch.nUsed);
+                XByteBuffer_Reset(&batch);
+            }
+
+            DirectGate_Search_FreeEvent(pEvent);
+            if (nStatus < 0) break;
+            continue;
+        }
+
+        /* Everything found so far goes out ahead of the search's final word. */
+        nStatus = DirectGate_Search_SendBatch(pSession, &batch, sPath);
+        if (nStatus < 0)
+        {
+            DirectGate_Search_FreeEvent(pEvent);
+            break;
+        }
+
         switch (pEvent->eType)
         {
-            case DIRECTGATE_SEARCH_EVENT_PARTIAL:
-            {
-                nStatus = DirectGate_Session_SendManagerData(pSession, "search", "partial",
-                    sPath, (const uint8_t*)pEvent->pPayload, pEvent->nPayloadLen);
-                break;
-            }
             case DIRECTGATE_SEARCH_EVENT_COMPLETE:
             {
                 xlogi("Search completed: sid(%u), wsfd(%d), path(%s), bytes(%zu)",
@@ -872,6 +867,9 @@ int DirectGate_Search_Process(directgate_session_t *pSession)
         DirectGate_Search_FreeEvent(pEvent);
         if (nStatus < 0) break;
     }
+
+    if (nStatus >= 0) nStatus = DirectGate_Search_SendBatch(pSession, &batch, sPath);
+    XByteBuffer_Clear(&batch);
 
     XSync_Lock(&pSearch->lock);
     xbool_t bRunning = pSearch->bRunning;

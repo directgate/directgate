@@ -79,7 +79,7 @@ static xbool_t wait_for_output(directgate_term_t *pTerm, const char *pNeedle, in
 
         if (nRead < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
         {
-            DirectGate_SleepMs(20);
+            usleep(20000);
             continue;
         }
 
@@ -100,7 +100,7 @@ static xbool_t wait_for_cwd(directgate_term_t *pTerm, const char *pExpect, int n
         if (DirectGate_Term_GetCwd(pTerm, sCwd, sizeof(sCwd)) == XSTDOK &&
             strcmp(sCwd, pExpect) == 0) return XTRUE;
 
-        DirectGate_SleepMs(20);
+        usleep(20000);
     }
 
     return XFALSE;
@@ -167,16 +167,31 @@ static int test_shell_path(void)
     /* The shell the child execs. An unusable SHELL must not be taken at its
      * word, or every terminal session dies at exec. */
     setenv("SHELL", "/nonexistent/shell", 1);
-    const char *pShell = DirectGate_Term_GetShellPath();
+    const char *pShell = DirectGate_Term_GetShellPath(NULL);
     CHECK(access(pShell, X_OK) == 0, "an unusable SHELL falls back to a shell that exists");
 
     setenv("SHELL", "/bin/sh", 1);
-    CHECK(strcmp(DirectGate_Term_GetShellPath(), "/bin/sh") == 0,
-        "a usable SHELL is used as given");
+    CHECK(strcmp(DirectGate_Term_GetShellPath(NULL), "/bin/sh") == 0,
+        "a usable SHELL is used as given when the account names no shell");
 
     unsetenv("SHELL");
-    pShell = DirectGate_Term_GetShellPath();
+    pShell = DirectGate_Term_GetShellPath(NULL);
     CHECK(access(pShell, X_OK) == 0, "with no SHELL set a usable shell is still found");
+
+    /* The account's login shell wins over the agent's own $SHELL, which after a
+     * privilege drop from root names root's shell. One that refuses logins or
+     * does not exist is never picked. */
+    setenv("SHELL", "/nonexistent/shell", 1);
+    CHECK(strcmp(DirectGate_Term_GetShellPath("/bin/sh"), "/bin/sh") == 0,
+        "the account's own login shell is preferred");
+
+    setenv("SHELL", "/bin/sh", 1);
+    CHECK(strcmp(DirectGate_Term_GetShellPath("/usr/sbin/nologin"), "/bin/sh") == 0,
+        "an account shell that refuses logins is not used");
+    CHECK(strcmp(DirectGate_Term_GetShellPath("/bin/false"), "/bin/sh") == 0,
+        "an account shell of false is not used");
+    CHECK(strcmp(DirectGate_Term_GetShellPath("/nonexistent/zsh"), "/bin/sh") == 0,
+        "an account shell that does not exist is not used");
 
     CHECK(strcmp(DirectGate_Term_GetArg0("/bin/bash"), "bash") == 0,
         "argv[0] is the shell's basename, so it starts as a login-style shell");
@@ -274,8 +289,11 @@ static int test_running_terminal(void)
     CHECK(term.txBuffer.nUsed == 0, "shutdown drops anything still buffered");
 
     /* A child that outlived its session would hold the PTY and the user's
-     * login open for as long as the agent runs. */
-    CHECK(kill(nChild, 0) != 0 || errno == ESRCH,
+     * login open for as long as the agent runs. The reap happens on the event
+     * loop now, so drive it the way the loop would, for at most two seconds. */
+    for (int nPass = 0; nPass < 200 && DirectGate_Term_ReapPending() > 0; nPass++) usleep(10000);
+    CHECK(DirectGate_Term_ReapPending() == 0, "the event loop reaps every hung-up shell");
+    CHECK(kill(nChild, 0) != 0 && errno == ESRCH,
         "shutdown reaps the shell rather than leaving it behind");
 
     DirectGate_Term_Clear(&term);

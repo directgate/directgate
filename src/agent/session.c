@@ -22,6 +22,7 @@
 #include "session.h"
 #include "websock.h"
 #include "protocol.h"
+#include "files.h"
 
 static int DirectGate_Session_GetWsFd(const directgate_session_t *pSession)
 {
@@ -86,6 +87,8 @@ static void DirectGate_Session_Destroy(directgate_session_t *pSession)
         XAPI_Disconnect(pApiSession);
     }
 
+    /* A copy or delete still running is left to finish on its own worker. */
+    DirectGate_Files_ReleaseOp(pSession);
     DirectGate_Desktop_Clear(&pSession->desktop);
     DirectGate_WebRTC_Clear(&pSession->webrtc);
     DirectGate_Search_Clear(&pSession->search);
@@ -243,6 +246,8 @@ directgate_session_t* DirectGate_SessionMgr_Create(directgate_session_mgr_t *pMg
     pSession->bClosing = XFALSE;
     pSession->pSearchSession = NULL;
     pSession->pDesktopSession = NULL;
+    pSession->pFileOpSession = NULL;
+    pSession->pFileOp = NULL;
     pSession->pPipeSession = NULL;
     pSession->pWsSession = NULL;
     pSession->nSessionId = nSessionId;
@@ -524,10 +529,10 @@ int DirectGate_Session_Send(directgate_session_t *pSession, xjson_obj_t *pHeader
             return XSTDOK;
         }
 
-        xlogw("WebRTC send failed, falling back to relay: sid(%u), wsfd(%d)",
-            pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
+        xlogw("WebRTC send failed, falling back to relay: sid(%u), wsfd(%d), bytes(%zu)",
+            pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), msg.nUsed);
 
-        pRTC->bConnected = XFALSE;
+        DirectGate_WebRTC_NoteSendFailure(pRTC);
     }
 
     nStatus = DirectGate_WebSock_Send(pApiSession, msg.pData, msg.nUsed);
@@ -584,15 +589,17 @@ const char* DirectGate_SessionMode_ToString(directgate_session_mode_t eMode)
 
 int DirectGate_Session_EnsureMode(directgate_session_t *pSession, directgate_session_mode_t eMode, const char *pReason)
 {
-    XCHECK_NL((pSession != NULL), XAPI_CONTINUE);
+    XCHECK_NL((pSession != NULL), XSTDERR);
 
+    /* Refusals return XSTDERR, never XAPI_CONTINUE: that one is XSTDOK under another name, and every caller's
+       "!= XSTDOK" guard read it as a pass - running the handler on a session this call had just freed. */
     if (!pSession->bAuthenticated)
     {
         xloge("Session is not authenticated for requested mode: sid(%u), wsfd(%d), required(%s)",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), DirectGate_SessionMode_ToString(eMode));
 
         DirectGate_Session_Close(pSession, "session not authenticated");
-        return XAPI_CONTINUE;
+        return XSTDERR;
     }
 
     if (pSession->eActiveMode != eMode)
@@ -605,7 +612,7 @@ int DirectGate_Session_EnsureMode(directgate_session_t *pSession, directgate_ses
         if (xstrused(pReason))
             DirectGate_Session_SendErrorMsg(pSession, pReason);
 
-        return XAPI_CONTINUE;
+        return XSTDERR;
     }
 
     return XSTDOK;
@@ -714,6 +721,9 @@ static int DirectGate_Session_AddRTCPipeEndpoint(directgate_session_t *pSession)
         xloge("Failed to register WebRTC pipe endpoint: sid(%u), wsfd(%d), pipefd(%d)",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), nPipeFd);
 
+        /* A failed registration has already closed the descriptor; closing it again at teardown could hit
+           whatever another thread opened under the same number in between. */
+        pSession->webrtc.nPipeFds[0] = XSOCK_INVALID;
         DirectGate_Session_Close(pSession, "pipe registration failed");
         return XAPI_DISCONNECT;
     }
@@ -744,6 +754,9 @@ static int DirectGate_Session_AddSearchPipeEndpoint(directgate_session_t *pSessi
     {
         xloge("Failed to register search pipe endpoint: sid(%u), wsfd(%d), pipefd(%d)",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), nPipeFd);
+
+        /* Already closed by the failed registration, see the WebRTC pipe above. */
+        pSession->search.nPipeFds[0] = XSOCK_INVALID;
 
         /* Session is freed by Close; report failure so no caller touches it. */
         DirectGate_Session_Close(pSession, "search pipe registration failed");
@@ -776,6 +789,9 @@ static int DirectGate_Session_AddDesktopEndpoint(directgate_session_t *pSession)
     {
         xloge("Failed to register desktop timer endpoint: sid(%u), wsfd(%d), timerfd(%d)",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), nTimerFd);
+
+        /* Already closed by the failed registration, see the WebRTC pipe above. */
+        pSession->desktop.nTimerFd = XSOCK_INVALID;
 
         /* Session is freed by Close; report failure so no caller touches it. */
         DirectGate_Session_Close(pSession, "desktop endpoint registration failed");
@@ -823,10 +839,11 @@ int DirectGate_Session_StartTerminal(directgate_session_t *pSession)
 
     if (XAPI_AddEndpoint(pApiSession->pApi, &endpt) < 0)
     {
-        DirectGate_Term_Shutdown(&pSession->term, XTRUE);
         xloge("Failed to register PTY endpoint: sid(%u), wsfd(%d), ptfd(%d)",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), pSession->term.nMasterFd);
 
+        /* The failed registration closed the PTY master already: reap the shell without closing it again. */
+        DirectGate_Term_Shutdown(&pSession->term, XFALSE);
         return DirectGate_Session_Close(pSession, "endpoint registration failed");
     }
 

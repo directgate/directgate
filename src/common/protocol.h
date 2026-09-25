@@ -286,6 +286,15 @@ xbool_t DirectGate_Proto_BindInnerSessionId(uint32_t nOuterSessionId, directgate
 */
 xbool_t DirectGate_Proto_IsClientPreAuthType(const char *pType);
 
+/*
+    What a client may take in the clear. Before authentication the relay is the only party that can speak, so it
+    gets the handshake's own types and nothing else: a data, file, webrtc or admin message at that point would be
+    the relay writing to the terminal, dropping a file into the working directory or forging the add-key verdict.
+    After authentication every message from the peer is encrypted, and only the relay's own error and status
+    notices stay in the clear - an unencrypted auth by then would let the relay restart the handshake.
+*/
+xbool_t DirectGate_Proto_ClientAcceptsPlain(directgate_pkg_type_t eType, xbool_t bAuthenticated);
+
 #ifdef __cplusplus
 }
 #endif

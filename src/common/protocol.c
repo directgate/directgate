@@ -477,6 +477,16 @@ xbool_t DirectGate_Proto_IsClientPreAuthType(const char *pType)
     return (eType == DIRECTGATE_PKG_ROLE || eType == DIRECTGATE_PKG_AUTH);
 }
 
+xbool_t DirectGate_Proto_ClientAcceptsPlain(directgate_pkg_type_t eType, xbool_t bAuthenticated)
+{
+    if (eType == DIRECTGATE_PKG_ERROR || eType == DIRECTGATE_PKG_STATUS) return XTRUE;
+    if (bAuthenticated) return XFALSE;
+
+    return (eType == DIRECTGATE_PKG_AUTH ||
+            eType == DIRECTGATE_PKG_CMD ||
+            eType == DIRECTGATE_PKG_KEEPALIVE);
+}
+
 xjson_obj_t* DirectGate_Proto_BuildRole(const char *pRole, const char *pDeviceId)
 {
     xjson_obj_t *pHeader = DirectGate_Proto_NewHeader("role", XSTDNON);

@@ -82,7 +82,7 @@ int main(void)
         "\"allowTCP\":true,"
         "\"auth\":{\"method\":\"srp\",\"salt\":\"%s\",\"verifier\":\"abcdef\"},"
         "\"desktop\":{\"elevatedInput\":false,\"lockScreen\":false},"
-        "\"enroll\":{\"enrolled\":true,"
+        "\"enrollment\":{\"enrolled\":true,"
         "\"apiUrl\":\"https://api.example\","
         "\"accessToken\":\"access-from-file\","
         "\"refreshToken\":\"refresh-from-file\"},"
@@ -205,6 +205,34 @@ int main(void)
             (char*)"directgate", (char*)"-c", sMissingPath, (char*)"-e", NULL
         };
         CHECK(parse(&enrollCfg, 4, enrollArgv), "enroll may create the config");
+    }
+
+    /* A normal start needs working credentials and an enrollment. ParseArgs used to report these as XSTDERR,
+       which an xbool_t turns into 255 and every caller reads as success, so the agent ran on without either. */
+    {
+        char sBarePath[512];
+        snprintf(sBarePath, sizeof(sBarePath), "%s/unenrolled.json", sRoot);
+
+        char sBare[1024];
+        int nBare = snprintf(sBare, sizeof(sBare),
+            "{\"deviceId\":\"dev-bare\",\"relayUrl\":\"wss://relay.example/websock\","
+            "\"auth\":{\"srp\":{\"salt\":\"%s\",\"verifier\":\"abcdef\"}}}", pSalt);
+
+        CHECK(nBare > 0 && (size_t)nBare < sizeof(sBare), "compose unenrolled config json");
+        CHECK(write_file(sBarePath, sBare), "write unenrolled config json");
+
+        directgate_cfg_t cfg;
+        char *argv[] = { (char*)"directgate", (char*)"-c", sBarePath, NULL };
+        CHECK(!parse(&cfg, 3, argv), "an agent that was never enrolled refuses to start");
+
+        CHECK(write_file(sBarePath, "{\"deviceId\":\"dev-bare\",\"relayUrl\":\"wss://relay.example/websock\","
+            "\"routingKey\":\"rk\",\"enrollment\":{\"enrolled\":true,\"refreshToken\":\"r\"},"
+            "\"auth\":{\"srp\":{\"salt\":\"zz\",\"verifier\":\"abcdef\"}}}"),
+            "write config with an unusable salt");
+
+        directgate_cfg_t badSalt;
+        CHECK(!parse(&badSalt, 3, argv), "an agent whose SRP record is unusable refuses to start");
+        unlink(sBarePath);
     }
 
     /* -c with no value is rejected rather than silently reading a default. */

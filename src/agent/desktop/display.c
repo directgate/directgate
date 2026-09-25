@@ -44,10 +44,13 @@
 
 #ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
 
-/* How long the event loop is held waiting for the portal. Long enough for
- * someone already looking at the prompt to answer it, short enough that the
- * rest of the agent's work is not visibly stalled. */
-#define DIRECTGATE_DESKTOP_WAYLAND_WAIT_MS 5000
+/* How long the event loop is held waiting for the portal. Long enough for a
+ * remembered grant, which the portal answers in a few hundred milliseconds,
+ * to start the screen without a "waiting" flash. Anything slower is a person
+ * reading the prompt, and the desktop tick picks their answer up within a
+ * frame (DirectGate_Desktop_ResumeWayland) - so holding longer only froze
+ * every other session on the agent while they read it. */
+#define DIRECTGATE_DESKTOP_WAYLAND_WAIT_MS 500
 
 /* The portal grant belongs to the process, not to one desktop session.
  *

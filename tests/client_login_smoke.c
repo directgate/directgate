@@ -134,6 +134,21 @@ static int test_parse_request(void)
         sCode, sizeof(sCode), sError, sizeof(sError)), "ignore unrelated request");
     CHECK(sCode[0] == '\0', "unrelated request leaves no code");
 
+    /* The code is spliced into the token request's JSON body, and anything on the machine can post to the
+       loopback port: a quote, a backslash or a control byte in it is refused rather than sent. */
+    CHECK(!DirectGate_Login_ParseRequest(
+        "GET /callback?code=abc%22%2C%22codeVerifier%22%3A%22x HTTP/1.1\r\n\r\n", NULL,
+        sCode, sizeof(sCode), sError, sizeof(sError)), "refuse quote in GET code");
+    CHECK(sCode[0] == '\0', "refused GET code is not handed back");
+    CHECK(!DirectGate_Login_ParseRequest("GET /callback?code=abc%5Cu0022 HTTP/1.1\r\n\r\n", NULL,
+        sCode, sizeof(sCode), sError, sizeof(sError)), "refuse backslash in GET code");
+    CHECK(!DirectGate_Login_ParseRequest("GET /callback?code=abc%0A HTTP/1.1\r\n\r\n", NULL,
+        sCode, sizeof(sCode), sError, sizeof(sError)), "refuse control byte in GET code");
+    CHECK(!DirectGate_Login_ParseRequest(
+        "POST /callback HTTP/1.1\r\nContent-Length: 22\r\n\r\n{\"code\":\"a\\\"b\\\\c\"}", NULL,
+        sCode, sizeof(sCode), sError, sizeof(sError)), "refuse escaped quote in POST code");
+    CHECK(sCode[0] == '\0', "refused POST code is not handed back");
+
     /* A callback that carries a state must carry ours. One that carries none is a page that does not echo it
        yet, and is still accepted so sign-in keeps working until it does. */
     directgate_login_guard_t guard;

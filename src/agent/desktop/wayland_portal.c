@@ -138,6 +138,9 @@ struct directgate_wl_portal_ {
      * request failing. The caller's flag, not this struct's, because the
      * portal is freed on the way out and the answer has to outlive it. */
     xbool_t *pDeclined;
+    /* The caller's too: raised when whoever asked has gone, so a grant wait that could run two minutes ends at the
+     * next 100ms step instead of holding the thread that has to be joined before the session can be torn down. */
+    xvolatile_t *pCancel;
 };
 
 static void DirectGate_WL_PortalSetError(char *pErrBuf, size_t nErrSize, const char *pFmt, ...)
@@ -374,6 +377,12 @@ static int DirectGate_WL_WaitResponse(directgate_wl_portal_t *pPortal, const cha
 
     while (XTime_GetMs() < nDeadline)
     {
+        if (pPortal->pCancel != NULL && XSYNC_ATOMIC_GET(pPortal->pCancel))
+        {
+            DirectGate_WL_PortalSetError(pErrBuf, nErrSize, "The screen sharing request was abandoned.");
+            return XSTDERR;
+        }
+
         if (!g_dbus.readWrite(pPortal->pConn, 100))
         {
             DirectGate_WL_PortalSetError(pErrBuf, nErrSize, "The D-Bus connection to the portal was lost.");
@@ -873,7 +882,7 @@ const directgate_wl_stream_t* DirectGate_WL_PortalStream(const directgate_wl_por
 
 directgate_wl_portal_t* DirectGate_WL_PortalOpen(const char *pRestoreToken,
                                                  char *pNewToken, size_t nTokenSize,
-                                                 xbool_t *pDeclined,
+                                                 xbool_t *pDeclined, xvolatile_t *pCancel,
                                                  char *pErrBuf, size_t nErrSize)
 {
     if (pDeclined != NULL) *pDeclined = XFALSE;
@@ -887,6 +896,7 @@ directgate_wl_portal_t* DirectGate_WL_PortalOpen(const char *pRestoreToken,
     }
 
     pPortal->pDeclined = pDeclined;
+    pPortal->pCancel = pCancel;
 
     DBusError error;
     g_dbus.errorInit(&error);
@@ -1120,6 +1130,10 @@ directgate_wl_portal_t* DirectGate_WL_PortalOpen(const char *pRestoreToken,
 
     xlogi("Desktop sharing permission remembered: restore(%s)",
         (pNewToken != NULL && pNewToken[0]) ? "yes" : "no");
+
+    /* The flag lives on the opening thread's stack, which is gone once this returns;
+       every request that could report a refusal has been made by now. */
+    pPortal->pDeclined = NULL;
 
     return pPortal;
 }

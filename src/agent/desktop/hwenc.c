@@ -219,6 +219,10 @@ typedef struct directgate_hwenc_device_ {
 static directgate_hwenc_device_t g_hwencDevices[DIRECTGATE_HWENC_MAX_DEVICES];
 static uint32_t g_nHwencDevices;
 
+/* Encoders are opened on the event loop when a session starts and on a session's own encode worker when it falls
+ * back from zero-copy, so two sessions can be here at once. Only encoder setup takes it, never a frame. */
+static pthread_mutex_t g_hwencDeviceLock = PTHREAD_MUTEX_INITIALIZER;
+
 /* Returns a new reference to a cached device, opening it on first use.
  * pDevice may be NULL for "the library default". */
 static AVBufferRef* DirectGate_HWEnc_AcquireDevice(enum AVHWDeviceType eType,
@@ -226,42 +230,56 @@ static AVBufferRef* DirectGate_HWEnc_AcquireDevice(enum AVHWDeviceType eType,
                                                    int *pError)
 {
     const char *pKey = (pDevice != NULL) ? pDevice : "";
+    AVBufferRef *pResult = NULL;
     *pError = 0;
 
-    for (uint32_t i = 0; i < g_nHwencDevices; i++)
-    {
-        directgate_hwenc_device_t *pEntry = &g_hwencDevices[i];
-        if (pEntry->eType != eType || !xstrcmp(pEntry->sDevice, pKey)) continue;
+    pthread_mutex_lock(&g_hwencDeviceLock);
 
-        if (pEntry->bFailed)
+    do
+    {
+        directgate_hwenc_device_t *pCached = NULL;
+
+        for (uint32_t i = 0; i < g_nHwencDevices && pCached == NULL; i++)
         {
-            *pError = AVERROR(ENODEV);
-            return NULL;
+            directgate_hwenc_device_t *pEntry = &g_hwencDevices[i];
+            if (pEntry->eType == eType && xstrcmp(pEntry->sDevice, pKey)) pCached = pEntry;
         }
 
-        return g_hwenc.av_buffer_ref(pEntry->pRef);
+        if (pCached != NULL)
+        {
+            if (pCached->bFailed) *pError = AVERROR(ENODEV);
+            else pResult = g_hwenc.av_buffer_ref(pCached->pRef);
+            break;
+        }
+
+        AVBufferRef *pRef = NULL;
+        int nRet = g_hwenc.av_hwdevice_ctx_create(&pRef, eType, pDevice, NULL, 0);
+        xbool_t bCached = XFALSE;
+
+        if (g_nHwencDevices < DIRECTGATE_HWENC_MAX_DEVICES)
+        {
+            directgate_hwenc_device_t *pEntry = &g_hwencDevices[g_nHwencDevices++];
+            xstrncpy(pEntry->sDevice, sizeof(pEntry->sDevice), pKey);
+            pEntry->bFailed = (nRet >= 0) ? XFALSE : XTRUE;
+            pEntry->pRef = (nRet >= 0) ? pRef : NULL;
+            pEntry->eType = eType;
+            bCached = (nRet >= 0) ? XTRUE : XFALSE;
+        }
+
+        if (nRet < 0)
+        {
+            *pError = nRet;
+            break;
+        }
+
+        /* One reference stays in the cache, one goes to the caller. A full cache keeps none, so the caller gets
+           the only one rather than a second reference nobody would ever drop. */
+        pResult = bCached ? g_hwenc.av_buffer_ref(pRef) : pRef;
     }
+    while (0);
 
-    AVBufferRef *pRef = NULL;
-    int nRet = g_hwenc.av_hwdevice_ctx_create(&pRef, eType, pDevice, NULL, 0);
-
-    if (g_nHwencDevices < DIRECTGATE_HWENC_MAX_DEVICES)
-    {
-        directgate_hwenc_device_t *pEntry = &g_hwencDevices[g_nHwencDevices++];
-        xstrncpy(pEntry->sDevice, sizeof(pEntry->sDevice), pKey);
-        pEntry->bFailed = (nRet >= 0) ? XFALSE : XTRUE;
-        pEntry->pRef = (nRet >= 0) ? pRef : NULL;
-        pEntry->eType = eType;
-    }
-
-    if (nRet < 0)
-    {
-        *pError = nRet;
-        return NULL;
-    }
-
-    /* One reference stays in the cache, one goes to the caller. */
-    return g_hwenc.av_buffer_ref(pRef);
+    pthread_mutex_unlock(&g_hwencDeviceLock);
+    return pResult;
 }
 
 /* Probe order. NVENC first so a machine with a discrete NVIDIA card plus an

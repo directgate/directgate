@@ -375,6 +375,11 @@ void DirectGate_Desktop_ComputeOutputSize(const directgate_desktop_t *pDesktop,
  * another frame; platform encoders skip the capture entirely in that case. */
 xbool_t DirectGate_Desktop_ShouldSkipForBackpressure(const directgate_session_t *pSession);
 
+/* True while a stream without an open data channel has fallen this far behind
+ * on the shared relay WebSocket. Main thread only: it reads the relay socket's
+ * send queue, which only the event loop may touch. */
+xbool_t DirectGate_Desktop_RelayIsBacklogged(const directgate_session_t *pSession);
+
 /* System-audio streaming (desktop/audio.c + per-platform capture backend).
  * DIRECTGATE_DESKTOP_HAS_AUDIO gates the call sites; every desktop platform now
  * ships a backend (PulseAudio/PipeWire on Linux, WASAPI on Windows,

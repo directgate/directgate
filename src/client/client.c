@@ -346,14 +346,21 @@ static ssize_t DirectGate_Client_WriteAll(int nFd, const void *pBuff, size_t nSi
             continue;
         }
 
-        if (nWritten < 0)
+        if (nWritten < 0 && errno == EINTR) continue;
+
+#ifndef _WIN32
+        /* A terminal's stdin and stdout are one open file description, so raw mode's O_NONBLOCK on stdin lands
+           on stdout too. A full terminal is backpressure, not a reason to drop the rest of the remote output:
+           wait for room, and give up only when the client is shutting down. */
+        if (nWritten < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
         {
-            if (errno == EINTR)
-                continue;
-            if (errno == EAGAIN ||
-                errno == EWOULDBLOCK)
-                return (ssize_t)(nSize - nLeft);
+            struct pollfd pfd = { .fd = nFd, .events = POLLOUT, .revents = 0 };
+            int nReady = poll(&pfd, 1, -1);
+
+            if (nReady > 0 && !(pfd.revents & (POLLERR | POLLNVAL))) continue;
+            if (nReady < 0 && errno == EINTR && !g_bFinish) continue;
         }
+#endif
 
         return XSTDERR;
     }
@@ -479,21 +486,6 @@ static void DirectGate_Client_WebRTC_SignalCb(const char *pJson, size_t nLen, vo
     XJSON_Destroy(&json);
 }
 
-static xbool_t DirectGate_Client_RequiresEncryption(directgate_ctx_t *pCli, const directgate_pkg_t *pPkg)
-{
-    XCHECK((pCli != NULL), XFALSE);
-    XCHECK((pPkg != NULL), XFALSE);
-    XCHECK_NL((pCli->bAuthDone), XFALSE);
-    XCHECK_NL((pPkg->header.nSessionId != 0), XFALSE);
-
-    return (pPkg->header.eType == DIRECTGATE_PKG_DATA ||
-            pPkg->header.eType == DIRECTGATE_PKG_FILE ||
-            pPkg->header.eType == DIRECTGATE_PKG_MANAGER ||
-            pPkg->header.eType == DIRECTGATE_PKG_RESIZE ||
-            pPkg->header.eType == DIRECTGATE_PKG_WEBRTC ||
-            pPkg->header.eType == DIRECTGATE_PKG_ADMIN);
-}
-
 /*
  * Hands the client key to the device for authorization. This is the whole
  * point of -a: one admin message on an authenticated, encrypted session, the
@@ -532,7 +524,9 @@ static int DirectGate_Client_HandleAdminMsg(directgate_ctx_t *pCli, directgate_p
     else if (xstrcmp(pStatus, "already")) printf("\n  Key was already authorized on this device.\n\n");
     else
     {
-        xloge("Device refused the key: %s", xstrused(pAdmin->pReason) ? pAdmin->pReason : "unknown reason");
+        char sReason[XSTR_MID];
+        DirectGate_CopyDisplaySafe(sReason, sizeof(sReason), xstrused(pAdmin->pReason) ? pAdmin->pReason : "unknown reason");
+        xloge("Device refused the key: %s", sReason);
         pCli->bAddKeyDone = XFALSE;
         g_bFinish = XTRUE;
         return XAPI_DISCONNECT;
@@ -653,8 +647,9 @@ static int DirectGate_Client_HandleKeyAuthMsg(directgate_ctx_t *pCli, directgate
             That is exactly what the password is for, so the caller reconnects
             and runs SRP instead of failing outright.
         */
-        xlogn("KeyAuth: Key was not accepted (%s), falling back to the password",
-            xstrused(pAuth->pReason) ? pAuth->pReason : "rejected");
+        char sReason[XSTR_MID];
+        DirectGate_CopyDisplaySafe(sReason, sizeof(sReason), xstrused(pAuth->pReason) ? pAuth->pReason : "rejected");
+        xlogn("KeyAuth: Key was not accepted (%s), falling back to the password", sReason);
 
         pCli->bKeyAuthFailed = XTRUE;
         g_bFinish = XTRUE;
@@ -764,16 +759,20 @@ static int DirectGate_Client_HandleAuthMsg(directgate_ctx_t *pCli, directgate_pk
         return XAPI_CONTINUE;
     }
 
+    /* Unauthenticated until here, so the reason may be the relay's words, not the host's */
+    char sReason[XSTR_MID];
+    DirectGate_CopyDisplaySafe(sReason, sizeof(sReason), xstrused(pAuth->pReason) ? pAuth->pReason : "unknown");
+
     if (xstrused(pAuth->pStatus) && xstrcmp(pAuth->pStatus, "failed"))
     {
-        xloge("Authentication failed: %s", xstrused(pAuth->pReason) ? pAuth->pReason : "unknown");
+        xloge("Authentication failed: %s", sReason);
         DirectGate_Client_CleanseSecretCtx(pCli);
         return XAPI_DISCONNECT;
     }
 
     if (xstrused(pAuth->pStatus) && xstrcmp(pAuth->pStatus, "error"))
     {
-        xloge("Authentication error: %s", xstrused(pAuth->pReason) ? pAuth->pReason : "unknown");
+        xloge("Authentication error: %s", sReason);
         DirectGate_Client_CleanseSecretCtx(pCli);
         return XAPI_DISCONNECT;
     }
@@ -930,6 +929,21 @@ static int DirectGate_Client_HandleKeepaliveMsg(directgate_ctx_t *pCli, directga
     return XAPI_CONTINUE;
 }
 
+static int DirectGate_Client_HandleErrorMsg(directgate_ctx_t *pCli, directgate_pkg_t *pMsg)
+{
+    directgate_pkg_error_t *pError = (directgate_pkg_error_t*)pMsg->pPackage;
+    char sReason[XSTR_MID];
+    (void)pCli;
+
+    /* Sent by the relay in the clear: it gets no more say over the terminal than any other untrusted text */
+    DirectGate_CopyDisplaySafe(sReason, sizeof(sReason),
+        (pError != NULL && xstrused(pError->pReason)) ?
+        pError->pReason : "unknown");
+
+    xloge("Received server side error message: %s", sReason);
+    return XAPI_CONTINUE;
+}
+
 static int DirectGate_Client_DispatchMessage(directgate_ctx_t *pCli, directgate_pkg_t *pMsg, const char *pTransport)
 {
     XCHECK((pCli != NULL), XAPI_DISCONNECT);
@@ -939,12 +953,7 @@ static int DirectGate_Client_DispatchMessage(directgate_ctx_t *pCli, directgate_
     switch (pMsg->header.eType)
     {
         case DIRECTGATE_PKG_ERROR:
-        {
-            directgate_pkg_error_t *pError = (directgate_pkg_error_t*)pMsg->pPackage;
-            const char *pReason = (pError != NULL && xstrused(pError->pReason)) ? pError->pReason : "unknown";
-            xloge("Received server side error message: %s", pReason);
-            return XAPI_CONTINUE;
-        }
+            return DirectGate_Client_HandleErrorMsg(pCli, pMsg);
         case DIRECTGATE_PKG_AUTH:
             return DirectGate_Client_HandleAuthMsg(pCli, pMsg);
         case DIRECTGATE_PKG_CMD:
@@ -1040,11 +1049,12 @@ static int DirectGate_Client_HandleMessage(directgate_ctx_t *pCli, const uint8_t
     {
         nStatus = DirectGate_Client_HandleEncryptedMsg(pCli, &msg, pTransport);
     }
-    else if (DirectGate_Client_RequiresEncryption(pCli, &msg))
+    else if (!DirectGate_Proto_ClientAcceptsPlain(msg.header.eType, pCli->bAuthDone))
     {
-        xloge("%s: Protocol violation: unencrypted '%s' after auth",
+        xloge("%s: Protocol violation: unencrypted '%s' %s auth",
             xstrused(pTransport) ? pTransport : "transport",
-            xstrused(msg.header.pType) ? msg.header.pType : "N/A");
+            xstrused(msg.header.pType) ? msg.header.pType : "N/A",
+            pCli->bAuthDone ? "after" : "before");
 
         nStatus = XAPI_DISCONNECT;
     }
@@ -1312,10 +1322,10 @@ static int DirectGate_Client_HandshakeRequest(xapi_ctx_t *pCtx, xapi_session_t *
             XByteBuffer_Clear(&pHandle->rawData);
             pHandle->nComplete = XFALSE;
 
-            XCHECK((XHTTP_Assemble(pHandle, pBuffer, nLength) != NULL),
-                xthrowr(XAPI_DISCONNECT, "Failed to reassemble handshake request"));
-
+            xbool_t bAssembled = XHTTP_Assemble(pHandle, pBuffer, nLength) != NULL;
             free(pBuffer);
+
+            XCHECK((bAssembled), xthrowr(XAPI_DISCONNECT, "Failed to reassemble handshake request"));
         }
     }
 
@@ -1391,57 +1401,50 @@ static int DirectGate_Client_HandleStdin(xapi_session_t *pSession)
     directgate_ctx_t *pCli = (directgate_ctx_t*)pSession->pSessionData;
     XCHECK((pCli->pWsSession != NULL), XAPI_DISCONNECT);
 
+    /* One read per wakeup: the poll is level triggered, so whatever is left fires again, and a second read in a
+       row would block the whole loop whenever stdin is not in non-blocking mode (it is not a tty, raw mode was
+       never entered). */
     uint8_t sBuffer[XSTR_BIG];
-    for (;;)
+#ifdef _WIN32
+    int nRead = recv(g_nStdinBridge[0], (char*)sBuffer, (int)sizeof(sBuffer), 0);
+#else
+    ssize_t nRead = read(STDIN_FILENO, sBuffer, sizeof(sBuffer));
+#endif
+
+    if (nRead == 0)
+    {
+        g_bFinish = XTRUE;
+        return XAPI_CONTINUE;
+    }
+
+    if (nRead < 0)
     {
 #ifdef _WIN32
-        int nRead = recv(g_nStdinBridge[0], (char*)sBuffer, (int)sizeof(sBuffer), 0);
-#else
-        ssize_t nRead = read(STDIN_FILENO, sBuffer, sizeof(sBuffer));
-#endif
-        if (nRead > 0)
-        {
-            if (!pCli->pWsSession->bHandshakeDone) continue;
-
-            /* Don't let client input break the session while auth is pending.
-             * Keyed on the handshake itself, not on the password, or a key
-             * authenticated session would pass keystrokes through early. */
-            if (!pCli->bAuthDone)
-            {
-                if (!pCli->bInputBlocked)
-                {
-                    xlogi("Waiting for authentication - input is temporarily blocked");
-                    pCli->bInputBlocked = XTRUE;
-                }
-
-                continue;
-            }
-
-            if (DirectGate_Client_SendData(pCli, sBuffer, (size_t)nRead) < 0)
-                return XAPI_DISCONNECT;
-
-            continue;
-        }
-
-        if (nRead == 0)
-        {
-            g_bFinish = XTRUE;
-            return XAPI_CONTINUE;
-        }
-
-#ifdef _WIN32
         int nError = WSAGetLastError();
-        if (nError == WSAEINTR) continue;
-        if (nError == WSAEWOULDBLOCK) break;
+        if (nError == WSAEINTR || nError == WSAEWOULDBLOCK) return XAPI_CONTINUE;
 #else
-        if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return XAPI_CONTINUE;
 #endif
-
         return XAPI_DISCONNECT;
     }
 
-    return XAPI_CONTINUE;
+    if (!pCli->pWsSession->bHandshakeDone) return XAPI_CONTINUE;
+
+    /* Don't let client input break the session while auth is pending.
+     * Keyed on the handshake itself, not on the password, or a key
+     * authenticated session would pass keystrokes through early. */
+    if (!pCli->bAuthDone)
+    {
+        if (!pCli->bInputBlocked)
+        {
+            xlogi("Waiting for authentication - input is temporarily blocked");
+            pCli->bInputBlocked = XTRUE;
+        }
+
+        return XAPI_CONTINUE;
+    }
+
+    return DirectGate_Client_SendData(pCli, sBuffer, (size_t)nRead) < 0 ? XAPI_DISCONNECT : XAPI_CONTINUE;
 }
 
 static int DirectGate_Client_HandleFrame(xapi_ctx_t *pCtx, xapi_session_t *pSession)
@@ -2035,6 +2038,13 @@ static XSTATUS DirectGate_Client_Run(directgate_ctx_t *pClient, directgate_cfg_t
     if (XLink_Parse(&link, pArgs->sSignalingUrl) < 0)
     {
         xloge("Failed to parse URL: %s", pArgs->sSignalingUrl);
+        return XSTDERR;
+    }
+
+    /* The role message carries the relay access token, so a plaintext relay would hand it to the network */
+    if (!DirectGate_IsRelayEndpointAllowed(pArgs->sSignalingUrl))
+    {
+        xloge("Unencrypted relay connection not allowed in production mode: relay(%s)", pArgs->sSignalingUrl);
         return XSTDERR;
     }
 
