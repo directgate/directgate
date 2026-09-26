@@ -103,6 +103,10 @@ typedef struct directgate_client_ctx_ {
     xbool_t bHaveSize;
     xbool_t bAuthDone;
     xbool_t bInputBlocked;
+
+    /* Ended in a way a script has to be able to see even after a login: the
+       host could not give what was asked for, or broke the protocol. */
+    xbool_t bSessionFailed;
 } directgate_ctx_t;
 
 static int DirectGate_Client_SendAuthHello(directgate_ctx_t *pCli);
@@ -131,6 +135,17 @@ static void DirectGate_Client_CleanseSecret(directgate_cfg_t *pCfg)
     XCHECK_VOID_NL((pCfg != NULL));
     OPENSSL_cleanse(pCfg->sSecret, sizeof(pCfg->sSecret));
     pCfg->sSecret[0] = XSTR_NUL;
+}
+
+/* What DirectGate_Client_Init allocates, and the key material a run may have loaded. A connection
+   that closes releases the SRP state itself; a command that ends before any connection - -g, -i,
+   login, devices, a refused -k - left the bignums behind and the client key in memory. */
+static void DirectGate_Client_Release(directgate_ctx_t *pCli)
+{
+    XCHECK_VOID_NL((pCli != NULL));
+    DirectGate_SRP_ClientCleanse(&pCli->srp);
+    DirectGate_KeyAuth_Cleanse(&pCli->keyauth);
+    DirectGate_KeyAuth_KeyCleanse(&pCli->key);
 }
 
 static void DirectGate_Client_CleanseSecretCtx(directgate_ctx_t *pCli)
@@ -619,6 +634,7 @@ static int DirectGate_Client_HandleKeyAuthMsg(directgate_ctx_t *pCli, directgate
                 xloge("Nobody is logged on to this device yet, so only a remote desktop "
                       "session is available; sign in there first");
 
+                pCli->bSessionFailed = XTRUE;
                 g_bFinish = XTRUE;
                 return XAPI_DISCONNECT;
             }
@@ -736,6 +752,7 @@ static int DirectGate_Client_HandleAuthMsg(directgate_ctx_t *pCli, directgate_pk
             xloge("Nobody is logged on to this device yet, so only a remote desktop "
                   "session is available; sign in there first");
 
+            pCli->bSessionFailed = XTRUE;
             g_bFinish = XTRUE;
             return XAPI_DISCONNECT;
         }
@@ -975,6 +992,7 @@ static int DirectGate_Client_HandleEncryptedMsg(directgate_ctx_t *pCli, directga
         xloge("%s: Encrypted message but E2E not initialized",
             xstrused(pTransport) ? pTransport : "transport");
 
+        pCli->bSessionFailed = XTRUE;
         return XAPI_DISCONNECT;
     }
 
@@ -993,6 +1011,7 @@ static int DirectGate_Client_HandleEncryptedMsg(directgate_ctx_t *pCli, directga
     {
         xloge("%s: Failed to parse decrypted message", xstrused(pTransport) ? pTransport : "transport");
         XByteBuffer_Clear(&inner);
+        pCli->bSessionFailed = XTRUE;
         return XAPI_DISCONNECT;
     }
 
@@ -1005,6 +1024,7 @@ static int DirectGate_Client_HandleEncryptedMsg(directgate_ctx_t *pCli, directga
 
         DirectGate_Package_Clear(&innerMsg);
         XByteBuffer_Clear(&inner);
+        pCli->bSessionFailed = XTRUE;
         return XAPI_DISCONNECT;
     }
 
@@ -1024,6 +1044,7 @@ static int DirectGate_Client_HandleMessage(directgate_ctx_t *pCli, const uint8_t
     if (!DirectGate_Package_Parse(&msg, pPayload, nPayload))
     {
         xlogw("%s: Invalid protocol message", xstrused(pTransport) ? pTransport : "transport");
+        pCli->bSessionFailed = XTRUE;
         return XAPI_DISCONNECT;
     }
 
@@ -1031,6 +1052,7 @@ static int DirectGate_Client_HandleMessage(directgate_ctx_t *pCli, const uint8_t
     {
         xlogw("%s: Message missing type", xstrused(pTransport) ? pTransport : "transport");
         DirectGate_Package_Clear(&msg);
+        pCli->bSessionFailed = XTRUE;
         return XAPI_DISCONNECT;
     }
 
@@ -1046,6 +1068,7 @@ static int DirectGate_Client_HandleMessage(directgate_ctx_t *pCli, const uint8_t
             xstrused(msg.header.pType) ? msg.header.pType : "N/A",
             pCli->bAuthDone ? "after" : "before");
 
+        pCli->bSessionFailed = XTRUE;
         nStatus = XAPI_DISCONNECT;
     }
     else
@@ -1779,8 +1802,12 @@ static void DirectGate_Client_PrepareKeyAuth(directgate_ctx_t *pCli,
 
     if (!xstrused(pDevice->sAgentPub))
     {
-        xlogw("Device '%s' has not published a host key, using the password",
-            pDevice->sName);
+        /* Nothing to pin the host to, so the key is not offered. With -k that ends the
+           attempt rather than falling back, and the message must not promise otherwise. */
+        if (pCfg->bKeyRequired)
+            xloge("Device '%s' has not published a host key, so the key given with -k cannot be used", pDevice->sName);
+        else
+            xlogw("Device '%s' has not published a host key, using the password", pDevice->sName);
 
         DirectGate_KeyAuth_KeyCleanse(&pCli->key);
         return;
@@ -2199,13 +2226,16 @@ int main(int argc, char* argv[])
     int nStatus = DirectGate_ParseArgs(&args, argc, argv);
     if (nStatus < 0)
     {
-        DirectGate_DisplayUsage(argv[0]);
+        /* A failure has already said what went wrong; only bad arguments get the usage. */
+        if (nStatus != XSTDEXC) DirectGate_DisplayUsage(argv[0]);
+        DirectGate_Client_Release(&client);
         XLog_Destroy();
         return XSTDERR;
     }
     else if (!nStatus)
     {
         /* -i and -s finish their work inside the parser */
+        DirectGate_Client_Release(&client);
         XLog_Destroy();
         return XSTDNON;
     }
@@ -2228,6 +2258,7 @@ int main(int argc, char* argv[])
     {
         DirectGate_Account_Cleanse(&account);
         DirectGate_Client_CleanseSecret(&args);
+        DirectGate_Client_Release(&client);
         XLog_Destroy();
 
         return nStatus == XSTDNON ? XSTDNON : XSTDERR;
@@ -2256,7 +2287,8 @@ int main(int argc, char* argv[])
          * way. Only an explicitly refused key sends us round again. */
         if (!client.bKeyAuthFailed)
         {
-            if (args.bAddKey && !client.bAddKeyDone) nResult = XSTDERR;
+            if (!client.bAuthDone || client.bSessionFailed) nResult = XSTDERR;
+            else if (args.bAddKey && !client.bAddKeyDone) nResult = XSTDERR;
             break;
         }
 
@@ -2280,7 +2312,7 @@ int main(int argc, char* argv[])
 
     DirectGate_Client_RestoreIO(&client.io);
     DirectGate_Client_CleanseSecret(&args);
-    DirectGate_KeyAuth_KeyCleanse(&client.key);
+    DirectGate_Client_Release(&client);
 
     DirectGate_WebRTC_Clear(&client.webrtc);
     DirectGate_WebRTC_Cleanup();

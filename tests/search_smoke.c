@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "src/agent/files.h"
@@ -176,7 +178,7 @@ int main(void)
        that followed it would report every file again under a path leading
        through it, and would keep doing so until the path stopped growing -
        then never stop. */
-    char sLoop[512];
+    char sLoop[600];
     snprintf(sLoop, sizeof(sLoop), "%s/loop", sNested);
     CHECK(symlink(sRoot, sLoop) == 0, "link back to the search root");
 
@@ -263,6 +265,120 @@ int main(void)
     CHECK(g_capture.nFailed == 1, "invalid criteria should send failure");
     CHECK(strcmp(g_capture.sLastReason, "invalid search criteria") == 0,
         "invalid criteria failure reason");
+
+    /* Every kind of entry a type names, and the filters that narrow by mode and size. */
+    {
+        char sKinds[600], sPath[700];
+        snprintf(sKinds, sizeof(sKinds), "%s/kinds", sRoot);
+        CHECK(mkdir(sKinds, 0755) == 0, "mkdir kinds");
+
+        snprintf(sPath, sizeof(sPath), "%s/pipe-entry", sKinds);
+        CHECK(mkfifo(sPath, 0600) == 0, "a named pipe");
+
+        snprintf(sPath, sizeof(sPath), "%s/sock-entry", sKinds);
+        int nSock = socket(AF_UNIX, SOCK_STREAM, 0);
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        xstrncpy(addr.sun_path, sizeof(addr.sun_path), sPath);
+        CHECK(nSock >= 0 && bind(nSock, (struct sockaddr*)&addr, sizeof(addr)) == 0, "a socket file");
+        close(nSock);
+
+        snprintf(sPath, sizeof(sPath), "%s/tool-entry", sKinds);
+        CHECK(write_file(sPath, "#!/bin/sh\n") && chmod(sPath, 0755) == 0, "an executable");
+        snprintf(sPath, sizeof(sPath), "%s/secret-entry", sKinds);
+        CHECK(write_file(sPath, "0123456789") && chmod(sPath, 0600) == 0, "a small private file");
+        snprintf(sPath, sizeof(sPath), "%s/big-entry", sKinds);
+        char sBig[101];
+        memset(sBig, 'x', 100);
+        sBig[100] = '\0';
+        CHECK(write_file(sPath, sBig) && chmod(sPath, 0644) == 0, "a bigger shared file");
+
+        const struct {
+            const char *pTypes;
+            const char *pPerm;
+            const char *pMinSize;
+            const char *pExpect;
+            const char *pReject;
+            const char *pMsg;
+        } cases[] = {
+            { "p", NULL, NULL, "pipe-entry", "sock-entry", "a pipe filter finds pipes only" },
+            { "s", NULL, NULL, "sock-entry", "pipe-entry", "a socket filter finds sockets only" },
+            { "x", NULL, NULL, "tool-entry", "secret-entry", "an executable filter finds executables only" },
+            { "f", "rw-------", NULL, "secret-entry", "big-entry", "a mode filter finds files with that mode only" },
+            { "f", NULL, "50", "big-entry", "secret-entry", "a size filter finds files at least that big only" },
+            { "f", NULL, "1k", NULL, "big-entry", "a size in kilobytes leaves out the smaller files" }
+        };
+
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        {
+            reset_capture();
+            memset(&mgr, 0, sizeof(mgr));
+            mgr.pPath = sKinds;
+            mgr.pTypes = cases[i].pTypes;
+            mgr.pPermissions = cases[i].pPerm;
+            mgr.pMinSize = cases[i].pMinSize;
+            CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDOK, "a filtered search starts");
+            CHECK(wait_for_search(&session) == XSTDOK && g_capture.nFailed == 0 && g_capture.nOk == 1,
+                "a filtered search completes");
+            CHECK((cases[i].pExpect == NULL || strstr(g_capture.sPayload, cases[i].pExpect) != NULL) &&
+                strstr(g_capture.sPayload, cases[i].pReject) == NULL, cases[i].pMsg);
+        }
+
+        /* Devices: a character device is found as one, and not as a block device. */
+        reset_capture();
+        memset(&mgr, 0, sizeof(mgr));
+        mgr.pPath = "/dev";
+        mgr.pTypes = "c";
+        mgr.pFileName = "null";
+        CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDOK, "a device search starts");
+        CHECK(wait_for_search(&session) == XSTDOK && g_capture.nOk == 1 && strstr(g_capture.sPayload, "null") != NULL,
+            "a character device filter finds /dev/null");
+
+        reset_capture();
+        mgr.pTypes = "b";
+        CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDOK, "a block device search starts");
+        CHECK(wait_for_search(&session) == XSTDOK && g_capture.nOk == 1 && strstr(g_capture.sPayload, "\"null\"") == NULL,
+            "a block device filter does not find a character device");
+
+        /* A mode or a size that is not one fails the search rather than filtering nothing. */
+        const struct { const char *pPerm; const char *pMinSize; const char *pMsg; } bad[] = {
+            { "rwx-bogus", NULL, "a mode that is not one fails the search" },
+            { "rw", NULL, "a mode of the wrong length fails the search" },
+            { NULL, "big", "a size that is not a number fails the search" },
+            { NULL, "5q", "a size with an unknown unit fails the search" }
+        };
+
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+        {
+            reset_capture();
+            memset(&mgr, 0, sizeof(mgr));
+            mgr.pPath = sKinds;
+            mgr.pFileName = "*";
+            mgr.pPermissions = bad[i].pPerm;
+            mgr.pMinSize = bad[i].pMinSize;
+            CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDOK, "a search with a bad filter starts");
+            CHECK(wait_for_search(&session) == XSTDOK && g_capture.nFailed == 1, bad[i].pMsg);
+        }
+    }
+
+    /* One search at a time: a second one while the first runs is refused, not queued. */
+    reset_capture();
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.pPath = "/usr";
+    mgr.pFileName = "*";
+    mgr.bRecursive = XTRUE;
+    CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDOK, "a long search starts");
+    CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDERR, "a second search while one runs is refused");
+    CHECK(strcmp(DirectGate_Search_GetReason(&session.search), "search already in progress") == 0,
+        "the refusal says a search is already running");
+    CHECK(DirectGate_Search_Cancel(&session.search) == XSTDOK, "the running search is cancelled");
+    for (int i = 0; i < 500 && g_capture.nCancelled == 0 && g_capture.nOk == 0; i++)
+    {
+        DirectGate_Search_Process(&session);
+        usleep(10000);
+    }
+    CHECK(g_capture.nCancelled == 1 || g_capture.nOk == 1, "the cancelled search ends with an answer");
 
     /* A broad search outruns a busy main loop. The worker used to give up with
        "failed to queue search results" once 1024 matches were waiting; it has
@@ -358,9 +474,89 @@ int main(void)
         CHECK(g_capture.nFailed == 0, "a cancelled search is not reported as a failure");
     }
 
+    /* A queue that fills while nobody drains it: the worker waits for room, a
+       cancel ends the wait, and the events it left are dropped by the next start. */
+    {
+        char sMany[600];
+        snprintf(sMany, sizeof(sMany), "%s/many/", sRoot);
+
+        reset_capture();
+        memset(&mgr, 0, sizeof(mgr));
+        mgr.pPath = sMany;
+        mgr.pFileName = "match-*";
+        CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDOK, "a search nobody drains starts");
+
+        uint32_t nQueued = 0;
+        for (int i = 0; i < 1000 && nQueued < 4096U; i++)
+        {
+            usleep(10000);
+            XSync_Lock(&session.search.lock);
+            nQueued = (uint32_t)session.search.nQueuedEvents;
+            XSync_Unlock(&session.search.lock);
+        }
+
+        CHECK(nQueued >= 4096U, "the undrained queue fills up");
+        usleep(30000);
+        CHECK(DirectGate_Search_Cancel(&session.search) == XSTDOK, "a search waiting for room takes a cancel");
+
+        xbool_t bRunning = XTRUE;
+        for (int i = 0; i < 500 && bRunning; i++)
+        {
+            usleep(10000);
+            XSync_Lock(&session.search.lock);
+            bRunning = session.search.bRunning;
+            XSync_Unlock(&session.search.lock);
+        }
+
+        CHECK(!bRunning, "the cancel ends the wait");
+        CHECK(DirectGate_Search_Cancel(&session.search) == XSTDOK, "a search that ended with events still queued is pending");
+
+        /* The next start joins the old worker and drops what it left. */
+        reset_capture();
+        mgr.pFileName = "match-0001.dat";
+        CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDOK, "a new search starts over the old events");
+        CHECK(wait_for_search(&session) == XSTDOK && g_capture.nOk == 1 && g_capture.nEntries == 1,
+            "only the new search's match is delivered");
+    }
+
+    /* Directories that cannot be read: a warning inside the tree, a failure at the root. */
+    if (geteuid() != 0)
+    {
+        char sLocked[600], sInner[700];
+        snprintf(sLocked, sizeof(sLocked), "%s/locked", sRoot);
+        snprintf(sInner, sizeof(sInner), "%s/locked/inner", sRoot);
+        CHECK(mkdir(sLocked, 0755) == 0 && mkdir(sInner, 0755) == 0, "mkdir the locked tree");
+        CHECK(chmod(sInner, 0) == 0, "lock the inner directory");
+
+        reset_capture();
+        memset(&mgr, 0, sizeof(mgr));
+        mgr.pPath = sLocked;
+        mgr.pFileName = "*";
+        mgr.bRecursive = XTRUE;
+        CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDOK, "a search over an unreadable directory starts");
+        CHECK(wait_for_search(&session) == XSTDOK, "it finishes");
+        CHECK(g_capture.nOk == 1 || g_capture.nFailed == 1, "it reports how it ended");
+
+        /* libxutils reports an unopenable directory as a warning, the root included,
+           so this ends as an empty result rather than a failure. */
+        CHECK(chmod(sInner, 0755) == 0 && chmod(sLocked, 0) == 0, "lock the root instead");
+        reset_capture();
+        CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDOK, "a search of an unreadable root starts");
+        CHECK(wait_for_search(&session) == XSTDOK, "it finishes");
+        CHECK(g_capture.nOk == 1 && g_capture.nEntries == 0, "an unreadable root finds nothing");
+        CHECK(chmod(sLocked, 0755) == 0, "unlock the root");
+    }
+
     DirectGate_Search_Clear(&session.search);
     CHECK(DirectGate_Search_GetPipeFd(&session.search) == XSTDERR,
         "search pipe should be closed after clear");
+
+    /* A search whose pipe is gone cannot start. */
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.pPath = sRoot;
+    mgr.pFileName = "*";
+    CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDERR, "a search without its pipe is refused");
+    CHECK(strcmp(DirectGate_Search_GetReason(&session.search), "search pipe is not available") == 0, "and says why");
 
     DirectGate_Files_Delete(sRoot, XTRUE);
     puts("search_smoke: OK");

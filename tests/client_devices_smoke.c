@@ -250,6 +250,35 @@ int main(void)
     CHECK(DirectGate_Devices_Search(&parsed, "beta", sId, sizeof(sId)) &&
           strcmp(sId, "id-b") == 0, "tab-separated load");
 
+    /* Names have spaces of their own, and a list written by -s has to read back as written. */
+    CHECK(write_text(sInput,
+        "Home Box  dev-home\n"
+        "  Office PC\tdev-office\n"
+        "Lab Rack dev-lab\n"
+        "Solo\n"), "write a list with spaced names");
+
+    xmap_t spaced;
+    CHECK(init_map(&spaced), "init the spaced map");
+    CHECK(DirectGate_Devices_Load(&spaced, sInput), "load the spaced list");
+    CHECK(spaced.nCount == 3, "every named line loads and a name without an id does not");
+    CHECK(DirectGate_Devices_Search(&spaced, "Home Box", sId, sizeof(sId)) && strcmp(sId, "dev-home") == 0,
+        "a name with a space keeps it, as -s writes it");
+    CHECK(DirectGate_Devices_Search(&spaced, "Office PC", sId, sizeof(sId)) && strcmp(sId, "dev-office") == 0,
+        "a tab ends a spaced name too");
+    CHECK(DirectGate_Devices_Search(&spaced, "Lab Rack", sId, sizeof(sId)) && strcmp(sId, "dev-lab") == 0,
+        "a line typed with single spaces ends in its id");
+
+    CHECK(DirectGate_Devices_Write(&spaced, sOutput), "write the spaced list back");
+    xmap_t reread;
+    CHECK(init_map(&reread), "init the reread map");
+    CHECK(DirectGate_Devices_Load(&reread, sOutput) && reread.nCount == 3, "the written list reads back whole");
+    CHECK(DirectGate_Devices_Search(&reread, "Home Box", sId, sizeof(sId)) && strcmp(sId, "dev-home") == 0,
+        "a spaced name survives a write and a read");
+    CHECK(!DirectGate_Devices_Add(&reread, "Home Box", "dev-other", XFALSE),
+        "a spaced name read back is still a duplicate without force");
+    XMap_Destroy(&reread);
+    XMap_Destroy(&spaced);
+
     xmap_t empty;
     CHECK(init_map(&empty), "init empty map");
     CHECK(!DirectGate_Devices_Write(&empty, sOutput), "write empty map");

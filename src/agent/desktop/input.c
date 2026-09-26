@@ -646,6 +646,28 @@ static xbool_t DirectGate_Desktop_X11ShiftDown(Display *pDisplay)
     return (nMask & ShiftMask) ? XTRUE : XFALSE;
 }
 
+/* Lets one held key go on the host, the way it was pressed: by keycode or
+ * keysym through the portal on Wayland, by keycode through XTest on Xorg. */
+static void DirectGate_Desktop_ReleaseHeld(directgate_desktop_t *pDesktop,
+                                           const directgate_desktop_held_key_t *pHeld)
+{
+#ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
+    if (pDesktop->pWayland != NULL)
+    {
+        directgate_wl_portal_t *pPortal = DirectGate_WL_SourcePortal((directgate_wl_source_t*)pDesktop->pWayland);
+        if (pPortal == NULL) return;
+
+        if (pHeld->bPhysical) DirectGate_WL_PortalKeycode(pPortal, (int32_t)pHeld->nKeycode, XFALSE);
+        else DirectGate_WL_PortalKeysym(pPortal, (int32_t)pHeld->nKeycode, XFALSE);
+        return;
+    }
+#endif
+
+    if (pDesktop->pDisplay == NULL || pDesktop->pFakeKey == NULL) return;
+    DirectGate_Desktop_X11MarkScratchHeld(pDesktop, (KeyCode)pHeld->nKeycode, XFALSE);
+    ((directgate_xtest_key_fn)pDesktop->pFakeKey)((Display*)pDesktop->pDisplay, (KeyCode)pHeld->nKeycode, XFALSE, CurrentTime);
+}
+
 /* What the browser code that is currently down was injected as: an X11
  * keycode on an Xorg session, a keysym on a Wayland one. Both backends need
  * the same bookkeeping - a key that went down must be releasable by the code
@@ -667,8 +689,12 @@ static void DirectGate_Desktop_RememberKey(directgate_desktop_t *pDesktop,
         }
     }
 
+    /* Full: the oldest entry makes room, but its key is let go first. Dropped
+     * while still down, nothing would ever release it - not the session end,
+     * not the idle watchdog - and the host would keep holding it. */
     if (pDesktop->nHeldKeyCount >= DIRECTGATE_DESKTOP_MAX_HELD_KEYS)
     {
+        DirectGate_Desktop_ReleaseHeld(pDesktop, &pDesktop->heldKeys[0]);
         memmove(&pDesktop->heldKeys[0], &pDesktop->heldKeys[1],
             sizeof(pDesktop->heldKeys[0]) * (DIRECTGATE_DESKTOP_MAX_HELD_KEYS - 1U));
         pDesktop->nHeldKeyCount = DIRECTGATE_DESKTOP_MAX_HELD_KEYS - 1U;
@@ -783,16 +809,8 @@ void DirectGate_Desktop_ReleaseHeldKeys(directgate_desktop_t *pDesktop)
      * restarted. */
     if (pDesktop->pWayland != NULL)
     {
-        directgate_wl_portal_t *pPortal = DirectGate_WL_SourcePortal((directgate_wl_source_t*)pDesktop->pWayland);
-        if (pPortal != NULL)
-        {
-            for (uint32_t i = 0; i < pDesktop->nHeldKeyCount; i++)
-            {
-                const directgate_desktop_held_key_t *pHeld = &pDesktop->heldKeys[i];
-                if (pHeld->bPhysical) DirectGate_WL_PortalKeycode(pPortal, (int32_t)pHeld->nKeycode, XFALSE);
-                else DirectGate_WL_PortalKeysym(pPortal, (int32_t)pHeld->nKeycode, XFALSE);
-            }
-        }
+        for (uint32_t i = 0; i < pDesktop->nHeldKeyCount; i++)
+            DirectGate_Desktop_ReleaseHeld(pDesktop, &pDesktop->heldKeys[i]);
 
         pDesktop->nHeldKeyCount = 0;
         return;
@@ -801,17 +819,14 @@ void DirectGate_Desktop_ReleaseHeldKeys(directgate_desktop_t *pDesktop)
 
     if (pDesktop->pDisplay == NULL || pDesktop->pFakeKey == NULL) return;
 
-    Display *pDisplay = (Display*)pDesktop->pDisplay;
-    directgate_xtest_key_fn pKeyFn = (directgate_xtest_key_fn)pDesktop->pFakeKey;
-
     for (uint32_t i = 0; i < pDesktop->nHeldKeyCount; i++)
-        pKeyFn(pDisplay, (KeyCode)pDesktop->heldKeys[i].nKeycode, XFALSE, CurrentTime);
+        DirectGate_Desktop_ReleaseHeld(pDesktop, &pDesktop->heldKeys[i]);
 
     pDesktop->nHeldKeyCount = 0;
     for (uint32_t i = 0; i < pDesktop->nScratchCount; i++)
         pDesktop->scratchKeys[i].bHeld = XFALSE;
 
-    XFlush(pDisplay);
+    XFlush((Display*)pDesktop->pDisplay);
 }
 
 /* How long a key may stay down with nothing else arriving before it is taken

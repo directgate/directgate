@@ -3,7 +3,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "src/common/common.h"
@@ -47,6 +50,105 @@ static int has_entry_prefix(const char *pDirPath, const char *pPrefix)
 
     closedir(pDir);
     return nFound;
+}
+
+/* A write big enough to cross the file size cap. Run in a child: the cap applies
+   to the whole process, and crossing it raises SIGXFSZ unless that is ignored. */
+static int capped_write_child(const char *pPath)
+{
+    signal(SIGXFSZ, SIG_IGN);
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_FSIZE, &limit) != 0) return 2;
+
+    static uint8_t big[16384];
+    memset(big, 'b', sizeof(big));
+
+    struct rlimit capped = limit;
+    capped.rlim_cur = 4096;
+    if (setrlimit(RLIMIT_FSIZE, &capped) != 0) return 2;
+    xbool_t bWritten = DirectGate_WritePrivateFile(pPath, big, sizeof(big));
+
+    /* Lifted again before exit: the coverage and memcheck reports are bigger than the cap. */
+    setrlimit(RLIMIT_FSIZE, &limit);
+    return bWritten ? 1 : 0;
+}
+
+/* Every way the atomic write can fail leaves the old file, or nothing, and never a temp file behind. */
+static int test_private_failures(const char *pRoot)
+{
+    const uint8_t sSecret[] = "secret";
+    CHECK(!DirectGate_EnsurePrivateFileParent(NULL), "a parent needs a path");
+    CHECK(DirectGate_EnsurePrivateFileParent("bare-name.json"), "a bare name has no parent to create");
+    CHECK(DirectGate_EnsurePrivateFileParent("/at-the-root.json"), "the root is never created");
+    DirectGate_SetPrivateFileGrantee("nobody");
+    DirectGate_SetPrivateFileGrantee(NULL);
+
+    /* A file standing where the parent directory should be. */
+    char sPlain[XPATH_MAX], sUnder[XPATH_MAX];
+    snprintf(sPlain, sizeof(sPlain), "%s/plain", pRoot);
+    snprintf(sUnder, sizeof(sUnder), "%s/plain/config.json", pRoot);
+    CHECK(DirectGate_WritePrivateFile(sPlain, sSecret, sizeof(sSecret) - 1), "write a plain file");
+    CHECK(!DirectGate_EnsurePrivateFileParent(sUnder), "a file is not taken for the parent directory");
+    CHECK(!DirectGate_WritePrivateFile(sUnder, sSecret, sizeof(sSecret) - 1), "a path through a file is refused");
+    CHECK(unlink(sPlain) == 0, "cleanup plain file");
+
+    /* A directory where the file should be: the temp file is written, the rename refuses. */
+    char sDirTarget[XPATH_MAX];
+    snprintf(sDirTarget, sizeof(sDirTarget), "%s/is-a-dir", pRoot);
+    CHECK(mkdir(sDirTarget, 0700) == 0, "mkdir the directory in the way");
+    CHECK(!DirectGate_WritePrivateFile(sDirTarget, sSecret, sizeof(sSecret) - 1), "a directory is never replaced");
+    struct stat st;
+    CHECK(stat(sDirTarget, &st) == 0 && S_ISDIR(st.st_mode), "the directory is still there");
+    CHECK(!has_entry_prefix(pRoot, "is-a-dir.tmp."), "a refused rename leaves no temp file");
+    CHECK(rmdir(sDirTarget) == 0, "cleanup directory in the way");
+
+    /* A path so long the temp name no longer fits. */
+    char sLong[XPATH_MAX];
+    const size_t nWant = sizeof(sLong) - 8;
+    size_t nLen = (size_t)snprintf(sLong, sizeof(sLong), "%s", pRoot);
+    while (nLen + 1 < nWant)
+    {
+        size_t nPart = nWant - nLen - 1;
+        if (nPart > 100) nPart = 100;
+        sLong[nLen++] = '/';
+        memset(sLong + nLen, 'd', nPart);
+        nLen += nPart;
+    }
+    sLong[nLen] = '\0';
+    CHECK(!DirectGate_WritePrivateFile(sLong, sSecret, sizeof(sSecret) - 1), "a path with no room for the temp name is refused");
+    char sCmd[XPATH_MAX + 32];
+    snprintf(sCmd, sizeof(sCmd), "rm -rf '%s/dddd'*", pRoot);
+    CHECK(system(sCmd) == 0, "cleanup long path");
+
+    /* A write the file size cap cuts short. */
+    char sCapped[XPATH_MAX];
+    snprintf(sCapped, sizeof(sCapped), "%s/capped.json", pRoot);
+    pid_t nPid = fork();
+    CHECK(nPid >= 0, "fork a child for the size cap");
+    /* exit, not _exit: the child's coverage is written by its exit handlers. */
+    if (nPid == 0) exit(capped_write_child(sCapped));
+    int nStatus = 0;
+    CHECK(waitpid(nPid, &nStatus, 0) == nPid, "wait for the size-capped child");
+    CHECK(WIFEXITED(nStatus) && WEXITSTATUS(nStatus) == 0, "a write cut short fails");
+    CHECK(access(sCapped, F_OK) != 0 && !has_entry_prefix(pRoot, "capped.json.tmp."),
+        "a write cut short leaves neither the file nor its temp");
+
+    /* Permissions only bind a user without CAP_DAC_OVERRIDE. */
+    if (geteuid() != 0)
+    {
+        char sLocked[XPATH_MAX], sInside[XPATH_MAX], sDeeper[XPATH_MAX];
+        snprintf(sLocked, sizeof(sLocked), "%s/locked", pRoot);
+        snprintf(sInside, sizeof(sInside), "%s/locked/config.json", pRoot);
+        snprintf(sDeeper, sizeof(sDeeper), "%s/locked/new/config.json", pRoot);
+        CHECK(mkdir(sLocked, 0500) == 0, "mkdir a read-only directory");
+        CHECK(!DirectGate_WritePrivateFile(sInside, sSecret, sizeof(sSecret) - 1),
+            "a directory that takes no new files refuses the temp file");
+        CHECK(!DirectGate_WritePrivateFile(sDeeper, sSecret, sizeof(sSecret) - 1),
+            "a parent that cannot be created is refused");
+        CHECK(chmod(sLocked, 0700) == 0 && rmdir(sLocked) == 0, "cleanup read-only directory");
+    }
+
+    return 0;
 }
 
 int main(void)
@@ -276,6 +378,8 @@ int main(void)
         "private file in existing directory mode");
     CHECK(unlink(sExistingFile) == 0, "cleanup private file in existing directory");
     CHECK(rmdir(sExistingDir) == 0, "cleanup existing shared dir");
+
+    if (test_private_failures(sRoot)) return 1;
     CHECK(rmdir(sRoot) == 0, "cleanup private root");
 
     xtime_t parsedTime;

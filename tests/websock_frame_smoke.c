@@ -3,6 +3,7 @@
  * back losslessly, that client sessions mask (RFC 6455 requires it) while
  * agent/peer sessions do not, and that the guard clauses hold. */
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,6 +110,13 @@ int main(void)
     CHECK(session.txBuffer.nUsed == 0, "guards leave tx buffer untouched");
     CHECK(DirectGate_WebSock_Send(NULL, small, sizeof(small)) == XAPI_DISCONNECT,
         "NULL session guard");
+
+    /* A length no frame can carry drops the connection before a byte is read or buffered. */
+    session.sAddr[0] = '\0';
+    CHECK(DirectGate_WebSock_Send(&session, small, (size_t)INT_MAX) == XAPI_DISCONNECT, "an oversized frame is refused");
+    snprintf(session.sAddr, sizeof(session.sAddr), "192.0.2.7");
+    CHECK(DirectGate_WebSock_Send(&session, small, (size_t)INT_MAX) == XAPI_DISCONNECT, "and refused with a peer address too");
+    CHECK(session.txBuffer.nUsed == 0, "a refused frame leaves the tx buffer untouched");
 
     /* SendBuff wrapper goes through the same path */
     xbyte_buffer_t pkgBuf;

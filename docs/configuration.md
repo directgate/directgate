@@ -192,6 +192,8 @@ The device password is prompted for after the device is chosen and is never writ
 
 A production build of `dgcli` connects only to a `wss://` relay, whether the URL came from the API or from its own configuration: the first relay message carries the access token, so a plaintext relay would hand it to the network. Debug builds also accept `ws://` for local development.
 
+`dgcli` exits `0` when the session ran and ended: the host closed it, or `-A` authorized the key (or found it already authorized). Anything a script has to be able to tell apart from that exits non-zero: a configuration that does not load, a device that cannot be connected, a login that did not complete (a wrong password, a host that could not prove itself), a host with nobody logged on (it serves desktop sessions only, and `dgcli` has no desktop client), a session broken by a protocol violation after the login, and a key the device refused.
+
 ### Key authentication
 
 `dgcli` can authenticate with an Ed25519 key instead of typing the device password every time. The key is always tried first; the password is only reached when there is no usable key or the host refuses the one offered.

@@ -56,30 +56,47 @@ static xbool_t DirectGate_ParseDeviceLine(const char *pLine,
     pNameOut[0] = '\0';
     pIdOut[0] = '\0';
 
-    const char *ptr = DirectGate_JumpWiteSpace(pLine);
-    if (*ptr == '\0') return XFALSE;
+    const char *pBeg = DirectGate_JumpWiteSpace(pLine);
+    size_t nLen = strlen(pBeg);
+    while (nLen > 0 && isspace((unsigned char)pBeg[nLen - 1])) nLen--;
+    if (!nLen) return XFALSE;
 
-    const char *pNameBeg = ptr;
-    const char *pNameEnd = DirectGate_SkipToken(pNameBeg);
-    size_t nNameLen = (size_t)(pNameEnd - pNameBeg);
-    if (!nNameLen || nNameLen + 1 > nNameOutSize) return XFALSE;
+    /* The list is written as the name, two spaces and the id, and a name may have
+       single spaces of its own - splitting at the first space read "Home Box  dev-1"
+       back as a device "Home" with the id "Box". So a tab or a run of two spaces
+       ends the name and anything after the id is ignored; a line with single
+       spaces only, typed by hand, ends in its id. */
+    size_t nSep = 0;
+    while (nSep < nLen && pBeg[nSep] != '\t' &&
+           !(pBeg[nSep] == ' ' && nSep + 1 < nLen && isspace((unsigned char)pBeg[nSep + 1]))) nSep++;
 
-    memcpy(pNameOut, pNameBeg, nNameLen);
+    size_t nNameLen = 0;
+    size_t nIdBeg = 0;
+    size_t nIdLen = 0;
+
+    if (nSep < nLen)
+    {
+        nNameLen = nSep;
+        nIdBeg = nSep;
+        while (nIdBeg < nLen && isspace((unsigned char)pBeg[nIdBeg])) nIdBeg++;
+        while (nIdBeg + nIdLen < nLen && !isspace((unsigned char)pBeg[nIdBeg + nIdLen])) nIdLen++;
+    }
+    else
+    {
+        nIdBeg = nLen;
+        while (nIdBeg > 0 && !isspace((unsigned char)pBeg[nIdBeg - 1])) nIdBeg--;
+        nNameLen = nIdBeg;
+        nIdLen = nLen - nIdBeg;
+    }
+
+    while (nNameLen > 0 && isspace((unsigned char)pBeg[nNameLen - 1])) nNameLen--;
+    if (!nNameLen || !nIdLen || nNameLen + 1 > nNameOutSize || nIdLen + 1 > nIdOutSize) return XFALSE;
+
+    memcpy(pNameOut, pBeg, nNameLen);
     pNameOut[nNameLen] = '\0';
 
-    ptr = DirectGate_JumpWiteSpace(pNameEnd);
-    if (*ptr == '\0') return XFALSE;
-
-    const char *pIdBeg = ptr;
-    const char *pIdEnd = DirectGate_SkipToken(pIdBeg);
-    size_t nIdLen = (size_t)(pIdEnd - pIdBeg);
-    if (!nIdLen || nIdLen + 1 > nIdOutSize) return XFALSE;
-
-    memcpy(pIdOut, pIdBeg, nIdLen);
+    memcpy(pIdOut, pBeg + nIdBeg, nIdLen);
     pIdOut[nIdLen] = '\0';
-
-    DirectGate_TrimStringRight(pNameOut);
-    DirectGate_TrimStringRight(pIdOut);
 
     return XTRUE;
 }

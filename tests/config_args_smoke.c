@@ -205,6 +205,21 @@ int main(void)
             (char*)"directgate", (char*)"-c", sMissingPath, (char*)"-e", NULL
         };
         CHECK(parse(&enrollCfg, 4, enrollArgv), "enroll may create the config");
+
+        /* -w is a switch, not an option with a value: the -e after it still counts. */
+        directgate_cfg_t verboseCfg;
+        char *verboseArgv[] = {
+            (char*)"directgate", (char*)"-w", (char*)"-e", (char*)"-c", sMissingPath, NULL
+        };
+        CHECK(parse(&verboseCfg, 5, verboseArgv), "enroll after -w may still create the config");
+
+        /* -u takes a value, and the letters of that value are not options: the
+           'e' in "relay" must not pass for -e and excuse a missing config. */
+        directgate_cfg_t relayCfg;
+        char *relayArgv[] = {
+            (char*)"directgate", (char*)"-c", sMissingPath, (char*)"-uwss://relay.example.test/ws", NULL
+        };
+        CHECK(!parse(&relayCfg, 4, relayArgv), "a relay URL's letters do not excuse a missing config");
     }
 
     /* A normal start needs working credentials and an enrollment. ParseArgs used to report these as XSTDERR,

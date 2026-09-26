@@ -19,7 +19,11 @@ set(CTEST_MEMORYCHECK_COMMAND_OPTIONS
 set(CTEST_MEMORYCHECK_SUPPRESSIONS_FILE "${CMAKE_CURRENT_LIST_DIR}/valgrind.supp")
 
 ctest_start(Experimental)
-ctest_memcheck(RETURN_VALUE test_result DEFECT_COUNT defects)
+# "gpu" tests drive real GPU drivers. Valgrind cannot see memory a driver fills
+# through its ioctls, so it reports reads inside the closed NVIDIA and Intel
+# libraries as uninitialised, and runs them too slowly to finish. They are run
+# in the smoke and sanitizer lanes instead.
+ctest_memcheck(EXCLUDE_LABEL "gpu" RETURN_VALUE test_result DEFECT_COUNT defects)
 # Check both: a test may return success while Valgrind reports errors from a
 # forked child, or return a skip code despite a memory error in its log.
 if(NOT test_result EQUAL 0 OR NOT defects EQUAL 0)

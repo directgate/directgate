@@ -264,6 +264,62 @@ static int check_stdin_single_read(void)
     return nFailed ? 1 : 0;
 }
 
+/* Keystrokes before the host has let the user in are held back, a stdin with
+   nothing yet is waited on, and one that cannot be read ends the session. */
+static int check_stdin_states(void)
+{
+    int fds[2];
+    CHECK(pipe(fds) == 0, "stdin pipe");
+    CHECK(fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL) | O_NONBLOCK) == 0, "non-blocking stdin");
+
+    int nSavedIn = dup(STDIN_FILENO);
+    CHECK(nSavedIn >= 0 && dup2(fds[0], STDIN_FILENO) >= 0, "redirect stdin");
+
+    directgate_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    directgate_ctx_t cli;
+    DirectGate_Client_Init(&cli);
+    cli.pCfg = &cfg;
+
+    xapi_session_t ws, input;
+    memset(&ws, 0, sizeof(ws));
+    memset(&input, 0, sizeof(input));
+    ws.bHandshakeDone = XTRUE;
+    input.pSessionData = &cli;
+    cli.pWsSession = &ws;
+
+    int nFailed = 0;
+    do
+    {
+        if (DirectGate_Client_HandleStdin(&input) != XAPI_CONTINUE || g_bFinish) { nFailed = 1; break; }
+
+        if (write(fds[1], "early", 5) != 5) { nFailed = 2; break; }
+        if (DirectGate_Client_HandleStdin(&input) != XAPI_CONTINUE || !cli.bInputBlocked) { nFailed = 3; break; }
+        if (write(fds[1], "again", 5) != 5) { nFailed = 4; break; }
+        if (DirectGate_Client_HandleStdin(&input) != XAPI_CONTINUE || ws.txBuffer.nUsed != 0) { nFailed = 5; break; }
+
+        /* A directory is not something read() can take bytes from. */
+        int nDir = open("/", O_RDONLY | O_DIRECTORY);
+        if (nDir < 0 || dup2(nDir, STDIN_FILENO) < 0) { nFailed = 6; break; }
+        close(nDir);
+        if (DirectGate_Client_HandleStdin(&input) != XAPI_DISCONNECT) { nFailed = 7; break; }
+    }
+    while (0);
+
+    g_bFinish = XFALSE;
+    dup2(nSavedIn, STDIN_FILENO);
+    close(nSavedIn);
+    close(fds[0]);
+    close(fds[1]);
+
+    DirectGate_Transfer_Destroy(&cli.transfer);
+    DirectGate_WebRTC_Clear(&cli.webrtc);
+    DirectGate_SRP_ClientCleanse(&cli.srp);
+
+    if (nFailed) fprintf(stderr, "client_io_smoke: stdin state step %d\n", nFailed);
+    return nFailed ? 1 : 0;
+}
+
 int main(void)
 {
     xlog_defaults();
@@ -275,6 +331,7 @@ int main(void)
     if (check_plain_gate()) return 1;
     if (check_write_all_waits()) return 1;
     if (check_stdin_single_read()) return 1;
+    if (check_stdin_states()) return 1;
 
     DirectGate_WebRTC_Cleanup();
     XLog_Destroy();

@@ -227,9 +227,59 @@ static int framing(void)
     return 0;
 }
 
+/* The helpers around the peer connection: SDP escaping, libdatachannel's log
+   levels, and channel errors, current and stale, through the event queue. */
+static int helpers(void)
+{
+    const char *raw = "v=0\r\na=x:\t\"quoted\" back\\slash";
+    char *esc = DirectGate_JSON_Escape(raw);
+    CHECK(esc != NULL && strstr(esc, "\\t") && strstr(esc, "\\\"") && strstr(esc, "\\\\"), "control characters are escaped");
+    char *back = DirectGate_JSON_Unescape(esc);
+    CHECK(back != NULL && !strcmp(back, raw), "escaped SDP comes back unchanged");
+    free(esc);
+    free(back);
+
+    back = DirectGate_JSON_Unescape("a\\/b\\qc\\");
+    CHECK(back != NULL && !strcmp(back, "a/b\\qc\\"), "an escaped slash is unescaped, anything unknown is kept");
+    free(back);
+    CHECK(DirectGate_JSON_Escape("") == NULL && DirectGate_JSON_Unescape(NULL) == NULL, "nothing to escape is refused");
+
+    char line[8];
+    DirectGate_WebRTC_CopySdpLine(line, sizeof(line), NULL, 3);
+    CHECK(line[0] == '\0', "a missing SDP line copies as empty");
+    DirectGate_WebRTC_CopySdpLine(line, sizeof(line), "abcdefghijk", 11);
+    CHECK(!strcmp(line, "abcdefg"), "a long SDP line is cut to the buffer");
+
+    char mid[64], profile[128];
+    uint8_t pt = 0;
+    CHECK(DirectGate_WebRTC_ParseRemoteH264("m=video 9 UDP/TLS/RTP/SAVPF 96\na=rtpmap:96 H264/90000\n", &pt,
+        mid, sizeof(mid), profile, sizeof(profile)) && pt == 96 && !strcmp(mid, "0"), "H.264 without a mid gets the default one");
+
+    const rtcLogLevel levels[] = { RTC_LOG_FATAL, RTC_LOG_ERROR, RTC_LOG_WARNING, RTC_LOG_INFO,
+        RTC_LOG_DEBUG, RTC_LOG_VERBOSE, RTC_LOG_NONE };
+    for (size_t i = 0; i < sizeof(levels) / sizeof(levels[0]); i++)
+        DirectGate_WebRTC_LogCallback(levels[i], "libdatachannel says something");
+
+    directgate_webrtc_t rtc;
+    DirectGate_WebRTC_Init(&rtc);
+    rtc.nDataChannelID = 5;
+    rtc.nVideoTrackID = 6;
+    DirectGate_WebRTC_QueueDataChannelError(5, "the channel broke", &rtc);
+    DirectGate_WebRTC_QueueDataChannelError(99, "an old channel broke", &rtc);
+    DirectGate_WebRTC_QueueVideoTrackError(6, NULL, &rtc);
+    DirectGate_WebRTC_QueueVideoTrackError(98, "an old track broke", &rtc);
+    DirectGate_WebRTC_ProcessQueue(&rtc);
+    CHECK(rtc.nDataChannelID == 5 && rtc.nVideoTrackID == 6, "a channel error is reported, not acted on");
+
+    rtc.nDataChannelID = -1;
+    rtc.nVideoTrackID = -1;
+    DirectGate_WebRTC_Clear(&rtc);
+    return 0;
+}
+
 int main(void)
 {
-    if (negotiation() || handles() || framing()) return 1;
+    if (negotiation() || handles() || framing() || helpers()) return 1;
     puts("webrtc_static_smoke: OK");
     return 0;
 }

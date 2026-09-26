@@ -4,6 +4,8 @@
 #include "src/common/includes.h"
 #include "src/client/webapi.h"
 
+#include "fake_https.h"
+
 #define CHECK(cond, msg) \
     do { \
         if (!(cond)) { \
@@ -188,6 +190,55 @@ static int test_error_reporting(void)
     return 0;
 }
 
+/* The request as the API sees it, and every shape of answer it can give. */
+static int test_live_requests(void)
+{
+    fake_https_t api;
+    CHECK(fake_https_begin(&api), "start the API");
+
+    directgate_webapi_res_t res;
+    fake_https_reply(&api, 200, "application/json", "{\"ok\":true}");
+    CHECK(DirectGate_WebApi_Request(&res, XHTTP_POST, api.sUrl, "/api/v1/probe", "bearer-1", "anon-key", "{\"a\":1}"),
+        "a JSON answer succeeds");
+    CHECK(res.nStatusCode == 200 && res.pRoot != NULL && res.sError[0] == '\0', "the parsed answer is handed back");
+    DirectGate_WebApi_Clear(&res);
+
+    fake_https_t last;
+    CHECK(fake_https_last(&api, &last) == 1, "the API was asked once");
+    CHECK(strcmp(last.sUri, "/api/v1/probe") == 0, "the path is the one asked for");
+    CHECK(strcmp(last.sAuth, "Bearer bearer-1") == 0 && strcmp(last.sApiKey, "anon-key") == 0, "bearer and apikey both go out");
+    CHECK(strcmp(last.sBody, "{\"a\":1}") == 0, "the body goes out as given");
+    CHECK(strcmp(last.sHost, api.sUrl + strlen("https://")) == 0, "a non-default port stays in the Host header");
+
+    /* A success that is not JSON is still a failure: every caller reads fields out of it. */
+    fake_https_reply(&api, 200, "text/html", "<html>captive portal</html>");
+    CHECK(!DirectGate_WebApi_Request(&res, XHTTP_GET, api.sUrl, "/api/v1/probe", NULL, NULL, NULL), "an HTML success fails");
+    CHECK(strcmp(res.sError, "response body is not valid JSON") == 0 && res.pRoot == NULL, "and says why");
+    DirectGate_WebApi_Clear(&res);
+
+    fake_https_reply(&api, 200, "", "");
+    CHECK(!DirectGate_WebApi_Request(&res, XHTTP_GET, api.sUrl, "/api/v1/probe", NULL, NULL, NULL), "an empty success fails");
+    CHECK(strcmp(res.sError, "response body is not valid JSON") == 0, "an empty body is not JSON either");
+    DirectGate_WebApi_Clear(&res);
+
+    /* An error page that is not JSON falls back to the status code. */
+    fake_https_reply(&api, 502, "text/html", "<html>bad gateway</html>");
+    CHECK(!DirectGate_WebApi_Request(&res, XHTTP_GET, api.sUrl, "/api/v1/probe", NULL, NULL, NULL), "a 502 fails");
+    CHECK(res.nStatusCode == 502 && strstr(res.sError, "502") != NULL, "an HTML error reports its status");
+    DirectGate_WebApi_Clear(&res);
+
+    char sGone[64];
+    snprintf(sGone, sizeof(sGone), "%s", api.sUrl);
+    fake_https_end(&api);
+
+    /* Nobody listening: the host and port are named, since that is what a user can check. */
+    CHECK(!DirectGate_WebApi_Request(&res, XHTTP_GET, sGone, "/api/v1/probe", NULL, NULL, NULL), "a closed port fails");
+    CHECK(strstr(res.sError, "host 127.0.0.1") != NULL && strstr(res.sError, strrchr(sGone, ':') + 1) != NULL,
+        "a transport failure names the host and port");
+    DirectGate_WebApi_Clear(&res);
+    return 0;
+}
+
 int main(void)
 {
     xlog_setfl(XLOG_NONE);
@@ -202,6 +253,9 @@ int main(void)
     if (nStatus) return nStatus;
 
     nStatus = test_request_guards();
+    if (nStatus) return nStatus;
+
+    nStatus = test_live_requests();
     if (nStatus) return nStatus;
 
     puts("client_webapi_smoke: OK");

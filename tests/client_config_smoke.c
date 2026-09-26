@@ -176,8 +176,45 @@ int main(void)
           strstr(sLine, "cli-device-id") != NULL, "CLI device list content");
     CHECK(fclose(pDevices) == 0, "close CLI device list");
 
+    /* -n connects to the device the list names, and a name the list does not
+       hold is matched against the account's devices like any other name. */
+    char *byNameArgs[] = { (char*)"directgate", (char*)"-p", sDevices, (char*)"-n", (char*)"cli-device" };
+    CHECK(DirectGate_ParseArgs(&cfg, 5, byNameArgs) == XSTDOK, "parse a connection by saved name");
+    CHECK(strcmp(cfg.sDeviceQuery, "cli-device-id") == 0, "a saved name connects to the id the list holds for it");
+
+    char *unlistedArgs[] = { (char*)"directgate", (char*)"-p", sDevices, (char*)"-n", (char*)"Test Box" };
+    CHECK(DirectGate_ParseArgs(&cfg, 5, unlistedArgs) == XSTDOK, "parse a connection by an unlisted name");
+    CHECK(strcmp(cfg.sDeviceQuery, "Test Box") == 0, "an unlisted name is looked for among the account's devices");
+
+    char *positionalArgs[] = { (char*)"directgate", (char*)"-p", sDevices, (char*)"-n", (char*)"cli-device", (char*)"other" };
+    CHECK(DirectGate_ParseArgs(&cfg, 6, positionalArgs) == XSTDOK, "parse a named device and a positional one");
+    CHECK(strcmp(cfg.sDeviceQuery, "other") == 0, "a device given after the options wins over -n");
+
     char *helpArgs[] = { (char*)"directgate", (char*)"-h" };
     CHECK(DirectGate_ParseArgs(&cfg, 2, helpArgs) == XSTDERR, "CLI help status");
+
+    /* A config that does not load is a failure the caller exits on, not a
+       finished command: it used to come back as XSTDNON and dgcli exited 0. */
+    char *missingArgs[] = { (char*)"directgate", (char*)"-c", (char*)"/nonexistent/dgcli.json", (char*)"devices" };
+    CHECK(DirectGate_ParseArgs(&cfg, 4, missingArgs) == XSTDEXC, "a missing config is reported as a failure");
+
+    /* Only -i may name a config that is not there yet. The letters of an option's value are not
+       options: an 'i' in a device name does not excuse a config that is missing. */
+    char *valueArgs[] = { (char*)"directgate", (char*)"-c", (char*)"/nonexistent/dgcli.json", (char*)"-ninky" };
+    CHECK(DirectGate_ParseArgs(&cfg, 4, valueArgs) == XSTDEXC, "an 'i' inside a value does not pass for -i");
+    char *spacedArgs[] = { (char*)"directgate", (char*)"-n", (char*)"-i", (char*)"-c", (char*)"/nonexistent/dgcli.json" };
+    CHECK(DirectGate_ParseArgs(&cfg, 5, spacedArgs) == XSTDEXC, "a value that looks like -i does not pass for -i");
+
+    CHECK(write_text(sMalformed, "{\"apiUrl\":"), "write a truncated config");
+    char *malformedArgs[] = { (char*)"directgate", (char*)"-c", sMalformed, (char*)"devices" };
+    CHECK(DirectGate_ParseArgs(&cfg, 4, malformedArgs) == XSTDEXC, "a malformed config is reported as a failure");
+
+    /* Saving a device into a list that cannot be written fails the same way. */
+    char *badSaveArgs[] = {
+        (char*)"directgate", (char*)"-d", (char*)"cli-device-id", (char*)"-n", (char*)"cli-device",
+        (char*)"-p", (char*)"/proc/directgate-no-such-dir/devices", (char*)"-s"
+    };
+    CHECK(DirectGate_ParseArgs(&cfg, 8, badSaveArgs) == XSTDEXC, "a device list that cannot be written is a failure");
 
     CHECK(unlink(sValid) == 0, "unlink valid");
     CHECK(unlink(sMalformed) == 0, "unlink malformed");

@@ -942,8 +942,10 @@ static xbool_t DirectGate_ArgsAllowMissingConfig(int argc, char *argv[])
             char ch = pArg[j];
             if (ch == 'e' || ch == 'i') return XTRUE;
 
+            /* The options that take a value, exactly as the option string has them:
+               the rest of this word, or the next one, is that value and not options. */
             if (ch == 'a' || ch == 'c' || ch == 'd' || ch == 'g' ||
-                ch == 'l' || ch == 't' || ch == 'v' || ch == 'w')
+                ch == 'l' || ch == 't' || ch == 'u' || ch == 'v')
             {
                 if (pArg[j + 1] == XSTR_NUL && i + 1 < argc)
                     i++;

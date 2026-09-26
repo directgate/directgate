@@ -119,6 +119,138 @@ static int read_file(const char *pPath, char *pOut, size_t nOutSize)
     return 1;
 }
 
+/* The helpers' own corners: the root directory, bare names, links that lead
+   nowhere or too far, copies that cannot finish, and a transfer the session
+   stops being allowed to make. */
+static int test_static_corners(const char *pRoot)
+{
+    char sOut[XFILE_PATH_SIZE];
+    char sPath[XFILE_PATH_SIZE];
+    char sOther[XFILE_PATH_SIZE];
+
+    CHECK(strcmp(DirectGate_Files_TypeStr((xfile_type_t)0), "unknown") == 0, "an entry of no known type is unknown");
+    CHECK(strcmp(DirectGate_Files_TypeStr(XF_PIPE), "pipe") == 0 && strcmp(DirectGate_Files_TypeStr(XF_SOCKET), "socket") == 0,
+        "pipes and sockets are named");
+
+    DirectGate_Files_NormalizeDirPath(sOut, sizeof(sOut), NULL);
+    CHECK(strcmp(sOut, "/") == 0, "no directory is the root");
+    DirectGate_Files_NormalizeDirPath(sOut, sizeof(sOut), "");
+    CHECK(strcmp(sOut, "/") == 0, "an empty directory is the root");
+    CHECK(DirectGate_Files_BuildFullPath(sOut, sizeof(sOut), "///", "etc") == XSTDOK && strcmp(sOut, "/etc") == 0,
+        "an entry of the root gets one slash");
+
+    /* A bare name is pasted next to itself in the working directory. */
+    char sCwd[XFILE_PATH_SIZE];
+    CHECK(getcwd(sCwd, sizeof(sCwd)) != NULL, "remember the working directory");
+    CHECK(chdir(pRoot) == 0, "work in the test root");
+    CHECK(write_file("paste.txt", "x"), "create a file to paste over");
+    CHECK(DirectGate_Files_ResolvePasteTarget(sOut, sizeof(sOut), "paste.txt") == XSTDOK && strcmp(sOut, "./paste(2).txt") == 0,
+        "a bare name that exists gets a numbered sibling in the working directory");
+    CHECK(unlink("paste.txt") == 0 && chdir(sCwd) == 0, "restore the working directory");
+
+    /* In the root the numbered name keeps a single slash. */
+    if (access("/tmp(2)", F_OK) != 0)
+        CHECK(DirectGate_Files_ResolvePasteTarget(sOut, sizeof(sOut), "/tmp") == XSTDOK && strcmp(sOut, "/tmp(2)") == 0,
+            "an entry of the root is numbered in the root");
+
+    /* Links: one that leads nowhere resolves to nothing, as does a plain file. */
+    snprintf(sPath, sizeof(sPath), "%s/dangling", pRoot);
+    CHECK(symlink("/no/such/target", sPath) == 0, "make a dangling link");
+    CHECK(DirectGate_Files_ResolveLink(sPath) == NULL, "a link that leads nowhere resolves to nothing");
+    CHECK(unlink(sPath) == 0, "remove the dangling link");
+
+    /* A directory under a file cannot be made, nor a link in a directory that is not there. */
+    snprintf(sPath, sizeof(sPath), "%s/plain", pRoot);
+    CHECK(write_file(sPath, "plain"), "create a plain file");
+    snprintf(sOther, sizeof(sOther), "%s/plain/sub", pRoot);
+    CHECK(DirectGate_Files_CreateDir(sOther) == XSTDERR, "a directory under a file is refused");
+    CHECK(DirectGate_Files_CreateSymlink("/no/such/dir/link", "anywhere") == XSTDERR, "a link in a missing directory is refused");
+    snprintf(sOther, sizeof(sOther), "%s/missing/renamed", pRoot);
+    CHECK(DirectGate_Files_Rename(sPath, sOther) == XSTDERR && access(sPath, F_OK) == 0,
+        "a rename into a missing directory fails and keeps the source");
+
+    /* A mode that cannot be applied is logged, and errno is what it was. */
+    errno = EAGAIN;
+    DirectGate_Files_ApplyMode("/no/such/path/at/all", 0644);
+    CHECK(errno == EAGAIN, "applying a mode keeps errno");
+
+    /* Copies that cannot finish leave nothing behind. */
+    xstat_t st;
+    CHECK(xstat(sPath, &st) == XSTDOK, "stat the plain file");
+    CHECK(DirectGate_Files_CopyEntry(sPath, sPath, &st, 0) == XSTDERR && errno == EINVAL, "a copy onto itself is refused");
+    CHECK(DirectGate_Files_CopyRegularFile(sPath, "/no/such/dir/copy") == XSTDERR, "a copy into a missing directory fails");
+
+    snprintf(sOther, sizeof(sOther), "%s/unreadable-copy", pRoot);
+    CHECK(DirectGate_Files_CopyRegularFile("/proc/self/mem", sOther) == XSTDERR, "a source that cannot be read fails the copy");
+    CHECK(access(sOther, F_OK) != 0, "a copy that failed while reading is removed");
+
+    char sTree[XFILE_PATH_SIZE];
+    snprintf(sTree, sizeof(sTree), "%s/tree", pRoot);
+    CHECK(XDir_Create(sTree, 0755) > 0, "create a directory to copy");
+    CHECK(xstat(sTree, &st) == XSTDOK, "stat the directory");
+
+    snprintf(sOther, sizeof(sOther), "%s/tree-deep", pRoot);
+    CHECK(DirectGate_Files_CopyEntry(sTree, sOther, &st, DIRECTGATE_FILES_COPY_MAX_DEPTH) == XSTDERR && errno == ELOOP,
+        "a directory past the depth limit is refused");
+    CHECK(access(sOther, F_OK) != 0, "and nothing is created for it");
+
+    snprintf(sOther, sizeof(sOther), "%s/plain/tree-copy", pRoot);
+    CHECK(DirectGate_Files_CopyEntry(sTree, sOther, &st, 0) == XSTDERR, "a directory copy under a file fails");
+
+    /* A link whose target fills the whole buffer may have been cut short: refused, and the tree copy with it. */
+    char *pLong = (char*)malloc(XFILE_PATH_SIZE);
+    CHECK(pLong != NULL, "allocate a long link target");
+    memset(pLong, 'l', XFILE_PATH_SIZE - 1);
+    pLong[0] = '/';
+    pLong[XFILE_PATH_SIZE - 1] = '\0';
+    snprintf(sPath, sizeof(sPath), "%s/tree/long-link", pRoot);
+    int nLinked = symlink(pLong, sPath);
+    free(pLong);
+
+    if (nLinked == 0)
+    {
+        xstat_t linkSt;
+        snprintf(sOther, sizeof(sOther), "%s/long-link-copy", pRoot);
+        CHECK(xstat(sPath, &linkSt) == XSTDOK, "stat the long link");
+        CHECK(DirectGate_Files_CopyEntry(sPath, sOther, &linkSt, 0) == XSTDERR && errno == ENAMETOOLONG,
+            "a link target that may be cut short is refused");
+
+        snprintf(sOther, sizeof(sOther), "%s/tree-copy", pRoot);
+        CHECK(DirectGate_Files_CopyEntry(sTree, sOther, &st, 0) == XSTDERR && errno == ENAMETOOLONG,
+            "a child that cannot be copied fails the whole tree");
+        CHECK(access(sOther, F_OK) != 0, "a tree copy that failed is removed");
+        CHECK(unlink(sPath) == 0, "remove the long link");
+    }
+
+    /* A directory that cannot be listed is not copied (permissions bind only without CAP_DAC_OVERRIDE). */
+    if (geteuid() != 0)
+    {
+        CHECK(chmod(sTree, 0300) == 0, "make the directory unlistable");
+        snprintf(sOther, sizeof(sOther), "%s/unlistable-copy", pRoot);
+        CHECK(DirectGate_Files_CopyEntry(sTree, sOther, &st, 0) == XSTDERR, "an unlistable directory fails the copy");
+        CHECK(access(sOther, F_OK) != 0, "and its half-made copy is removed");
+        CHECK(chmod(sTree, 0755) == 0, "make the directory listable again");
+    }
+
+    /* A transfer the session stops being allowed to make is cancelled and torn down. */
+    directgate_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.nSessionId = 77;
+    session.bAuthenticated = XTRUE;
+    DirectGate_Transfer_Init(&session.transfer);
+
+    snprintf(sPath, sizeof(sPath), "%s/plain", pRoot);
+    CHECK(DirectGate_Transfer_Send(&session.transfer, sPath, DirectGate_Files_TransferSendCb, &session) == XSTDOK,
+        "start sending a file");
+    session.bAuthenticated = XFALSE;
+    DirectGate_Files_ProcessTransfer(&session);
+    CHECK(session.transfer.eState != XTRANSFER_STATE_SENDING, "a send the session may no longer make stops");
+    DirectGate_Transfer_Destroy(&session.transfer);
+
+    CHECK(unlink(sPath) == 0 && rmdir(sTree) == 0, "cleanup corner files");
+    return 0;
+}
+
 int main(void)
 {
     char sRoot[] = "/tmp/directgate_files_static.XXXXXX";
@@ -669,6 +801,8 @@ int main(void)
         CHECK(!DirectGate_Files_DirectoryHasEntries("/no/such/directory"),
             "a directory that is not there reports no entries");
     }
+
+    if (test_static_corners(sRoot)) return 1;
 
     CHECK(DirectGate_Files_Delete(sDirCopy, XTRUE) == XSTDOK,
         "cleanup copied directory");

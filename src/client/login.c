@@ -547,10 +547,21 @@ static XSOCKET DirectGate_Login_Listen(xsock_t *pSock, uint16_t *pPort)
 {
     XCHECK((pSock != NULL && pPort != NULL), XSOCK_INVALID);
 
+#ifdef _WIN32
+    /* A TIME_WAIT port binds here without help, and SO_REUSEADDR would let
+       another process bind over the listener the sign-in code arrives on. */
+    uint32_t nFlags = XSOCK_TCP_SERVER;
+#else
+    /* Every sign-in that answered a browser leaves its port in TIME_WAIT for
+       a minute, and a few in a row used up the whole range. A live listener
+       still cannot be bound over: that takes SO_REUSEPORT, never set here. */
+    uint32_t nFlags = XSOCK_TCP_SERVER | XSOCK_REUSEADDR;
+#endif
+
     for (uint16_t i = 0; i < DIRECTGATE_LOGIN_PORT_COUNT; i++)
     {
         uint16_t nPort = (uint16_t)(DIRECTGATE_LOGIN_PORT_FIRST + i);
-        if (XSock_Create(pSock, XSOCK_TCP_SERVER, "127.0.0.1", nPort) != XSOCK_INVALID)
+        if (XSock_Create(pSock, nFlags, "127.0.0.1", nPort) != XSOCK_INVALID)
         {
             *pPort = nPort;
             return pSock->nFD;

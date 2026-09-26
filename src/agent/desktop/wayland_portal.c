@@ -46,6 +46,11 @@
 #define DIRECTGATE_PORTAL_DEVICE_POINTER  2U
 #define DIRECTGATE_PORTAL_PERSIST_SESSION 2U
 
+/* Input calls remembered by serial, so a refusal can be matched to the call
+ * it answers. Refusals are collected on every send, so only the handful sent
+ * in one bus round trip are ever outstanding. */
+#define DIRECTGATE_PORTAL_INFLIGHT 32
+
 typedef DBusConnection* (*directgate_dbus_bus_get_fn)(DBusBusType, DBusError*);
 typedef void         (*directgate_dbus_error_init_fn)(DBusError*);
 typedef void         (*directgate_dbus_error_free_fn)(DBusError*);
@@ -76,6 +81,7 @@ typedef dbus_bool_t  (*directgate_dbus_threads_init_fn)(void);
 typedef int          (*directgate_dbus_msg_type_fn)(DBusMessage*);
 typedef const char*  (*directgate_dbus_msg_errname_fn)(DBusMessage*);
 typedef void         (*directgate_dbus_exit_on_disc_fn)(DBusConnection*, dbus_bool_t);
+typedef dbus_uint32_t (*directgate_dbus_msg_reply_serial_fn)(DBusMessage*);
 
 typedef struct directgate_dbus_lib_ {
     void *pHandle;
@@ -109,6 +115,7 @@ typedef struct directgate_dbus_lib_ {
     directgate_dbus_msg_type_fn msgType;
     directgate_dbus_msg_errname_fn msgErrorName;
     directgate_dbus_exit_on_disc_fn setExitOnDisconnect;
+    directgate_dbus_msg_reply_serial_fn replySerial;
     xbool_t bLoadAttempted;
     xbool_t bLoaded;
 } directgate_dbus_lib_t;
@@ -125,6 +132,12 @@ struct directgate_wl_portal_ {
     uint32_t nStreamCount;
     uint32_t nDevices;        /* device types the portal actually granted */
     uint32_t nInputErrors;    /* refused input events already reported */
+    /* The input calls last sent, by serial. A refusal is read off the bus
+     * while later events go out, so the call being sent when it is collected
+     * is not, in general, the call it refuses. */
+    dbus_uint32_t nSentSerials[DIRECTGATE_PORTAL_INFLIGHT];
+    const char *pSentMethods[DIRECTGATE_PORTAL_INFLIGHT];
+    uint32_t nSentNext;
     xbool_t bKeysymRefused;   /* this portal will not type by character */
     xbool_t bInvertScrollY;   /* KDE's portal negates vertical smooth scrolling */
     /* The last absolute pointer coordinate that went out. Refusals come back
@@ -212,6 +225,7 @@ int DirectGate_WL_DBusLoad(char *pErrBuf, size_t nErrSize)
     pLib->threadsInit = (directgate_dbus_threads_init_fn)dlsym(pHandle, "dbus_threads_init_default");
     pLib->msgType = (directgate_dbus_msg_type_fn)dlsym(pHandle, "dbus_message_get_type");
     pLib->msgErrorName = (directgate_dbus_msg_errname_fn)dlsym(pHandle, "dbus_message_get_error_name");
+    pLib->replySerial = (directgate_dbus_msg_reply_serial_fn)dlsym(pHandle, "dbus_message_get_reply_serial");
 
     if (pLib->busGet == NULL || pLib->newCall == NULL || pLib->sendBlock == NULL ||
         pLib->iterInitAppend == NULL || pLib->iterAppend == NULL || pLib->iterOpen == NULL ||
@@ -1191,6 +1205,18 @@ int DirectGate_WL_PortalOpenPipeWire(directgate_wl_portal_t *pPortal, char *pErr
     return nFd;
 }
 
+/* The input call a reply answers, or NULL when it is no longer remembered. */
+static const char* DirectGate_WL_PortalRepliedMethod(const directgate_wl_portal_t *pPortal, DBusMessage *pReply)
+{
+    dbus_uint32_t nSerial = g_dbus.replySerial(pReply);
+    if (!nSerial) return NULL;
+
+    for (uint32_t i = 0; i < DIRECTGATE_PORTAL_INFLIGHT; i++)
+        if (pPortal->nSentSerials[i] == nSerial) return pPortal->pSentMethods[i];
+
+    return NULL;
+}
+
 /* Non-blocking sweep of anything the bus sent back, so a refused input event
  * is visible. Rate-limited: a portal that rejects everything would otherwise
  * turn one broken session into a flooded log. */
@@ -1209,12 +1235,17 @@ static void DirectGate_WL_PortalDrainErrors(directgate_wl_portal_t *pPortal, con
 
         if (xstrused(pName))
         {
+            /* Pinned on the call it answers. Without a serial to go by, the
+             * call that collected it is the best guess left. */
+            const char *pRefused = g_dbus.replySerial != NULL ?
+                DirectGate_WL_PortalRepliedMethod(pPortal, pMessage) : pMethod;
+
             /* Which method was refused decides what it costs. Keysyms are the
              * only way to type a character the host keyboard layout does not
              * carry, so a portal that will not take them can still be typed
              * on - just not in another script - and the viewer is better told
              * than left wondering why some keys do nothing. */
-            if (xstrcmp(pMethod, "NotifyKeyboardKeysym")) pPortal->bKeysymRefused = XTRUE;
+            if (xstrcmp(pRefused, "NotifyKeyboardKeysym")) pPortal->bKeysymRefused = XTRUE;
 
             /* The name is almost always the generic org.freedesktop.DBus.Error.Failed;
              * the reason is in the message body, and it is the whole content
@@ -1231,7 +1262,7 @@ static void DirectGate_WL_PortalDrainErrors(directgate_wl_portal_t *pPortal, con
             {
                 pPortal->nInputErrors++;
                 xloge("The desktop portal refused an input event: method(%s), error(%s), reason(%s), last(%.1f,%.1f)",
-                    pMethod, pName, xstrused(pReason) ? pReason : "not stated",
+                    pRefused != NULL ? pRefused : "unknown", pName, xstrused(pReason) ? pReason : "not stated",
                     pPortal->nLastMotionX, pPortal->nLastMotionY);
             }
         }
@@ -1264,8 +1295,16 @@ static int DirectGate_WL_PortalNotify(directgate_wl_portal_t *pPortal, const cha
 
     if (fnArgs != NULL) fnArgs(&args, pCtx);
 
-    dbus_bool_t bSent = (g_dbus.send != NULL) ? g_dbus.send(pPortal->pConn, pCall, NULL) : FALSE;
+    dbus_uint32_t nSerial = 0;
+    dbus_bool_t bSent = (g_dbus.send != NULL) ? g_dbus.send(pPortal->pConn, pCall, &nSerial) : FALSE;
     g_dbus.msgUnref(pCall);
+
+    if (bSent)
+    {
+        uint32_t nSlot = pPortal->nSentNext++ % DIRECTGATE_PORTAL_INFLIGHT;
+        pPortal->nSentSerials[nSlot] = nSerial;
+        pPortal->pSentMethods[nSlot] = pMethod;
+    }
 
     if (g_dbus.flush != NULL) g_dbus.flush(pPortal->pConn);
 
@@ -1314,6 +1353,10 @@ static void DirectGate_WL_KeyArgs(DBusMessageIter *pArgs, void *pCtx)
 
 int DirectGate_WL_PortalPointerMotion(directgate_wl_portal_t *pPortal, uint32_t nStream, double nX, double nY)
 {
+    /* The one input call that touches the portal before sending: check here
+     * rather than leave it to the shared sender, as every other call does. */
+    XCHECK((pPortal != NULL), XSTDERR);
+
     directgate_wl_motion_t motion = { nStream ? nStream : DirectGate_WL_PortalNodeId(pPortal), nX, nY };
     pPortal->nLastMotionX = nX;
     pPortal->nLastMotionY = nY;

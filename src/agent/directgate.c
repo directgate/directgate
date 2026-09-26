@@ -2840,6 +2840,13 @@ void DirectGate_TestRetryPendingSave(directgate_conn_t *pConn)
 {
     DirectGate_RetryPendingSave(pConn);
 }
+
+xbool_t DirectGate_TestPrepareEndpoint(directgate_conn_t *pConn)
+{
+    xapi_endpoint_t endpt;
+    XAPI_InitEndpoint(&endpt);
+    return DirectGate_PrepareEndpoint(pConn, &endpt);
+}
 #endif
 
 static void DirectGate_RunService(xapi_t *pApi, xapi_endpoint_t *pEndpt, directgate_conn_t *pSessData)

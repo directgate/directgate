@@ -74,9 +74,13 @@ int DirectGate_WL_PortalKeysym(directgate_wl_portal_t *pPortal, int32_t nKeysym,
     return XSTDOK;
 }
 
+/* Which evdev keys the portal has been told are down. */
+static unsigned char g_keysDown[256];
+
 int DirectGate_WL_PortalKeycode(directgate_wl_portal_t *pPortal, int32_t nKeycode, xbool_t bPressed)
 {
-    (void)pPortal; (void)nKeycode; (void)bPressed;
+    (void)pPortal;
+    if (nKeycode >= 0 && nKeycode < 256) g_keysDown[nKeycode] = bPressed ? 1 : 0;
     return XSTDOK;
 }
 
@@ -140,6 +144,42 @@ static int CheckText(directgate_session_t *pSession, size_t nChars, unsigned int
     return 1;
 }
 
+static unsigned int KeysDown(void)
+{
+    unsigned int nDown = 0;
+    for (size_t i = 0; i < sizeof(g_keysDown); i++) nDown += g_keysDown[i];
+    return nDown;
+}
+
+/* More keys down than the held table keeps: the ones pushed out are let go on
+ * the host at once, and the session end lets go of the rest - none stays down. */
+static int CheckHeldOverflow(directgate_session_t *pSession)
+{
+    memset(g_keysDown, 0, sizeof(g_keysDown));
+
+    for (int i = 0; i < 36; i++)
+    {
+        char sPayload[128];
+        int nLength = snprintf(sPayload, sizeof(sPayload), "{\"action\":\"key\",\"code\":\"%s%c\",\"key\":\"%c\",\"down\":true}",
+            i < 26 ? "Key" : "Digit", i < 26 ? 'A' + i : '0' + (i - 26), i < 26 ? 'a' + i : '0' + (i - 26));
+        DirectGate_Desktop_HandleInput(pSession, (const uint8_t*)sPayload, (size_t)nLength);
+    }
+
+    /* KEY_A is evdev 30: the first one pressed, so the first one pushed out. */
+    if (KeysDown() != DIRECTGATE_DESKTOP_MAX_HELD_KEYS || g_keysDown[30] != 0)
+    {
+        fprintf(stderr, "wayland_input_smoke: %u keys down after overflow, KEY_A %s\n",
+            KeysDown(), g_keysDown[30] ? "still down" : "released");
+        return 1;
+    }
+
+    DirectGate_Desktop_ReleaseHeldKeys(&pSession->desktop);
+    if (KeysDown() == 0 && pSession->desktop.nHeldKeyCount == 0) return 0;
+
+    fprintf(stderr, "wayland_input_smoke: %u keys still down after release\n", KeysDown());
+    return 1;
+}
+
 int main(void)
 {
     static directgate_session_t session;
@@ -174,6 +214,7 @@ int main(void)
     nFailures += CheckText(&session, DIRECTGATE_DESKTOP_MAX_TEXT_BYTES, DIRECTGATE_DESKTOP_MAX_TEXT_BYTES * 2);
     nFailures += CheckText(&session, DIRECTGATE_DESKTOP_MAX_TEXT_BYTES + 1, 0);
     nFailures += CheckText(&session, 1024 * 1024, 0);
+    nFailures += CheckHeldOverflow(&session);
 
     if (nFailures != 0) return 1;
     puts("wayland_input_smoke: OK");

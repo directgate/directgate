@@ -343,6 +343,42 @@ static void DirectGate_ClearDevicePair(xmap_pair_t *pPair)
     }
 }
 
+/* -i writes the config -c names, so for it a missing file is the expected case
+   rather than a mistake. The same rule as the agent's, with dgcli's options. */
+static xbool_t DirectGate_ArgsInitConfig(int argc, char *argv[])
+{
+    for (int i = 1; i < argc; i++)
+    {
+        const char *pArg = argv[i];
+        if (!xstrused(pArg)) continue;
+        if (xstrcmp(pArg, "--")) break;
+        if (pArg[0] != '-' || pArg[1] == XSTR_NUL) continue;
+        if (pArg[1] == '-') continue;
+
+        for (size_t j = 1; pArg[j] != XSTR_NUL; j++)
+        {
+            char ch = pArg[j];
+            if (ch == 'i') return XTRUE;
+
+            /* An option that takes a value: the rest of this word, or the next one, is the value. */
+            if (ch == 'n' || ch == 'd' || ch == 'a' || ch == 'c' || ch == 'p' ||
+                ch == 'l' || ch == 'v' || ch == 'w' || ch == 'k')
+            {
+                if (pArg[j + 1] == XSTR_NUL && i + 1 < argc)
+                    i++;
+
+                break;
+            }
+        }
+    }
+
+    return XFALSE;
+}
+
+/* XSTDOK: go on and connect. XSTDNON: the command finished its work here (-i, -s).
+   XSTDEXC: it failed, and the caller has to exit with an error. XSTDERR: the
+   arguments were wrong (or -h), so the usage is what to show. A failure used
+   to come back as XSTDNON, and a config that did not load exited 0. */
 XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
 {
     DirectGate_InitConfig(pCfg);
@@ -351,7 +387,7 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
     if (XPath_Exists(pCfg->sCfgPath))
     {
         if (!DirectGate_LoadConfig(pCfg, pCfg->sCfgPath))
-            return XSTDNON;
+            return XSTDEXC;
     }
 
     for (int i = 1; i + 1 < argc; ++i)
@@ -359,7 +395,8 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
         if (!strcmp(argv[i], "-c") && (i + 1) < argc)
         {
             xstrncpy(pCfg->sCfgPath, sizeof(pCfg->sCfgPath), argv[i + 1]);
-            if (!DirectGate_LoadConfig(pCfg, argv[i + 1])) return XSTDNON;
+            if (DirectGate_ArgsInitConfig(argc, argv) && !XPath_Exists(argv[i + 1])) break;
+            if (!DirectGate_LoadConfig(pCfg, argv[i + 1])) return XSTDEXC;
             break;
         }
     }
@@ -446,24 +483,24 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
 
     if (pCfg->bInit)
     {
-        if (!DirectGate_PromptApiUrl(pCfg)) return XSTDNON;
-        if (!DirectGate_PromptSignalingUrl(pCfg)) return XSTDNON;
-        if (!DirectGate_PromptDevicesPath(pCfg)) return XSTDNON;
+        if (!DirectGate_PromptApiUrl(pCfg)) return XSTDEXC;
+        if (!DirectGate_PromptSignalingUrl(pCfg)) return XSTDEXC;
+        if (!DirectGate_PromptDevicesPath(pCfg)) return XSTDEXC;
 
-        if (!DirectGate_PromptBool("Log to screen", &pCfg->log.bToScreen)) return XSTDNON;
-        if (!DirectGate_PromptBool("Log to file", &pCfg->log.bToFile)) return XSTDNON;
+        if (!DirectGate_PromptBool("Log to screen", &pCfg->log.bToScreen)) return XSTDEXC;
+        if (!DirectGate_PromptBool("Log to file", &pCfg->log.bToFile)) return XSTDEXC;
 
         if (pCfg->log.bToFile)
         {
             if (!DirectGate_PromptString("Log path", pCfg->log.sPath,
                 sizeof(pCfg->log.sPath), pCfg->log.sPath, XFALSE))
-                return XSTDNON;
+                return XSTDEXC;
         }
 
         if (!DirectGate_SaveConfig(pCfg))
         {
             xloge("Failed to create config: %s", pCfg->sCfgPath);
-            return XSTDNON;
+            return XSTDEXC;
         }
 
         return XSTDNON;
@@ -487,41 +524,50 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
         DirectGate_Devices_Search(&deviceMap, pCfg->sDeviceName, pCfg->sDeviceId, sizeof(pCfg->sDeviceId)))
         xlogi("Using device ID from list: %s", pCfg->sDeviceId);
 
+    /* The device to connect to is chosen by query, so -n has to become one: the id the
+       list holds for it, or else the name itself to match against the account's devices.
+       Without this the name was looked up and then ignored, and the picker came up instead. */
+    if (!pCfg->bSaveDevice && !xstrused(pCfg->sDeviceQuery) && xstrused(pCfg->sDeviceName))
+    {
+        xstrncpy(pCfg->sDeviceQuery, sizeof(pCfg->sDeviceQuery),
+            xstrused(pCfg->sDeviceId) ? pCfg->sDeviceId : pCfg->sDeviceName);
+    }
+
     if (pCfg->bSaveDevice)
     {
         if (!xstrused(pCfg->sDeviceId) && !DirectGate_PromptDeviceId(pCfg))
         {
             xloge("Missing device ID");
             XMap_Destroy(&deviceMap);
-            return XSTDNON;
+            return XSTDEXC;
         }
 
         if (!xstrused(pCfg->sDeviceName) && !DirectGate_PromptDeviceName(pCfg))
         {
             xloge("Missing device name");
             XMap_Destroy(&deviceMap);
-            return XSTDNON;
+            return XSTDEXC;
         }
 
         if (!xstrused(pCfg->sDeviceList) && !DirectGate_PromptDevicesPath(pCfg))
         {
             xloge("Missing device list path");
             XMap_Destroy(&deviceMap);
-            return XSTDNON;
+            return XSTDEXC;
         }
 
         if (!DirectGate_Devices_Add(&deviceMap, pCfg->sDeviceName, pCfg->sDeviceId, pCfg->bForce))
         {
             xloge("Failed to add device to list: %s", pCfg->sDeviceList);
             XMap_Destroy(&deviceMap);
-            return XSTDNON;
+            return XSTDEXC;
         }
 
         if (!DirectGate_Devices_Write(&deviceMap, pCfg->sDeviceList))
         {
             xloge("Failed to save device list: %s", pCfg->sDeviceList);
             XMap_Destroy(&deviceMap);
-            return XSTDNON;
+            return XSTDEXC;
         }
 
         XMap_Destroy(&deviceMap);

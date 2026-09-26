@@ -74,9 +74,11 @@ foreach(test
         srp_smoke
         transfer_smoke
         transfer_bounds_smoke
+        transfer_failure_smoke
         webrtc_config_smoke
         webrtc_lifecycle_smoke
         webrtc_peer_smoke
+        webrtc_media_smoke
         webrtc_queue_smoke
         webrtc_static_smoke
         webrtc_rtcp_smoke
@@ -104,14 +106,22 @@ foreach(test
     directgate_smoke(${test})
 endforeach()
 
+# The trust store fallbacks, in a child with private user and mount namespaces.
+directgate_smoke(trust_store_smoke)
+set_tests_properties(trust_store_smoke PROPERTIES SKIP_RETURN_CODE 77)
+
 # The peer round trip also executes the unmodified libdatachannel dependency.
 # Keep it in the default suite and separately selectable for sanitizer reports.
-set_tests_properties(webrtc_peer_smoke PROPERTIES LABELS "external-webrtc")
+set_tests_properties(webrtc_peer_smoke webrtc_media_smoke PROPERTIES LABELS "external-webrtc")
 
 # OpenSSL 3 exposes AES-SIV through EVP. When available, use it as an
 # independent differential oracle for the bundled portable implementation.
 if(OPENSSL_VERSION VERSION_GREATER_EQUAL "3.0")
     directgate_smoke(crypto_siv_openssl_smoke)
+
+    # The agent's own SIV wrappers, both backends against each other.
+    directgate_smoke(siv_backends_smoke)
+    set_tests_properties(siv_backends_smoke PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # Agent tests that also compile specific agent sources.
@@ -137,6 +147,29 @@ if(UNIX AND NOT APPLE)
     # Leave room for libpulse's first-use initialization under Valgrind. The
     # backend's handshake deadline is still 3s; the test must also bound hangs.
     set_tests_properties(audio_linux_connection_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+
+    # The real agent binary against a relay and an enrollment API played by the
+    # test over TLS: startup refresh, WSS connect, SRP login, a shell, a dropped
+    # relay, a confirmed revocation and a clean SIGTERM exit.
+    directgate_smoke(agent_e2e_smoke)
+    target_compile_definitions(agent_e2e_smoke PRIVATE DIRECTGATE_AGENT_BIN="$<TARGET_FILE:directgate>")
+    add_dependencies(agent_e2e_smoke directgate)
+    set_tests_properties(agent_e2e_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 LABELS "e2e")
+
+    # The agent's own command line on a pseudo terminal - pairing, a password
+    # change, an identity rotation - against an enrollment API over TLS.
+    directgate_smoke(agent_cli_smoke)
+    target_compile_definitions(agent_cli_smoke PRIVATE DIRECTGATE_AGENT_BIN="$<TARGET_FILE:directgate>")
+    add_dependencies(agent_cli_smoke directgate)
+    set_tests_properties(agent_cli_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 LABELS "e2e")
+
+    # dgcli on a pseudo terminal against an API and a relay-plus-host played by the
+    # test over TLS: device list, relay envelope, password prompt, SRP login, shell
+    # I/O both ways, a window resize, a keepalive and a clean exit.
+    directgate_smoke(client_e2e_smoke)
+    target_compile_definitions(client_e2e_smoke PRIVATE DIRECTGATE_CLIENT_BIN="$<TARGET_FILE:dgcli>")
+    add_dependencies(client_e2e_smoke dgcli)
+    set_tests_properties(client_e2e_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 LABELS "e2e")
 
     directgate_smoke(openh264_smoke ${AGENT_DIR}/desktop/openh264.c)
     target_include_directories(openh264_smoke PRIVATE ${AGENT_DIR}/openh264)
@@ -166,6 +199,28 @@ if(UNIX AND NOT APPLE)
         set_tests_properties(hwenc_abi_smoke PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
+    # The GPU encoder itself, against this host's libavcodec and hardware. Only
+    # for the single-ABI build (system headers): the multi-ABI package build has
+    # hwenc_abi_smoke above. Skips (77) without libavcodec or a usable GPU.
+    if(NOT DIRECTGATE_HWENC_ABIS AND LIBAV_FOUND)
+        directgate_smoke(hwenc_smoke ${AGENT_DIR}/desktop/hwenc.c)
+        target_compile_definitions(hwenc_smoke PRIVATE DIRECTGATE_HAVE_HWENC=1)
+        target_include_directories(hwenc_smoke PRIVATE ${LIBAV_INCLUDE_DIRS})
+        target_link_libraries(hwenc_smoke PRIVATE ${CMAKE_DL_LIBS})
+        if(LIBAVFILTER_FOUND)
+            target_compile_definitions(hwenc_smoke PRIVATE DIRECTGATE_HWENC_HAS_FILTER=1)
+            target_include_directories(hwenc_smoke PRIVATE ${LIBAVFILTER_INCLUDE_DIRS})
+        endif()
+        # Real GPU drivers hold frames and state for the life of the process -
+        # NVIDIA's CUDA and VAAPI stack from code with no symbols, so no leak
+        # suppression can name it. Memory errors are still caught under ASan;
+        # only the leak report is off, for this one test. Run with
+        # LIBVA_DRIVER_NAME=iHD DIRECTGATE_HWENC_ENCODER=h264_vaapi to see the
+        # agent's own encoder path leak-free.
+        set_tests_properties(hwenc_smoke PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu"
+            ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0:halt_on_error=1:strict_string_checks=1")
+    endif()
+
     # Compiles the X11 input unit directly (like files_static_smoke) to test
     # the browser-key -> keysym mapping; needs Xlib but no running X server.
     directgate_smoke(desktop_input_smoke)
@@ -189,6 +244,15 @@ if(UNIX AND NOT APPLE)
         target_compile_definitions(wayland_portal_smoke PRIVATE DIRECTGATE_DESKTOP_HAS_WAYLAND=1)
         target_include_directories(wayland_portal_smoke SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
         target_link_libraries(wayland_portal_smoke PRIVATE ${DBUS_LIBRARIES} ${CMAKE_DL_LIBS})
+
+        # The same client against a fake portal on a private dbus-daemon: the
+        # whole handshake, input and every refusal a real portal can give.
+        # Skips (77) where there is no dbus-daemon to start.
+        directgate_smoke(wayland_portal_bus_smoke ${AGENT_DIR}/desktop/wayland_portal.c)
+        target_compile_definitions(wayland_portal_bus_smoke PRIVATE DIRECTGATE_DESKTOP_HAS_WAYLAND=1)
+        target_include_directories(wayland_portal_bus_smoke SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
+        target_link_libraries(wayland_portal_bus_smoke PRIVATE ${DBUS_LIBRARIES} ${CMAKE_DL_LIBS} Threads::Threads)
+        set_tests_properties(wayland_portal_bus_smoke PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
     # Same idea for the adaptive bitrate controller: compiles desktop.c and
@@ -210,6 +274,16 @@ if(UNIX AND NOT APPLE)
         ${AGENT_DIR}/desktop/input.c
         ${AGENT_DIR}/desktop/stream.c)
     directgate_smoke_desktop(desktop_control_smoke)
+
+    # The same module set against a private Xvfb: display, capture, encoder
+    # thread, RandR modes and XTest input for real. Skips without Xvfb.
+    directgate_smoke(desktop_x11_smoke
+        ${AGENT_DIR}/desktop/desktop.c
+        ${AGENT_DIR}/desktop/display.c
+        ${AGENT_DIR}/desktop/input.c
+        ${AGENT_DIR}/desktop/stream.c)
+    directgate_smoke_desktop(desktop_x11_smoke)
+    set_tests_properties(desktop_x11_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
 endif()
 directgate_smoke(enroll_prompt_smoke ${AGENT_DIR}/enroll.c)
 directgate_smoke(files_smoke         ${AGENT_DIR}/files.c)
@@ -294,6 +368,26 @@ directgate_smoke_desktop(connection_lifecycle_smoke)
 target_compile_definitions(connection_lifecycle_smoke PRIVATE DIRECTGATE_TESTING)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(connection_lifecycle_smoke PRIVATE -Wno-unused-function)
+endif()
+
+# The relay re-probe after repeated reconnect failures, against an in-process
+# HTTPS API; needs the whole connection layer, like the lifecycle test above.
+directgate_smoke(relay_reprobe_smoke
+    ${AGENT_DIR}/config.c
+    ${AGENT_DIR}/desktop/desktop.c
+    ${AGENT_DIR}/desktop/display.c
+    ${AGENT_DIR}/desktop/input.c
+    ${AGENT_DIR}/desktop/stream.c
+    ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/files.c
+    ${AGENT_DIR}/search.c
+    ${AGENT_DIR}/session.c
+    ${AGENT_DIR}/term.c
+    ${AGENT_DIR}/directgate.c)
+directgate_smoke_desktop(relay_reprobe_smoke)
+target_compile_definitions(relay_reprobe_smoke PRIVATE DIRECTGATE_TESTING)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(relay_reprobe_smoke PRIVATE -Wno-unused-function)
 endif()
 
 # Messages that end a session inside their own handler; needs the whole

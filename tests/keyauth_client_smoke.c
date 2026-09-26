@@ -303,6 +303,49 @@ static int test_host_pinning(void)
         sChalAgentPub, sChalAgentEph, NULL, sChalChallenge, sChalSig,
         sClientSig, sizeof(sClientSig)), "client rejects an incomplete challenge");
 
+    /* Fields that do not decode, or decode to the wrong size, are refused before any
+       signature is checked: each one against a fresh client, in the state that expects it. */
+    char sShortB64[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
+    CHECK(DirectGate_KeyAuth_Base64Encode(expectedPub, sizeof(expectedPub) - 1, sShortB64, sizeof(sShortB64)),
+        "encode a key one byte short");
+
+    const struct {
+        const char *pPub;
+        const char *pEph;
+        const char *pNonce;
+        const char *pChallenge;
+        const char *pSig;
+        const char *pMsg;
+    } malformed[] = {
+        { "!!!not base64!!!", sChalAgentEph, sChalNonce, sChalChallenge, sChalSig, "an agent key that is not base64 is refused" },
+        { sShortB64, sChalAgentEph, sChalNonce, sChalChallenge, sChalSig, "an agent key of the wrong size is refused" },
+        { sExpectedB64, "!!!", sChalNonce, sChalChallenge, sChalSig, "an ephemeral key that is not base64 is refused" },
+        { sExpectedB64, sShortB64, sChalNonce, sChalChallenge, sChalSig, "an ephemeral key of the wrong size is refused" },
+        { sExpectedB64, sChalAgentEph, "zz", sChalChallenge, sChalSig, "a nonce that is not hex is refused" },
+        { sExpectedB64, sChalAgentEph, "0011", sChalChallenge, sChalSig, "a nonce of the wrong size is refused" },
+        { sExpectedB64, sChalAgentEph, sChalNonce, "abcd", sChalSig, "a challenge of the wrong size is refused" },
+        { sExpectedB64, sChalAgentEph, sChalNonce, sChalChallenge, "!!!", "a signature that is not base64 is refused" },
+        { sExpectedB64, sChalAgentEph, sChalNonce, sChalChallenge, sShortB64, "a signature of the wrong size is refused" }
+    };
+
+    for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++)
+    {
+        CHECK(DirectGate_KeyAuth_ClientInit(&client, pDeviceId, &key, sExpectedB64), "re-init client for a malformed field");
+        CHECK(DirectGate_KeyAuth_ClientBuildHello(&client,
+            sClientPubB64, sizeof(sClientPubB64),
+            sClientEphB64, sizeof(sClientEphB64),
+            sClientNonceHex, sizeof(sClientNonceHex)), "rebuild client hello for a malformed field");
+        CHECK(!DirectGate_KeyAuth_ClientProcessChallenge(&client, &key, malformed[i].pPub, malformed[i].pEph,
+            malformed[i].pNonce, malformed[i].pChallenge, malformed[i].pSig, sClientSig, sizeof(sClientSig)),
+            malformed[i].pMsg);
+        CHECK(client.eState == DIRECTGATE_KEYAUTH_STATE_FAILED, "a malformed challenge leaves the client failed");
+    }
+
+    /* A challenge out of turn - before any hello - is refused without touching the state. */
+    CHECK(DirectGate_KeyAuth_ClientInit(&client, pDeviceId, &key, sExpectedB64), "re-init client for an early challenge");
+    CHECK(!DirectGate_KeyAuth_ClientProcessChallenge(&client, &key, sExpectedB64, sChalAgentEph, sChalNonce,
+        sChalChallenge, sChalSig, sClientSig, sizeof(sClientSig)), "a challenge before the hello is refused");
+
     DirectGate_KeyAuth_Cleanse(&client);
     DirectGate_KeyAuth_Cleanse(&rogue);
     DirectGate_KeyAuth_Cleanse(&liar);

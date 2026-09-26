@@ -25,6 +25,8 @@
 #include "src/agent/directgate.h"
 #include "src/agent/files.h"
 
+#include "xvfb_fixture.h"
+
 #define CHECK(cond, msg) \
     do { \
         if (!(cond)) { \
@@ -403,7 +405,8 @@ int main(void)
         DirectGate_TestRetryPendingSave(&fix.conn);
         CHECK(fix.cfg.bSavePending, "a save that still cannot be written stays pending");
         CHECK(fix.conn.nNextSaveRetryMs > XTime_GetMonoMs(), "the next attempt is spaced out");
-        CHECK(fix.conn.nNextSaveRetryMs < XTime_GetMonoMs() + DIRECTGATE_TEST_HOUR_MS, "the save retry is on the monotonic clock");
+        CHECK(fix.conn.nNextSaveRetryMs < XTime_GetMonoMs() + DIRECTGATE_TEST_HOUR_MS,
+            "the save retry is on the monotonic clock");
 
         uint64_t nScheduled = fix.conn.nNextSaveRetryMs;
         DirectGate_TestRetryPendingSave(&fix.conn);
@@ -507,7 +510,16 @@ int main(void)
         CHECK(deliver(&fix, pCopy, &fix.peer, NULL, 0) == XAPI_CONTINUE, "a copy request is accepted");
         CHECK(pSession->pFileOp != NULL, "the copy runs on its own worker");
 
+        /* One operation at a time: a second is refused while the first is still out,
+           answered at once rather than queued behind it. */
         char sAction[256], sStatus[256], sPath[1024];
+        xjson_obj_t *pSecond = manager_header("delete", sSrc, 61);
+        CHECK(pSecond != NULL, "build a second operation");
+        CHECK(deliver(&fix, pSecond, &fix.peer, NULL, 0) == XAPI_CONTINUE, "a second operation is handled");
+        CHECK(take_manager_reply(&fix, sAction, sStatus, sPath, sizeof(sAction)), "the second operation is answered at once");
+        CHECK(!strcmp(sAction, "delete") && !strcmp(sStatus, "failed"), "a second operation while one runs is refused");
+        CHECK(path_exists(sSrc), "the refused operation did nothing");
+
         CHECK(service_until_reply(&fix, &api), "the copy answers through the event loop");
         CHECK(take_manager_reply(&fix, sAction, sStatus, sPath, sizeof(sAction)), "the copy answer can be read");
         CHECK(!strcmp(sAction, "copy") && !strcmp(sStatus, "ok") && !strcmp(sPath, sDst),
@@ -572,6 +584,9 @@ int main(void)
             "a real shell starts behind a registered PTY endpoint");
         CHECK(pSession->eActiveMode == DIRECTGATE_SESSION_MODE_TERMINAL, "the session is in terminal mode");
         CHECK(pSession->term.pPTYSession != NULL, "the PTY endpoint is attached");
+        xapi_session_t *pPty = pSession->term.pPTYSession;
+        CHECK(DirectGate_Session_StartMode(pSession, DIRECTGATE_SESSION_MODE_TERMINAL) == XAPI_CONTINUE &&
+            pSession->term.pPTYSession == pPty, "starting the running terminal again keeps the same shell");
         drain(&fix);
 
         /* Shell output is not read while the link is this far behind; reading used to go on until the PTY ran
@@ -612,6 +627,99 @@ int main(void)
         XAPI_Destroy(&api);
         fix.api.pApi = NULL;
         drain(&fix);
+    }
+
+    /* ---- a desktop session on a private X server ------------------------------------------------------ */
+
+    /* Desktop mode registers the WebRTC pipe and the frame timer with the event loop; closing the session has to
+       take the timer endpoint down with it. Needs an Xvfb (DIRECTGATE_XVFB or PATH); skipped without one. */
+    {
+        char sXvfb[4096];
+        xvfb_t xvfb;
+
+        if (find_xvfb(sXvfb, sizeof(sXvfb)) && xvfb_start(&xvfb, sXvfb, 24, NULL))
+        {
+            setenv("DISPLAY", xvfb.sDisplay, 1);
+            setenv("XDG_SESSION_TYPE", "x11", 1);
+            setenv("DIRECTGATE_DESKTOP_FORCE_RAW", "1", 1);
+            unsetenv("WAYLAND_DISPLAY");
+
+            xapi_t api;
+            XAPI_Init(&api, DirectGate_ServiceCallback, &fix.conn);
+            fix.api.pApi = &api;
+
+            directgate_session_t *pSession = new_session(&fix, 52, XTRUE);
+            CHECK(pSession != NULL && seal_session(&fix, pSession), "a session for the desktop");
+            CHECK(DirectGate_Session_StartMode(pSession, DIRECTGATE_SESSION_MODE_DESKTOP) == XAPI_CONTINUE,
+                "the desktop starts on the private display");
+            CHECK(pSession->eActiveMode == DIRECTGATE_SESSION_MODE_DESKTOP, "the session is in desktop mode");
+            CHECK(pSession->pDesktopSession != NULL, "the frame timer is registered with the event loop");
+            CHECK(DirectGate_Session_StartMode(pSession, DIRECTGATE_SESSION_MODE_DESKTOP) == XAPI_CONTINUE,
+                "starting the running desktop again is harmless");
+            drain(&fix);
+
+            DirectGate_Session_Close(pSession, "desktop test done");
+            CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 52) == NULL, "closing the session ends the desktop with it");
+
+            XAPI_Destroy(&api);
+            fix.api.pApi = NULL;
+            drain(&fix);
+
+            unsetenv("DIRECTGATE_DESKTOP_FORCE_RAW");
+            xvfb_stop(&xvfb);
+        }
+    }
+
+    /* ---- the edges of a session's life --------------------------------------------------------------- */
+    {
+        CHECK(DirectGate_SessionMode_FromString("desktop") == DIRECTGATE_SESSION_MODE_DESKTOP &&
+            DirectGate_SessionMode_FromString("file-manager") == DIRECTGATE_SESSION_MODE_FILE_MANAGER &&
+            DirectGate_SessionMode_FromString("terminal") == DIRECTGATE_SESSION_MODE_TERMINAL &&
+            DirectGate_SessionMode_FromString("juggler") == DIRECTGATE_SESSION_MODE_NONE &&
+            DirectGate_SessionMode_FromString(NULL) == DIRECTGATE_SESSION_MODE_NONE, "mode names map both ways");
+
+        /* A manager answer for a session nobody logged in to closes the session instead of going out. */
+        directgate_session_t *pSession = new_session(&fix, 60, XFALSE);
+        CHECK(pSession != NULL, "an unauthenticated session");
+        size_t nBefore = fix.api.txBuffer.nUsed;
+        CHECK(DirectGate_Session_SendManagerData(pSession, "list", "ok", "/", (const uint8_t*)"{}", 2) == XAPI_CONTINUE,
+            "a manager answer on an unauthenticated session is not fatal");
+        CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 60) == NULL, "it closes the session");
+        CHECK(fix.api.txBuffer.nUsed >= nBefore, "and nothing but the close goes out");
+        drain(&fix);
+
+        /* A temporary desktop share asks for a terminal: refused, and the share is over. */
+        pSession = new_session(&fix, 61, XTRUE);
+        CHECK(pSession != NULL && seal_session(&fix, pSession), "a temporary desktop share session");
+        pSession->bDesktopShare = XTRUE;
+        DirectGate_Session_StartMode(pSession, DIRECTGATE_SESSION_MODE_TERMINAL);
+        CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 61) == NULL, "a share asking for a terminal is closed");
+        drain(&fix);
+
+        /* An upload still pending when its session goes leaves no temp file behind; one that cannot be
+           removed is logged, not fatal. */
+        char sTemp[600];
+        snprintf(sTemp, sizeof(sTemp), "%s/.directgate-upload-left.part", sRoot);
+        FILE *pTemp = fopen(sTemp, "w");
+        CHECK(pTemp != NULL, "create a pending upload temp file");
+        fclose(pTemp);
+
+        pSession = new_session(&fix, 62, XTRUE);
+        CHECK(pSession != NULL, "a session with a pending upload");
+        xstrncpy(pSession->sSaveTempPath, sizeof(pSession->sSaveTempPath), sTemp);
+        DirectGate_Session_Close(pSession, "upload abandoned");
+        CHECK(access(sTemp, F_OK) != 0, "the pending upload's temp file is removed with the session");
+
+        char sInner[700];
+        snprintf(sInner, sizeof(sInner), "%s/x", sTemp);
+        CHECK(mkdir(sTemp, 0700) == 0 && mkdir(sInner, 0700) == 0, "a temp path that is a non-empty directory");
+        pSession = new_session(&fix, 63, XTRUE);
+        CHECK(pSession != NULL, "a session whose temp path cannot be removed");
+        xstrncpy(pSession->sSaveTempPath, sizeof(pSession->sSaveTempPath), sTemp);
+        DirectGate_Session_Close(pSession, "upload abandoned");
+        CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 63) == NULL, "the session still closes");
+        drain(&fix);
+        DirectGate_Files_Delete(sTemp, XTRUE);
     }
 
     DirectGate_SessionMgr_Destroy(&fix.conn.mgr);

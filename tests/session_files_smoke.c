@@ -14,15 +14,19 @@
  * the assertions are about what actually went on the wire.
  */
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "src/agent/directgate.h"
 #include "src/agent/files.h"
+#include "src/agent/search.h"
 
 #define CHECK(cond, msg) \
     do { \
@@ -210,6 +214,263 @@ static int write_file(const char *pPath, const char *pData)
     int nOk = fwrite(pData, 1, nLen, pFile) == nLen;
     fclose(pFile);
     return nOk;
+}
+
+/* A manager request with permissions attached, the way a browser copies a file's mode across. */
+static xjson_obj_t* manager_with_perm(const char *pAction, const char *pPath, const char *pPerm, uint32_t nSessionId)
+{
+    xjson_obj_t *pHeader = manager_header(pAction, pPath, NULL, nSessionId, XFALSE);
+    if (pHeader != NULL && pPerm != NULL) XJSON_AddString(pHeader, "permissions", pPerm);
+    return pHeader;
+}
+
+/* "action/status" of the next queued answer, which is consumed, leaving any
+   answers queued after it; "" when nothing is queued. */
+static const char* answer_status(fixture_t *pFix, char *pOut, size_t nSize)
+{
+    pOut[0] = '\0';
+    if (pFix->api.txBuffer.nUsed == 0) return pOut;
+
+    xws_frame_t frame;
+    xws_status_t eStatus = XWebFrame_ParseData(&frame, pFix->api.txBuffer.pData, pFix->api.txBuffer.nUsed);
+    size_t nFrame = frame.nHeaderSize + frame.nPayloadLength;
+    XWebFrame_Clear(&frame);
+    if (eStatus != XWS_FRAME_COMPLETE) return pOut;
+
+    directgate_pkg_t pkg;
+    if (take_packet(pFix, &pkg))
+    {
+        xjson_obj_t *pRoot = pkg.jsonHeader.pRootObj;
+        const char *pStatus = XJSON_GetString(XJSON_GetObject(pRoot, "status"));
+        const char *pAction = XJSON_GetString(XJSON_GetObject(pRoot, "action"));
+        snprintf(pOut, nSize, "%s/%s", pAction != NULL ? pAction : "", pStatus != NULL ? pStatus : "");
+        DirectGate_Package_Clear(&pkg);
+    }
+
+    XByteBuffer_Advance(&pFix->api.txBuffer, nFrame);
+    return pOut;
+}
+
+/* Uploads pBody to the save that was just accepted. When pIntruder is set,
+   that path is created between the last chunk and the end, which is a file
+   appearing under a save that was told there was nothing to replace. */
+static int upload(fixture_t *pFix, const char *pId, const char *pBody, const char *pIntruder)
+{
+    size_t nBody = strlen(pBody);
+    char sSha[XSHA256_DIGEST_SIZE * 2 + 1];
+    uint8_t digest[XSHA256_DIGEST_SIZE];
+    XSHA256_Compute(digest, sizeof(digest), (const uint8_t*)pBody, nBody);
+    for (size_t i = 0; i < sizeof(digest); i++) snprintf(sSha + (i * 2), sizeof(sSha) - (i * 2), "%02x", digest[i]);
+
+    xjson_obj_t *pStart = DirectGate_Proto_BuildFileStart(pId, "upload.bin", nBody, 1, 65536);
+    if (pStart == NULL) return 0;
+    XJSON_AddU32(pStart, "sessionId", 11);
+    if (deliver(pFix, pStart) != XAPI_CONTINUE) return 0;
+    drain(pFix);
+
+    xjson_obj_t *pChunk = DirectGate_Proto_BuildFileChunk(pId, 0);
+    if (pChunk == NULL) return 0;
+    XJSON_AddU32(pChunk, "sessionId", 11);
+    if (deliver_payload(pFix, pChunk, (const uint8_t*)pBody, nBody) != XAPI_CONTINUE) return 0;
+    drain(pFix);
+
+    if (pIntruder != NULL && !write_file(pIntruder, "already here")) return 0;
+
+    xjson_obj_t *pEnd = DirectGate_Proto_BuildFileEnd(pId, sSha);
+    if (pEnd == NULL) return 0;
+    XJSON_AddU32(pEnd, "sessionId", 11);
+    return deliver(pFix, pEnd) == XAPI_CONTINUE;
+}
+
+/* Everything the manager can be asked that ends in a refusal or a detail the
+   happy paths above never reach: each one answered, and the tree left as it was. */
+static int manager_corners(fixture_t *pFix, const char *pRoot)
+{
+    char sPath[512], sOther[512], sAnswer[128];
+
+    /* Saving over a file that exists needs force; a browser is told first. */
+    snprintf(sPath, sizeof(sPath), "%s/exists.txt", pRoot);
+    CHECK(write_file(sPath, "keep me"), "seed a file to save over");
+    CHECK(deliver(pFix, manager_header("save", sPath, NULL, 11, XFALSE)) == XAPI_CONTINUE, "save over an existing file");
+    CHECK(expect_manager(pFix, "save", "exists"), "saving over a file without force is answered with exists");
+
+    /* A saved file takes the mode it was sent with. */
+    snprintf(sPath, sizeof(sPath), "%s/private.txt", pRoot);
+    CHECK(deliver(pFix, manager_with_perm("save", sPath, "rw-r-----", 11)) == XAPI_CONTINUE, "save with a mode");
+    CHECK(expect_manager(pFix, "save", "ok"), "the save with a mode is accepted");
+    CHECK(upload(pFix, "perm-1", "secret body", NULL), "upload the file with a mode");
+    CHECK(strcmp(answer_status(pFix, sAnswer, sizeof(sAnswer)), "ack/") == 0, "the upload with a mode is acknowledged");
+    struct stat st;
+    CHECK(stat(sPath, &st) == 0 && (st.st_mode & 0777) == 0640, "the saved file has the mode it was sent with");
+
+    /* A mode that is not one is logged and the file kept. */
+    snprintf(sPath, sizeof(sPath), "%s/oddmode.txt", pRoot);
+    CHECK(deliver(pFix, manager_with_perm("save", sPath, "rwx-bogus", 11)) == XAPI_CONTINUE, "save with a nonsense mode");
+    CHECK(expect_manager(pFix, "save", "ok"), "the save with a nonsense mode is accepted");
+    CHECK(upload(pFix, "perm-2", "odd body", NULL), "upload the file with a nonsense mode");
+    CHECK(strcmp(answer_status(pFix, sAnswer, sizeof(sAnswer)), "ack/") == 0, "a nonsense mode does not fail the upload");
+    CHECK(XPath_Exists(sPath), "the file with a nonsense mode is saved");
+
+    /* A file that appears under a save while it uploads is not replaced. */
+    snprintf(sPath, sizeof(sPath), "%s/raced.txt", pRoot);
+    CHECK(deliver(pFix, manager_header("save", sPath, NULL, 11, XFALSE)) == XAPI_CONTINUE, "save a new file");
+    CHECK(expect_manager(pFix, "save", "ok"), "the save of a new file is accepted");
+    CHECK(upload(pFix, "race-1", "uploaded body", sPath), "upload while the file appears");
+    CHECK(strcmp(answer_status(pFix, sAnswer, sizeof(sAnswer)), "cancel/") == 0,
+        "a file that appeared during the upload cancels the save");
+    xbyte_buffer_t kept;
+    CHECK(XPath_LoadBuffer(sPath, &kept) > 0, "the file that appeared is still there");
+    int bKept = kept.nUsed == strlen("already here") && memcmp(kept.pData, "already here", kept.nUsed) == 0;
+    XByteBuffer_Clear(&kept);
+    CHECK(bKept, "the file that appeared is not replaced by the upload");
+    CHECK(!xstrused(pFix->pSession->sSaveTempPath), "the cancelled save leaves no temporary upload behind");
+
+    /* A directory takes its mode; a nonsense mode is logged and the directory kept. */
+    snprintf(sPath, sizeof(sPath), "%s/modedir", pRoot);
+    CHECK(deliver(pFix, manager_with_perm("mkdir", sPath, "rwx------", 11)) == XAPI_CONTINUE, "mkdir with a mode");
+    CHECK(expect_manager(pFix, "mkdir", "ok"), "mkdir with a mode succeeds");
+    CHECK(stat(sPath, &st) == 0 && (st.st_mode & 0777) == 0700, "the directory has the mode it was sent with");
+    snprintf(sPath, sizeof(sPath), "%s/oddmodedir", pRoot);
+    CHECK(deliver(pFix, manager_with_perm("mkdir", sPath, "bogus", 11)) == XAPI_CONTINUE, "mkdir with a nonsense mode");
+    CHECK(expect_manager(pFix, "mkdir", "ok"), "a nonsense mode does not fail the mkdir");
+    snprintf(sPath, sizeof(sPath), "%s/no/such/parent/dir", pRoot);
+    CHECK(deliver(pFix, manager_header("mkdir", sPath, NULL, 11, XFALSE)) == XAPI_CONTINUE, "mkdir under a missing parent");
+    CHECK(expect_manager(pFix, "mkdir", "ok") && XPath_Exists(sPath), "mkdir creates the missing parents on the way");
+
+    /* Renames and moves that cannot happen. */
+    snprintf(sPath, sizeof(sPath), "%s/exists.txt", pRoot);
+    snprintf(sOther, sizeof(sOther), "%s/private.txt", pRoot);
+    CHECK(deliver(pFix, manager_header("rename", sPath, sOther, 11, XFALSE)) == XAPI_CONTINUE, "rename onto an existing file");
+    CHECK(expect_manager(pFix, "rename", "failed"), "a rename never replaces an existing file");
+    snprintf(sPath, sizeof(sPath), "%s/nowhere.txt", pRoot);
+    CHECK(deliver(pFix, manager_header("rename", sPath, sOther, 11, XFALSE)) == XAPI_CONTINUE, "rename a missing file");
+    CHECK(expect_manager(pFix, "rename", "failed"), "renaming a missing file fails");
+
+    CHECK(deliver(pFix, manager_header("move", sPath, NULL, 11, XFALSE)) == XAPI_CONTINUE, "move without a target");
+    CHECK(expect_manager(pFix, "move", "failed"), "a move without a target fails");
+    snprintf(sOther, sizeof(sOther), "%s/moved-missing.txt", pRoot);
+    CHECK(deliver(pFix, manager_header("move", sPath, sOther, 11, XFALSE)) == XAPI_CONTINUE, "move a missing file");
+    CHECK(expect_manager(pFix, "move", "failed"), "moving a missing file fails");
+
+    /* Moving onto a name that is taken picks the next free one instead of replacing it. */
+    snprintf(sPath, sizeof(sPath), "%s/exists.txt", pRoot);
+    snprintf(sOther, sizeof(sOther), "%s/private.txt", pRoot);
+    CHECK(deliver(pFix, manager_header("move", sPath, sOther, 11, XFALSE)) == XAPI_CONTINUE, "move onto a taken name");
+    CHECK(expect_manager(pFix, "move", "ok"), "a move onto a taken name succeeds");
+    snprintf(sPath, sizeof(sPath), "%s/private(2).txt", pRoot);
+    CHECK(XPath_Exists(sPath) && XPath_Exists(sOther), "the move landed beside the taken name, which is kept");
+
+    /* A name without an extension, and one relative to the agent's directory. */
+    snprintf(sPath, sizeof(sPath), "%s/modedir", pRoot);
+    snprintf(sOther, sizeof(sOther), "%s/oddmodedir", pRoot);
+    CHECK(deliver(pFix, manager_header("copy", sPath, sOther, 11, XFALSE)) == XAPI_CONTINUE, "copy onto a taken directory name");
+    CHECK(expect_manager(pFix, "copy", "ok"), "a copy onto a taken directory name succeeds");
+    snprintf(sPath, sizeof(sPath), "%s/oddmodedir(2)", pRoot);
+    CHECK(XPath_Exists(sPath), "the copy landed beside the taken directory name");
+
+    /* Deleting what is not there. */
+    snprintf(sPath, sizeof(sPath), "%s/never-was", pRoot);
+    CHECK(deliver(pFix, manager_header("delete", sPath, NULL, 11, XFALSE)) == XAPI_CONTINUE, "delete a missing entry");
+    CHECK(expect_manager(pFix, "delete", "failed"), "deleting a missing entry fails");
+
+    /* Listing shows what kind of entry each one is, pipes and sockets included. */
+    snprintf(sPath, sizeof(sPath), "%s/kinds", pRoot);
+    CHECK(mkdir(sPath, 0755) == 0, "a directory of special entries");
+    snprintf(sOther, sizeof(sOther), "%s/kinds/fifo", pRoot);
+    CHECK(mkfifo(sOther, 0600) == 0, "a named pipe");
+    snprintf(sOther, sizeof(sOther), "%s/kinds/socket", pRoot);
+    int nSock = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    xstrncpy(addr.sun_path, sizeof(addr.sun_path), sOther);
+    CHECK(nSock >= 0 && bind(nSock, (struct sockaddr*)&addr, sizeof(addr)) == 0, "a socket file");
+    close(nSock);
+    snprintf(sOther, sizeof(sOther), "%s/kinds/device", pRoot);
+    CHECK(symlink("/dev/null", sOther) == 0, "a link to a device");
+
+    CHECK(deliver(pFix, manager_header("list", sPath, NULL, 11, XFALSE)) == XAPI_CONTINUE, "list special entries");
+    {
+        directgate_pkg_t pkg;
+        CHECK(take_packet(pFix, &pkg), "the listing reaches the wire");
+        int bKinds = memmem(pFix->pktBuf.pData, pFix->pktBuf.nUsed, "\"pipe\"", 6) != NULL &&
+            memmem(pFix->pktBuf.pData, pFix->pktBuf.nUsed, "\"socket\"", 8) != NULL;
+        DirectGate_Package_Clear(&pkg);
+        drain(pFix);
+        CHECK(bKinds, "a listing names pipes and sockets as what they are");
+    }
+
+    CHECK(deliver(pFix, manager_header("list", "/dev", NULL, 11, XFALSE)) == XAPI_CONTINUE, "list the device directory");
+    {
+        directgate_pkg_t pkg;
+        CHECK(take_packet(pFix, &pkg), "the device listing reaches the wire");
+        int bChar = memmem(pFix->pktBuf.pData, pFix->pktBuf.nUsed, "\"char\"", 6) != NULL;
+        DirectGate_Package_Clear(&pkg);
+        drain(pFix);
+        CHECK(bChar, "a listing names character devices as what they are");
+    }
+
+    /* Search through the manager: a search that cannot start, one that runs,
+       and a cancel with nothing to cancel. */
+    snprintf(sPath, sizeof(sPath), "%s/no-such-dir", pRoot);
+    xjson_obj_t *pSearch = manager_header("search", sPath, NULL, 11, XFALSE);
+    CHECK(pSearch != NULL, "build a search of a missing directory");
+    XJSON_AddString(pSearch, "fileName", "*.txt");
+    CHECK(deliver(pFix, pSearch) == XAPI_CONTINUE, "search a missing directory");
+    CHECK(expect_manager(pFix, "search", "failed"), "a search of a missing directory fails at once");
+
+    pSearch = manager_header("search", pRoot, NULL, 11, XFALSE);
+    CHECK(pSearch != NULL, "build a search");
+    XJSON_AddString(pSearch, "fileName", "*.txt");
+    CHECK(deliver(pFix, pSearch) == XAPI_CONTINUE, "start a search");
+
+    int bDone = 0;
+    for (int i = 0; i < 300 && !bDone; i++)
+    {
+        DirectGate_Search_Process(pFix->pSession);
+        if (pFix->api.txBuffer.nUsed)
+        {
+            answer_status(pFix, sAnswer, sizeof(sAnswer));
+            bDone = strcmp(sAnswer, "search/ok") == 0 || strcmp(sAnswer, "search/failed") == 0;
+        }
+        else usleep(10000);
+    }
+
+    CHECK(bDone && strcmp(sAnswer, "search/ok") == 0, "a search through the manager finishes and reports its results");
+    drain(pFix);
+
+    pSearch = manager_header("search", pRoot, NULL, 11, XFALSE);
+    CHECK(pSearch != NULL, "build a cancel");
+    XJSON_AddBool(pSearch, "cancel", XTRUE);
+    CHECK(deliver(pFix, pSearch) == XAPI_CONTINUE, "cancel with no search running");
+    CHECK(expect_manager(pFix, "search", "cancelled"), "cancelling when nothing runs says so");
+
+    /* A search that is running when the cancel arrives is asked to stop. */
+    pSearch = manager_header("search", "/usr", NULL, 11, XFALSE);
+    CHECK(pSearch != NULL, "build a broad search");
+    XJSON_AddString(pSearch, "fileName", "*");
+    XJSON_AddBool(pSearch, "recursive", XTRUE);
+    CHECK(deliver(pFix, pSearch) == XAPI_CONTINUE, "start a broad search");
+    pSearch = manager_header("search", "/usr", NULL, 11, XFALSE);
+    CHECK(pSearch != NULL, "build a cancel for the running search");
+    XJSON_AddBool(pSearch, "cancel", XTRUE);
+    CHECK(deliver(pFix, pSearch) == XAPI_CONTINUE, "cancel the running search");
+
+    bDone = 0;
+    for (int i = 0; i < 500 && !bDone; i++)
+    {
+        DirectGate_Search_Process(pFix->pSession);
+        if (pFix->api.txBuffer.nUsed)
+        {
+            answer_status(pFix, sAnswer, sizeof(sAnswer));
+            bDone = strcmp(sAnswer, "search/cancelled") == 0 || strcmp(sAnswer, "search/ok") == 0;
+        }
+        else usleep(10000);
+    }
+
+    CHECK(bDone, "a cancelled search ends with an answer");
+    drain(pFix);
+    return 0;
 }
 
 int main(void)
@@ -1010,9 +1271,17 @@ int main(void)
         CHECK(expect_manager(&fix, "symlink", "failed"), "a targetless request is refused");
     }
 
-    /* A message for a session that does not exist is dropped, not fatal. */
+    /* ---- manager corners ----------------------------------------------- */
+
+    CHECK(manager_corners(&fix, sRoot) == 0, "the manager's refusals and details");
+
+    /* A message for a session that does not exist is dropped, not fatal. It is
+       sealed under session 11's keys, so it is also an inner id that does not
+       match the outer one, and that closes session 11: this goes last. */
     CHECK(deliver(&fix, manager_header("list", sRoot, NULL, 999, XFALSE)) == XAPI_CONTINUE,
         "a message for an unknown session is ignored");
+    CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 11) == NULL,
+        "a sealed message whose inner session differs from the outer one closes the session");
 
     /* ---- teardown ------------------------------------------------------- */
 

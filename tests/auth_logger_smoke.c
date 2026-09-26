@@ -1,6 +1,7 @@
 /* SRP auth record management (auth.c), logger configuration (logger.c)
  * and version strings (version.c). */
 
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,7 @@
 
 #include "src/common/auth.h"
 #include "src/common/logger.h"
+#include "src/common/webrtc.h"
 #include "src/common/version.h"
 
 #define CHECK(cond, msg) \
@@ -55,6 +57,18 @@ int main(void)
     CHECK(!DirectGate_AuthSaltHexToBytes("zz", salt, 1), "non-hex salt rejected");
     CHECK(!DirectGate_AuthSaltHexToBytes("", salt, sizeof(salt)), "empty salt rejected");
     CHECK(!DirectGate_AuthSaltHexToBytes("0a", salt, 0), "zero-size salt rejected");
+    {
+        /* Full length: upper-case hex is the same salt, and one stray character spoils it. */
+        char sUpper[DIRECTGATE_AUTH_SALT_HEX_SIZE];
+        uint8_t lower[DIRECTGATE_SRP_SALT_SIZE], upper[DIRECTGATE_SRP_SALT_SIZE];
+        for (size_t i = 0; auth.sSaltHex[i] != '\0'; i++) sUpper[i] = (char)toupper((unsigned char)auth.sSaltHex[i]);
+        sUpper[DIRECTGATE_AUTH_SALT_HEX_SIZE - 1] = '\0';
+        CHECK(DirectGate_AuthSaltHexToBytes(auth.sSaltHex, lower, sizeof(lower)), "lower-case salt decodes");
+        CHECK(DirectGate_AuthSaltHexToBytes(sUpper, upper, sizeof(upper)), "upper-case salt decodes");
+        CHECK(memcmp(lower, upper, sizeof(lower)) == 0, "the case of the hex does not change the salt");
+        sUpper[DIRECTGATE_AUTH_SALT_HEX_SIZE - 2] = 'g';
+        CHECK(!DirectGate_AuthSaltHexToBytes(sUpper, upper, sizeof(upper)), "a salt with a non-hex character is refused");
+    }
 
     /* AuthLoad from a config document */
     {
@@ -144,6 +158,48 @@ int main(void)
         CHECK(strcmp(reloaded.sPath, logCfg.sPath) == 0, "roundtrip path");
         CHECK(strcmp(reloaded.sIdent, logCfg.sIdent) == 0, "roundtrip ident");
         CHECK(reloaded.nFlags == logCfg.nFlags, "roundtrip flags");
+    }
+
+    /* Level names in any case, unknown ones and non-strings skipped; "all" ends the list. */
+    {
+        static const struct { const char *pDoc; uint16_t nFlags; int nRTC; } levels[] = {
+            { "[\"Note\",\"INFO\",5,\"nonsense\",\"trace\"]", XLOG_NOTE | XLOG_INFO | XLOG_TRACE | XLOG_NONE, RTC_LOG_VERBOSE },
+            { "[\"warning\",\"all\",\"error\"]", XLOG_ALL, RTC_LOG_VERBOSE },
+            { "[\"debug\"]", XLOG_DEBUG | XLOG_NONE, RTC_LOG_DEBUG },
+            { "[\"info\"]", XLOG_INFO | XLOG_NONE, RTC_LOG_INFO },
+            { "[\"note\"]", XLOG_NOTE | XLOG_NONE, RTC_LOG_WARNING },
+            { "[\"warn\"]", XLOG_WARN | XLOG_NONE, RTC_LOG_WARNING },
+            { "[\"error\"]", XLOG_ERROR | XLOG_NONE, RTC_LOG_ERROR },
+            { "[\"panic\"]", XLOG_FATAL | XLOG_NONE, RTC_LOG_FATAL }
+        };
+
+        for (size_t i = 0; i < sizeof(levels) / sizeof(levels[0]); i++)
+        {
+            char sDoc[256];
+            snprintf(sDoc, sizeof(sDoc), "{\"log\":{\"logRTC\":true,\"levels\":%s}}", levels[i].pDoc);
+
+            xjson_t json;
+            CHECK(parse_json(&json, sDoc), "parse levels json");
+
+            directgate_log_t levelled;
+            DirectGate_LogInit(&levelled, "x", XLOG_DEFAULT);
+            CHECK(DirectGate_LogLoad(&levelled, json.pRootObj), "levels load");
+            XJSON_Destroy(&json);
+            CHECK(levelled.nFlags == levels[i].nFlags, "level names map to their flags");
+            CHECK(levelled.nRTCLevel == levels[i].nRTC, "the flags map to the WebRTC log level");
+        }
+
+        /* Nothing it knows: the flags already in place stay. */
+        xjson_t json;
+        CHECK(parse_json(&json, "{\"log\":{\"levels\":[\"loud\",\"\"]}}"), "parse unknown levels json");
+        directgate_log_t unknown;
+        DirectGate_LogInit(&unknown, "x", XLOG_ERROR);
+        CHECK(DirectGate_LogLoad(&unknown, json.pRootObj) && unknown.nFlags == XLOG_ERROR, "unknown level names change nothing");
+        XJSON_Destroy(&json);
+
+        unknown.bLogRTC = XTRUE;
+        unknown.nFlags = 0;
+        CHECK(DirectGate_LogGetRTCLevel(&unknown) == RTC_LOG_NONE, "no levels at all is no WebRTC logging");
     }
 
     /* RTC level mapping respects the master switch */

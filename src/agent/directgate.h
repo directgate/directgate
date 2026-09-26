@@ -89,6 +89,7 @@ int DirectGate_TestHandleTransportMessage(xapi_session_t *pApiSession,
 void DirectGate_TestCheckWebRTCKeepalive(directgate_conn_t *pConn);
 xbool_t DirectGate_TestCheckTokenRefresh(directgate_conn_t *pConn);
 void DirectGate_TestRetryPendingSave(directgate_conn_t *pConn);
+xbool_t DirectGate_TestPrepareEndpoint(directgate_conn_t *pConn);
 #endif
 
 #ifdef __cplusplus

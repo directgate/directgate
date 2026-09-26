@@ -58,6 +58,28 @@ int main(void)
         (const uint8_t*)pMissingRefresh, strlen(pMissingRefresh)),
         "pair response must require refresh token");
 
+    /* Every field the agent needs to reach the relay is required; a response without one changes nothing. */
+    static const char *pRequired[] = { "accessToken", "enrollmentExpiresAt", "routingKey", "relayUrl" };
+    for (size_t i = 0; i < sizeof(pRequired) / sizeof(pRequired[0]); i++)
+    {
+        char sBody[1024];
+        size_t nLen = (size_t)snprintf(sBody, sizeof(sBody), "{\"refreshToken\":\"refresh\",\"accessTokenExpiresIn\":3600,"
+            "\"refreshTokenExpiresAt\":\"2099-01-01T00:00:00.000Z\"");
+        if (strcmp(pRequired[i], "accessToken") != 0)
+            nLen += (size_t)snprintf(sBody + nLen, sizeof(sBody) - nLen, ",\"accessToken\":\"access\"");
+        if (strcmp(pRequired[i], "enrollmentExpiresAt") != 0)
+            nLen += (size_t)snprintf(sBody + nLen, sizeof(sBody) - nLen, ",\"enrollmentExpiresAt\":\"2099-01-01T00:00:00.000Z\"");
+        if (strcmp(pRequired[i], "routingKey") != 0)
+            nLen += (size_t)snprintf(sBody + nLen, sizeof(sBody) - nLen, ",\"routingKey\":\"rk\"");
+        if (strcmp(pRequired[i], "relayUrl") != 0)
+            nLen += (size_t)snprintf(sBody + nLen, sizeof(sBody) - nLen, ",\"relayUrl\":\"wss://relay.example.test/websock\"");
+        nLen += (size_t)snprintf(sBody + nLen, sizeof(sBody) - nLen, "}");
+
+        CHECK(!DirectGate_Enroll_ApplyPairResponse(&cfg, (const uint8_t*)sBody, nLen),
+            "a pair response without a required field must fail");
+        CHECK(!cfg.enroll.bEnrolled && cfg.enroll.sAccessToken[0] == '\0', "a refused pair response stores nothing");
+    }
+
     time_t tBefore = time(NULL);
     const char *pPairJson =
         "{"

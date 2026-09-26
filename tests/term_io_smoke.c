@@ -15,6 +15,7 @@
 #include "src/agent/term.c"
 
 #include <pwd.h>
+#include <pty.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -381,6 +382,126 @@ static int test_size_before_start(void)
     return 0;
 }
 
+/* A shell that ignores the hangup is given the grace period and then killed
+   with its whole process group, never left holding the PTY. */
+static int test_hangup_ignored(void)
+{
+    const char *pUser = current_user();
+    if (pUser == NULL) return 0;
+
+    directgate_term_t term;
+    DirectGate_Term_Init(&term);
+    term.nSessionId = 6;
+    xstrncpy(term.sShellUser, sizeof(term.sShellUser), pUser);
+    xstrncpy(term.sShellHome, sizeof(term.sShellHome), "/tmp");
+
+    CHECK(DirectGate_Term_StartNoEndpoint(&term, &g_api, &g_ws) == XSTDOK, "start a shell to ignore the hangup");
+    /* sleep inherits the ignored SIGHUP and never reads the terminal, so closing it does not end it either. */
+    const char sTrap[] = "trap '' HUP; echo hup-$((40+2)); exec sleep 30\n";
+    CHECK(DirectGate_Term_Write(&term, (const uint8_t*)sTrap, sizeof(sTrap) - 1) == XSTDOK, "tell it to ignore SIGHUP");
+    CHECK(wait_for_output(&term, "hup-42", 200), "the shell ignores SIGHUP from here on");
+
+    pid_t nChild = term.nPid;
+    uint64_t nStart = XTime_GetMonoMs();
+    DirectGate_Term_Shutdown(&term, XTRUE);
+
+    for (int nPass = 0; nPass < 300 && DirectGate_Term_ReapPending() > 0; nPass++) usleep(10000);
+    CHECK(DirectGate_Term_ReapPending() == 0 && kill(nChild, 0) != 0 && errno == ESRCH,
+        "a shell that ignored the hangup is killed and reaped");
+    CHECK(XTime_GetMonoMs() - nStart >= DIRECTGATE_TERM_HUP_GRACE_MS, "but only once its grace period is over");
+
+    DirectGate_Term_Clear(&term);
+    return 0;
+}
+
+/* With every reap slot taken, a shell is killed at once rather than forgotten. */
+static int test_reap_queue_full(void)
+{
+    pid_t nChild = fork();
+    CHECK(nChild >= 0, "fork a stand-in shell");
+    if (nChild == 0)
+    {
+        setpgid(0, 0);
+        pause();
+        _exit(0);
+    }
+
+    setpgid(nChild, nChild);
+    directgate_term_reap_t saved[DIRECTGATE_TERM_REAP_SLOTS];
+    memcpy(saved, g_termReap, sizeof(saved));
+
+    /* Slots held by a pid that is not ours: waitpid() on it fails, but not before this call. */
+    for (size_t i = 0; i < DIRECTGATE_TERM_REAP_SLOTS; i++)
+    {
+        g_termReap[i].nPid = 1;
+        g_termReap[i].nKillAtMs = UINT64_MAX;
+    }
+
+    DirectGate_Term_DeferReap(nChild);
+    memcpy(g_termReap, saved, sizeof(saved));
+
+    int nStatus = 0;
+    CHECK(waitpid(nChild, &nStatus, 0) == nChild || errno == ECHILD, "the stand-in shell is gone");
+    CHECK(kill(nChild, 0) != 0, "a full reap queue kills the shell rather than losing it");
+    return 0;
+}
+
+/* A terminal whose PTY went bad under it: every call fails cleanly. */
+static int test_broken_pty(void)
+{
+    directgate_term_t term;
+    DirectGate_Term_Init(&term);
+    term.nSessionId = 7;
+    term.bRunning = XTRUE;
+
+    /* The read end of a pipe: not a terminal to size, not a file to write. */
+    int fds[2];
+    CHECK(pipe(fds) == 0, "create a pipe to stand in for the PTY");
+    term.nMasterFd = fds[0];
+
+    struct winsize size;
+    memset(&size, 0, sizeof(size));
+    size.ws_row = 24;
+    size.ws_col = 80;
+    CHECK(DirectGate_Term_UpdateWinSize(&term, &size) == XSTDERR, "a window size a non-terminal cannot take fails");
+    CHECK(DirectGate_Term_Write(&term, (const uint8_t*)"x", 1) == XSTDERR, "a write the PTY refuses fails");
+    XByteBuffer_Clear(&term.txBuffer);
+
+    /* A master whose slave is gone reads EIO: the shell has exited. */
+    int nMaster = -1, nSlave = -1;
+    CHECK(openpty(&nMaster, &nSlave, NULL, NULL, NULL) == 0, "open a PTY pair");
+    close(nSlave);
+    term.nMasterFd = nMaster;
+    CHECK(DirectGate_Term_OnRead(&term) == XAPI_DISCONNECT, "a PTY whose shell has gone ends the session");
+
+    /* Any other read error ends it too. */
+    term.nMasterFd = fds[1];
+    CHECK(DirectGate_Term_OnRead(&term) == XAPI_DISCONNECT, "a PTY that cannot be read ends the session");
+
+    /* A child that is gone has no working directory. */
+    pid_t nGone = fork();
+    CHECK(nGone >= 0, "fork a child that exits");
+    if (nGone == 0) _exit(0);
+    CHECK(waitpid(nGone, NULL, 0) == nGone, "reap it");
+    term.nPid = nGone;
+    char sCwd[XPATH_MAX];
+    CHECK(DirectGate_Term_GetCwd(&term, sCwd, sizeof(sCwd)) == XSTDERR && sCwd[0] == '\0', "a gone child has no cwd");
+
+    /* Paused reading on a terminal that stopped is simply unpaused. */
+    term.bRunning = XFALSE;
+    term.bReadPaused = XTRUE;
+    DirectGate_Term_ResumeRead(&term);
+    CHECK(!term.bReadPaused, "a stopped terminal is not left paused");
+
+    close(fds[0]);
+    close(fds[1]);
+    close(nMaster);
+    term.nMasterFd = (int)XSOCK_INVALID;
+    term.nPid = 0;
+    DirectGate_Term_Clear(&term);
+    return 0;
+}
+
 int main(void)
 {
     setup_stubs();
@@ -390,6 +511,9 @@ int main(void)
     if (test_running_terminal()) return 1;
     if (test_restart_keeps_window_size()) return 1;
     if (test_size_before_start()) return 1;
+    if (test_hangup_ignored()) return 1;
+    if (test_reap_queue_full()) return 1;
+    if (test_broken_pty()) return 1;
 
     puts("term_io_smoke: OK");
     return 0;

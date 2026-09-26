@@ -4,6 +4,10 @@
  * layouts selected by openh264.c. Set DIRECTGATE_OPENH264_LIB to run the
  * same binary against a specific distro library. */
 
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include "src/agent/desktop/openh264.h"
 
 static int fail(const char *pMessage)
@@ -12,8 +16,45 @@ static int fail(const char *pMessage)
     return 1;
 }
 
+/* A library named by DIRECTGATE_OPENH264_LIB that cannot be used, loaded in a
+   child so the parent's one load per process is still the real one. The error
+   has to say what was wrong, and a second attempt must not try again. */
+static int child_refuses(const char *pLibrary, const char *pExpect)
+{
+    char sError[DIRECTGATE_DESKTOP_REASON_LEN] = {0};
+    setenv("DIRECTGATE_OPENH264_LIB", pLibrary, 1);
+
+    if (DirectGate_OpenH264_Load(sError, sizeof(sError)) == XSTDOK) return fail("an unusable library was loaded");
+    if (strstr(sError, pExpect) == NULL) return fail(sError);
+
+    sError[0] = '\0';
+    if (DirectGate_OpenH264_Load(sError, sizeof(sError)) == XSTDOK || strstr(sError, "not available") == NULL)
+        return fail("a failed load is not retried, and says so");
+
+    return 0;
+}
+
+static int refuses(const char *pLibrary, const char *pExpect)
+{
+    pid_t nPid = fork();
+    if (nPid < 0) return fail("fork");
+
+    /* exit, not _exit: the child's coverage is written by its exit handlers. */
+    if (nPid == 0) exit(child_refuses(pLibrary, pExpect));
+
+    int nStatus = 0;
+    if (waitpid(nPid, &nStatus, 0) != nPid || !WIFEXITED(nStatus) || WEXITSTATUS(nStatus) != 0)
+        return fail("an unusable OpenH264 library is refused with the reason");
+
+    return 0;
+}
+
 int main(void)
 {
+    /* A path that does not load, and a library that is not OpenH264. */
+    if (refuses("/nonexistent/libopenh264.so", "DIRECTGATE_OPENH264_LIB")) return 1;
+    if (refuses("libm.so.6", "missing required encoder symbols")) return 1;
+
     char sError[DIRECTGATE_DESKTOP_REASON_LEN] = {0};
     if (DirectGate_OpenH264_Load(sError, sizeof(sError)) != XSTDOK)
     {
@@ -75,10 +116,28 @@ int main(void)
         else if (nType == 5U) bIdr = XTRUE;
     }
 
+    /* The rate and quality follow the session, and the encoder keeps going. */
+    xbool_t bTuned = DirectGate_OpenH264_GetWidth(pEncoder) == nWidth && DirectGate_OpenH264_GetHeight(pEncoder) == nHeight &&
+        DirectGate_OpenH264_GetWidth(NULL) == 0 && DirectGate_OpenH264_GetHeight(NULL) == 0 &&
+        DirectGate_OpenH264_SetBitrate(pEncoder, 0) == XSTDERR && DirectGate_OpenH264_SetBitrate(NULL, 2000) == XSTDERR &&
+        DirectGate_OpenH264_SetBitrate(pEncoder, 2000) == XSTDOK;
+
+    directgate_desktop_quality_t defaults;
+    memset(&defaults, 0, sizeof(defaults));
+    bTuned = bTuned && DirectGate_OpenH264_ApplyQuality(pEncoder, &defaults) == XSTDOK &&
+        DirectGate_OpenH264_ApplyQuality(pEncoder, NULL) == XSTDERR &&
+        DirectGate_OpenH264_ApplyQuality(pEncoder, &quality) == XSTDOK;
+
+    XByteBuffer_Reset(&output);
+    xbool_t bSecondKey = XTRUE;
+    int nSecond = DirectGate_OpenH264_Encode(pEncoder, pI420, 33U, XFALSE, &output, &bSecondKey);
+
     free(pI420);
     DirectGate_OpenH264_Destroy(pEncoder);
     XByteBuffer_Clear(&output);
 
+    if (!bTuned) return fail("bitrate and quality changes are taken, and nonsense ones refused");
+    if (nSecond < 0) return fail("the encoder keeps encoding after its rate and quality change");
     if (nStatus != XSTDOK) return fail("first forced frame was not encoded");
     if (!bKeyframe) return fail("first forced frame was not marked as a keyframe");
     if (!bSps || !bPps || !bIdr)

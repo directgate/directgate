@@ -318,6 +318,25 @@ int main(void)
     CHECK(strcmp(revokeCfg.sRoutingKey, "routing-key") == 0,
         "a relay revocation claim must not wipe the routing key");
 
+    /* Every reason that casts doubt on the enrollment is treated the same way; any other is not. */
+    static const char *pDoubts[] = {
+        "device-enrollment-expired", "device-reenroll", "refresh-token-reuse", "invalid-refresh-token"
+    };
+
+    for (size_t i = 0; i < sizeof(pDoubts) / sizeof(pDoubts[0]); i++)
+    {
+        revokeConn.bEnrollmentDoubt = XFALSE;
+        CHECK(send_header(&revokeConn, &revokeRelay, DirectGate_Proto_BuildError(pDoubts[i], 0)) == XAPI_CONTINUE,
+            "a relay enrollment claim is accepted as a message");
+        CHECK(revokeConn.bEnrollmentDoubt && revokeCfg.enroll.bEnrolled && !revokeConn.bReconnectSuppressed,
+            "each enrollment claim only marks the enrollment for an API check");
+    }
+
+    revokeConn.bEnrollmentDoubt = XFALSE;
+    CHECK(send_header(&revokeConn, &revokeRelay, DirectGate_Proto_BuildError("rate-limited", 0)) == XAPI_CONTINUE,
+        "another relay error is accepted as a message");
+    CHECK(!revokeConn.bEnrollmentDoubt, "an error about something else casts no doubt on the enrollment");
+
     DirectGate_SessionMgr_Destroy(&revokeConn.mgr);
 
     puts("connection_lifecycle_smoke: OK");

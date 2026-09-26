@@ -242,6 +242,21 @@ int main(void)
         tty_close(&tty);
     }
 
+    {
+        /* With no current value there is no default to show, and a word is not a number. */
+        prompt_tty_t tty;
+        CHECK(tty_open(&tty, "12\nabc\n9\nxyz\n"), "open pty for numbers without a default");
+
+        uint16_t nShort = 0;
+        CHECK(DirectGate_PromptU16("Number", &nShort) && nShort == 12, "PromptU16 reads a number with no default");
+        CHECK(!DirectGate_PromptU16("Number", &nShort) && nShort == 12, "PromptU16 refuses a word and keeps the value");
+
+        uint32_t nLong = 0;
+        CHECK(DirectGate_PromptU32("Number", &nLong) && nLong == 9, "PromptU32 reads a number with no default");
+        CHECK(!DirectGate_PromptU32("Number", &nLong) && nLong == 9, "PromptU32 refuses a word and keeps the value");
+        tty_close(&tty);
+    }
+
     /* Null arguments must be refused rather than dereferenced. */
     CHECK(!DirectGate_PromptBool("Flag", NULL), "PromptBool rejects a null value");
     CHECK(!DirectGate_PromptBool(NULL, NULL), "PromptBool rejects a null label");

@@ -129,6 +129,12 @@ static void DirectGate_Desktop_EnumerateMonitors(directgate_desktop_t *pDesktop)
     DirectGate_Desktop_AddMonitor(pDesktop, "all", "All displays", 0, 0,
         pDesktop->nScreenWidth, pDesktop->nScreenHeight, XFALSE);
 
+    /* No RandR on this server (some nested and remote ones): all displays is
+     * the whole list. Asked first because libXrandr, told the extension is
+     * missing, keeps a record for the connection that nothing ever frees. */
+    int nOpcode = 0, nEvent = 0, nError = 0;
+    if (!XQueryExtension(pDisplay, "RANDR", &nOpcode, &nEvent, &nError)) return;
+
     int nMonitorCount = 0;
     XRRMonitorInfo *pMonitors = XRRGetMonitors(pDisplay, root, XTRUE, &nMonitorCount);
     XRRScreenResources *pResources = XRRGetScreenResourcesCurrent(pDisplay, root);
