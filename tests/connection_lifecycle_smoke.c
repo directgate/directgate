@@ -94,6 +94,13 @@ int main(void)
     xapi_session_t firstRelay;
     CHECK(dispatch(&conn, &firstRelay, XAPI_CB_CONNECTED) == XAPI_CONTINUE,
         "initial relay connection should be accepted");
+
+    /* Liveness is measured on the monotonic clock, so a change of the system
+       time can neither fake a dead relay nor hide one. A wall clock stamp is
+       some fifty years of milliseconds past it. */
+    uint64_t nMonoMs = XTime_GetMonoMs();
+    CHECK(conn.nLastRelayRecvMs <= nMonoMs && nMonoMs - conn.nLastRelayRecvMs < 60000ULL,
+        "relay liveness should be stamped on the monotonic clock");
     CHECK(conn.pWsSession == &firstRelay,
         "initial relay connection should be attached");
     CHECK(DirectGate_SessionMgr_IsEmpty(&conn.mgr),
@@ -153,7 +160,7 @@ int main(void)
     directgate_session_t *pSession = DirectGate_SessionMgr_Create(&conn.mgr, 1);
     CHECK(pSession != NULL, "logical session should be created");
     pSession->pWsSession = &firstRelay;
-    conn.mgr.nAuthWindowStartMs = XTime_GetMs();
+    conn.mgr.nAuthWindowStartMs = XTime_GetMonoMs();
     conn.mgr.nAuthAttempts = 7;
 
     CHECK(dispatch(&conn, &firstRelay, XAPI_CB_CLOSED) == XAPI_CONTINUE,
@@ -205,7 +212,7 @@ int main(void)
     pKeepalive->pWsSession = &kaRelay;
     pKeepalive->bAuthenticated = XTRUE;
 
-    uint64_t nStaleMs = XTime_GetMs() - (uint64_t)cfg.nKAInterval * 3000ULL * 2ULL;
+    uint64_t nStaleMs = XTime_GetMonoMs() - (uint64_t)cfg.nKAInterval * 3000ULL * 2ULL;
     pKeepalive->nLastKAPingMs = nStaleMs;
     pKeepalive->nLastKAPongMs = nStaleMs;
     pKeepalive->webrtc.bConnected = XFALSE;
@@ -226,6 +233,8 @@ int main(void)
         "a session must survive the first keepalive pass after the channel returns");
     CHECK(pKeepalive->nLastKAPongMs != 0,
         "keepalive schedule should re-arm once the data channel is back");
+    CHECK(pKeepalive->nLastKAPongMs <= XTime_GetMonoMs() + (uint64_t)cfg.nKAInterval * 1000ULL,
+        "keepalive schedule should be armed on the monotonic clock");
 
     pKeepalive->webrtc.bConnected = XFALSE;
     pKeepalive->webrtc.nDataChannelID = -1;

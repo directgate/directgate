@@ -75,7 +75,7 @@ typedef struct directgate_files_id_cache_ {
 
 static void DirectGate_Files_ExpireIdCache(directgate_files_id_cache_t *pCache)
 {
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
 
     if (pCache->bStamped &&
         nNowMs - pCache->nStampMs < DIRECTGATE_FILES_ID_CACHE_TTL_MS) return;

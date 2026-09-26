@@ -219,11 +219,13 @@ int main(void)
      * waits for the idle window, and any input at all resets it. */
     desktop.nLastInputMs = 0;
     CHECK(!DirectGate_Desktop_ExpireHeldKeys(&desktop), "watchdog fired before any input was seen");
-    desktop.nLastInputMs = XTime_GetMs();
+    /* On the monotonic clock: input stamped just now is recent to a watchdog
+     * reading that clock, and a wall clock watchdog would see it as ancient. */
+    desktop.nLastInputMs = XTime_GetMonoMs();
     CHECK(!DirectGate_Desktop_ExpireHeldKeys(&desktop), "watchdog fired on a key held just now");
-    desktop.nLastInputMs = XTime_GetMs() - (DIRECTGATE_DESKTOP_HELD_KEY_IDLE_MS - 1000U);
+    desktop.nLastInputMs = XTime_GetMonoMs() - (DIRECTGATE_DESKTOP_HELD_KEY_IDLE_MS - 1000U);
     CHECK(!DirectGate_Desktop_ExpireHeldKeys(&desktop), "watchdog fired inside the idle window");
-    desktop.nLastInputMs = XTime_GetMs() - (DIRECTGATE_DESKTOP_HELD_KEY_IDLE_MS + 1000U);
+    desktop.nLastInputMs = XTime_GetMonoMs() - (DIRECTGATE_DESKTOP_HELD_KEY_IDLE_MS + 1000U);
     CHECK(DirectGate_Desktop_ExpireHeldKeys(&desktop), "watchdog missed a key stuck past the idle window");
     /* Nothing held is nothing to release, however long the silence. */
     desktop.nHeldKeyCount = 0;

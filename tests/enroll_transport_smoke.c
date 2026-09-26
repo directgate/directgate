@@ -145,9 +145,9 @@ static int test_pair_retries_transient_failures(void)
     xstrncpy(cfg.sDeviceId, sizeof(cfg.sDeviceId), "dev-transport");
     xstrncpy(cfg.enroll.sApiUrl, sizeof(cfg.enroll.sApiUrl), sApiUrl);
 
-    uint64_t nStartMs = XTime_GetMs();
+    uint64_t nStartMs = XTime_GetMonoMs();
     xbool_t bPaired = DirectGate_Enroll_Pair(&cfg, "pairing-token-1");
-    uint64_t nElapsedMs = XTime_GetMs() - nStartMs;
+    uint64_t nElapsedMs = XTime_GetMonoMs() - nStartMs;
 
     unlink(sCfgPath);
 

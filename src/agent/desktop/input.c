@@ -827,7 +827,7 @@ xbool_t DirectGate_Desktop_ExpireHeldKeys(directgate_desktop_t *pDesktop)
     XCHECK_NL((pDesktop != NULL), XFALSE);
     if (!pDesktop->nHeldKeyCount || !pDesktop->nLastInputMs) return XFALSE;
 
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
     if (nNowMs <= pDesktop->nLastInputMs) return XFALSE;
     if (nNowMs - pDesktop->nLastInputMs < DIRECTGATE_DESKTOP_HELD_KEY_IDLE_MS) return XFALSE;
 
@@ -1051,7 +1051,7 @@ static int DirectGate_Desktop_WaylandHandleInput(directgate_session_t *pSession,
 
             if (bAtEdge)
             {
-                uint64_t nNowMs = XTime_GetMs();
+                uint64_t nNowMs = XTime_GetMonoMs();
                 if (nNowMs - pDesktop->nWlPointerLogMs >= 2000ULL)
                 {
                     pDesktop->nWlPointerLogMs = nNowMs;
@@ -1202,7 +1202,7 @@ int DirectGate_Desktop_HandleInput(directgate_session_t *pSession, const uint8_t
     /* Feeds the held-key watchdog: any event at all, not just a keystroke,
      * proves the viewer is still there and that a key they are holding is
      * being held on purpose. */
-    pDesktop->nLastInputMs = XTime_GetMs();
+    pDesktop->nLastInputMs = XTime_GetMonoMs();
 
     char *pJsonText = (char*)calloc(1, nPayloadLength + 1U);
     XCHECK((pJsonText != NULL), XAPI_CONTINUE);
@@ -1397,7 +1397,7 @@ static uint32_t DirectGate_Desktop_MacClickCount(directgate_desktop_t *pDesktop,
 {
     if (!bDown) return pDesktop->nClickCount ? pDesktop->nClickCount : 1U;
 
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
     int nX = (int)point.x, nY = (int)point.y;
 
     xbool_t bNearby = abs(nX - (int)pDesktop->nLastClickX) <= 5 &&
@@ -1625,7 +1625,7 @@ static xbool_t DirectGate_Desktop_MacEnsureInput(directgate_session_t *pSession)
     directgate_desktop_t *pDesktop = &pSession->desktop;
     if (pDesktop->bInputReady) return XTRUE;
 
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
     if (pDesktop->nInputRecheckMs != 0 && nNowMs - pDesktop->nInputRecheckMs < 2000) return XFALSE;
     pDesktop->nInputRecheckMs = nNowMs;
 

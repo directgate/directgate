@@ -118,28 +118,28 @@ static int CheckCancel(directgate_wl_portal_t *pPortal)
     char sError[256];
 
     /* Not raised: a short wait simply times out, as before */
-    uint64_t nStartMs = XTime_GetMs();
+    uint64_t nStartMs = XTime_GetMonoMs();
     CHECK(DirectGate_WL_WaitResponse(pPortal, "/req", 250, &pMessage, &results, sError, sizeof(sError)) == XSTDERR,
         "unanswered wait fails");
     CHECK(strstr(sError, "did not answer in time") != NULL, "unanswered wait reports a timeout");
-    CHECK(XTime_GetMs() - nStartMs >= 200, "unanswered wait lasts its timeout");
+    CHECK(XTime_GetMonoMs() - nStartMs >= 200, "unanswered wait lasts its timeout");
 
     /* Raised before: no wait at all */
     XSYNC_ATOMIC_SET(&nCancel, 1);
-    nStartMs = XTime_GetMs();
+    nStartMs = XTime_GetMonoMs();
     CHECK(DirectGate_WL_WaitResponse(pPortal, "/req", 120000, &pMessage, &results, sError, sizeof(sError)) == XSTDERR,
         "cancelled wait fails");
     CHECK(strstr(sError, "abandoned") != NULL, "cancelled wait says so");
-    CHECK(XTime_GetMs() - nStartMs < 1000, "cancelled wait returns at once");
+    CHECK(XTime_GetMonoMs() - nStartMs < 1000, "cancelled wait returns at once");
 
     /* Raised from another thread mid-wait: the two-minute grant ends at the next step */
     XSYNC_ATOMIC_SET(&nCancel, 0);
     xthread_t thread;
     CHECK(XThread_Create(&thread, RaiseCancel, (void*)&nCancel, XFALSE) >= 0, "cancel thread");
 
-    nStartMs = XTime_GetMs();
+    nStartMs = XTime_GetMonoMs();
     int nStatus = DirectGate_WL_WaitResponse(pPortal, "/req", 120000, &pMessage, &results, sError, sizeof(sError));
-    uint64_t nElapsedMs = XTime_GetMs() - nStartMs;
+    uint64_t nElapsedMs = XTime_GetMonoMs() - nStartMs;
     XThread_Join(&thread);
 
     CHECK(nStatus == XSTDERR && pMessage == NULL, "wait cancelled mid-way fails");

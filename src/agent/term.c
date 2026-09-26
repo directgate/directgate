@@ -860,7 +860,7 @@ static void DirectGate_Term_DeferReap(pid_t nPid)
         if (g_termReap[i].nPid > 0) continue;
 
         g_termReap[i].nPid = nPid;
-        g_termReap[i].nKillAtMs = XTime_GetMs() + DIRECTGATE_TERM_HUP_GRACE_MS;
+        g_termReap[i].nKillAtMs = XTime_GetMonoMs() + DIRECTGATE_TERM_HUP_GRACE_MS;
         g_termReap[i].bKilled = XFALSE;
         return;
     }
@@ -873,7 +873,7 @@ static void DirectGate_Term_DeferReap(pid_t nPid)
 
 size_t DirectGate_Term_ReapPending(void)
 {
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
     size_t nPending = 0;
 
     for (size_t i = 0; i < DIRECTGATE_TERM_REAP_SLOTS; i++)

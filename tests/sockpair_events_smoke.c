@@ -125,8 +125,8 @@ int main(void)
     xevent_data_t *pTimer = XEvents_AddTimer(&events, NULL, 20);
     CHECK(pTimer != NULL, "add timer");
 
-    uint64_t nStart = XTime_GetMs();
-    while (ctx.nTimerEvents == 0 && XTime_GetMs() - nStart < 2000)
+    uint64_t nStart = XTime_GetMonoMs();
+    while (ctx.nTimerEvents == 0 && XTime_GetMonoMs() - nStart < 2000)
         CHECK(XEvents_Service(&events, 50) == XEVENTS_SUCCESS, "timer service");
 
     CHECK(ctx.nTimerEvents == 1, "timer fired once");
@@ -134,8 +134,8 @@ int main(void)
     /* Re-arm the same timer through the extend API */
     CHECK(XEvents_ExtendTimer(&events, pTimer, 20) == XEVENTS_SUCCESS, "extend timer");
 
-    nStart = XTime_GetMs();
-    while (ctx.nTimerEvents == 1 && XTime_GetMs() - nStart < 2000)
+    nStart = XTime_GetMonoMs();
+    while (ctx.nTimerEvents == 1 && XTime_GetMonoMs() - nStart < 2000)
         CHECK(XEvents_Service(&events, 50) == XEVENTS_SUCCESS, "extend service");
 
     CHECK(ctx.nTimerEvents == 2, "extended timer fired");
@@ -151,8 +151,8 @@ int main(void)
     CHECK(write(pUser->nFD, &nSignal, sizeof(nSignal)) == (ssize_t)sizeof(nSignal),
         "write user event");
 
-    nStart = XTime_GetMs();
-    while (ctx.nUserEvents == 0 && XTime_GetMs() - nStart < 2000)
+    nStart = XTime_GetMonoMs();
+    while (ctx.nUserEvents == 0 && XTime_GetMonoMs() - nStart < 2000)
         CHECK(XEvents_Service(&events, 50) == XEVENTS_SUCCESS, "user event service");
 
     CHECK(ctx.nUserEvents >= 1, "user event fired");

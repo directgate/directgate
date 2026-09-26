@@ -251,7 +251,7 @@ directgate_session_t* DirectGate_SessionMgr_Create(directgate_session_mgr_t *pMg
     pSession->pPipeSession = NULL;
     pSession->pWsSession = NULL;
     pSession->nSessionId = nSessionId;
-    pSession->nCreatedMs = XTime_GetMs();
+    pSession->nCreatedMs = XTime_GetMonoMs();
     pSession->nAuthMessages = 0;
     pSession->nLastKAPingMs = XSTDNON;
     pSession->nLastKAPongMs = XSTDNON;
@@ -292,7 +292,7 @@ directgate_session_t* DirectGate_SessionMgr_GetOrCreate(directgate_session_mgr_t
         return NULL;
     }
 
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
     if (pMgr->nAuthWindowStartMs == 0 || nNowMs < pMgr->nAuthWindowStartMs ||
         nNowMs - pMgr->nAuthWindowStartMs >= DIRECTGATE_AUTH_RATE_WINDOW_MS)
     {
@@ -376,7 +376,7 @@ size_t DirectGate_SessionMgr_ExpireUnauthenticated(directgate_session_mgr_t *pMg
 xbool_t DirectGate_SessionMgr_IsAuthLocked(directgate_session_mgr_t *pMgr, uint64_t *pRemainMs)
 {
     XCHECK_NL((pMgr != NULL), XFALSE);
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
 
     /* A clock that jumped backwards must not hold the door shut for longer than a lockout could ever last. */
     if (pMgr->nAuthLockoutUntilMs > nNowMs + DIRECTGATE_AUTH_LOCKOUT_MAX_MS) pMgr->nAuthLockoutUntilMs = 0;
@@ -401,7 +401,7 @@ void DirectGate_SessionMgr_NoteAuthFailure(directgate_session_mgr_t *pMgr)
         if (nDelayMs > DIRECTGATE_AUTH_LOCKOUT_MAX_MS) nDelayMs = DIRECTGATE_AUTH_LOCKOUT_MAX_MS;
     }
 
-    pMgr->nAuthLockoutUntilMs = XTime_GetMs() + nDelayMs;
+    pMgr->nAuthLockoutUntilMs = XTime_GetMonoMs() + nDelayMs;
 
     xlogw("Throttling authentication after repeated failures: failures(%u), lockoutMs(%llu)",
         pMgr->nAuthFailures, (unsigned long long)nDelayMs);

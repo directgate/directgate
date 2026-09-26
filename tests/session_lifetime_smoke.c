@@ -33,6 +33,11 @@
         } \
     } while (0)
 
+/* Every back-off and stagger here is far shorter than this, and a deadline on
+   the wall clock lands decades beyond it: it is the bound that tells the two
+   clocks apart. */
+#define DIRECTGATE_TEST_HOUR_MS 3600000ULL
+
 int DirectGate_ServiceCallback(xapi_ctx_t *pCtx, xapi_session_t *pApiSession);
 
 /* Not in api.h: creates the event loop without registering anything on it. */
@@ -327,7 +332,8 @@ int main(void)
 
         DirectGate_TestCheckWebRTCKeepalive(&fix.conn);
         uint64_t nFirstPing = pSession->nLastKAPingMs;
-        CHECK(nFirstPing > XTime_GetMs(), "the first ping is staggered into the future");
+        CHECK(nFirstPing > XTime_GetMonoMs(), "the first ping is staggered into the future");
+        CHECK(nFirstPing < XTime_GetMonoMs() + DIRECTGATE_TEST_HOUR_MS, "the stagger is on the monotonic clock");
 
         DirectGate_TestCheckWebRTCKeepalive(&fix.conn);
         CHECK(pSession->nLastKAPingMs == nFirstPing,
@@ -367,7 +373,9 @@ int main(void)
 
         CHECK(DirectGate_TestCheckTokenRefresh(&fix.conn), "a transient refresh failure keeps a usable token");
         CHECK(fix.conn.nTokenRefreshFailures == 1, "the failed attempt is counted");
-        CHECK(fix.conn.nNextTokenRefreshMs > XTime_GetMs(), "the next attempt is scheduled in the future");
+        CHECK(fix.conn.nNextTokenRefreshMs > XTime_GetMonoMs(), "the next attempt is scheduled in the future");
+        CHECK(fix.conn.nNextTokenRefreshMs < XTime_GetMonoMs() + DIRECTGATE_TEST_HOUR_MS,
+            "the refresh back-off is on the monotonic clock");
 
         uint64_t nScheduled = fix.conn.nNextTokenRefreshMs;
         CHECK(DirectGate_TestCheckTokenRefresh(&fix.conn), "a pass inside the back-off keeps the session");
@@ -394,7 +402,8 @@ int main(void)
 
         DirectGate_TestRetryPendingSave(&fix.conn);
         CHECK(fix.cfg.bSavePending, "a save that still cannot be written stays pending");
-        CHECK(fix.conn.nNextSaveRetryMs > XTime_GetMs(), "the next attempt is spaced out");
+        CHECK(fix.conn.nNextSaveRetryMs > XTime_GetMonoMs(), "the next attempt is spaced out");
+        CHECK(fix.conn.nNextSaveRetryMs < XTime_GetMonoMs() + DIRECTGATE_TEST_HOUR_MS, "the save retry is on the monotonic clock");
 
         uint64_t nScheduled = fix.conn.nNextSaveRetryMs;
         DirectGate_TestRetryPendingSave(&fix.conn);

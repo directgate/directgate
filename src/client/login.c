@@ -709,9 +709,9 @@ static xbool_t DirectGate_Login_Await(xsock_t *pListener, const directgate_login
     pCode[0] = XSTR_NUL;
 
     char sError[XSTR_TINY] = { 0 };
-    time_t nDeadline = time(NULL) + DIRECTGATE_LOGIN_TIMEOUT_SEC;
+    uint64_t nDeadlineMs = XTime_GetMonoMs() + (uint64_t)DIRECTGATE_LOGIN_TIMEOUT_SEC * 1000ULL;
 
-    while (time(NULL) < nDeadline)
+    while (XTime_GetMonoMs() < nDeadlineMs)
     {
         if (bAllowPaste && DirectGate_Login_StdinReady())
         {

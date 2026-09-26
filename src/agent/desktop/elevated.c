@@ -124,14 +124,14 @@ xbool_t DirectGate_Elevated_RecvRecord(HANDLE hPipe, uint16_t *pType,
 static xbool_t DirectGate_Elev_RecvTimed(HANDLE hPipe, uint16_t *pType, void *pPayload,
                                          uint16_t *pLength, uint32_t nTimeoutMs)
 {
-    uint64_t nDeadlineMs = XTime_GetMs() + nTimeoutMs;
+    uint64_t nDeadlineMs = XTime_GetMonoMs() + nTimeoutMs;
 
     for (;;)
     {
         DWORD nAvailable = 0;
         if (!PeekNamedPipe(hPipe, NULL, 0, NULL, &nAvailable, NULL)) return XFALSE;
         if (nAvailable >= sizeof(directgate_elev_hdr_t)) break;
-        if (XTime_GetMs() >= nDeadlineMs) return XFALSE;
+        if (XTime_GetMonoMs() >= nDeadlineMs) return XFALSE;
         Sleep(5);
     }
 

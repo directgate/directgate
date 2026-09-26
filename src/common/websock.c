@@ -27,17 +27,12 @@ int DirectGate_WebSock_SendPong(xapi_session_t *pSession, xws_frame_t *pPing)
     XCHECK((pSession != NULL && pPing != NULL), XAPI_DISCONNECT);
     XCHECK((pPing->eType == XWS_PING && pPing->bFin && pPing->nPayloadLength <= 125), XAPI_DISCONNECT);
 
-    xws_frame_t pong;
     xbool_t bMask = pSession->eRole == XAPI_CLIENT ? XTRUE : XFALSE;
 
     /* RFC 6455 section 5.5.3 requires the ping's application data verbatim. */
-    if (XWebFrame_Create(&pong, XWebFrame_GetPayload(pPing), XWebFrame_GetPayloadLength(pPing),
+    if (XWS_AppendFrame(&pSession->txBuffer, XWebFrame_GetPayload(pPing), XWebFrame_GetPayloadLength(pPing),
         XWS_PONG, bMask, XTRUE) != XWS_ERR_NONE) return XAPI_DISCONNECT;
 
-    int nAdded = XByteBuffer_AddBuff(&pSession->txBuffer, &pong.buffer);
-    XWebFrame_Clear(&pong);
-
-    if (nAdded <= 0) return XAPI_DISCONNECT;
     return XAPI_EnableEvent(pSession, XPOLLOUT);
 }
 
@@ -48,10 +43,11 @@ int DirectGate_WebSock_Send(xapi_session_t *pSession, const uint8_t *pPkg, size_
     XCHECK((nLen > 0), XAPI_CONTINUE);
 
     xbool_t bMask = (pSession->eRole == XAPI_CLIENT) ? XTRUE : XFALSE;
-    xws_status_t status;
-    xws_frame_t frame;
 
-    status = XWebFrame_Create(&frame, pPkg, nLen, XWS_BINARY, bMask, XTRUE);
+    /* The frame is written straight into the tx buffer: building it on its own
+       first and then adding it copied every payload twice, with an allocation
+       and a free in between, on the path every desktop frame takes. */
+    xws_status_t status = XWS_AppendFrame(&pSession->txBuffer, pPkg, nLen, XWS_BINARY, bMask, XTRUE);
     if (status != XWS_ERR_NONE)
     {
         const char *pAddr = (pSession != NULL && xstrused(pSession->sAddr)) ? pSession->sAddr : "N/A";
@@ -65,13 +61,6 @@ int DirectGate_WebSock_Send(xapi_session_t *pSession, const uint8_t *pPkg, size_
         return XAPI_DISCONNECT;
     }
 
-    if (XByteBuffer_AddBuff(&pSession->txBuffer, &frame.buffer) <= 0)
-    {
-        XWebFrame_Clear(&frame);
-        return XAPI_DISCONNECT;
-    }
-
-    XWebFrame_Clear(&frame);
     return XAPI_EnableEvent(pSession, XPOLLOUT);
 }
 

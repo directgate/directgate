@@ -33,9 +33,9 @@ static int test_receive_timeout_is_honoured(void)
 
     /* Nothing is ever written, so the read can only end on the timeout */
     uint8_t sBuffer[16];
-    uint64_t nStartMs = XTime_GetMs();
+    uint64_t nStartMs = XTime_GetMonoMs();
     int nRead = XSock_Read(&reader, sBuffer, sizeof(sBuffer));
-    uint64_t nElapsedMs = XTime_GetMs() - nStartMs;
+    uint64_t nElapsedMs = XTime_GetMonoMs() - nStartMs;
 
     CHECK(nRead <= 0, "a read with no data must not succeed");
 
@@ -65,9 +65,9 @@ static int test_timeout_arguments(void)
     CHECK(XSock_TimeOutR(&sock, 0, 500) != XSOCK_INVALID, "set a sub-millisecond receive timeout");
 
     uint8_t sBuffer[8];
-    uint64_t nStartMs = XTime_GetMs();
+    uint64_t nStartMs = XTime_GetMonoMs();
     XSock_Read(&sock, sBuffer, sizeof(sBuffer));
-    uint64_t nElapsedMs = XTime_GetMs() - nStartMs;
+    uint64_t nElapsedMs = XTime_GetMonoMs() - nStartMs;
 
     CHECK(nElapsedMs < 5000, "a sub-millisecond timeout must not become no timeout");
 

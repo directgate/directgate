@@ -207,6 +207,8 @@ int main(void)
     CHECK(pFirst != NULL, "create first session");
     CHECK(pFirst->nSessionId == 1, "first session id");
     CHECK(pFirst->nCreatedMs > 0, "new session should have a creation timestamp");
+    CHECK(pFirst->nCreatedMs <= XTime_GetMonoMs() && XTime_GetMonoMs() - pFirst->nCreatedMs < 60000ULL,
+        "the pre-auth timeout should be measured on the monotonic clock");
     CHECK(pFirst->pMgr == &mgr, "session manager back pointer");
     CHECK(pFirst->pCfg == &cfg, "session config pointer");
     CHECK(pFirst->eActiveMode == DIRECTGATE_SESSION_MODE_NONE,
@@ -281,8 +283,8 @@ int main(void)
     CHECK(!DirectGate_Session_ConsumeAuthMessage(pCreated),
         "auth messages above the per-session limit should be rejected");
 
-    pCreated->nCreatedMs = XTime_GetMs() - DIRECTGATE_AUTH_TIMEOUT_MS;
-    CHECK(DirectGate_SessionMgr_ExpireUnauthenticated(&noAuthMgr, XTime_GetMs()) == 1,
+    pCreated->nCreatedMs = XTime_GetMonoMs() - DIRECTGATE_AUTH_TIMEOUT_MS;
+    CHECK(DirectGate_SessionMgr_ExpireUnauthenticated(&noAuthMgr, XTime_GetMonoMs()) == 1,
         "expired pre-auth session should be removed");
     CHECK(DirectGate_SessionMgr_Find(&noAuthMgr, 200) == NULL,
         "expired pre-auth session slot should be cleared");

@@ -218,7 +218,7 @@ static uint32_t DirectGate_ReconnectDelayMs(uint32_t nAttempt)
 
 static uint32_t DirectGate_ReconnectWaitMs(uint64_t nNextReconnectMs)
 {
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
     if (nNextReconnectMs == 0 ||
         nNextReconnectMs <= nNowMs)
         return 0;
@@ -472,7 +472,7 @@ static void DirectGate_ScheduleReconnect(directgate_conn_t *pConn, const char *p
     XCHECK_VOID_NL((!g_bFinish));
     XCHECK_VOID_NL((!pConn->bReconnectSuppressed));
 
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
     DirectGate_TryRelayReprobe(pConn, nNowMs);
 
     uint32_t nDelayMs = DirectGate_ReconnectDelayMs(pConn->nReconnectAttempt);
@@ -878,10 +878,9 @@ static int DirectGate_SendControlFrame(xapi_session_t *pApiSession, xws_frame_ty
     XCHECK((pApiSession != NULL), XAPI_DISCONNECT);
     directgate_conn_t *pConn = (directgate_conn_t*)pApiSession->pSessionData;
 
-    xws_status_t status;
-    xws_frame_t frame;
+    size_t nQueued = pApiSession->txBuffer.nUsed;
+    xws_status_t status = XWS_AppendFrame(&pApiSession->txBuffer, NULL, 0, eType, XTRUE, XTRUE);
 
-    status = XWebFrame_Create(&frame, NULL, 0, eType, XTRUE, XTRUE);
     if (status != XWS_ERR_NONE)
     {
         xloge("Failed to create %s frame: id(%u), fd(%d), status(%s)",
@@ -897,11 +896,7 @@ static int DirectGate_SendControlFrame(xapi_session_t *pApiSession, xws_frame_ty
         XWS_FrameTypeStr(eType),
         DirectGate_Conn_GetID(pConn, pApiSession),
         DirectGate_Conn_GetFD(pConn, pApiSession),
-        frame.buffer.nUsed);
-
-    int nAdded = XByteBuffer_AddBuff(&pApiSession->txBuffer, &frame.buffer);
-    XWebFrame_Clear(&frame);
-    if (nAdded <= 0) return XAPI_DISCONNECT;
+        pApiSession->txBuffer.nUsed - nQueued);
 
     return XAPI_EnableEvent(pApiSession, XPOLLOUT);
 }
@@ -960,7 +955,7 @@ static int DirectGate_InitConnection(xapi_ctx_t *pCtx, xapi_session_t *pApiSessi
         DirectGate_Conn_GetAddr(pConn, pApiSession), DirectGate_Conn_GetPort(pConn, pApiSession));
 
     pConn->pWsSession = pApiSession;
-    pConn->nLastRelayRecvMs = XTime_GetMs();
+    pConn->nLastRelayRecvMs = XTime_GetMonoMs();
     pConn->nLastRelayProbeMs = 0;
     pConn->nNextReconnectMs = 0;
     pConn->sDisconnectReason[0] = XSTR_NUL;
@@ -1220,7 +1215,7 @@ static xbool_t DirectGate_TemporaryDesktopShare_Provision(directgate_conn_t *pCo
         return XFALSE;
     }
 
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
     DirectGate_TemporaryDesktopShares_Cleanup(pConn, nNowMs);
     directgate_temporary_desktop_share_t *pSlot = NULL;
 
@@ -1922,7 +1917,7 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
         if (xstrused(pAuth->pDesktopShareId))
         {
             directgate_temporary_desktop_share_t *pShare;
-            pShare = DirectGate_TemporaryDesktopShare_Find(pConn, pAuth->pDesktopShareId, XTime_GetMs());
+            pShare = DirectGate_TemporaryDesktopShare_Find(pConn, pAuth->pDesktopShareId, XTime_GetMonoMs());
             if (pShare == NULL)
             {
                 DirectGate_Session_SendAuthResp(pSession, "failed", NULL, "temporary desktop share is invalid or expired");
@@ -2041,7 +2036,7 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
         directgate_temporary_desktop_share_t *pTemporaryShare = NULL;
         if (pSession->bDesktopSharePending)
         {
-            pTemporaryShare = DirectGate_TemporaryDesktopShare_Find(pConn, pSession->sDesktopShareId, XTime_GetMs());
+            pTemporaryShare = DirectGate_TemporaryDesktopShare_Find(pConn, pSession->sDesktopShareId, XTime_GetMonoMs());
             if (pTemporaryShare == NULL)
             {
                 DirectGate_Session_SendAuthResp(pSession, "failed", NULL, "temporary desktop share is invalid or expired");
@@ -2185,7 +2180,7 @@ static int DirectGate_HandleKeepalive(xapi_session_t *pApiSession, directgate_pk
         xlogd("Received keepalive pong: sid(%u), wsfd(%d)",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
 
-        pSession->nLastKAPongMs = XTime_GetMs();
+        pSession->nLastKAPongMs = XTime_GetMonoMs();
     }
     else if (xstrcmp(pKAPkg->pAction, "ping"))
     {
@@ -2459,7 +2454,7 @@ int DirectGate_HandleFrame(xapi_ctx_t *pCtx, xapi_session_t *pApiSession)
 
     XCHECK((pConn != NULL), xthrowr(XAPI_DISCONNECT, "Invalid connection"));
     XCHECK((pFrame != NULL), xthrowr(XAPI_DISCONNECT, "Invalid frame"));
-    pConn->nLastRelayRecvMs = XTime_GetMs();
+    pConn->nLastRelayRecvMs = XTime_GetMonoMs();
 
     xlogt("Received WS frame: id(%u), fd(%d), type(%s), fin(%s), hdr(%zu), pl(%zu), bytes(%zu)",
         DirectGate_Conn_GetID(pConn, pApiSession), DirectGate_Conn_GetFD(pConn, pApiSession),
@@ -2642,7 +2637,7 @@ static xbool_t DirectGate_CheckTokenRefresh(directgate_conn_t *pConn)
         return XTRUE;
     }
 
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
     if (nNowMs < pConn->nNextTokenRefreshMs) return XTRUE;
 
     xlogi("Refreshing access token for active relay session: id(%u), fd(%d), relay(%s)",
@@ -2661,7 +2656,7 @@ static xbool_t DirectGate_CheckTokenRefresh(directgate_conn_t *pConn)
         if (nDelayMs > DIRECTGATE_TOKEN_REFRESH_RETRY_MAX_MS) nDelayMs = DIRECTGATE_TOKEN_REFRESH_RETRY_MAX_MS;
 
         if (pConn->nTokenRefreshFailures < UINT32_MAX) pConn->nTokenRefreshFailures++;
-        pConn->nNextTokenRefreshMs = XTime_GetMs() + nDelayMs;
+        pConn->nNextTokenRefreshMs = XTime_GetMonoMs() + nDelayMs;
 
         xlogw("Token refresh failed: id(%u), fd(%d), status(%d), reason(%s), retryMs(%u)",
             DirectGate_Conn_GetID(pConn, pConn->pWsSession),
@@ -2695,7 +2690,7 @@ static void DirectGate_RetryPendingSave(directgate_conn_t *pConn)
     XCHECK_VOID_NL((pConn != NULL && pConn->pCfg != NULL));
     XCHECK_VOID_NL((pConn->pCfg->bSavePending));
 
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
     if (nNowMs < pConn->nNextSaveRetryMs) return;
 
     if (!DirectGate_SaveConfig(pConn->pCfg))
@@ -2715,7 +2710,7 @@ static void DirectGate_CheckRelayKeepalive(directgate_conn_t *pConn)
     XCHECK_VOID_NL((pConn->pWsSession != NULL));
     XCHECK_VOID_NL((pConn->nLastRelayRecvMs > 0));
 
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
     uint64_t nSinceRecv = nNowMs - pConn->nLastRelayRecvMs;
 
     if (nSinceRecv < DIRECTGATE_RELAY_KA_TIMEOUT_MS)
@@ -2743,7 +2738,7 @@ static void DirectGate_CheckRelayKeepalive(directgate_conn_t *pConn)
 static void DirectGate_CheckAuthTimeouts(directgate_conn_t *pConn)
 {
     XCHECK_VOID((pConn != NULL));
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
 
     DirectGate_SessionMgr_ExpireUnauthenticated(&pConn->mgr, nNowMs);
     DirectGate_TemporaryDesktopShares_Cleanup(pConn, nNowMs);
@@ -2764,7 +2759,7 @@ static void DirectGate_CheckWebRTCKeepalive(directgate_conn_t *pConn)
     XCHECK_VOID((pConn->pCfg != NULL));
     XCHECK_VOID_NL((pConn->pCfg->nKAInterval > 0));
 
-    uint64_t nNowMs = XTime_GetMs();
+    uint64_t nNowMs = XTime_GetMonoMs();
     uint16_t nInterval = pConn->pCfg->nKAInterval;
     uint64_t nIntervalMs = (uint64_t)nInterval * 1000ULL;
     uint64_t nTimeoutMs = nIntervalMs * 3ULL;
@@ -2885,7 +2880,7 @@ static void DirectGate_RunService(xapi_t *pApi, xapi_endpoint_t *pEndpt, directg
             !pSessData->bReconnectSuppressed &&
             pSessData->nNextReconnectMs > 0)
         {
-            uint64_t nNow = XTime_GetMs();
+            uint64_t nNow = XTime_GetMonoMs();
             if (nNow >= pSessData->nNextReconnectMs)
             {
                 if (!DirectGate_PreConnectRefresh(pSessData))

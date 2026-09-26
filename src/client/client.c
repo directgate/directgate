@@ -371,24 +371,14 @@ static ssize_t DirectGate_Client_WriteAll(int nFd, const void *pBuff, size_t nSi
 static int DirectGate_Client_SendFrame(xapi_session_t *pSession, const uint8_t *pPayload,
                                        size_t nLength, xws_frame_type_t eType)
 {
-    xws_frame_t frame;
-    xws_status_t status;
-
-    status = XWebFrame_Create(&frame, pPayload, nLength, eType, XTRUE, XTRUE);
+    /* Written straight into the tx buffer, with no frame of its own to copy */
+    xws_status_t status = XWS_AppendFrame(&pSession->txBuffer, pPayload, nLength, eType, XTRUE, XTRUE);
     if (status != XWS_ERR_NONE)
     {
         xloge("Failed to create WS frame: %s", XWebSock_GetStatusStr(status));
         return XAPI_DISCONNECT;
     }
 
-    if (XAPI_PutTxBuff(pSession, &frame.buffer) < 0)
-    {
-        xloge("Failed to put data to tx buffer: errno(%d)", errno);
-        XWebFrame_Clear(&frame);
-        return XAPI_DISCONNECT;
-    }
-
-    XWebFrame_Clear(&frame);
     return XAPI_EnableEvent(pSession, XPOLLOUT);
 }
 

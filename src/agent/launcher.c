@@ -1286,7 +1286,7 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
                     because the price of one spurious reading is a live session
                     killed under someone sitting at the machine.
                 */
-                uint64_t nNow = XTime_GetMs();
+                uint64_t nNow = XTime_GetMonoMs();
 
                 if (nUserGoneSinceMs == 0)
                 {
@@ -1327,7 +1327,7 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
 
         if (hAgent == NULL)
         {
-            uint64_t nNow = XTime_GetMs();
+            uint64_t nNow = XTime_GetMonoMs();
             if (nNow - nLastSpawnMs < DIRECTGATE_WIN_LAUNCHER_RESPAWN_MS)
             {
                 Sleep(DIRECTGATE_WIN_LAUNCHER_POLL_MS);
@@ -1411,7 +1411,7 @@ static XSTATUS DirectGate_WinLauncher_Run(const char *pCfgPath)
                reason for a SYSTEM process to be injecting input. */
             DirectGate_WinLauncher_StopElevChannel();
             CloseHandle(hAgent);
-            uint64_t nNow = XTime_GetMs();
+            uint64_t nNow = XTime_GetMonoMs();
             uint64_t nLived = (nAgentStartedMs != 0 && nNow > nAgentStartedMs) ? nNow - nAgentStartedMs : 0;
 
             /* An agent that barely lived says more about its session than about

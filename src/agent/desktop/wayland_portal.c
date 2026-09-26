@@ -372,10 +372,10 @@ static int DirectGate_WL_WaitResponse(directgate_wl_portal_t *pPortal, const cha
                                       int nTimeoutMs, DBusMessage **ppMessage,
                                       DBusMessageIter *pResults, char *pErrBuf, size_t nErrSize)
 {
-    uint64_t nDeadline = XTime_GetMs() + (uint64_t)nTimeoutMs;
+    uint64_t nDeadline = XTime_GetMonoMs() + (uint64_t)nTimeoutMs;
     *ppMessage = NULL;
 
-    while (XTime_GetMs() < nDeadline)
+    while (XTime_GetMonoMs() < nDeadline)
     {
         if (pPortal->pCancel != NULL && XSYNC_ATOMIC_GET(pPortal->pCancel))
         {
