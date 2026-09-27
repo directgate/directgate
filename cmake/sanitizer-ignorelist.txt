@@ -1,7 +1,9 @@
-# libjuice 3c40a3545b6b1b62c7adee7f8f2bd58aa290afd6 uses incompatible
-# function-pointer types for picohash's hash/HMAC callbacks. This is upstream
-# undefined behavior, not a false positive. Remove this exception after an
-# upstream fix and a successful strict webrtc_peer_smoke sanitizer run.
+# libjuice (still in v1.7.4, b89c792e3612faf2f12cf35bcc56857313a06be3, bundled
+# with libdatachannel v0.24.6) uses incompatible function-pointer types for
+# picohash's hash/HMAC callbacks. This is upstream undefined behavior, not a
+# false positive: a strict run still stops in picohash_update(). Remove this
+# exception after an upstream fix and a successful strict webrtc_peer_smoke
+# sanitizer run (-DDIRECTGATE_SANITIZER_PICOHASH_WORKAROUND=OFF).
 # Limit the exception to this check and header; do not disable other sanitizers.
 # https://clang.llvm.org/docs/SanitizerSpecialCaseList.html
 [function]
