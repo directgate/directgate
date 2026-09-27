@@ -257,6 +257,26 @@ int main(void)
         tty_close(&tty);
     }
 
+    {
+        /* A number too big for the field, a negative one, or digits followed by anything else used to be stored
+           mangled; they are refused and the value is kept. Blanks around the digits and a plus sign are fine. */
+        prompt_tty_t tty;
+        CHECK(tty_open(&tty, "70000\n-1\n12abc\n 15 \n4294967296\n-5\n7x\n+8\n"), "open pty for out of range numbers");
+
+        uint16_t nShort = 42;
+        CHECK(!DirectGate_PromptU16("Number", &nShort) && nShort == 42, "PromptU16 refuses a value past 16 bits");
+        CHECK(!DirectGate_PromptU16("Number", &nShort) && nShort == 42, "PromptU16 refuses a negative value");
+        CHECK(!DirectGate_PromptU16("Number", &nShort) && nShort == 42, "PromptU16 refuses trailing text");
+        CHECK(DirectGate_PromptU16("Number", &nShort) && nShort == 15, "PromptU16 accepts blanks around the digits");
+
+        uint32_t nLong = 42;
+        CHECK(!DirectGate_PromptU32("Number", &nLong) && nLong == 42, "PromptU32 refuses a value past 32 bits");
+        CHECK(!DirectGate_PromptU32("Number", &nLong) && nLong == 42, "PromptU32 refuses a negative value");
+        CHECK(!DirectGate_PromptU32("Number", &nLong) && nLong == 42, "PromptU32 refuses trailing text");
+        CHECK(DirectGate_PromptU32("Number", &nLong) && nLong == 8, "PromptU32 accepts a plus sign");
+        tty_close(&tty);
+    }
+
     /* Null arguments must be refused rather than dereferenced. */
     CHECK(!DirectGate_PromptBool("Flag", NULL), "PromptBool rejects a null value");
     CHECK(!DirectGate_PromptBool(NULL, NULL), "PromptBool rejects a null label");

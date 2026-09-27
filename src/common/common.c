@@ -812,6 +812,27 @@ xbool_t DirectGate_PromptBool(const char *pLabel, xbool_t *pValue)
     return XTRUE;
 }
 
+/* An unsigned decimal answer no larger than nMax. strtoul() on its own read "70000" for a 16-bit field as 4464, "-1"
+   as its type's largest value and "12abc" as 12; each of those is refused now, like any other answer that is not a
+   number. Blanks around the digits, and the carriage return a Windows console leaves, are still fine. */
+static xbool_t DirectGate_ParsePromptNumber(const char *pInput, unsigned long nMax, unsigned long *pValue)
+{
+    const char *pChar = pInput;
+    while (*pChar == ' ' || *pChar == '\t') pChar++;
+    if (*pChar == '-') return XFALSE;
+
+    errno = 0;
+    char *pEnd = NULL;
+    unsigned long nValue = strtoul(pChar, &pEnd, 10);
+    if (pEnd == pChar || errno == ERANGE || nValue > nMax) return XFALSE;
+
+    while (*pEnd == ' ' || *pEnd == '\t' || *pEnd == '\r') pEnd++;
+    if (*pEnd != XSTR_NUL) return XFALSE;
+
+    *pValue = nValue;
+    return XTRUE;
+}
+
 xbool_t DirectGate_PromptU16(const char *pLabel, uint16_t *pValue)
 {
     XCHECK((pLabel != NULL), XFALSE);
@@ -828,11 +849,10 @@ xbool_t DirectGate_PromptU16(const char *pLabel, uint16_t *pValue)
     if (nStatus < 0) return XFALSE;
     if (!xstrused(sInput)) return XTRUE;
 
-    char *pEnd = NULL;
-    uint16_t nVal = (uint16_t)strtoul(sInput, &pEnd, 10);
-    if (pEnd == sInput) return XFALSE;
+    unsigned long nVal = 0;
+    if (!DirectGate_ParsePromptNumber(sInput, UINT16_MAX, &nVal)) return XFALSE;
 
-    *pValue = nVal;
+    *pValue = (uint16_t)nVal;
     return XTRUE;
 }
 
@@ -852,11 +872,10 @@ xbool_t DirectGate_PromptU32(const char *pLabel, uint32_t *pValue)
     if (nStatus < 0) return XFALSE;
     if (!xstrused(sInput)) return XTRUE;
 
-    char *pEnd = NULL;
-    uint32_t nVal = (uint32_t)strtoul(sInput, &pEnd, 10);
-    if (pEnd == sInput) return XFALSE;
+    unsigned long nVal = 0;
+    if (!DirectGate_ParsePromptNumber(sInput, UINT32_MAX, &nVal)) return XFALSE;
 
-    *pValue = nVal;
+    *pValue = (uint32_t)nVal;
     return XTRUE;
 }
 
