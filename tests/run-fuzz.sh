@@ -1,7 +1,8 @@
 #!/bin/sh
 # Build and run the coverage-guided wire parser fuzzer (tests/fuzz_wire.c).
-# The target recompiles the JSON, package, WebSocket, RTCP and SDP parsers with
-# libFuzzer coverage on top of the ASan/UBSan build; xcommon supplies the rest.
+# The target recompiles the JSON, package, WebSocket, RTCP and SDP parsers and
+# the replay counter check with libFuzzer coverage on top of the ASan/UBSan
+# build; xcommon supplies the rest.
 #
 # Environment:
 #   FUZZ_TIME      wall clock seconds to fuzz for (default 60)

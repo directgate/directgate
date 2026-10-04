@@ -3,13 +3,24 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "src/common/e2e.h"
 #include "src/common/protocol.h"
 #include "src/common/webrtc.h"
+
+/* Messages are formatted and dropped: a log argument that points into freed memory is caught by ASan
+   only when the message is actually written. */
+static int discard_log(const char *pLog, size_t nLength, xlog_flag_t eFlag, void *pCtx)
+{
+    (void)pLog; (void)nLength; (void)eFlag; (void)pCtx;
+    return 0;
+}
 
 int LLVMFuzzerInitialize(int *argc, char ***argv)
 {
     (void)argc; (void)argv;
-    xlog_init(NULL, 0, 0);
+    xlog_init(NULL, XLOG_ALL, 0);
+    xlog_screen(XFALSE);
+    xlog_callback(discard_log, NULL);
     return 0;
 }
 
@@ -27,6 +38,60 @@ static void check_route(const uint8_t *data, size_t size)
 
     DirectGate_Package_Clear(&route);
     DirectGate_Package_Clear(&full);
+}
+
+static xbool_t check_cc_once(const uint8_t *header, size_t size, const char *pad, size_t padLen, directgate_e2e_t *e2e)
+{
+    xbyte_buffer_t packet;
+    XByteBuffer_Init(&packet, size + padLen + 5, XFALSE);
+    uint32_t len = (uint32_t)(size + padLen);
+    uint8_t preamble[4] = { (uint8_t)len, (uint8_t)(len >> 8), (uint8_t)(len >> 16), (uint8_t)(len >> 24) };
+
+    /* The pad goes right behind the opening brace */
+    size_t brace = 0;
+    while (padLen && header[brace] != '{') brace++;
+
+    XByteBuffer_Add(&packet, preamble, sizeof(preamble));
+    XByteBuffer_Add(&packet, header, padLen ? brace + 1 : size);
+    if (padLen)
+    {
+        XByteBuffer_Add(&packet, (const uint8_t*)pad, padLen);
+        XByteBuffer_Add(&packet, header + brace + 1, size - brace - 1);
+    }
+
+    xbool_t accepted = DirectGate_Proto_CheckCC(&packet, e2e);
+    XByteBuffer_Clear(&packet);
+    return accepted;
+}
+
+/* CheckCC reads a flat header in place and parses anything else. With a nested member in front, which only
+   the parser takes, a flat header has to get the same verdict twice over (the second time as a replay) and
+   leave the windows exactly as the scan did. */
+static void check_cc(const uint8_t *header, size_t size)
+{
+    directgate_e2e_t scanned, parsed;
+    DirectGate_E2E_Init(&scanned);
+    DirectGate_E2E_Init(&parsed);
+
+    xjson_field_t field[1] = { { "~pad~", NULL, 0, 0 } };
+    xbool_t flat = size && XJSON_ScanFlat((const char*)header, size, field, 1) && field[0].nType == XJSON_TYPE_INVALID;
+
+    /* An empty object takes the member without a comma after it */
+    const char *pad = "\"~pad~\":{},";
+    if (flat)
+    {
+        size_t i = 0;
+        while (header[i] != '{') i++;
+        for (i++; header[i] == ' ' || header[i] == '\t' || header[i] == '\r' || header[i] == '\n'; i++);
+        if (header[i] == '}') pad = "\"~pad~\":{}";
+    }
+
+    for (int round = 0; round < 2; round++)
+    {
+        xbool_t a = check_cc_once(header, size, NULL, 0, &scanned);
+        xbool_t b = flat ? check_cc_once(header, size, pad, strlen(pad), &parsed) : check_cc_once(header, size, NULL, 0, &parsed);
+        if (a != b || memcmp(&scanned, &parsed, sizeof(scanned))) abort();
+    }
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
@@ -56,6 +121,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             for (int i = 0; i < 4; i++) packet[i] = (uint8_t)(len >> (8 * i));
             memcpy(packet + 4, data, size);
             check_route(packet, size + 4);
+            check_cc(data, size);
             free(packet);
         }
     }

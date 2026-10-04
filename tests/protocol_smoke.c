@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "src/common/protocol.h"
@@ -41,6 +42,79 @@ static xbool_t check_scoped_cc(directgate_e2e_t *pE2E, const char *pScope,
     xbool_t bAccepted = bBuilt ? DirectGate_Proto_CheckCC(&packet, pE2E) : XFALSE;
     XByteBuffer_Clear(&packet);
     return bAccepted;
+}
+
+/* The outer header of an encrypted packet is written out directly. It has to be, byte for byte, the one
+   NewHeader("encrypted") and Build give, and the payload behind it has to decrypt to what went in. */
+static int check_encrypted_header(void)
+{
+    uint8_t sKey[32], agentNonce[32], clientNonce[32];
+    memset(sKey, 0x5c, sizeof(sKey));
+    memset(agentNonce, 0x11, sizeof(agentNonce));
+    memset(clientNonce, 0x22, sizeof(clientNonce));
+
+    directgate_e2e_t agent, client;
+    DirectGate_E2E_Init(&agent);
+    DirectGate_E2E_Init(&client);
+    CHECK(DirectGate_E2E_DeriveFromSRP(&agent, sKey, sizeof(sKey), agentNonce, clientNonce, sizeof(agentNonce), "dev", XTRUE) &&
+          DirectGate_E2E_DeriveFromSRP(&client, sKey, sizeof(sKey), agentNonce, clientNonce, sizeof(agentNonce), "dev", XFALSE),
+          "derive both ends of a session");
+
+    static const uint32_t sessionIds[] = { 0, 1, 9, 10, 42, 99, 100, 65535, 65536, 999999999, 1000000000, 4294967295u };
+    static const size_t sizes[] = { 1, 2, 9, 10, 31, 32, 33, 67, 68, 99, 100, 967, 968, 9967, 9968, 65535, 65536, 99968, 131072 };
+    /* The reference packet carries a stand-in payload as long as the encrypted one, 32 bytes past the plaintext */
+    uint8_t *pPlain = (uint8_t*)malloc(131072 + 32);
+    CHECK(pPlain != NULL, "allocate the plaintext");
+    for (size_t i = 0; i < 131072 + 32; i++) pPlain[i] = (uint8_t)(i * 31 + 7);
+
+    xbyte_buffer_t packet, expected;
+    XByteBuffer_Init(&packet, XSTDNON, XFALSE);
+    XByteBuffer_Init(&expected, XSTDNON, XFALSE);
+
+    for (size_t s = 0; s < sizeof(sessionIds) / sizeof(sessionIds[0]); s++)
+    {
+        for (size_t n = 0; n < sizeof(sizes) / sizeof(sizes[0]); n++)
+        {
+            XByteBuffer_Reset(&packet);
+            CHECK(XByteBuffer_Add(&packet, pPlain, sizes[n]) > 0, "fill the plaintext");
+            CHECK(DirectGate_Proto_EncryptPackage(&packet, &agent, sessionIds[s]), "encrypt a package");
+
+            /* Encryption adds a nonce and a tag of 16 bytes each */
+            xjson_obj_t *pHeader = DirectGate_Proto_NewHeader("encrypted", sessionIds[s]);
+            CHECK(pHeader != NULL && build_packet(&expected, pHeader, pPlain, sizes[n] + 32, XFALSE) == 0,
+                "build the header the tree gives");
+
+            uint32_t nHdrLen = (uint32_t)expected.pData[0] | ((uint32_t)expected.pData[1] << 8) |
+                               ((uint32_t)expected.pData[2] << 16) | ((uint32_t)expected.pData[3] << 24);
+            if (packet.nUsed != expected.nUsed || memcmp(packet.pData, expected.pData, 4 + nHdrLen))
+            {
+                fprintf(stderr, "protocol_smoke: encrypted header differs: sid(%u), size(%zu): %.*s\n",
+                    sessionIds[s], sizes[n], (int)nHdrLen, (const char*)expected.pData + 4);
+                return 1;
+            }
+
+            directgate_pkg_t pkg;
+            CHECK(DirectGate_Package_Parse(&pkg, packet.pData, packet.nUsed), "the encrypted package parses");
+            const directgate_pkg_data_t *pData = (const directgate_pkg_data_t*)pkg.pPackage;
+            CHECK(pkg.header.eType == DIRECTGATE_PKG_ENCRYPTED && pkg.header.nSessionId == sessionIds[s] &&
+                  pData->nPayloadLength == sizes[n] + 32, "with its type, session and payload");
+
+            size_t nDecrypted = 0;
+            uint8_t *pDecrypted = DirectGate_E2E_Decrypt(&client, pData->pPayload, pData->nPayloadLength, &nDecrypted);
+            CHECK(pDecrypted != NULL && nDecrypted == sizes[n] && !memcmp(pDecrypted, pPlain, sizes[n]),
+                "the payload decrypts to the plaintext");
+
+            free(pDecrypted);
+            DirectGate_Package_Clear(&pkg);
+        }
+    }
+
+    free(pPlain);
+    XByteBuffer_Clear(&packet);
+    XByteBuffer_Clear(&expected);
+    DirectGate_E2E_Clear(&agent);
+    DirectGate_E2E_Clear(&client);
+    return 0;
 }
 
 int main(void)
@@ -285,6 +359,7 @@ int main(void)
         "unknown packet type must fail");
 
     XByteBuffer_Clear(&packet);
+    if (check_encrypted_header()) return 1;
     puts("protocol_smoke: OK");
     return 0;
 }

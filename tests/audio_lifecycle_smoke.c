@@ -2,8 +2,9 @@
 #include <stdio.h>
 #include "src/agent/desktop/audio.c"
 #define CHECK(c, msg) do { if (!(c)) { fprintf(stderr, "audio_lifecycle_smoke: %s\n", msg); return 1; } } while (0)
-static int fail_read, pending_read, opened, closed, encoders, encode_calls, fail_open, fail_encoder;
-static xvolatile_t pending_calls;
+static int opened, closed, encoders, encode_calls, fail_open, fail_encoder;
+/* Read by the audio worker while the test flips them */
+static xvolatile_t fail_read, pending_read, pending_calls;
 void* DirectGate_Audio_BackendOpen(uint32_t rate, uint32_t channels, char *err, size_t len)
 {
     (void)rate; (void)channels;
@@ -15,8 +16,8 @@ int DirectGate_Audio_BackendRead(void *ctx, int16_t *out, uint32_t frames, uint3
 {
     (void)ctx;
     xusleep(1000);
-    if (fail_read) return XSTDERR;
-    if (pending_read)
+    if (XSYNC_ATOMIC_GET(&fail_read)) return XSTDERR;
+    if (XSYNC_ATOMIC_GET(&pending_read))
     {
         XSYNC_ATOMIC_SET(&pending_calls, XSYNC_ATOMIC_GET(&pending_calls) + 1);
         return XSTDNON;
@@ -39,7 +40,7 @@ int DirectGate_Opus_Encode(directgate_opus_t *ctx, const int16_t *pcm, uint32_t 
 int main(void)
 {
     directgate_session_t session = {0};
-    fail_read = 1;
+    XSYNC_ATOMIC_SET(&fail_read, 1);
     CHECK(DirectGate_Desktop_AudioStart(&session) == XSTDOK, "worker starts");
     directgate_audio_t *audio = session.desktop.pAudio;
     for (int i = 0; i < 1000 && !XSYNC_ATOMIC_GET(&audio->nFinished); i++) xusleep(1000);
@@ -48,8 +49,8 @@ int main(void)
     CHECK(!session.desktop.pAudio && !session.desktop.bAudioReady && session.desktop.sAudioReason[0],
         "main loop exposes failure and releases resources");
     CHECK(opened == closed && encoders == 0, "failure cleans capture and encoder");
-    fail_read = 0;
-    pending_read = 1;
+    XSYNC_ATOMIC_SET(&fail_read, 0);
+    XSYNC_ATOMIC_SET(&pending_read, 1);
     CHECK(DirectGate_Desktop_AudioStart(&session) == XSTDOK, "pending source starts");
     audio = session.desktop.pAudio;
     for (int i = 0; i < 1000 && XSYNC_ATOMIC_GET(&pending_calls) < 3 &&
@@ -58,7 +59,7 @@ int main(void)
     CHECK(XSYNC_ATOMIC_GET(&pending_calls) >= 3, "pending frames keep the worker alive");
     CHECK(encode_calls == 0, "pending PCM is never encoded as silence");
     CHECK(opened == closed && encoders == 0, "Stop joins a stalled source before freeing it");
-    pending_read = 0;
+    XSYNC_ATOMIC_SET(&pending_read, 0);
     for (int i = 0; i < 50; i++)
     {
         CHECK(DirectGate_Desktop_AudioStart(&session) == XSTDOK, "restart after failure");
@@ -98,10 +99,10 @@ int main(void)
 
     CHECK(dropped > 0, "a full ring drops its oldest frame rather than growing");
 
-    fail_read = 1;
+    XSYNC_ATOMIC_SET(&fail_read, 1);
     for (int i = 0; i < 1000 && !XSYNC_ATOMIC_GET(&running->nFinished); i++) xusleep(1000);
     CHECK(XSYNC_ATOMIC_GET(&running->nFinished), "the worker gives up on a failing source");
-    fail_read = 0;
+    XSYNC_ATOMIC_SET(&fail_read, 0);
     int opened_before = opened;
     CHECK(DirectGate_Desktop_AudioStart(&session) == XSTDOK && opened == opened_before + 1 && closed == opened_before,
         "starting over a finished worker replaces it");

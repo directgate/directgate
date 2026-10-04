@@ -155,7 +155,7 @@ The tests labeled `e2e` run the real `directgate` and `dgcli` binaries against a
 
 `webrtc_peer_smoke` creates two local peers and is labeled `external-webrtc`. It remains part of the default suite. At the pinned dependency revisions it exposes sanitizer defects in the unmodified `libdatachannel` dependency tree; see [the C audit](c-audit-2026-09-09.md). To report the other tests separately, use `ctest --test-dir build-sanitizers -LE external-webrtc --output-on-failure`. An excluded peer test is not evidence that the full transport is sanitizer clean.
 
-For coverage-guided fuzzing of JSON, protocol, WebSocket, RTCP and SDP parsers:
+For coverage-guided fuzzing of the JSON, protocol, WebSocket, RTCP and SDP parsers and of the replay counter check every decrypted message passes (`DirectGate_Proto_CheckCC`, whose in-place read of a flat header is checked against the parsed one), with log messages formatted and dropped so that a log argument pointing at freed memory is caught as well:
 
 ```sh
 ./tests/run-fuzz.sh

@@ -23,6 +23,9 @@
 #include "protocol.h"
 #include "version.h"
 
+/* {"sessionId":4294967295,"payloadSize":4294967295,"type":"encrypted","version":4294967295} fits with room to spare */
+#define DIRECTGATE_PROTO_ENC_HEADER_MAX 128
+
 static uint32_t DirectGate_Proto_ReadU32LE(const uint8_t *pData)
 {
     return (uint32_t)pData[0] |
@@ -59,6 +62,19 @@ xjson_obj_t* DirectGate_Proto_NewHeader(const char *pType, uint32_t nSessionId)
     return pHeader;
 }
 
+/* Preamble, header, payload. Only a zero return from XByteBuffer_Add counts as a failure here, which
+   is what every packet has always been assembled with. */
+static xbool_t DirectGate_Proto_Assemble(xbyte_buffer_t *pOut, const char *pHeader, size_t nHdrLen,
+                                         const uint8_t *pPayload, size_t nPayload)
+{
+    uint8_t sPreamble[DIRECTGATE_PROTO_PREAMBLE_SIZE];
+    DirectGate_Proto_WriteU32LE(sPreamble, (uint32_t)nHdrLen);
+
+    return (XByteBuffer_Add(pOut, sPreamble, sizeof(sPreamble)) &&
+            XByteBuffer_Add(pOut, (const uint8_t*)pHeader, nHdrLen) &&
+            (pPayload == NULL || !nPayload || XByteBuffer_Add(pOut, pPayload, nPayload))) ? XTRUE : XFALSE;
+}
+
 xbool_t DirectGate_Proto_Build(xbyte_buffer_t *pOut, xjson_obj_t *pHeader,
                                const uint8_t *pPayload, size_t nPayload,
                                xbool_t bEncrypted)
@@ -85,13 +101,7 @@ xbool_t DirectGate_Proto_Build(xbyte_buffer_t *pOut, xjson_obj_t *pHeader,
         return XFALSE;
     }
 
-    uint32_t nHdrLen = (uint32_t)writer.nLength;
-    uint8_t sPreamble[DIRECTGATE_PROTO_PREAMBLE_SIZE];
-    DirectGate_Proto_WriteU32LE(sPreamble, nHdrLen);
-
-    if (!XByteBuffer_Add(pOut, sPreamble, sizeof(sPreamble)) ||
-        !XByteBuffer_Add(pOut, (uint8_t*)writer.pData, writer.nLength) ||
-        (pPayload != NULL && nPayload && !XByteBuffer_Add(pOut, pPayload, nPayload)))
+    if (!DirectGate_Proto_Assemble(pOut, writer.pData, writer.nLength, pPayload, nPayload))
     {
         const char *pType = XJSON_GetString(XJSON_GetObject(pHeader, "type"));
         uint32_t nSessionId = XJSON_GetU32(XJSON_GetObject(pHeader, "sessionId"));
@@ -875,11 +885,6 @@ xjson_obj_t* DirectGate_Proto_BuildVerify(const char *pAction, const char *pAcce
     return pHeader;
 }
 
-static xbool_t DirectGate_Proto_IsSignalScope(const char *pScope)
-{
-    return xstrused(pScope) && xstrcmp(pScope, "signal") ? XTRUE : XFALSE;
-}
-
 xbool_t DirectGate_Proto_AddCC(xjson_obj_t *pHeader, directgate_e2e_t *pE2E,
                                uint32_t nSessionEpoch)
 {
@@ -912,6 +917,75 @@ xbool_t DirectGate_Proto_AddCC(xjson_obj_t *pHeader, directgate_e2e_t *pE2E,
     return XTRUE;
 }
 
+/* What CheckCC reads from an inner header. A scope that is absent or not a string is no scope at all,
+   as the empty string XJSON_GetString gives for it always was. */
+typedef struct {
+    const char *pScope;
+    size_t nScopeLen;
+    uint32_t nScopedCC;
+    uint32_t nEpoch;
+    uint32_t nCC;
+} directgate_cc_header_t;
+
+static xbool_t DirectGate_Proto_ScopeIs(const directgate_cc_header_t *pHdr, const char *pName)
+{
+    size_t nLength = strlen(pName);
+    return pHdr->nScopeLen == nLength && !memcmp(pHdr->pScope, pName, nLength);
+}
+
+static xbool_t DirectGate_Proto_AcceptHeaderCC(directgate_e2e_t *pE2E, const directgate_cc_header_t *pHdr)
+{
+    XCHECK((pHdr->nCC > 0), xthrowr(XFALSE, "Missing CC in the packet header"));
+    int nScopeLen = (int)XSTD_MIN(pHdr->nScopeLen, (size_t)INT_MAX);
+    xbool_t bScoped = pHdr->nScopeLen > 0;
+    xbool_t bSignal = DirectGate_Proto_ScopeIs(pHdr, "signal");
+    xbool_t bInput = DirectGate_Proto_ScopeIs(pHdr, "input");
+
+    XCHECK((!bScoped || bSignal || bInput || DirectGate_Proto_ScopeIs(pHdr, "session")),
+        xthrowr(XFALSE, "Unknown CC scope: %.*s", nScopeLen, pHdr->pScope));
+
+    if (!bScoped)
+    {
+        if (DirectGate_E2E_AcceptCC(&pE2E->rxWindow, pHdr->nCC)) return XTRUE;
+        xlogw("Dropping replayed or stale packet: cc(%u), window(%u)", pHdr->nCC, pE2E->rxWindow.nHighest);
+        return XFALSE;
+    }
+
+    XCHECK((pHdr->nScopedCC > 0), xthrowr(XFALSE, "Missing scoped CC for scope(%.*s)", nScopeLen, pHdr->pScope));
+    directgate_ccwin_t *pWindow;
+
+    if (bSignal)
+    {
+        pWindow = &pE2E->rxSignalWindow;
+    }
+    else
+    {
+        XCHECK((pHdr->nEpoch >= pE2E->nRxSessionEpoch), xthrowr(XFALSE,
+            "Stale session CC epoch(%u) < active(%u)", pHdr->nEpoch, pE2E->nRxSessionEpoch));
+
+        if (pHdr->nEpoch > pE2E->nRxSessionEpoch)
+        {
+            pE2E->nRxSessionEpoch = pHdr->nEpoch;
+            DirectGate_E2E_ResetCCWindow(&pE2E->rxSessionWindow);
+            DirectGate_E2E_ResetCCWindow(&pE2E->rxInputWindow);
+        }
+
+        pWindow = bInput ?
+            &pE2E->rxInputWindow :
+            &pE2E->rxSessionWindow;
+    }
+
+    if (!DirectGate_E2E_AcceptCC(pWindow, pHdr->nScopedCC))
+    {
+        xlogw("Dropping replayed or stale packet: sc(%u), window(%u), scope(%s)",
+            pHdr->nScopedCC, pWindow->nHighest, bSignal ? "signal" : (bInput ? "input" : "session"));
+        return XFALSE;
+    }
+
+    DirectGate_E2E_AcceptCC(&pE2E->rxWindow, pHdr->nCC);
+    return XTRUE;
+}
+
 xbool_t DirectGate_Proto_CheckCC(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E)
 {
     XCHECK((pE2E != NULL), XFALSE);
@@ -923,80 +997,48 @@ xbool_t DirectGate_Proto_CheckCC(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E)
     /* Decrypted, so the length is authenticated but a peer that has completed
        the handshake is still not trusted to be well behaved, and the wrap this
        avoids is the same one Package_Parse guards. */
-    if (nHdrLen > 0 && nHdrLen <= pOut->nUsed - DIRECTGATE_PROTO_PREAMBLE_SIZE)
+    if (!nHdrLen || nHdrLen > pOut->nUsed - DIRECTGATE_PROTO_PREAMBLE_SIZE) return XFALSE;
+    const char *pJsonData = (const char*)(pOut->pData + DIRECTGATE_PROTO_PREAMBLE_SIZE);
+    directgate_cc_header_t hdr = { NULL, 0, 0, 0, 0 };
+
+    /* Every inner header is a flat object, read in place. XJSON_ScanFlat takes nothing XJSON_Parse would not
+       and reports the same members, so anything it refuses is read from the parsed tree as it always was. */
+    xjson_field_t fields[] = {
+        { "cc", NULL, 0, 0 },
+        { "ccScope", NULL, 0, 0 },
+        { "sc", NULL, 0, 0 },
+        { "ce", NULL, 0, 0 }
+    };
+
+    if (XJSON_ScanFlat(pJsonData, nHdrLen, fields, sizeof(fields) / sizeof(fields[0])))
     {
-        const char *pJsonData = (const char*)(pOut->pData + DIRECTGATE_PROTO_PREAMBLE_SIZE);
-        xjson_t json;
+        hdr.nCC = DirectGate_Proto_FieldU32(&fields[0]);
+        hdr.nScopedCC = DirectGate_Proto_FieldU32(&fields[2]);
+        hdr.nEpoch = DirectGate_Proto_FieldU32(&fields[3]);
 
-        if (XJSON_Parse(&json, NULL, pJsonData, nHdrLen))
+        if (fields[1].nType == XJSON_TYPE_STRING)
         {
-            uint32_t nCC = XJSON_GetU32(XJSON_GetObject(json.pRootObj, "cc"));
-            XCHECK_CALL((nCC > 0), XJSON_Destroy, &json,
-                xthrowr(XFALSE, "Missing CC in the packet header"));
-
-            xjson_obj_t *pScopeObj = XJSON_GetObject(json.pRootObj, "ccScope");
-            const char *pScope = pScopeObj != NULL ? XJSON_GetString(pScopeObj) : NULL;
-            xbool_t bSignal = DirectGate_Proto_IsSignalScope(pScope);
-            xbool_t bInput = xstrused(pScope) && xstrcmp(pScope, "input");
-
-            XCHECK_CALL((!xstrused(pScope) || bSignal || bInput || xstrcmp(pScope, "session")),
-                XJSON_Destroy, &json, xthrowr(XFALSE, "Unknown CC scope: %s", pScope));
-
-            if (xstrused(pScope))
-            {
-                uint32_t nScopedCC = XJSON_GetU32(XJSON_GetObject(json.pRootObj, "sc"));
-                XCHECK_CALL((nScopedCC > 0), XJSON_Destroy, &json,
-                    xthrowr(XFALSE, "Missing scoped CC for scope(%s)", pScope));
-
-                directgate_ccwin_t *pWindow;
-                if (bSignal)
-                {
-                    pWindow = &pE2E->rxSignalWindow;
-                }
-                else
-                {
-                    uint32_t nEpoch = XJSON_GetU32(XJSON_GetObject(json.pRootObj, "ce"));
-                    XCHECK_CALL((nEpoch >= pE2E->nRxSessionEpoch), XJSON_Destroy, &json,
-                        xthrowr(XFALSE, "Stale session CC epoch(%u) < active(%u)",
-                            nEpoch, pE2E->nRxSessionEpoch));
-                    if (nEpoch > pE2E->nRxSessionEpoch)
-                    {
-                        pE2E->nRxSessionEpoch = nEpoch;
-                        DirectGate_E2E_ResetCCWindow(&pE2E->rxSessionWindow);
-                        DirectGate_E2E_ResetCCWindow(&pE2E->rxInputWindow);
-                    }
-
-                    pWindow = bInput ?
-                        &pE2E->rxInputWindow :
-                        &pE2E->rxSessionWindow;
-                }
-
-                if (!DirectGate_E2E_AcceptCC(pWindow, nScopedCC))
-                {
-                    xlogw("Dropping replayed or stale packet: sc(%u), window(%u), scope(%s)",
-                        nScopedCC, pWindow->nHighest, bSignal ? "signal" : (bInput ? "input" : "session"));
-
-                    XJSON_Destroy(&json);
-                    return XFALSE;
-                }
-
-                DirectGate_E2E_AcceptCC(&pE2E->rxWindow, nCC);
-            }
-            else if (!DirectGate_E2E_AcceptCC(&pE2E->rxWindow, nCC))
-            {
-                xlogw("Dropping replayed or stale packet: cc(%u), window(%u)",
-                    nCC, pE2E->rxWindow.nHighest);
-
-                XJSON_Destroy(&json);
-                return XFALSE;
-            }
-
-            XJSON_Destroy(&json);
-            return XTRUE;
+            hdr.pScope = fields[1].pValue;
+            hdr.nScopeLen = fields[1].nLength;
         }
+
+        return DirectGate_Proto_AcceptHeaderCC(pE2E, &hdr);
     }
 
-    return XFALSE;
+    xjson_t json;
+    XCHECK_NL(XJSON_Parse(&json, NULL, pJsonData, nHdrLen), XFALSE);
+
+    hdr.nCC = XJSON_GetU32(XJSON_GetObject(json.pRootObj, "cc"));
+    hdr.nScopedCC = XJSON_GetU32(XJSON_GetObject(json.pRootObj, "sc"));
+    hdr.nEpoch = XJSON_GetU32(XJSON_GetObject(json.pRootObj, "ce"));
+
+    xjson_obj_t *pScopeObj = XJSON_GetObject(json.pRootObj, "ccScope");
+    hdr.pScope = pScopeObj != NULL ? XJSON_GetString(pScopeObj) : NULL;
+    hdr.nScopeLen = hdr.pScope != NULL ? strlen(hdr.pScope) : 0;
+
+    xbool_t bAccepted = DirectGate_Proto_AcceptHeaderCC(pE2E, &hdr);
+    XJSON_Destroy(&json);
+    return bAccepted;
 }
 
 xbool_t DirectGate_Proto_EncryptPackage(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E, uint32_t nSessionId)
@@ -1008,14 +1050,19 @@ xbool_t DirectGate_Proto_EncryptPackage(xbyte_buffer_t *pOut, directgate_e2e_t *
     uint8_t *pEncrypted = DirectGate_E2E_Encrypt(pE2E, pOut->pData, pOut->nUsed, &nEncLen);
     XCHECK((pEncrypted != NULL), xthrowr(XFALSE, "E2E encryption failed"));
 
+    /* The header NewHeader("encrypted") and Build give, written out without a tree to build, serialize and
+       free for every packet: the members in the order its map holds them, the payload never empty. The text
+       is compared with what they give in protocol_smoke, so a change on either side fails there first. */
+    char sHeader[DIRECTGATE_PROTO_ENC_HEADER_MAX];
+    int nHdrLen = snprintf(sHeader, sizeof(sHeader),
+        "{\"sessionId\":%u,\"payloadSize\":%u,\"type\":\"encrypted\",\"version\":%u}",
+        nSessionId, (uint32_t)nEncLen, (uint32_t)DIRECTGATE_PROTOCOL_VERSION);
+
     XByteBuffer_Reset(pOut);
-    xjson_obj_t *pHeader = DirectGate_Proto_NewHeader("encrypted", nSessionId);
-    XCHECK_FREE(pHeader, pEncrypted, xthrowr(XFALSE, "Failed to create encryption header"));
+    xbool_t bOk = nHdrLen > 0 && DirectGate_Proto_Assemble(pOut, sHeader, (size_t)nHdrLen, pEncrypted, nEncLen);
+    if (!bOk) xloge("Failed to assemble protocol packet: type(encrypted), sid(%u), hdr(%d), payload(%zu)", nSessionId, nHdrLen, nEncLen);
 
-    xbool_t bOk = DirectGate_Proto_Build(pOut, pHeader, pEncrypted, nEncLen, XFALSE);
-    XJSON_FreeObject(pHeader);
     free(pEncrypted);
-
     return bOk;
 }
 

@@ -202,6 +202,42 @@ static int test_scoped_header(void)
     return 0;
 }
 
+/* The scope has to be one of the three names exactly, a scoped packet still needs its packet counter, and
+ * accepting it records that counter in the legacy window as well. */
+static int test_scoped_edges(void)
+{
+    directgate_e2e_t e2e;
+    xbyte_buffer_t pkg;
+    DirectGate_E2E_Init(&e2e);
+    XByteBuffer_Init(&pkg, 0, 0);
+
+    const char *pNearMisses[] = { "sessions", "signal ", "inputs", "sessio", "Signal", "input\\u0000" };
+    for (size_t i = 0; i < sizeof(pNearMisses) / sizeof(pNearMisses[0]); i++)
+    {
+        if (build_scoped(&pkg, pNearMisses[i], 20 + (uint32_t)i, 1, XTRUE, 0)) return 1;
+        CHECK(!DirectGate_Proto_CheckCC(&pkg, &e2e), "a scope that only resembles a known one is refused");
+    }
+
+    if (build_scoped(&pkg, "session", 0, 1, XTRUE, 0)) return 1;
+    CHECK(!DirectGate_Proto_CheckCC(&pkg, &e2e), "a scoped packet without its packet counter is refused");
+    if (build_scoped(&pkg, "signal", 0, 1, XFALSE, 0)) return 1;
+    CHECK(!DirectGate_Proto_CheckCC(&pkg, &e2e), "a signal packet without its packet counter is refused");
+    CHECK(e2e.rxSessionWindow.nHighest == 0 && e2e.rxSignalWindow.nHighest == 0 && e2e.rxWindow.nHighest == 0,
+        "the refusals left every window as it was");
+
+    if (build_scoped(&pkg, "session", 40, 1, XTRUE, 0)) return 1;
+    CHECK(DirectGate_Proto_CheckCC(&pkg, &e2e), "a complete scoped packet is accepted");
+    CHECK(e2e.rxSessionWindow.nHighest == 1 && e2e.rxWindow.nHighest == 40, "both its counters are recorded");
+
+    if (build_scoped(&pkg, "signal", 41, 1, XFALSE, 0)) return 1;
+    CHECK(DirectGate_Proto_CheckCC(&pkg, &e2e), "a complete signal packet is accepted");
+    CHECK(e2e.rxSignalWindow.nHighest == 1 && e2e.rxWindow.nHighest == 41, "both of its counters are recorded too");
+
+    XByteBuffer_Clear(&pkg);
+    DirectGate_E2E_Clear(&e2e);
+    return 0;
+}
+
 /* The counters the agent emits have to be the ones the window expects: an
  * off-by-one between the two sides drops every packet of a session. */
 static int test_emitted_counters(void)
@@ -253,12 +289,176 @@ static int test_emitted_counters(void)
     return 0;
 }
 
+/* Wraps a header written out by hand in the preamble CheckCC reads */
+static int build_raw(xbyte_buffer_t *pOut, const char *pHeader)
+{
+    uint32_t nLength = (uint32_t)strlen(pHeader);
+    uint8_t preamble[4] = { (uint8_t)nLength, (uint8_t)(nLength >> 8), (uint8_t)(nLength >> 16), (uint8_t)(nLength >> 24) };
+
+    XByteBuffer_Reset(pOut);
+    CHECK(XByteBuffer_Add(pOut, preamble, sizeof(preamble)) > 0, "add the preamble");
+    CHECK(XByteBuffer_Add(pOut, (const uint8_t*)pHeader, nLength) > 0, "add the header");
+    return 0;
+}
+
+static char g_sLogged[4096];
+static size_t g_nLogged;
+
+static int collect_log(const char *pLog, size_t nLength, xlog_flag_t eFlag, void *pCtx)
+{
+    (void)eFlag;
+    (void)pCtx;
+    if (g_nLogged + nLength < sizeof(g_sLogged))
+    {
+        memcpy(g_sLogged + g_nLogged, pLog, nLength);
+        g_nLogged += nLength;
+        g_sLogged[g_nLogged] = '\0';
+    }
+    return 0;
+}
+
+/* A refusal names the scope the peer sent. The header tree it came from used to be freed before the
+ * message was formatted, so the log read freed memory: garbage at best, a crash under ASan. */
+static int test_refusal_logs(void)
+{
+    directgate_e2e_t e2e;
+    xbyte_buffer_t pkg;
+    DirectGate_E2E_Init(&e2e);
+    XByteBuffer_Init(&pkg, 0, 0);
+
+    xlog_init("e2e_ccwin_smoke", XLOG_ALL, XFALSE);
+    xlog_screen(XFALSE);
+    xlog_callback(collect_log, NULL);
+
+    /* Flat headers take the scan, the nested member sends the same header through the parser */
+    const char *pPads[] = { "", ",\"pad\":{}" };
+    for (size_t i = 0; i < sizeof(pPads) / sizeof(pPads[0]); i++)
+    {
+        char sHeader[256];
+        snprintf(sHeader, sizeof(sHeader), "{\"cc\":7,\"ccScope\":\"a-scope-from-a-newer-peer\",\"sc\":1%s}", pPads[i]);
+        if (build_raw(&pkg, sHeader)) return 1;
+
+        g_nLogged = 0;
+        g_sLogged[0] = '\0';
+        CHECK(!DirectGate_Proto_CheckCC(&pkg, &e2e), "an unknown scope is refused");
+        CHECK(strstr(g_sLogged, "Unknown CC scope: a-scope-from-a-newer-peer") != NULL, "the refusal names the unknown scope");
+
+        snprintf(sHeader, sizeof(sHeader), "{\"cc\":8,\"ccScope\":\"session\",\"ce\":0%s}", pPads[i]);
+        if (build_raw(&pkg, sHeader)) return 1;
+
+        g_nLogged = 0;
+        g_sLogged[0] = '\0';
+        CHECK(!DirectGate_Proto_CheckCC(&pkg, &e2e), "a scope without its counter is refused");
+        CHECK(strstr(g_sLogged, "Missing scoped CC for scope(session)") != NULL, "the refusal names the scope");
+    }
+
+    xlog_destroy();
+    XByteBuffer_Clear(&pkg);
+    DirectGate_E2E_Clear(&e2e);
+    return 0;
+}
+
+/* CheckCC reads a flat header in place and parses anything else. Every header here goes to one receiver as it
+ * is and to another with a nested member the scan refuses: both readings have to take the same decisions. */
+static int test_scan_matches_parse(void)
+{
+    static const char *pCounters[] = { "0", "1", "2", "3", "63", "64", "65", "66", "200", "4294967295", "4294967296",
+        "18446744073709551616", "-1", "-0", "1.0", "1e2", "\"5\"", "true", "null" };
+    static const char *pScopes[] = { NULL, "\"session\"", "\"input\"", "\"signal\"", "\"\"", "\"Session\"", "\"sess\\u0069on\"",
+        "\"signal \"", "5", "true", "null" };
+
+    directgate_e2e_t scanned, parsed;
+    xbyte_buffer_t pkg;
+    DirectGate_E2E_Init(&scanned);
+    DirectGate_E2E_Init(&parsed);
+    XByteBuffer_Init(&pkg, 0, 0);
+
+    uint32_t nState = 0x9E3779B9u;
+    int nAccepted = 0, nNewEpochs = 0;
+
+    for (int i = 0; i < 20000; i++)
+    {
+        nState = nState * 1664525u + 1013904223u;
+        uint32_t r = nState;
+        size_t nCounters = sizeof(pCounters) / sizeof(pCounters[0]);
+
+        /* A new session now and then: the odd counters push a window to the top of the range quickly */
+        if (i % 250 == 0)
+        {
+            DirectGate_E2E_Init(&scanned);
+            DirectGate_E2E_Init(&parsed);
+        }
+
+        const char *pScope = pScopes[(r >> 3) % (sizeof(pScopes) / sizeof(pScopes[0]))];
+        if (!(r & 0x40000000)) pScope = pScopes[1 + (r >> 9) % 3];
+        const directgate_ccwin_t *pWindow = pScope == pScopes[2] ? &scanned.rxInputWindow :
+            pScope == pScopes[3] ? &scanned.rxSignalWindow : &scanned.rxSessionWindow;
+
+        /* Mostly plausible counters, close to what each window last saw */
+        char sCC[32], sSC[32], sCE[32];
+        snprintf(sCC, sizeof(sCC), "%u", scanned.rxWindow.nHighest + (r & 3));
+        snprintf(sSC, sizeof(sSC), "%u", pWindow->nHighest + ((r >> 2) & 7) - 2);
+        snprintf(sCE, sizeof(sCE), "%u", scanned.nRxSessionEpoch + ((r >> 5) % 9 == 0));
+        const char *pCC = (r >> 8) % 16 ? sCC : pCounters[(r >> 11) % nCounters];
+        const char *pSC = (r >> 16) % 12 ? sSC : pCounters[(r >> 19) % nCounters];
+        const char *pCE = (r >> 24) % 12 ? sCE : pCounters[(r >> 27) % nCounters];
+
+        /* Each member is left out of one header in eight */
+        nState = nState * 1664525u + 1013904223u;
+        uint32_t nAbsent = nState >> 16;
+        xbool_t bCC = (nAbsent & 7) != 0, bSC = (nAbsent & 0x38) != 0, bCE = (nAbsent & 0x1c0) != 0;
+
+        char sMembers[256];
+        int nLength = snprintf(sMembers, sizeof(sMembers), "\"type\":\"data\"%s%s%s%s%s%s%s%s%s",
+            bCC ? ",\"cc\":" : "", bCC ? pCC : "",
+            pScope == NULL ? "" : ",\"ccScope\":", pScope == NULL ? "" : pScope,
+            bSC ? ",\"sc\":" : "", bSC ? pSC : "",
+            bCE ? ",\"ce\":" : "", bCE ? pCE : "",
+            (nAbsent & 0x200) ? "" : ",\"sessionId\":5");
+        CHECK(nLength > 0 && (size_t)nLength < sizeof(sMembers), "write the members");
+
+        char sFlat[300], sNested[320];
+        snprintf(sFlat, sizeof(sFlat), "{%s}", sMembers);
+        snprintf(sNested, sizeof(sNested), "{\"pad\":{\"cc\":1},%s}", sMembers);
+
+        xjson_field_t field[1] = { { "cc", NULL, 0, 0 } };
+        CHECK(XJSON_ScanFlat(sFlat, strlen(sFlat), field, 1), "the flat header is read in place");
+        CHECK(!XJSON_ScanFlat(sNested, strlen(sNested), field, 1), "the nested header is parsed");
+
+        uint32_t nEpoch = scanned.nRxSessionEpoch;
+        if (build_raw(&pkg, sFlat)) return 1;
+        xbool_t bScanned = DirectGate_Proto_CheckCC(&pkg, &scanned);
+        nNewEpochs += scanned.nRxSessionEpoch != nEpoch;
+        if (build_raw(&pkg, sNested)) return 1;
+        xbool_t bParsed = DirectGate_Proto_CheckCC(&pkg, &parsed);
+
+        if (bScanned != bParsed || memcmp(&scanned, &parsed, sizeof(scanned)))
+        {
+            fprintf(stderr, "e2e_ccwin_smoke: scan(%d) and parse(%d) disagree on %s\n", bScanned, bParsed, sFlat);
+            return 1;
+        }
+
+        nAccepted += bScanned;
+    }
+
+    CHECK(nAccepted > 5000, "enough of the headers were accepted for the comparison to cover the windows");
+    CHECK(nNewEpochs > 500, "and enough of them opened a new session epoch");
+
+    XByteBuffer_Clear(&pkg);
+    DirectGate_E2E_Clear(&scanned);
+    DirectGate_E2E_Clear(&parsed);
+    return 0;
+}
+
 int main(void)
 {
     if (test_window_basics()) return 1;
     if (test_window_edges()) return 1;
     if (test_scoped_header()) return 1;
+    if (test_scoped_edges()) return 1;
     if (test_emitted_counters()) return 1;
+    if (test_refusal_logs()) return 1;
+    if (test_scan_matches_parse()) return 1;
 
     puts("e2e_ccwin_smoke: OK");
     return 0;
