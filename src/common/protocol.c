@@ -470,6 +470,88 @@ xbool_t DirectGate_Package_Parse(directgate_pkg_t *pPkg, const uint8_t *pData, s
     return XTRUE;
 }
 
+/* The value XJSON_GetU32 reads from the same member once parsed: an integer that fits, otherwise zero */
+static uint32_t DirectGate_Proto_FieldU32(const xjson_field_t *pField)
+{
+    if (pField->nType != XJSON_TYPE_NUMBER || !pField->nLength || pField->pValue[0] == '-') return 0;
+    uint64_t nValue = 0;
+
+    for (size_t i = 0; i < pField->nLength; i++)
+    {
+        nValue = nValue * 10 + (uint64_t)(pField->pValue[i] - '0');
+        if (nValue > UINT32_MAX) return 0;
+    }
+
+    return (uint32_t)nValue;
+}
+
+static xbool_t DirectGate_Proto_FieldIs(const xjson_field_t *pField, const char *pText)
+{
+    size_t nLength = strlen(pText);
+    return pField->nType == XJSON_TYPE_STRING &&
+           pField->nLength == nLength &&
+           !memcmp(pField->pValue, pText, nLength);
+}
+
+/* Every message a relay forwards between a browser and its agent came through DirectGate_Package_Parse,
+   and building the header's tree took the most of the relay's time for a small message. The checks are
+   the ones it makes: the header bound, a known type and, for an encrypted packet, a payload that fits. */
+xbool_t DirectGate_Package_ParseRoute(directgate_pkg_t *pPkg, const uint8_t *pData, size_t nSize)
+{
+    XCHECK_NL((pPkg != NULL && pData != NULL), XFALSE);
+    XCHECK_NL((nSize >= DIRECTGATE_PROTO_PREAMBLE_SIZE), XFALSE);
+
+    uint32_t nHdrLen = DirectGate_Proto_ReadU32LE(pData);
+    XCHECK_NL((nHdrLen && nHdrLen <= nSize - DIRECTGATE_PROTO_PREAMBLE_SIZE), XFALSE);
+
+    xjson_field_t fields[] = {
+        { "type", NULL, 0, 0 },
+        { "sessionId", NULL, 0, 0 },
+        { "version", NULL, 0, 0 },
+        { "cc", NULL, 0, 0 },
+        { "payloadSize", NULL, 0, 0 }
+    };
+
+    const char *pHdrStr = (const char*)(pData + DIRECTGATE_PROTO_PREAMBLE_SIZE);
+    XCHECK_NL(XJSON_ScanFlat(pHdrStr, nHdrLen, fields, sizeof(fields) / sizeof(fields[0])), XFALSE);
+
+    static const struct {
+        const char *pName;
+        directgate_pkg_type_t eType;
+    } routed[] = {
+        { "encrypted", DIRECTGATE_PKG_ENCRYPTED },
+        { "webrtc", DIRECTGATE_PKG_WEBRTC },
+        { "resize", DIRECTGATE_PKG_RESIZE },
+        { "status", DIRECTGATE_PKG_STATUS }
+    };
+
+    directgate_pkg_type_t eType = DIRECTGATE_PKG_NONE;
+    const char *pType = NULL;
+
+    for (size_t i = 0; i < sizeof(routed) / sizeof(routed[0]) && pType == NULL; i++)
+    {
+        if (!DirectGate_Proto_FieldIs(&fields[0], routed[i].pName)) continue;
+        eType = routed[i].eType;
+        pType = routed[i].pName;
+    }
+
+    XCHECK_NL((pType != NULL), XFALSE);
+
+    /* The rest of the packet has to hold the payload the header announces, as DirectGate_Package_ParsePayload checks */
+    uint32_t nPayload = DirectGate_Proto_FieldU32(&fields[4]);
+    size_t nOffset = DIRECTGATE_PROTO_PREAMBLE_SIZE + (size_t)nHdrLen;
+    if (eType == DIRECTGATE_PKG_ENCRYPTED && nPayload && nPayload > nSize - nOffset) return XFALSE;
+
+    memset(pPkg, 0, sizeof(*pPkg));
+    pPkg->header.eType = eType;
+    pPkg->header.pType = pType;
+    pPkg->header.nSessionId = DirectGate_Proto_FieldU32(&fields[1]);
+    pPkg->header.nProtoVersion = DirectGate_Proto_FieldU32(&fields[2]);
+    pPkg->header.nPacketId = DirectGate_Proto_FieldU32(&fields[3]);
+
+    return XTRUE;
+}
+
 xbool_t DirectGate_Proto_IsClientPreAuthType(const char *pType)
 {
     XCHECK_NL((xstrused(pType)), XFALSE);

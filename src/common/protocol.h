@@ -192,6 +192,13 @@ typedef struct directgate_pkg_ {
 void DirectGate_Package_Clear(directgate_pkg_t *pPkg);
 xbool_t DirectGate_Package_Parse(directgate_pkg_t *pPkg, const uint8_t *pData, size_t nSize);
 
+/* Fills only pPkg->header, without building the header's JSON tree, for the packets a relay forwards without
+   looking inside: encrypted, webrtc, resize and status. XTRUE means DirectGate_Package_Parse accepts the packet
+   and reports the same header for it. pPackage stays NULL, so a caller that needs a package's own fields, or gets
+   XFALSE - any other type, invalid input, a header XJSON_ScanFlat declines - runs DirectGate_Package_Parse.
+   DirectGate_Package_Clear releases either. */
+xbool_t DirectGate_Package_ParseRoute(directgate_pkg_t *pPkg, const uint8_t *pData, size_t nSize);
+
 xbool_t DirectGate_Proto_Build(xbyte_buffer_t *pOut, xjson_obj_t *pHeader,
                                const uint8_t *pPayload, size_t nPayload,
                                xbool_t bEncrypted);
