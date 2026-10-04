@@ -69,6 +69,7 @@ foreach(test
         common_utils_smoke
         common_prompt_smoke
         protocol_smoke
+        protocol_route_smoke
         crypto_smoke
         e2e_ccwin_smoke
         srp_smoke
