@@ -731,6 +731,10 @@ xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
     xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, XFALSE);
     XCHECK((pRoot != NULL), xthrowr(XFALSE, "Failed to create JSON object for config"));
 
+    /* A field lost for want of memory makes the dump below fail and leaves the file as it
+       was, rather than saving a config without the relay, the tokens or the identity it had */
+    XJSON_SetStrict(pRoot, XTRUE);
+
     if (xstrused(pCfg->sRelayUrl)) XJSON_AddString(pRoot, "relayUrl", pCfg->sRelayUrl);
     if (xstrused(pCfg->sRoutingKey)) XJSON_AddString(pRoot, "routingKey", pCfg->sRoutingKey);
     if (xstrused(pCfg->sDeviceId)) XJSON_AddString(pRoot, "deviceId", pCfg->sDeviceId);

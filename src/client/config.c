@@ -285,6 +285,7 @@ static xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
 
     xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, 4);
     XCHECK((pRoot != NULL), xthrowr(XFALSE, "Failed to create JSON object for config"));
+    XJSON_SetStrict(pRoot, XTRUE); /* Never saved short of a field: the dump fails instead */
 
     if (xstrused(pCfg->sSignalingUrl)) XJSON_AddString(pRoot, "signalingUrl", pCfg->sSignalingUrl);
     if (xstrused(pCfg->sDeviceList)) XJSON_AddString(pRoot, "deviceList", pCfg->sDeviceList);

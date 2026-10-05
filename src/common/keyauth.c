@@ -688,6 +688,7 @@ xbool_t DirectGate_KeyAuth_KeySave(const directgate_client_key_t *pKey, const ch
         return XFALSE;
     }
 
+    XJSON_SetStrict(pRoot, XTRUE);
     XJSON_AddString(pRoot, "type", DIRECTGATE_CLIENT_KEY_FILE_TYPE);
     XJSON_AddString(pRoot, "clientPub", sPubB64);
     XJSON_AddString(pRoot, "clientSeed", sSeedB64);

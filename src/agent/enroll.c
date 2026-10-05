@@ -313,6 +313,7 @@ static char* DirectGate_Enroll_BuildBody(const directgate_enroll_field_t *pField
 
     xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, XTRUE);
     XCHECK_NL((pRoot != NULL), NULL);
+    XJSON_SetStrict(pRoot, XTRUE);
 
     for (size_t i = 0; i < nCount; i++)
         XJSON_AddStrIfUsed(pRoot, pFields[i].pKey, pFields[i].pValue);

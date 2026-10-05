@@ -55,6 +55,9 @@ xjson_obj_t* DirectGate_Proto_NewHeader(const char *pType, uint32_t nSessionId)
     xjson_obj_t *pHeader = XJSON_NewObject(NULL, NULL, XTRUE);
     XCHECK(pHeader, xthrowp(NULL, "Failed to create json header"));
 
+    /* Builders add their fields without checking each one: a header that lost one for want of memory has to
+       fail to build, not go out without its type, status or counter while the sender thinks it was sent */
+    XJSON_SetStrict(pHeader, XTRUE);
     XJSON_AddStrIfUsed(pHeader, "type", pType);
     XJSON_AddU32(pHeader, "version", DIRECTGATE_PROTOCOL_VERSION);
     XJSON_AddU32(pHeader, "sessionId", nSessionId);
@@ -62,17 +65,17 @@ xjson_obj_t* DirectGate_Proto_NewHeader(const char *pType, uint32_t nSessionId)
     return pHeader;
 }
 
-/* Preamble, header, payload. Only a zero return from XByteBuffer_Add counts as a failure here, which
-   is what every packet has always been assembled with. */
+/* Preamble, header, payload. XByteBuffer_Add returns a negative status when it cannot grow the buffer:
+   taken as success, a packet that ran out of memory went out empty or without its payload. */
 static xbool_t DirectGate_Proto_Assemble(xbyte_buffer_t *pOut, const char *pHeader, size_t nHdrLen,
                                          const uint8_t *pPayload, size_t nPayload)
 {
     uint8_t sPreamble[DIRECTGATE_PROTO_PREAMBLE_SIZE];
     DirectGate_Proto_WriteU32LE(sPreamble, (uint32_t)nHdrLen);
 
-    return (XByteBuffer_Add(pOut, sPreamble, sizeof(sPreamble)) &&
-            XByteBuffer_Add(pOut, (const uint8_t*)pHeader, nHdrLen) &&
-            (pPayload == NULL || !nPayload || XByteBuffer_Add(pOut, pPayload, nPayload))) ? XTRUE : XFALSE;
+    return (XByteBuffer_Add(pOut, sPreamble, sizeof(sPreamble)) > 0 &&
+            XByteBuffer_Add(pOut, (const uint8_t*)pHeader, nHdrLen) > 0 &&
+            (pPayload == NULL || !nPayload || XByteBuffer_Add(pOut, pPayload, nPayload) > 0)) ? XTRUE : XFALSE;
 }
 
 xbool_t DirectGate_Proto_Build(xbyte_buffer_t *pOut, xjson_obj_t *pHeader,
@@ -305,9 +308,8 @@ static void DirectGate_Package_ParseVerifyPkg(directgate_pkg_verify_t *pPkg, xjs
     xjson_obj_t *pExpObj = XJSON_GetObject(pHdr, "exp");
     if (pExpObj != NULL)
     {
-        const char *pExpStr = XJSON_GetString(pExpObj);
-        if (pExpStr != NULL) pPkg->nExp = (uint64_t)strtoull(pExpStr, NULL, 10);
-        else pPkg->nExp = (uint64_t)XJSON_GetU32(pExpObj);
+        if (pExpObj->nType == XJSON_TYPE_STRING) pPkg->nExp = (uint64_t)strtoull(XJSON_GetString(pExpObj), NULL, 10);
+        else pPkg->nExp = XJSON_GetU64(pExpObj);
     }
 }
 

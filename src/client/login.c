@@ -136,6 +136,7 @@ xbool_t DirectGate_Account_Save(const directgate_account_t *pAccount, const char
 
     xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, 4);
     XCHECK((pRoot != NULL), xthrowr(XFALSE, "Failed to create JSON object for account"));
+    XJSON_SetStrict(pRoot, XTRUE); /* Never saved short of a token: the dump fails instead */
 
     if (xstrused(pAccount->sAccessToken)) XJSON_AddString(pRoot, "accessToken", pAccount->sAccessToken);
     if (xstrused(pAccount->sRefreshToken)) XJSON_AddString(pRoot, "refreshToken", pAccount->sRefreshToken);

@@ -337,6 +337,26 @@ int main(void)
     CHECK(pVerify->nExp == 4294967305ULL, "verify uint64 exp");
     DirectGate_Package_Clear(&pkg);
 
+    /* An exp sent as a JSON number is read as one too, all 64 bits of it; anything else is no expiry */
+    for (int nForm = 0; nForm < 5; nForm++)
+    {
+        XByteBuffer_Reset(&packet);
+        pHeader = DirectGate_Proto_NewHeader("verify", 0);
+        CHECK(pHeader != NULL, "build a verify header by hand");
+        XJSON_AddString(pHeader, "action", "ack");
+        if (nForm == 0) XJSON_AddU64(pHeader, "exp", 4294967305ULL);
+        else if (nForm == 1) XJSON_AddU32(pHeader, "exp", 1700000000U);
+        else if (nForm == 2) XJSON_AddBool(pHeader, "exp", XTRUE);
+        else if (nForm == 3) XJSON_AddNull(pHeader, "exp");
+        CHECK(build_packet(&packet, pHeader, NULL, 0, XFALSE) == 0, "build the verify packet");
+        CHECK(DirectGate_Package_Parse(&pkg, packet.pData, packet.nUsed), "parse the verify packet");
+
+        static const uint64_t expected[] = { 4294967305ULL, 1700000000ULL, 0, 0, 0 };
+        pVerify = (directgate_pkg_verify_t*)pkg.pPackage;
+        CHECK(pVerify != NULL && pVerify->nExp == expected[nForm], "a numeric exp is read as the number it is");
+        DirectGate_Package_Clear(&pkg);
+    }
+
     memset(&pkg, 0, sizeof(pkg));
     CHECK(DirectGate_Proto_BindInnerSessionId(42, &pkg),
         "inner session id should inherit outer id");

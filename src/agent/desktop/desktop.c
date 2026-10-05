@@ -804,6 +804,9 @@ int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const char *pS
     xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, XFALSE);
     XCHECK((pRoot != NULL), XAPI_DISCONNECT);
 
+    /* Strict, with every container created or added inside it before it is filled: a field lost for want of
+       memory fails the dump below, so the viewer never gets a status without its status, input or monitors */
+    XJSON_SetStrict(pRoot, XTRUE);
     XJSON_AddString(pRoot, "status", xstrused(pStatus) ? pStatus : "unknown");
     XJSON_AddString(pRoot, "backend", xstrused(pSession->desktop.sBackend) ? pSession->desktop.sBackend : "unknown");
     XJSON_AddString(pRoot, "display", xstrused(pSession->desktop.sDisplay) ? pSession->desktop.sDisplay : "");
@@ -885,43 +888,53 @@ int DirectGate_Desktop_SendStatus(directgate_session_t *pSession, const char *pS
     if (xstrused(pReason)) XJSON_AddString(pRoot, "reason", pReason);
     else if (xstrused(pSession->desktop.sReason)) XJSON_AddString(pRoot, "reason", pSession->desktop.sReason);
 
-    xjson_obj_t *pMonitors = XJSON_NewArray(NULL, "monitors", XFALSE);
-    if (pMonitors != NULL)
+    /* Each container goes into its parent before it is filled, in the order the members always had, so it is
+       strict while it is filled. One that cannot be made or added leaves a status that cannot be sent. */
+    xjson_obj_t *pMonitors = XJSON_GetOrCreateArray(pRoot, "monitors", XFALSE);
+    xbool_t bComplete = pMonitors != NULL;
+
+    for (uint32_t i = 0; bComplete && i < pSession->desktop.nMonitorCount; i++)
     {
-        for (uint32_t i = 0; i < pSession->desktop.nMonitorCount; i++)
+        const directgate_desktop_monitor_t *pMonitor = &pSession->desktop.monitors[i];
+        xjson_obj_t *pItem = XJSON_NewObject(NULL, NULL, XFALSE);
+
+        if (pItem == NULL || XJSON_AddObject(pMonitors, pItem) != XJSON_ERR_NONE)
         {
-            const directgate_desktop_monitor_t *pMonitor = &pSession->desktop.monitors[i];
-            xjson_obj_t *pItem = XJSON_NewObject(NULL, NULL, XFALSE);
-            if (pItem == NULL) continue;
-
-            XJSON_AddString(pItem, "id", pMonitor->sId);
-            XJSON_AddString(pItem, "name", pMonitor->sName);
-            XJSON_AddInt(pItem, "x", pMonitor->nX);
-            XJSON_AddInt(pItem, "y", pMonitor->nY);
-            XJSON_AddU32(pItem, "width", pMonitor->nWidth);
-            XJSON_AddU32(pItem, "height", pMonitor->nHeight);
-            XJSON_AddBool(pItem, "primary", pMonitor->bPrimary);
-
-            xjson_obj_t *pModes = XJSON_NewArray(NULL, "modes", XFALSE);
-            if (pModes != NULL)
-            {
-                for (uint32_t m = 0; m < pMonitor->nModeCount; m++)
-                {
-                    xjson_obj_t *pMode = XJSON_NewObject(NULL, NULL, XFALSE);
-                    if (pMode == NULL) continue;
-
-                    XJSON_AddU32(pMode, "width", pMonitor->modes[m].nWidth);
-                    XJSON_AddU32(pMode, "height", pMonitor->modes[m].nHeight);
-                    XJSON_AddObject(pModes, pMode);
-                }
-
-                XJSON_AddObject(pItem, pModes);
-            }
-
-            XJSON_AddObject(pMonitors, pItem);
+            XJSON_FreeObject(pItem);
+            bComplete = XFALSE;
+            break;
         }
 
-        XJSON_AddObject(pRoot, pMonitors);
+        XJSON_AddString(pItem, "id", pMonitor->sId);
+        XJSON_AddString(pItem, "name", pMonitor->sName);
+        XJSON_AddInt(pItem, "x", pMonitor->nX);
+        XJSON_AddInt(pItem, "y", pMonitor->nY);
+        XJSON_AddU32(pItem, "width", pMonitor->nWidth);
+        XJSON_AddU32(pItem, "height", pMonitor->nHeight);
+        XJSON_AddBool(pItem, "primary", pMonitor->bPrimary);
+
+        xjson_obj_t *pModes = XJSON_GetOrCreateArray(pItem, "modes", XFALSE);
+        bComplete = pModes != NULL;
+
+        for (uint32_t m = 0; bComplete && m < pMonitor->nModeCount; m++)
+        {
+            xjson_obj_t *pMode = XJSON_NewObject(NULL, NULL, XFALSE);
+            if (pMode == NULL || XJSON_AddObject(pModes, pMode) != XJSON_ERR_NONE)
+            {
+                XJSON_FreeObject(pMode);
+                bComplete = XFALSE;
+                break;
+            }
+
+            XJSON_AddU32(pMode, "width", pMonitor->modes[m].nWidth);
+            XJSON_AddU32(pMode, "height", pMonitor->modes[m].nHeight);
+        }
+    }
+
+    if (!bComplete)
+    {
+        XJSON_FreeObject(pRoot);
+        return XAPI_DISCONNECT;
     }
 
     size_t nPayloadLen = 0;

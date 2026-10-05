@@ -225,6 +225,8 @@ int main(void)
 
     CHECK(!DirectGate_Devices_Load(&map, sMissing), "load missing file");
     CHECK(DirectGate_Devices_Write(&map, sOutput), "write populated map");
+    CHECK(access("/dev/full", W_OK) != 0 || !DirectGate_Devices_Write(&map, "/dev/full"),
+        "a list the disk could not take is not reported written");
 
     xmap_t roundtrip;
     CHECK(init_map(&roundtrip), "init roundtrip map");

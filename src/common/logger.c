@@ -90,12 +90,7 @@ static void DirectGate_LogAddLevel(xjson_obj_t *pLevels, const char *pLevel)
     XCHECK_VOID_NL((xstrused(pLevel)));
     XCHECK_VOID((pLevels != NULL));
     XCHECK_VOID((pLevels->nType == XJSON_TYPE_ARRAY));
-
-    xjson_obj_t *pItem = XJSON_NewString(pLevels->pPool, NULL, pLevel);
-    XCHECK_VOID((pItem != NULL));
-
-    if (XJSON_AddObject(pLevels, pItem) != XJSON_ERR_NONE)
-        XJSON_FreeObject(pItem);
+    XJSON_AddString(pLevels, NULL, pLevel);
 }
 
 static void DirectGate_LogAddLevelsJson(xjson_obj_t *pLog, uint16_t nFlags)

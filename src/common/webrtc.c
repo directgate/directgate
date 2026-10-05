@@ -1269,6 +1269,7 @@ static void DirectGate_WebRTC_NotifyTransport(directgate_webrtc_t *pRTC, int nPC
     xjson_obj_t *pHeader = XJSON_NewObject(NULL, NULL, XSTDNON);
     XCHECK_VOID((pHeader != NULL));
 
+    XJSON_SetStrict(pHeader, XTRUE);
     XJSON_AddString(pHeader, "type", "webrtc");
     XJSON_AddString(pHeader, "action", "transport");
     XJSON_AddBool(pHeader, "relay", bRelay);
@@ -1296,6 +1297,8 @@ static void DirectGate_WebRTC_NotifyPendingReady(directgate_webrtc_t *pRTC)
 
     xjson_obj_t *pHeader = XJSON_NewObject(NULL, NULL, XSTDNON);
     XCHECK_VOID((pHeader != NULL));
+
+    XJSON_SetStrict(pHeader, XTRUE);
     XJSON_AddString(pHeader, "type", "webrtc");
     XJSON_AddString(pHeader, "action", "migration-ready");
 
@@ -1340,6 +1343,7 @@ static void DirectGate_WebRTC_OnLocalDescription(int nPC, const char *pSdp, cons
         return;
     }
 
+    XJSON_SetStrict(pHeader, XTRUE);
     XJSON_AddString(pHeader, "type", "webrtc");
     XJSON_AddString(pHeader, "action", pType);
     XJSON_AddString(pHeader, "sdp", pEscaped);
@@ -1381,6 +1385,7 @@ static void DirectGate_WebRTC_OnLocalCandidate(int nPC, const char *pCand, const
     xjson_obj_t *pHeader = XJSON_NewObject(NULL, NULL, XSTDNON);
     XCHECK_VOID((pHeader != NULL));
 
+    XJSON_SetStrict(pHeader, XTRUE);
     XJSON_AddString(pHeader, "type", "webrtc");
     XJSON_AddString(pHeader, "action", "ice");
     XJSON_AddString(pHeader, "candidate", pCand);

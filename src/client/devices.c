@@ -198,8 +198,12 @@ xbool_t DirectGate_Devices_Write(xmap_t *pMap, const char *pPath)
     XCHECK((XFile_Open(&file, pPath, "cwt", NULL) >= 0),
         xthrowr(XFALSE, "Failed to open device list for writing: %s (%s)", pPath, XSTRERR));
 
-    XMap_Iterate(pMap, DirectGate_Devices_WriteIt, &file);
+    /* A line that could not be written stops the iteration; the list on disk is short then, and saying it was
+       saved would leave the caller trusting a file that lost devices */
+    int nStatus = XMap_Iterate(pMap, DirectGate_Devices_WriteIt, &file);
     XFile_Close(&file);
+
+    XCHECK((nStatus == XMAP_OK), xthrowr(XFALSE, "Failed to write device list: %s (%s)", pPath, XSTRERR));
     return XTRUE;
 }
 

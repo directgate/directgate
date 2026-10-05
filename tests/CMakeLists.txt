@@ -107,6 +107,14 @@ foreach(test
     directgate_smoke(${test})
 endforeach()
 
+# Out-of-memory sweep over the per-message paths. The linker wraps the allocator for the agent's and
+# libxutils' code, so only toolchains with --wrap build it.
+if(UNIX AND NOT APPLE)
+    directgate_smoke(alloc_fail_smoke ${CLIENT_DIR}/login.c ${CLIENT_DIR}/webapi.c)
+    target_link_options(alloc_fail_smoke PRIVATE
+        -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free -Wl,--wrap=strdup)
+endif()
+
 # The trust store fallbacks, in a child with private user and mount namespaces.
 directgate_smoke(trust_store_smoke)
 set_tests_properties(trust_store_smoke PROPERTIES SKIP_RETURN_CODE 77)
@@ -351,6 +359,30 @@ directgate_smoke_desktop(auth_flow_smoke)
 target_compile_definitions(auth_flow_smoke PRIVATE DIRECTGATE_TESTING)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(auth_flow_smoke PRIVATE -Wno-unused-function)
+endif()
+
+# The agent's login handling with each of its allocations failing in turn: the sources auth_flow_smoke
+# compiles, linked with the allocator wrapped (see alloc_fail_smoke above).
+if(UNIX AND NOT APPLE)
+    directgate_smoke(alloc_fail_agent_smoke
+        ${AGENT_DIR}/config.c
+        ${AGENT_DIR}/desktop/desktop.c
+        ${AGENT_DIR}/desktop/display.c
+        ${AGENT_DIR}/desktop/input.c
+        ${AGENT_DIR}/desktop/stream.c
+        ${AGENT_DIR}/enroll.c
+        ${AGENT_DIR}/files.c
+        ${AGENT_DIR}/search.c
+        ${AGENT_DIR}/session.c
+        ${AGENT_DIR}/term.c
+        ${AGENT_DIR}/directgate.c)
+    directgate_smoke_desktop(alloc_fail_agent_smoke)
+    target_compile_definitions(alloc_fail_agent_smoke PRIVATE DIRECTGATE_TESTING)
+    target_link_options(alloc_fail_agent_smoke PRIVATE
+        -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free -Wl,--wrap=strdup)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(alloc_fail_agent_smoke PRIVATE -Wno-unused-function)
+    endif()
 endif()
 
 directgate_smoke(connection_lifecycle_smoke

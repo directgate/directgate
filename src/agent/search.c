@@ -742,7 +742,10 @@ static xbool_t DirectGate_Search_AppendBatch(xbyte_buffer_t *pBatch, const char 
         xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, XFALSE);
         if (pRoot == NULL) return XFALSE;
 
+        /* Without its path the prefix would be "{" and the batch "{,\"entries\":[...": no dump at all instead */
+        XJSON_SetStrict(pRoot, XTRUE);
         XJSON_AddString(pRoot, "path", pRootPath);
+
         size_t nLength = 0;
         char *pPrefix = XJSON_DumpObj(pRoot, 0, &nLength);
         XJSON_FreeObject(pRoot);

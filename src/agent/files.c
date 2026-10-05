@@ -446,6 +446,9 @@ xjson_obj_t* DirectGate_Files_CreateEntryJson(const char *pName, const char *pDi
     xjson_obj_t *pEntry = XJSON_NewObject(NULL, NULL, XFALSE);
     XCHECK((pEntry != NULL), NULL);
 
+    /* An entry that lost a field for want of memory does not serialize, so the listing or search result it
+       goes into fails as a whole instead of going out with a nameless or typeless entry */
+    XJSON_SetStrict(pEntry, XTRUE);
     XJSON_AddString(pEntry, "name", pName);
     XJSON_AddString(pEntry, "path", sFullPath);
     XJSON_AddString(pEntry, "directoryPath", sDirPath);
@@ -641,9 +644,11 @@ static xjson_obj_t* DirectGate_Files_ListDrives(void)
     xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, XFALSE);
     XCHECK((pRoot != NULL), NULL);
 
+    /* Strict, and the array created inside it, so a member lost for want of memory fails the listing */
+    XJSON_SetStrict(pRoot, XTRUE);
     XJSON_AddString(pRoot, "path", "/");
 
-    xjson_obj_t *pEntries = XJSON_NewArray(NULL, "entries", XFALSE);
+    xjson_obj_t *pEntries = XJSON_GetOrCreateArray(pRoot, "entries", XFALSE);
     if (pEntries == NULL)
     {
         XJSON_FreeObject(pRoot);
@@ -667,8 +672,14 @@ static xjson_obj_t* DirectGate_Files_ListDrives(void)
         UINT nType = GetDriveTypeA(sDrivePath);
         if (nType == DRIVE_NO_ROOT_DIR || nType == DRIVE_UNKNOWN) continue;
 
+        /* Added before it is filled, so it is strict while it is */
         xjson_obj_t *pEntry = XJSON_NewObject(NULL, NULL, XFALSE);
-        if (pEntry == NULL) continue;
+        if (pEntry == NULL || XJSON_AddObject(pEntries, pEntry) != XJSON_ERR_NONE)
+        {
+            XJSON_FreeObject(pEntry);
+            XJSON_FreeObject(pRoot);
+            return NULL;
+        }
 
         char sName[4];
         snprintf(sName, sizeof(sName), "%c:", cLetter);
@@ -682,10 +693,8 @@ static xjson_obj_t* DirectGate_Files_ListDrives(void)
         XJSON_AddString(pEntry, "group", "none");
         XJSON_AddU64(pEntry, "sizeBytes", 0);
         XJSON_AddString(pEntry, "modified", "unknown");
-        XJSON_AddObject(pEntries, pEntry);
     }
 
-    XJSON_AddObject(pRoot, pEntries);
     return pRoot;
 }
 #endif
@@ -742,9 +751,11 @@ xjson_obj_t* DirectGate_Files_ListDir(const char *pPath)
         return NULL;
     }
 
+    /* Strict, and the array created inside it, so a member lost for want of memory fails the listing */
+    XJSON_SetStrict(pRoot, XTRUE);
     XJSON_AddString(pRoot, "path", pPath);
 
-    xjson_obj_t *pEntries = XJSON_NewArray(NULL, "entries", XFALSE);
+    xjson_obj_t *pEntries = XJSON_GetOrCreateArray(pRoot, "entries", XFALSE);
     if (pEntries == NULL)
     {
         XJSON_FreeObject(pRoot);
@@ -765,22 +776,19 @@ xjson_obj_t* DirectGate_Files_ListDir(const char *pPath)
         if (nPathLen <= 0 || (size_t)nPathLen >= sizeof(sFullPath)) continue;
         if (xstat(sFullPath, &st) < 0) continue;
 
+        /* An entry the array could not take is still ours to free */
         xjson_obj_t *pEntry = DirectGate_Files_CreateEntryJson(sName, pPath, &st);
-        if (pEntry == NULL)
+        if (pEntry == NULL || XJSON_AddObject(pEntries, pEntry) != XJSON_ERR_NONE)
         {
             xloge("Failed to allocate JSON object for directory entry: path(%s), entry(%s)", pPath, sName);
-            XJSON_FreeObject(pEntries);
+            XJSON_FreeObject(pEntry);
             XJSON_FreeObject(pRoot);
             XDir_Close(&dir);
             return NULL;
         }
-
-        XJSON_AddObject(pEntries, pEntry);
     }
 
-    XJSON_AddObject(pRoot, pEntries);
     XDir_Close(&dir);
-
     return pRoot;
 }
 
