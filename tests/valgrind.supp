@@ -38,3 +38,19 @@
    fun:_dl_resize_dtv
    ...
 }
+
+# libdatachannel tears its global state down on a detached thread it starts
+# when the last user lets go. The thread can still be ending when the process
+# exits, and the thread-local storage glibc gave it is then reported the same
+# way. Only "possible" again, and only for a thread that teardown started.
+
+{
+   libdatachannel's detached teardown thread can outlive the process
+   Memcheck:Leak
+   match-leak-kinds: possible
+   ...
+   fun:_dl_allocate_tls
+   ...
+   fun:*N3rtc4impl4Init12TokenPayload*
+   ...
+}

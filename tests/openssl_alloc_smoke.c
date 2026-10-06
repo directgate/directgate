@@ -37,10 +37,12 @@ static long g_nCount;
 static long g_nFailAt = -1;
 static long g_nLive;
 static int g_bArmed;
+static int g_bShielded;     /* Allocations still counted as live, but never failed */
+static int g_bSivFreesTwice;
 
 static int fail_now(void)
 {
-    return g_bArmed && ++g_nCount == g_nFailAt;
+    return g_bArmed && !g_bShielded && ++g_nCount == g_nFailAt;
 }
 
 static void *ossl_malloc(size_t nSize, const char *pFile, int nLine)
@@ -217,23 +219,46 @@ static int scn_e2e(void)
     size_t nSealed = 0, nOpened = 0;
     int nResult = SCN_FAILED;
 
-    if (DirectGate_E2E_DeriveFromSRP(&agent, sessionKey, sizeof(sessionKey), agentNonce, clientNonce,
+    xbool_t bKeys = DirectGate_E2E_DeriveFromSRP(&agent, sessionKey, sizeof(sessionKey), agentNonce, clientNonce,
             sizeof(agentNonce), DEVICE_ID, XTRUE) &&
         DirectGate_E2E_DeriveFromKey(&client, sessionKey, sizeof(sessionKey), agentNonce, clientNonce,
             sizeof(agentNonce), DEVICE_ID, XFALSE) &&
         DirectGate_E2E_DeriveFromSRP(&client, sessionKey, sizeof(sessionKey), agentNonce, clientNonce,
-            sizeof(agentNonce), DEVICE_ID, XFALSE) &&
-        (pSealed = DirectGate_E2E_Encrypt(&agent, message, sizeof(message), &nSealed)) != NULL &&
+            sizeof(agentNonce), DEVICE_ID, XFALSE);
+
+    g_bShielded = g_bSivFreesTwice;
+    if (bKeys && (pSealed = DirectGate_E2E_Encrypt(&agent, message, sizeof(message), &nSealed)) != NULL &&
         (pOpened = DirectGate_E2E_Decrypt(&client, pSealed, nSealed, &nOpened)) != NULL)
     {
         nResult = (nOpened == sizeof(message) && !memcmp(pOpened, message, nOpened)) ? SCN_DONE : SCN_WRONG;
     }
+    g_bShielded = 0;
 
     free(pSealed);
     free(pOpened);
     DirectGate_E2E_Clear(&agent);
     DirectGate_E2E_Clear(&client);
     return nResult;
+}
+
+/* Up to 3.0.17, 3.2.5, 3.3.4, 3.4.2 and 3.5.3, and in all of 3.1, an allocation failing part way through an AES-SIV
+   key setup makes OpenSSL free what the setup allocated so far once more when the cipher context is freed
+   (ossl_siv128_init, crypto/modes/siv128.c). With those, the E2E round trip keeps its cipher calls out of the sweep. */
+static int siv_setup_frees_twice(void)
+{
+    if (OPENSSL_version_major() != 3) return 0;
+    unsigned int nPatch = OPENSSL_version_patch();
+
+    switch (OPENSSL_version_minor())
+    {
+        case 0: return nPatch < 18;
+        case 1: return 1;
+        case 2: return nPatch < 6;
+        case 3: return nPatch < 5;
+        case 4: return nPatch < 3;
+        case 5: return nPatch < 4;
+        default: return 0;
+    }
 }
 
 /* Under valgrind every scrypt costs seconds, so the scenarios that run it fail every few allocations there instead
@@ -281,6 +306,11 @@ int main(void)
 {
     CHECK(CRYPTO_set_mem_functions(ossl_malloc, ossl_realloc, ossl_free) == 1,
         "OpenSSL takes the injecting allocator before anything is allocated");
+
+    g_bSivFreesTwice = siv_setup_frees_twice();
+    if (g_bSivFreesTwice)
+        printf("openssl_alloc_smoke: OpenSSL %s frees a failed AES-SIV key setup twice, the cipher calls are not swept\n",
+            OpenSSL_version(OPENSSL_VERSION_STRING));
 
     for (size_t i = 0; i < sizeof(g_salt); i++) g_salt[i] = (uint8_t)(i * 7 + 1);
     for (size_t i = 0; i < sizeof(g_salt); i++) snprintf(&g_sSaltHex[i * 2], 3, "%02x", g_salt[i]);
