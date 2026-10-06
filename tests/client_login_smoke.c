@@ -183,6 +183,22 @@ static int test_parse_request(void)
         "Content-Length: 20\r\n\r\n{\"code\":\"posted-1\"}", &guard,
         sCode, sizeof(sCode), sError, sizeof(sError)), "reject POST from another origin");
 
+    /* A posted body has to be JSON, carry our state with its code, and a body with no code only reports an error */
+    CHECK(!DirectGate_Login_ParseRequest(
+        "POST /callback HTTP/1.1\r\nOrigin: https://directgate.io\r\n"
+        "Content-Length: 9\r\n\r\n{\"code\":", &guard, sCode, sizeof(sCode), sError, sizeof(sError)),
+        "reject a posted body that is not JSON");
+    CHECK(!DirectGate_Login_ParseRequest(
+        "POST /callback HTTP/1.1\r\nOrigin: https://directgate.io\r\n"
+        "Content-Length: 34\r\n\r\n{\"code\":\"posted-2\",\"state\":\"other\"}", &guard,
+        sCode, sizeof(sCode), sError, sizeof(sError)), "reject a posted code with a foreign state");
+    sError[0] = '\0';
+    CHECK(!DirectGate_Login_ParseRequest(
+        "POST /callback HTTP/1.1\r\nOrigin: https://directgate.io\r\n"
+        "Content-Length: 24\r\n\r\n{\"error\":\"access_denied\"}", &guard,
+        sCode, sizeof(sCode), sError, sizeof(sError)), "a posted error is no code");
+    CHECK(!strcmp(sError, "access_denied"), "the posted error is handed back");
+
     CHECK(!DirectGate_Login_ParseRequest(NULL, NULL, sCode, sizeof(sCode), sError, sizeof(sError)),
         "reject NULL request");
     CHECK(!DirectGate_Login_ParseRequest("garbage", NULL, sCode, sizeof(sCode), sError, sizeof(sError)),
@@ -242,6 +258,18 @@ static int test_apply_token(void)
     CHECK(XJSON_Parse(&json, NULL, pBroken, strlen(pBroken)), "parse broken body");
     CHECK(!DirectGate_Login_ApplyToken(&account, json.pRootObj),
         "reject a session without an access token");
+    XJSON_Destroy(&json);
+
+    /* A token that does not fit would be stored cut short and fail somewhere far away: refused here */
+    char *pHuge = (char*)malloc(sizeof(account.sAccessToken) + 64);
+    CHECK(pHuge != NULL, "allocate an oversized token body");
+    int nHuge = snprintf(pHuge, sizeof(account.sAccessToken) + 64, "{\"accessToken\":\"%0*d\",\"refreshToken\":\"r\"}",
+        (int)sizeof(account.sAccessToken), 0);
+    CHECK(nHuge > 0 && XJSON_Parse(&json, NULL, pHuge, (size_t)nHuge), "parse an oversized token body");
+    free(pHuge);
+    DirectGate_Account_Init(&account);
+    CHECK(!DirectGate_Login_ApplyToken(&account, json.pRootObj) && account.sAccessToken[0] == '\0',
+        "reject an access token larger than the client buffer");
     XJSON_Destroy(&json);
 
     CHECK(!DirectGate_Login_ApplyToken(NULL, NULL), "reject NULL arguments");

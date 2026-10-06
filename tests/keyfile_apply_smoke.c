@@ -152,6 +152,67 @@ int main(void)
     CHECK(DirectGate_ApplyConfig(&missingCfg) == XSTDERR,
         "missing key file should fail enroll-key");
 
+    /* With every authorized slot taken, no further key is authorized, and a generated one is not even written */
+    directgate_cfg_t fullCfg;
+    DirectGate_InitConfig(&fullCfg);
+    xstrncpy(fullCfg.sCfgPath, sizeof(fullCfg.sCfgPath), sCfgPath2);
+    xstrncpy(fullCfg.sDeviceId, sizeof(fullCfg.sDeviceId), "keyfile-device-full");
+    for (int i = 0; i < DIRECTGATE_MAX_AUTHORIZED_KEYS; i++)
+    {
+        uint8_t raw[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
+        memset(raw, i + 1, sizeof(raw));
+        CHECK(DirectGate_KeyAuth_Base64Encode(raw, sizeof(raw), fullCfg.keyauth.sAuthorizedKeys[i],
+            sizeof(fullCfg.keyauth.sAuthorizedKeys[i])), "fill an authorized slot");
+    }
+    fullCfg.keyauth.nAuthorizedKeyCount = DIRECTGATE_MAX_AUTHORIZED_KEYS;
+
+    fullCfg.bEnrollKey = XTRUE;
+    xstrncpy(fullCfg.sEnrollKeyPath, sizeof(fullCfg.sEnrollKeyPath), sKeyPath);
+    CHECK(DirectGate_ApplyConfig(&fullCfg) == XSTDERR, "a full authorized list should refuse an existing key");
+
+    char sFullKeyPath[512];
+    snprintf(sFullKeyPath, sizeof(sFullKeyPath), "%s/full-key.json", sRoot);
+    fullCfg.bEnrollKey = XFALSE;
+    fullCfg.bGenKey = XTRUE;
+    xstrncpy(fullCfg.sGenKeyPath, sizeof(fullCfg.sGenKeyPath), sFullKeyPath);
+    CHECK(DirectGate_ApplyConfig(&fullCfg) == XSTDERR && access(sFullKeyPath, F_OK) != 0,
+        "a full authorized list should refuse a new key and not write it");
+
+    /* A key that cannot be persisted as authorized is not reported as authorized */
+    char sBlocker[512], sBlockedCfg[600];
+    snprintf(sBlocker, sizeof(sBlocker), "%s/blocker", sRoot);
+    snprintf(sBlockedCfg, sizeof(sBlockedCfg), "%s/agent.json", sBlocker);
+    CHECK(write_file(sBlocker, "not a directory"), "create a file where a directory should be");
+
+    directgate_cfg_t blockedCfg;
+    DirectGate_InitConfig(&blockedCfg);
+    xstrncpy(blockedCfg.sCfgPath, sizeof(blockedCfg.sCfgPath), sBlockedCfg);
+    xstrncpy(blockedCfg.sDeviceId, sizeof(blockedCfg.sDeviceId), "keyfile-device-blocked");
+    xstrncpy(blockedCfg.sEnrollKeyPath, sizeof(blockedCfg.sEnrollKeyPath), sKeyPath);
+    blockedCfg.bEnrollKey = XTRUE;
+    CHECK(DirectGate_ApplyConfig(&blockedCfg) == XSTDERR, "an authorization that cannot be saved should fail");
+
+    blockedCfg.bEnrollKey = XFALSE;
+    blockedCfg.bGenKey = XTRUE;
+    xstrncpy(blockedCfg.sGenKeyPath, sizeof(blockedCfg.sGenKeyPath), sFullKeyPath);
+    CHECK(DirectGate_ApplyConfig(&blockedCfg) == XSTDERR && access(sFullKeyPath, F_OK) != 0,
+        "a generated key whose authorization cannot be saved should not be written");
+
+    /* Rotating the agent identity needs the API, the device and a live enrollment */
+    directgate_cfg_t rotateCfg;
+    DirectGate_InitConfig(&rotateCfg);
+    xstrncpy(rotateCfg.sCfgPath, sizeof(rotateCfg.sCfgPath), sCfgPath);
+    rotateCfg.bRotateAgentKey = XTRUE;
+    rotateCfg.enroll.sApiUrl[0] = '\0';
+    CHECK(DirectGate_ApplyConfig(&rotateCfg) == XSTDERR, "a rotation without an API should fail");
+    xstrncpy(rotateCfg.enroll.sApiUrl, sizeof(rotateCfg.enroll.sApiUrl), "https://api.example.test");
+    rotateCfg.sDeviceId[0] = '\0';
+    CHECK(DirectGate_ApplyConfig(&rotateCfg) == XSTDERR, "a rotation without a device should fail");
+    xstrncpy(rotateCfg.sDeviceId, sizeof(rotateCfg.sDeviceId), "keyfile-device");
+    CHECK(DirectGate_ApplyConfig(&rotateCfg) == XSTDERR, "a rotation without an enrollment should fail");
+    CHECK(DirectGate_ApplyConfig(NULL) == XSTDERR, "nothing is applied without a config");
+    unlink(sBlocker);
+
     unlink(sCfgPath);
     unlink(sCfgPath2);
     unlink(sKeyPath);

@@ -43,6 +43,7 @@ set(CMAKE_C_STANDARD 11)
 # ---- Security and diagnostics --------------------------------------------
 option(DIRECTGATE_ENABLE_HARDENING "Enable compiler and linker hardening" ON)
 option(DIRECTGATE_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(DIRECTGATE_ENABLE_COVERAGE "Instrument the DirectGate sources for GCC line and branch coverage" OFF)
 option(DIRECTGATE_SANITIZER_PICOHASH_WORKAROUND
     "Ignore the known upstream picohash function-pointer mismatch in Clang sanitizer builds" ON)
 option(DIRECTGATE_DEBUG "Enable DirectGate debug mode" OFF)
@@ -224,6 +225,20 @@ else()
 endif()
 add_compile_definitions(_XCHECK_LOG)
 
+# Only our own sources are instrumented; libxutils and libdatachannel are added
+# above and keep their flags. The -O0 has to come after the -O2: a function the
+# optimizer inlined or folded has no lines left to count. libdatachannel calls
+# into our code from its own threads, and racing counter updates can make the
+# branch counts gcov derives by subtraction negative, so updates are atomic.
+if(DIRECTGATE_ENABLE_COVERAGE)
+    if(NOT CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        message(FATAL_ERROR "DIRECTGATE_ENABLE_COVERAGE requires GCC: tests/report-coverage.py reads gcov's output")
+    endif()
+
+    add_compile_options(--coverage -O0 -fprofile-update=atomic)
+    add_link_options(--coverage)
+endif()
+
 if(WIN32)
     # Target Windows 10 1809+: required for ConPTY (CreatePseudoConsole).
     # WIN32_LEAN_AND_MEAN keeps windows.h from dragging in winsock.h, which
@@ -246,7 +261,8 @@ endif()
 
 if(NOT APPLE AND NOT WIN32)
     add_compile_definitions(_XUTILS_USE_GNU)
-    if(DIRECTGATE_ENABLE_HARDENING)
+    # glibc warns in every unoptimized file that asks for _FORTIFY_SOURCE.
+    if(DIRECTGATE_ENABLE_HARDENING AND NOT DIRECTGATE_ENABLE_COVERAGE)
         add_compile_definitions(_FORTIFY_SOURCE=2)
     endif()
 endif()

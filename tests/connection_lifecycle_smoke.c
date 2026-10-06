@@ -134,6 +134,14 @@ int main(void)
     CHECK(send_header(&conn, &firstRelay,
         DirectGate_Proto_BuildStatus("closed", 51)) == XAPI_CONTINUE,
         "pre-auth closed status should be ignored");
+
+    /* A message of a type this agent does not know, or of no type at all, is dropped and the link stays up */
+    CHECK(send_header(&conn, &firstRelay, DirectGate_Proto_NewHeader("from-the-future", 0)) == XAPI_CONTINUE,
+        "a message of an unknown type should be ignored");
+    xjson_obj_t *pUntyped = XJSON_NewObject(NULL, NULL, XFALSE);
+    CHECK(pUntyped != NULL && XJSON_AddInt(pUntyped, "version", 1) == XJSON_ERR_NONE, "build an untyped header");
+    CHECK(send_header(&conn, &firstRelay, pUntyped) == XAPI_CONTINUE, "a message without a type should be ignored");
+    CHECK(conn.pWsSession == &firstRelay, "dropped messages should leave the relay attached");
     CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 51) == pUnauth,
         "pre-auth closed status must not remove a session");
 
@@ -236,8 +244,37 @@ int main(void)
     CHECK(pKeepalive->nLastKAPongMs <= XTime_GetMonoMs() + (uint64_t)cfg.nKAInterval * 1000ULL,
         "keepalive schedule should be armed on the monotonic clock");
 
-    pKeepalive->webrtc.bConnected = XFALSE;
-    pKeepalive->webrtc.nDataChannelID = -1;
+    /* With the channel up: a ping goes out once an interval has passed, a pass after a stalled loop restarts
+       the schedule instead of pinging into it, and a pong older than three intervals ends the session. */
+    cfg.nKAInterval = 1;
+    uint64_t nBeforeMs = XTime_GetMonoMs();
+    pKeepalive->nLastKAPingMs = nBeforeMs - 1500ULL;
+    pKeepalive->nLastKAPongMs = nBeforeMs;
+
+    DirectGate_TestCheckWebRTCKeepalive(&conn);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 90) == pKeepalive && pKeepalive->nLastKAPingMs >= nBeforeMs,
+        "a ping should go out once the interval has passed");
+    CHECK(!pKeepalive->webrtc.bConnected, "a ping the data channel refused should mark the channel down");
+
+    pKeepalive->webrtc.bConnected = XTRUE;
+    nBeforeMs = XTime_GetMonoMs();
+    pKeepalive->nLastKAPingMs = nBeforeMs - 7000ULL;
+    pKeepalive->nLastKAPongMs = nBeforeMs;
+
+    DirectGate_TestCheckWebRTCKeepalive(&conn);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 90) == pKeepalive && pKeepalive->nLastKAPingMs >= nBeforeMs,
+        "a stalled loop should restart the ping schedule from now");
+
+    pKeepalive->webrtc.bConnected = XTRUE;
+    nBeforeMs = XTime_GetMonoMs();
+    pKeepalive->nLastKAPingMs = nBeforeMs;
+    pKeepalive->nLastKAPongMs = nBeforeMs - 3000ULL;
+
+    DirectGate_TestCheckWebRTCKeepalive(&conn);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 90) == NULL,
+        "a session whose last pong is three intervals old should be closed");
+    CHECK(kaRelay.txBuffer.nUsed > 0, "the ping and the close went out over the relay");
+    XByteBuffer_Clear(&kaRelay.txBuffer);
 
     CHECK(dispatch(&conn, &kaRelay, XAPI_CB_CLOSED) == XAPI_CONTINUE,
         "keepalive test relay disconnect should be handled");

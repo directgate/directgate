@@ -147,6 +147,15 @@ AddressSanitizer and UndefinedBehaviorSanitizer can be used to run the tests und
 
 The script configures the build with `-DDIRECTGATE_BUILD_TESTS=ON`, builds the test executables, and runs them through `ctest`.
 
+Line and branch coverage of the smoke tests needs GCC:
+
+```bash
+./tests/run-coverage.sh
+./tests/report-coverage.py
+```
+
+`-DDIRECTGATE_ENABLE_COVERAGE=ON` instruments DirectGate's own sources at `-O0`; libxutils and libdatachannel are left as they are. Each test compiles its own copy of the sources it needs, so the report counts a line as executed, and a branch as taken, when any copy did. It writes the per-file table to `build-coverage/coverage-report/summary.md` and lists the lines never executed and the branches never taken in `uncovered.txt` next to it. CI runs both on every push and pull request (`.github/workflows/coverage.yml`), shows the table on the run's summary page and keeps the report as the `agent-coverage` artifact.
+
 The tests labeled `e2e` run the real `directgate` and `dgcli` binaries against an enrollment API and a relay played by the test over TLS, the client on a pseudo terminal. `wayland_portal_bus_smoke` starts a private `dbus-daemon` (with no service directories, so nothing installed can be activated onto it) and plays the desktop portal on it; it skips where `dbus-daemon` is missing.
 
 `desktop_x11_smoke` runs the X11 desktop against private Xvfb servers: capture on the H.264 and raw paths, RandR display modes, XTest input checked from a second X connection, and screens without MIT-SHM or RandR and at 16 and 30 bits. It takes Xvfb from `DIRECTGATE_XVFB` or `PATH` (`xorg-x11-server-Xvfb` on Fedora, `xvfb` on Debian) and skips without one; `session_lifetime_smoke` uses the same server for its desktop-mode case and leaves that case out without one. Neither ever uses the display it was started from. Set `DIRECTGATE_XVFB_LOG` to a directory to keep each server's own log. `trust_store_smoke`, and the display-scan case of `desktop_x11_smoke`, run in a child with private user and mount namespaces so empty directories can cover the real ones; they skip where unprivileged user namespaces are off.

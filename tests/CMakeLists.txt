@@ -103,7 +103,8 @@ foreach(test
         websock_frame_smoke
         websock_entropy_smoke
         term_priv_smoke
-        term_io_smoke)
+        term_io_smoke
+        common_guards_smoke)
     directgate_smoke(${test})
 endforeach()
 
@@ -114,6 +115,10 @@ if(UNIX AND NOT APPLE)
     target_link_options(alloc_fail_smoke PRIVATE
         -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free -Wl,--wrap=strdup)
 endif()
+
+# Out-of-memory sweep over OpenSSL's own allocations, which the linker wrap above cannot reach.
+directgate_smoke(openssl_alloc_smoke)
+set_tests_properties(openssl_alloc_smoke PROPERTIES TIMEOUT 300)
 
 # The trust store fallbacks, in a child with private user and mount namespaces.
 directgate_smoke(trust_store_smoke)
@@ -137,6 +142,8 @@ endif()
 directgate_smoke(enroll_smoke        ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(enroll_edge_smoke   ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(enroll_transport_smoke ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
+directgate_smoke(enroll_api_smoke    ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
+set_tests_properties(enroll_api_smoke PROPERTIES SKIP_RETURN_CODE 77)
 directgate_smoke(add_key_smoke       ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(config_smoke        ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(config_extra_smoke  ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)

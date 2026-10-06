@@ -1,0 +1,43 @@
+name: Coverage
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # The smoke set plus what reaches the desktop code: Xvfb for the X11
+      # tests, PipeWire and D-Bus headers for the Wayland backend, and a
+      # dbus-daemon for the fake portal.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential pkg-config python3 \
+            libssl-dev libx11-dev libxrandr-dev libxext-dev libopus-dev \
+            libopenh264-dev libavcodec-dev libavutil-dev \
+            libpipewire-0.3-dev libdbus-1-dev dbus xvfb
+
+      - name: Build and run smoke tests with coverage
+        run: sh ./tests/run-coverage.sh
+
+      - name: Report line and branch coverage
+        run: |
+          ./tests/report-coverage.py
+          cat build-coverage/coverage-report/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep coverage report
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-coverage
+          path: build-coverage/coverage-report/

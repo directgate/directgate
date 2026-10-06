@@ -32,6 +32,123 @@ static void bytes_to_hex(const uint8_t *pData, size_t nLen,
     pOut[nLen * 2] = '\0';
 }
 
+/* Refusals of both sides, and the argument guards of every entry point */
+static int srp_refusals(const uint8_t *pSalt, const char *pSaltHex, const char *pVerifierHex)
+{
+    const char *pDeviceId = "srp-guard-device";
+    const char *pPassword = "srp guard password";
+    char sHex[1024], sNonce[DIRECTGATE_SRP_NONCE_SIZE * 2 + 1], sM2[DIRECTGATE_SRP_KEY_SIZE * 2 + 1];
+    uint8_t bytes[4];
+    size_t nLen = 0;
+
+    CHECK(!DirectGate_SRP_HexToBytes(NULL, bytes, sizeof(bytes), &nLen), "hex parser needs input");
+    CHECK(!DirectGate_SRP_HexToBytes("00", NULL, sizeof(bytes), &nLen), "hex parser needs output");
+    CHECK(!DirectGate_SRP_HexToBytes("0g", bytes, sizeof(bytes), &nLen), "hex parser rejects a non-hex digit");
+    CHECK(!DirectGate_SRP_HexToBytes("g0", bytes, sizeof(bytes), &nLen), "hex parser rejects a leading non-hex digit");
+    CHECK(!DirectGate_SRP_HexToBytes("0011223344", bytes, sizeof(bytes), &nLen), "hex parser rejects an overflow");
+    CHECK(!DirectGate_SRP_HexToBytes("", bytes, sizeof(bytes), &nLen), "hex parser rejects empty input");
+
+    CHECK(!strcmp(DirectGate_SRP_StateName(DIRECTGATE_SRP_STATE_IDLE), "IDLE") &&
+          !strcmp(DirectGate_SRP_StateName(DIRECTGATE_SRP_STATE_CHALLENGE_SENT), "CHALLENGE_SENT") &&
+          !strcmp(DirectGate_SRP_StateName(DIRECTGATE_SRP_STATE_AUTHENTICATED), "AUTHENTICATED") &&
+          !strcmp(DirectGate_SRP_StateName(DIRECTGATE_SRP_STATE_FAILED), "FAILED") &&
+          !strcmp(DirectGate_SRP_StateName((directgate_srp_state_t)99), "UNKNOWN"), "every state has a name");
+
+    directgate_srp_t empty;
+    memset(&empty, 0, sizeof(empty));
+    CHECK(!DirectGate_SRP_Init(NULL), "server init needs a context");
+    DirectGate_SRP_Destroy(NULL);
+    CHECK(!DirectGate_SRP_SetClientPublic(NULL, "02") && !DirectGate_SRP_SetClientPublic(&empty, "02"),
+        "A needs an initialized server");
+    CHECK(!DirectGate_SRP_LoadVerifier(NULL, pSalt, DIRECTGATE_SRP_SALT_SIZE, pVerifierHex) &&
+          !DirectGate_SRP_LoadVerifier(&empty, pSalt, DIRECTGATE_SRP_SALT_SIZE, pVerifierHex),
+          "a verifier needs an initialized server");
+    CHECK(!DirectGate_SRP_GenerateChallenge(NULL, sHex, sizeof(sHex), sNonce, sizeof(sNonce)) &&
+          !DirectGate_SRP_GenerateChallenge(&empty, sHex, sizeof(sHex), sNonce, sizeof(sNonce)),
+          "a challenge needs an initialized server");
+    CHECK(!DirectGate_SRP_VerifyClientProof(NULL, "00", sM2, sizeof(sM2)) &&
+          !DirectGate_SRP_VerifyClientProof(&empty, "00", sM2, sizeof(sM2)), "a proof needs an initialized server");
+
+    directgate_srp_t server;
+    CHECK(DirectGate_SRP_Init(&server), "guard server init");
+    xstrncpy(server.sDeviceId, sizeof(server.sDeviceId), pDeviceId);
+    char *pNHex = BN_bn2hex(server.N);
+    CHECK(pNHex != NULL, "N prints as hex");
+
+    CHECK(!DirectGate_SRP_LoadVerifier(&server, NULL, DIRECTGATE_SRP_SALT_SIZE, pVerifierHex), "a verifier needs a salt");
+    CHECK(!DirectGate_SRP_LoadVerifier(&server, pSalt, DIRECTGATE_SRP_SALT_SIZE - 1, pVerifierHex),
+        "a verifier needs a whole salt");
+    CHECK(!DirectGate_SRP_LoadVerifier(&server, pSalt, DIRECTGATE_SRP_SALT_SIZE, ""), "a verifier needs a value");
+    CHECK(!DirectGate_SRP_LoadVerifier(&server, pSalt, DIRECTGATE_SRP_SALT_SIZE, "zz"), "a verifier must be hex");
+    CHECK(!DirectGate_SRP_LoadVerifier(&server, pSalt, DIRECTGATE_SRP_SALT_SIZE, "-01"), "a verifier must be positive");
+    CHECK(!DirectGate_SRP_LoadVerifier(&server, pSalt, DIRECTGATE_SRP_SALT_SIZE, pNHex), "a verifier must be below N");
+    CHECK(DirectGate_SRP_LoadVerifier(&server, pSalt, DIRECTGATE_SRP_SALT_SIZE, pVerifierHex), "the real verifier loads");
+
+    CHECK(!DirectGate_SRP_GenerateChallenge(&server, sHex, sizeof(sHex), sNonce, sizeof(sNonce)),
+        "no challenge goes out before A arrives");
+
+    /* A public value that is a multiple of N would make the session key known to anyone */
+    char sTwoN[1100];
+    snprintf(sTwoN, sizeof(sTwoN), "%s0", pNHex);
+    CHECK(!DirectGate_SRP_SetClientPublic(&server, "") && !DirectGate_SRP_SetClientPublic(&server, "zz"),
+        "A must be hex");
+    CHECK(!DirectGate_SRP_SetClientPublic(&server, pNHex), "A equal to N is rejected");
+    CHECK(!DirectGate_SRP_SetClientPublic(&server, "-02"), "a negative A is rejected");
+
+    directgate_srp_client_t client;
+    char sAHex[1024], sClientNonce[DIRECTGATE_SRP_NONCE_SIZE * 2 + 1], sM1[DIRECTGATE_SRP_KEY_SIZE * 2 + 1];
+    CHECK(!DirectGate_SRP_ClientInit(NULL), "client init needs a context");
+    DirectGate_SRP_ClientCleanse(NULL);
+    CHECK(DirectGate_SRP_ClientInit(&client), "guard client init");
+    CHECK(!DirectGate_SRP_ClientGenerateA(NULL, sAHex, sizeof(sAHex), sClientNonce, sizeof(sClientNonce)),
+        "A needs a client");
+    CHECK(!DirectGate_SRP_ClientGenerateA(&client, sAHex, 4, sClientNonce, sizeof(sClientNonce)),
+        "A needs room for its hex");
+    CHECK(!DirectGate_SRP_ClientGenerateA(&client, sAHex, sizeof(sAHex), sClientNonce, 4), "A needs room for the nonce");
+    CHECK(DirectGate_SRP_ClientGenerateA(&client, sAHex, sizeof(sAHex), sClientNonce, sizeof(sClientNonce)),
+        "the client makes A");
+
+    CHECK(DirectGate_SRP_SetClientPublic(&server, sAHex), "the server takes the client's A");
+    CHECK(!DirectGate_SRP_GenerateChallenge(&server, sHex, 4, sNonce, sizeof(sNonce)), "B needs room for its hex");
+    CHECK(DirectGate_SRP_SetClientPublic(&server, sAHex), "the server takes A again after a refused challenge");
+    CHECK(DirectGate_SRP_GenerateChallenge(&server, sHex, sizeof(sHex), sNonce, sizeof(sNonce)), "the server makes B");
+
+    /* A B that is a multiple of N, a foreign suite or a short salt is refused by the client */
+    CHECK(!DirectGate_SRP_ClientComputeKey(&client, pDeviceId, pPassword, pSaltHex, pNHex, DIRECTGATE_SRP_SUITE,
+        sM1, sizeof(sM1)), "the client rejects B equal to N");
+    CHECK(!DirectGate_SRP_ClientComputeKey(&client, pDeviceId, pPassword, pSaltHex, sTwoN, DIRECTGATE_SRP_SUITE,
+        sM1, sizeof(sM1)), "the client rejects B equal to a multiple of N");
+    CHECK(!DirectGate_SRP_ClientComputeKey(&client, pDeviceId, pPassword, pSaltHex, sHex, DIRECTGATE_SRP_SUITE + 1,
+        sM1, sizeof(sM1)), "the client rejects an unsupported suite");
+    CHECK(!DirectGate_SRP_ClientComputeKey(&client, pDeviceId, pPassword, "0011", sHex, DIRECTGATE_SRP_SUITE,
+        sM1, sizeof(sM1)), "the client rejects a short salt");
+    CHECK(!DirectGate_SRP_ClientComputeKey(&client, pDeviceId, pPassword, pSaltHex, "zz", DIRECTGATE_SRP_SUITE,
+        sM1, sizeof(sM1)), "the client rejects a B that is not hex");
+    CHECK(!DirectGate_SRP_ClientComputeKey(&client, "", pPassword, pSaltHex, sHex, DIRECTGATE_SRP_SUITE, sM1, sizeof(sM1)),
+        "the client needs a device id");
+    CHECK(!DirectGate_SRP_ClientComputeKey(&client, pDeviceId, pPassword, pSaltHex, sHex, DIRECTGATE_SRP_SUITE, NULL, 0),
+        "the client needs room for M1");
+
+    /* A proof that is not a whole hash is refused before any work */
+    CHECK(!DirectGate_SRP_VerifyClientProof(&server, "", sM2, sizeof(sM2)), "a proof must be present");
+    CHECK(!DirectGate_SRP_VerifyClientProof(&server, "abc", sM2, sizeof(sM2)), "a proof must be whole hex");
+    CHECK(!DirectGate_SRP_VerifyClientProof(&server, "0011", sM2, sizeof(sM2)), "a proof must be a whole hash");
+    CHECK(!DirectGate_SRP_VerifyClientProof(&server, "0011", NULL, 0), "a proof needs room for M2");
+    CHECK(!DirectGate_SRP_ClientVerifyM2(&client, sHex, "0011"), "the client rejects a short M2");
+    CHECK(!DirectGate_SRP_ClientVerifyM2(NULL, sHex, "0011"), "M2 needs a client");
+
+    CHECK(!DirectGate_SRP_CreateVerifier(NULL, pSalt, DIRECTGATE_SRP_SALT_SIZE, sHex, sizeof(sHex)),
+        "a verifier needs a password");
+    CHECK(!DirectGate_SRP_CreateVerifier(pPassword, NULL, DIRECTGATE_SRP_SALT_SIZE, sHex, sizeof(sHex)),
+        "a verifier needs a salt");
+    CHECK(!DirectGate_SRP_CreateVerifier(pPassword, pSalt, DIRECTGATE_SRP_SALT_SIZE, sHex, 4), "a verifier needs room");
+
+    OPENSSL_free(pNHex);
+    DirectGate_SRP_ClientCleanse(&client);
+    DirectGate_SRP_Destroy(&server);
+    return 0;
+}
+
 int main(void)
 {
     uint8_t tiny;
@@ -191,6 +308,7 @@ int main(void)
     DirectGate_SRP_Destroy(&tamperServer);
     DirectGate_SRP_Destroy(&server);
     DirectGate_SRP_ClientCleanse(&client);
+    CHECK(srp_refusals(salt, saltHex, verifierHex) == 0, "every refusal and guard holds");
 
     puts("srp_smoke: OK");
     return 0;

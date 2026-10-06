@@ -138,10 +138,10 @@ static xbool_t DirectGate_SRP_ComputeKParam(directgate_srp_t *pSRP)
     }
 
     uint8_t hash[SHA256_DIGEST_LENGTH];
-    SHA256(pBuf, nBytes * 2, hash);
+    xbool_t bHashed = SHA256(pBuf, nBytes * 2, hash) != NULL;
 
     BN_free(pSRP->k);
-    pSRP->k = BN_bin2bn(hash, sizeof(hash), NULL);
+    pSRP->k = bHashed ? BN_bin2bn(hash, sizeof(hash), NULL) : NULL;
     xbool_t bOk = (pSRP->k != NULL);
 
     OPENSSL_cleanse(hash, sizeof(hash));
@@ -178,9 +178,7 @@ static xbool_t DirectGate_SRP_ComputeU(const directgate_srp_t *pSRP, const BIGNU
     }
 
     uint8_t hash[SHA256_DIGEST_LENGTH];
-    SHA256(pBuf, nBytes * 2, hash);
-
-    *ppU = BN_bin2bn(hash, sizeof(hash), NULL);
+    *ppU = SHA256(pBuf, nBytes * 2, hash) != NULL ? BN_bin2bn(hash, sizeof(hash), NULL) : NULL;
     xbool_t bOk = (*ppU != NULL);
 
     OPENSSL_cleanse(hash, sizeof(hash));
@@ -213,9 +211,15 @@ static xbool_t DirectGate_SRP_ComputeM1(const directgate_srp_t *pSRP,
     uint8_t hI[SHA256_DIGEST_LENGTH];
     uint8_t hXor[SHA256_DIGEST_LENGTH];
 
-    SHA256(nPad, nBytes, hN);
-    SHA256(gPad, nBytes, hG);
-    SHA256((const uint8_t*)pSRP->sDeviceId, strlen(pSRP->sDeviceId), hI);
+    /* The one-shot digest allocates in OpenSSL 3 and leaves its output untouched when that fails */
+    if (SHA256(nPad, nBytes, hN) == NULL || SHA256(gPad, nBytes, hG) == NULL ||
+        SHA256((const uint8_t*)pSRP->sDeviceId, strlen(pSRP->sDeviceId), hI) == NULL)
+    {
+        OPENSSL_cleanse(hN, sizeof(hN));
+        OPENSSL_cleanse(hG, sizeof(hG));
+        OPENSSL_cleanse(hI, sizeof(hI));
+        return XFALSE;
+    }
 
     for (size_t i = 0; i < sizeof(hXor); i++)
         hXor[i] = hN[i] ^ hG[i];
@@ -275,13 +279,12 @@ static xbool_t DirectGate_SRP_DeriveKFromS(const directgate_srp_t *pSRP, const B
     uint8_t sPad[512];
 
     if (nBytes == 0 || nBytes > sizeof(sPad)) return XFALSE;
-
     if (!DirectGate_SRP_BNToPadded(pSRP, pS, sPad, sizeof(sPad))) return XFALSE;
 
-    SHA256(sPad, nBytes, pK);
+    xbool_t bOk = SHA256(sPad, nBytes, pK) != NULL;
     OPENSSL_cleanse(sPad, sizeof(sPad));
 
-    return XTRUE;
+    return bOk;
 }
 
 xbool_t DirectGate_SRP_Init(directgate_srp_t *pSRP)
@@ -370,8 +373,8 @@ xbool_t DirectGate_SRP_SetClientPublic(directgate_srp_t *pSRP, const char *pAHex
     BN_CTX *pBN = BN_CTX_new();
     BIGNUM *pRem = BN_new();
 
-    XCHECK_CALL((pBN != NULL), BN_free, pA, XFALSE);
-    XCHECK_CALL((pRem != NULL), BN_free, pA, XFALSE);
+    XCHECK_CALL2((pBN != NULL), BN_free, pA, BN_free, pRem, XFALSE);
+    XCHECK_CALL2((pRem != NULL), BN_free, pA, BN_CTX_free, pBN, XFALSE);
 
     if (BN_mod(pRem, pA, pSRP->N, pBN) != 1 ||
         BN_is_zero(pRem) || BN_is_negative(pRem))
@@ -671,8 +674,8 @@ xbool_t DirectGate_SRP_ClientInit(directgate_srp_client_t *pClient)
     }
 
     uint8_t hash[SHA256_DIGEST_LENGTH];
-    SHA256(pBuf, nBytes * 2, hash);
-    pClient->k = BN_bin2bn(hash, sizeof(hash), NULL);
+    if (SHA256(pBuf, nBytes * 2, hash) != NULL)
+        pClient->k = BN_bin2bn(hash, sizeof(hash), NULL);
 
     OPENSSL_cleanse(hash, sizeof(hash));
     OPENSSL_cleanse(pBuf, nBytes * 2);
@@ -816,11 +819,14 @@ xbool_t DirectGate_SRP_ClientComputeKey(directgate_srp_client_t *pClient,
         uint8_t uHash[SHA256_DIGEST_LENGTH];
         uint8_t *pCombined = (uint8_t*)malloc(nBytes * 2);
         if (pCombined == NULL) break;
+
         memcpy(pCombined, aPad, nBytes);
         memcpy(pCombined + nBytes, bPad, nBytes);
-        SHA256(pCombined, nBytes * 2, uHash);
+        xbool_t bHashed = SHA256(pCombined, nBytes * 2, uHash) != NULL;
+
         OPENSSL_cleanse(pCombined, nBytes * 2);
         free(pCombined);
+        if (!bHashed) break;
 
         pU = BN_bin2bn(uHash, sizeof(uHash), NULL);
         OPENSSL_cleanse(uHash, sizeof(uHash));
@@ -871,8 +877,10 @@ xbool_t DirectGate_SRP_ClientComputeKey(directgate_srp_client_t *pClient,
         /* K = SHA256(PAD(S)) */
         uint8_t sPad[512];
         if (!DirectGate_SRP_ClientBNToPadded(pClient, pS, sPad, sizeof(sPad))) break;
-        SHA256(sPad, nBytes, pClient->K);
+
+        xbool_t bKeyed = SHA256(sPad, nBytes, pClient->K) != NULL;
         OPENSSL_cleanse(sPad, sizeof(sPad));
+        if (!bKeyed) break;
 
         /* M1 = SHA256(H(N)^H(g) || H(I) || salt || PAD(A) || PAD(B) || K) */
         uint8_t nPad2[512], gPad2[512];
@@ -881,9 +889,8 @@ xbool_t DirectGate_SRP_ClientComputeKey(directgate_srp_client_t *pClient,
 
         uint8_t hN[SHA256_DIGEST_LENGTH], hG[SHA256_DIGEST_LENGTH];
         uint8_t hI[SHA256_DIGEST_LENGTH], hXor[SHA256_DIGEST_LENGTH];
-        SHA256(nPad2, nBytes, hN);
-        SHA256(gPad2, nBytes, hG);
-        SHA256((const uint8_t*)pDeviceId, strlen(pDeviceId), hI);
+        if (SHA256(nPad2, nBytes, hN) == NULL || SHA256(gPad2, nBytes, hG) == NULL ||
+            SHA256((const uint8_t*)pDeviceId, strlen(pDeviceId), hI) == NULL) break;
         for (size_t i = 0; i < sizeof(hXor); i++) hXor[i] = hN[i] ^ hG[i];
 
         SHA256_CTX ctx;

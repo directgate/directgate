@@ -547,6 +547,36 @@ int main(void)
         CHECK(chmod(sLocked, 0755) == 0, "unlock the root");
     }
 
+    /* Each criterion is read whole: a number may be followed by spaces, a size by a unit, and anything else, or a
+       value out of range, fails the search as invalid instead of searching for something else */
+    const struct { const char *pMin; const char *pMax; const char *pSize; const char *pLinks; xbool_t bValid; } criteria[] = {
+        { "1 ", NULL, NULL, NULL, XTRUE }, { "1 k ", NULL, NULL, NULL, XTRUE }, { NULL, "2m", NULL, NULL, XTRUE },
+        { NULL, "1G", NULL, NULL, XTRUE }, { "1kb", NULL, NULL, NULL, XFALSE }, { "1x", NULL, NULL, NULL, XFALSE },
+        { " 1", NULL, NULL, NULL, XFALSE }, { "99999999999999999999", NULL, NULL, NULL, XFALSE },
+        { NULL, "99999999999g", NULL, NULL, XFALSE }, { NULL, NULL, "5000000000", NULL, XFALSE },
+        { NULL, NULL, NULL, "1 ", XTRUE }, { NULL, NULL, NULL, "x", XFALSE }, { NULL, NULL, NULL, "99999999999", XFALSE },
+        { NULL, NULL, NULL, "1 2", XFALSE }
+    };
+
+    for (size_t i = 0; i < sizeof(criteria) / sizeof(criteria[0]); i++)
+    {
+        reset_capture();
+        memset(&mgr, 0, sizeof(mgr));
+        mgr.pPath = sRoot;
+        mgr.pFileName = "*";
+        mgr.pMinSize = criteria[i].pMin;
+        mgr.pMaxSize = criteria[i].pMax;
+        mgr.pFileSize = criteria[i].pSize;
+        mgr.pLinkCount = criteria[i].pLinks;
+
+        CHECK(DirectGate_Search_Start(&session.search, &mgr) == XSTDOK, "a search with criteria should start");
+        CHECK(wait_for_search(&session) == XSTDOK, "a search with criteria should finish");
+        CHECK(criteria[i].bValid ? (g_capture.nOk == 1 && g_capture.nFailed == 0) : (g_capture.nFailed == 1),
+            "a criterion should be taken whole or fail the search");
+        if (!criteria[i].bValid)
+            CHECK(strstr(g_capture.sLastReason, "criteria") != NULL, "an invalid criterion should be named as the reason");
+    }
+
     DirectGate_Search_Clear(&session.search);
     CHECK(DirectGate_Search_GetPipeFd(&session.search) == XSTDERR,
         "search pipe should be closed after clear");

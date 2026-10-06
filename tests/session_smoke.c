@@ -373,6 +373,69 @@ int main(void)
         "a cleared throttle should accept pre-auth sessions again");
     DirectGate_SessionMgr_Destroy(&lockMgr);
 
+    /* However many failures there were, the wait stops growing at its ceiling and the count stops at its maximum */
+    directgate_session_mgr_t capMgr;
+    DirectGate_SessionMgr_Init(&capMgr, &cfg);
+    for (uint32_t i = 0; i < DIRECTGATE_AUTH_FAILURE_GRACE + 40; i++) DirectGate_SessionMgr_NoteAuthFailure(&capMgr);
+    uint64_t nCapMs = 0;
+    CHECK(DirectGate_SessionMgr_IsAuthLocked(&capMgr, &nCapMs) && nCapMs <= DIRECTGATE_AUTH_LOCKOUT_MAX_MS &&
+          nCapMs + 60000ULL > DIRECTGATE_AUTH_LOCKOUT_MAX_MS, "the throttle should stop at its ceiling");
+    capMgr.nAuthFailures = UINT32_MAX;
+    DirectGate_SessionMgr_NoteAuthFailure(&capMgr);
+    CHECK(capMgr.nAuthFailures == UINT32_MAX && DirectGate_SessionMgr_IsAuthLocked(&capMgr, NULL),
+        "the failure count should saturate and keep throttling");
+
+    /* A lockout further away than any could be came from a clock that jumped back, and must not lock the door */
+    capMgr.nAuthLockoutUntilMs = XTime_GetMonoMs() + DIRECTGATE_AUTH_LOCKOUT_MAX_MS + 60000ULL;
+    CHECK(!DirectGate_SessionMgr_IsAuthLocked(&capMgr, NULL) && capMgr.nAuthLockoutUntilMs == 0,
+        "an impossible lockout should be dropped");
+    DirectGate_SessionMgr_Destroy(&capMgr);
+
+    /* A password login whose verifier does not load creates no session, and leaves its slot free */
+    directgate_cfg_t badCfg;
+    memcpy(&badCfg, &cfg, sizeof(badCfg));
+    badCfg.keyauth.nAuthorizedKeyCount = 0;
+    xstrncpy(badCfg.auth.sSaltHex, sizeof(badCfg.auth.sSaltHex),
+        "0000000000000000000000000000000000000000000000000000000000000000");
+    xstrncpy(badCfg.auth.sVerifierHex, sizeof(badCfg.auth.sVerifierHex), "0");
+
+    directgate_session_mgr_t badMgr;
+    DirectGate_SessionMgr_Init(&badMgr, &badCfg);
+    CHECK(DirectGate_SessionMgr_GetOrCreate(&badMgr, &apiSession, 4000) == NULL &&
+          DirectGate_SessionMgr_Find(&badMgr, 4000) == NULL && DirectGate_SessionMgr_IsEmpty(&badMgr),
+        "a verifier that does not load should create no session");
+    DirectGate_SessionMgr_Destroy(&badMgr);
+
+    /* The manager's entry points refuse what is not there */
+    directgate_session_mgr_t guardMgr;
+    DirectGate_SessionMgr_Init(&guardMgr, &cfg);
+    DirectGate_SessionMgr_Init(NULL, &cfg);
+    DirectGate_SessionMgr_Destroy(NULL);
+    DirectGate_SessionMgr_Remove(NULL, NULL);
+    DirectGate_SessionMgr_Remove(&guardMgr, NULL);
+    DirectGate_SessionMgr_RemoveWithId(NULL, 1);
+    DirectGate_SessionMgr_RemoveWithId(&guardMgr, 0);
+    DirectGate_SessionMgr_NoteAuthFailure(NULL);
+    DirectGate_SessionMgr_NoteAuthSuccess(NULL);
+    CHECK(!DirectGate_SessionMgr_IsEmpty(NULL) && DirectGate_SessionMgr_Find(NULL, 1) == NULL &&
+          DirectGate_SessionMgr_Create(NULL, 1) == NULL, "no manager holds no session");
+    CHECK(DirectGate_SessionMgr_GetOrCreate(NULL, &apiSession, 1) == NULL &&
+          DirectGate_SessionMgr_GetOrCreate(&guardMgr, &apiSession, 0) == NULL, "get-or-create needs a manager and an id");
+    CHECK(DirectGate_SessionMgr_ExpireUnauthenticated(NULL, 0) == 0 && !DirectGate_SessionMgr_IsAuthLocked(NULL, NULL),
+        "no manager expires or locks anything");
+    CHECK(DirectGate_SessionMgr_Close(NULL, 1, "x") == XAPI_CONTINUE && DirectGate_SessionMgr_Close(&guardMgr, 0, "x") ==
+          XAPI_CONTINUE && DirectGate_SessionMgr_Close(&guardMgr, 77, "x") == XAPI_CONTINUE,
+        "closing nothing is a no-op");
+    CHECK(!DirectGate_Session_ConsumeAuthMessage(NULL), "no session consumes an auth message");
+
+    directgate_session_t *pClosing = DirectGate_SessionMgr_Create(&guardMgr, 78);
+    CHECK(pClosing != NULL, "create a session to close");
+    pClosing->bAuthenticated = XTRUE;
+    CHECK(!DirectGate_Session_ConsumeAuthMessage(pClosing), "an authenticated session takes no auth message");
+    CHECK(DirectGate_SessionMgr_Close(&guardMgr, 78, "test") == XAPI_CONTINUE, "close a session by id");
+    CHECK(DirectGate_SessionMgr_Find(&guardMgr, 78) == NULL, "closing by id removes the session");
+    DirectGate_SessionMgr_Destroy(&guardMgr);
+
     puts("session_smoke: OK");
     return 0;
 }

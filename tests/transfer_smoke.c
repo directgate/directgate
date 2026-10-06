@@ -135,6 +135,129 @@ static void clear_file_pkg(xbyte_buffer_t *pWire, directgate_pkg_t *pPkg)
     XByteBuffer_Clear(pWire);
 }
 
+/* Fails the message whose action is in pCtx, and takes every other */
+static int failing_send(xjson_obj_t *pHeader, const uint8_t *pPayload, size_t nLen, void *pCtx)
+{
+    (void)pPayload;
+    (void)nLen;
+    const char *pAction = XJSON_GetString(XJSON_GetObject(pHeader, "action"));
+    return (xstrused(pAction) && !strcmp(pAction, (const char*)pCtx)) ? XSTDERR : XSTDOK;
+}
+
+/* Refusals of both directions, and every send that fails part way */
+static int transfer_refusals(const char *pSrcPath)
+{
+    directgate_transfer_t ft;
+    capture_ctx_t capture;
+    memset(&capture, 0, sizeof(capture));
+    DirectGate_Transfer_Init(NULL);
+    DirectGate_Transfer_Destroy(NULL);
+    CHECK(!DirectGate_Transfer_IsActive(NULL) && !DirectGate_Transfer_IsDone(NULL), "no transfer is active or done");
+    CHECK(DirectGate_Transfer_HandleCancel(NULL) == XSTDERR, "no transfer is cancelled");
+
+    DirectGate_Transfer_Init(&ft);
+    char sLong[sizeof(ft.sPath) + 8];
+    memset(sLong, 'p', sizeof(sLong) - 1);
+    sLong[sizeof(sLong) - 1] = '\0';
+    CHECK(DirectGate_Transfer_Send(NULL, pSrcPath, capture_send, &capture) == XSTDERR &&
+          DirectGate_Transfer_Send(&ft, NULL, capture_send, &capture) == XSTDERR &&
+          DirectGate_Transfer_Send(&ft, pSrcPath, NULL, &capture) == XSTDERR, "a send needs a transfer, a path and a sender");
+    CHECK(DirectGate_Transfer_Send(&ft, "", capture_send, &capture) == XSTDERR &&
+          DirectGate_Transfer_Send(&ft, sLong, capture_send, &capture) == XSTDERR, "a send needs a path that fits");
+    CHECK(DirectGate_Transfer_Send(&ft, "/tmp", capture_send, &capture) == XSTDERR && ft.eState == XTRANSFER_STATE_ERROR,
+        "a directory is not sent");
+    CHECK(DirectGate_Transfer_SendNext(NULL, capture_send, &capture) == XSTDERR &&
+          DirectGate_Transfer_SendNext(&ft, NULL, &capture) == XSTDERR, "sending on needs a transfer and a sender");
+    CHECK(DirectGate_Transfer_SendNext(&ft, capture_send, &capture) == XSTDNON, "a transfer that is not sending sends nothing");
+    DirectGate_Transfer_Destroy(&ft);
+
+    /* Whichever message the sender refuses, the transfer ends in error */
+    const char *pFailAt[] = { "start", "chunk", "end" };
+    for (size_t i = 0; i < sizeof(pFailAt) / sizeof(pFailAt[0]); i++)
+    {
+        DirectGate_Transfer_Init(&ft);
+        XSTATUS nStatus = DirectGate_Transfer_Send(&ft, pSrcPath, failing_send, (void*)pFailAt[i]);
+        if (i > 0)
+        {
+            CHECK(nStatus == XSTDOK && DirectGate_Transfer_Send(&ft, pSrcPath, failing_send, (void*)pFailAt[i]) == XSTDERR,
+                "a transfer that is sending takes no second send");
+        }
+
+        while (nStatus >= 0 && DirectGate_Transfer_IsActive(&ft))
+            nStatus = DirectGate_Transfer_SendNext(&ft, failing_send, (void*)pFailAt[i]);
+
+        CHECK(nStatus == XSTDERR && ft.eState == XTRANSFER_STATE_ERROR && DirectGate_Transfer_IsDone(&ft),
+            "a refused message ends the transfer in error");
+        DirectGate_Transfer_Destroy(&ft);
+    }
+
+    /* A source that shrinks while it is read ends the transfer instead of sending what is no longer there */
+    char sShrink[] = "/tmp/directgate_transfer_shrink.XXXXXX";
+    int nFd = mkstemp(sShrink);
+    CHECK(nFd >= 0, "create a source to shrink");
+    static uint8_t big[100000];
+    memset(big, 's', sizeof(big));
+    CHECK(write(nFd, big, sizeof(big)) == (ssize_t)sizeof(big), "fill the source");
+    close(nFd);
+
+    DirectGate_Transfer_Init(&ft);
+    CHECK(DirectGate_Transfer_Send(&ft, sShrink, capture_send, &capture) == XSTDOK, "start sending the source");
+    CHECK(DirectGate_Transfer_SendNext(&ft, capture_send, &capture) == XSTDOK, "send its first chunk");
+    CHECK(truncate(sShrink, 10) == 0, "shrink the source");
+    CHECK(DirectGate_Transfer_SendNext(&ft, capture_send, &capture) == XSTDERR && ft.eState == XTRANSFER_STATE_ERROR,
+        "a shrunken source ends the transfer");
+    DirectGate_Transfer_Destroy(&ft);
+    unlink(sShrink);
+
+    /* A start that is not whole, or not consistent, opens nothing */
+    xbyte_buffer_t wire;
+    directgate_pkg_t pkg;
+    char sDir[] = "/tmp/directgate_transfer_in.XXXXXX", sPath[128];
+    CHECK(mkdtemp(sDir) != NULL, "create a destination directory");
+    snprintf(sPath, sizeof(sPath), "%s/in.bin", sDir);
+
+    const struct { const char *pId; const char *pName; uint64_t nSize; uint32_t nChunks; } starts[] = {
+        { "", "in.bin", 10, 1 }, { "t-1", "in.bin", 10, 2 }, { "t-1", "in.bin", 10, 0 },
+        { "t-1", "..", 10, 1 }, { "t-1", "a/.", 10, 1 }, { "t-1", "dir/", 10, 1 }
+    };
+
+    for (size_t i = 0; i < sizeof(starts) / sizeof(starts[0]); i++)
+    {
+        DirectGate_Transfer_Init(&ft);
+        CHECK(build_file_pkg(&wire, &pkg, DirectGate_Proto_BuildFileStart(starts[i].pId, starts[i].pName,
+            starts[i].nSize, starts[i].nChunks, 65536), NULL, 0), "build a start");
+        CHECK(DirectGate_Transfer_HandleStart(&ft, &pkg, sDir) == XSTDERR && !DirectGate_Transfer_IsActive(&ft),
+            "a start without an id, of the wrong chunk count or of an unusable name is refused");
+        clear_file_pkg(&wire, &pkg);
+        DirectGate_Transfer_Destroy(&ft);
+    }
+
+    /* A name that walks out of the directory is cut to its last component */
+    DirectGate_Transfer_Init(&ft);
+    CHECK(build_file_pkg(&wire, &pkg, DirectGate_Proto_BuildFileStart("t-2", "../../escape.bin", 0, 0, 65536), NULL, 0),
+        "build a walking start");
+    CHECK(DirectGate_Transfer_HandleStart(&ft, &pkg, sDir) == XSTDOK, "a walking name is taken by its last component");
+    CHECK(strstr(ft.sPath, sDir) == ft.sPath && strstr(ft.sPath, "..") == NULL, "the file stays in its directory");
+    CHECK(DirectGate_Transfer_HandleStart(&ft, &pkg, sDir) == XSTDERR, "a second start waits for the first");
+    CHECK(DirectGate_Transfer_HandleStart(&ft, NULL, sDir) == XSTDERR, "a start needs a package");
+    CHECK(DirectGate_Transfer_HandleStartPath(&ft, &pkg, "") == XSTDERR, "a start needs a path");
+    clear_file_pkg(&wire, &pkg);
+    DirectGate_Transfer_Destroy(&ft);
+
+    /* A chunk with nowhere to go is refused */
+    DirectGate_Transfer_Init(&ft);
+    CHECK(build_file_pkg(&wire, &pkg, DirectGate_Proto_BuildFileChunk("t-3", 0), (const uint8_t*)"x", 1), "build a chunk");
+    CHECK(DirectGate_Transfer_HandleChunk(&ft, &pkg) == XSTDERR && DirectGate_Transfer_HandleChunk(NULL, &pkg) == XSTDERR,
+        "a chunk without a started transfer is refused");
+    clear_file_pkg(&wire, &pkg);
+    DirectGate_Transfer_Destroy(&ft);
+
+    char sCmd[160];
+    snprintf(sCmd, sizeof(sCmd), "rm -rf '%s'", sDir);
+    CHECK(system(sCmd) == 0, "remove the destination directory");
+    return 0;
+}
+
 int main(void)
 {
     uint8_t content[70000];
@@ -315,6 +438,7 @@ int main(void)
     DirectGate_Transfer_Destroy(&linkRx);
     CHECK(unlink(sLinkPath) == 0, "cleanup symlink destination");
 
+    CHECK(transfer_refusals(sSrcPath) == 0, "every refusal and failed send holds");
     unlink(sSrcPath);
     unlink(sDstPath);
     puts("transfer_smoke: OK");

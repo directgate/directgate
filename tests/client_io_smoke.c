@@ -320,6 +320,44 @@ static int check_stdin_states(void)
     return nFailed ? 1 : 0;
 }
 
+/* An HS256 token over the given payload; the secret does not matter, dgcli never verifies it */
+static char* make_token(const char *pPayload)
+{
+    xjwt_t jwt;
+    XJWT_Init(&jwt, XJWT_ALG_HS256);
+    char *pToken = NULL;
+
+    if (XJWT_AddPayload(&jwt, pPayload, strlen(pPayload), XFALSE) == XSTDOK)
+        pToken = XJWT_Create(&jwt, (const uint8_t*)"secret", 6, NULL);
+
+    XJWT_Destroy(&jwt);
+    return pToken;
+}
+
+/* Without a configured routing key, dgcli reads the one its access token carries */
+static int check_routing_key(void)
+{
+    char sKey[64];
+    char *pWith = make_token("{\"sub\":\"user\",\"rk\":\"rk-from-token\"}");
+    char *pWithout = make_token("{\"sub\":\"user\"}");
+    char *pEmpty = make_token("{\"sub\":\"user\",\"rk\":\"\"}");
+    CHECK(pWith != NULL && pWithout != NULL && pEmpty != NULL, "build the tokens");
+
+    CHECK(DirectGate_Client_ExtractRoutingKey(pWith, sKey, sizeof(sKey)) && !strcmp(sKey, "rk-from-token"),
+        "the routing key a token carries should be read");
+    CHECK(!DirectGate_Client_ExtractRoutingKey(pWithout, sKey, sizeof(sKey)) && sKey[0] == '\0',
+        "a token without a routing key yields none");
+    CHECK(!DirectGate_Client_ExtractRoutingKey(pEmpty, sKey, sizeof(sKey)), "an empty routing key is none");
+    CHECK(!DirectGate_Client_ExtractRoutingKey("not.a-token", sKey, sizeof(sKey)), "something that is not a token yields none");
+    CHECK(!DirectGate_Client_ExtractRoutingKey(NULL, sKey, sizeof(sKey)) &&
+          !DirectGate_Client_ExtractRoutingKey(pWith, NULL, 0), "a token and a buffer are needed");
+
+    free(pWith);
+    free(pWithout);
+    free(pEmpty);
+    return 0;
+}
+
 int main(void)
 {
     xlog_defaults();
@@ -332,6 +370,7 @@ int main(void)
     if (check_write_all_waits()) return 1;
     if (check_stdin_single_read()) return 1;
     if (check_stdin_states()) return 1;
+    if (check_routing_key()) return 1;
 
     DirectGate_WebRTC_Cleanup();
     XLog_Destroy();
