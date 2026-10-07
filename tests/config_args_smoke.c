@@ -53,6 +53,13 @@ static xbool_t parse(directgate_cfg_t *pCfg, int argc, char *argv[])
 
 int main(void)
 {
+    /* Cases that end in a prompt rely on nobody being there to answer it. Run from a terminal, ctest passes that
+       terminal on as stdin, and the prompt for a new password then waits for a keypress until the test times out.
+       stdin is nothing instead; the -i case below brings a terminal of its own. */
+    int nNull = open("/dev/null", O_RDONLY);
+    CHECK(nNull >= 0 && dup2(nNull, STDIN_FILENO) >= 0, "point stdin at nothing");
+    close(nNull);
+
     char sRoot[] = "/tmp/directgate_config_args_smoke.XXXXXX";
     CHECK(mkdtemp(sRoot) != NULL, "mkdtemp root");
     CHECK(setenv("HOME", sRoot, 1) == 0, "set HOME");
