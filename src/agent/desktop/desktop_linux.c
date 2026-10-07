@@ -897,6 +897,16 @@ static void DirectGate_Desktop_X11Enc_EncodeAndPublish(directgate_x11enc_t *pEnc
     int nStatus = DirectGate_Desktop_X11Enc_Encode(pEnc, pDmaBuf, nPtsUs, bForceKeyframe, &bKeyframe);
     if (nStatus == XSTDERR)
     {
+#ifdef DIRECTGATE_HAVE_HWENC
+        /* No encoder left at all: a fallback could not open one and has said why. More frames would only fail
+           the same way, streaming nothing meanwhile and replacing that reason with this generic one. */
+        if (pEnc->pEncoder == NULL && pEnc->pHwEncoder == NULL)
+        {
+            DIRECTGATE_X11ENC_SET(&pEnc->nFailures, DIRECTGATE_X11ENC_MAX_FAILURES);
+            return;
+        }
+#endif
+
         __atomic_add_fetch(&pEnc->nFailures, 1U, __ATOMIC_ACQ_REL);
         DirectGate_Desktop_X11Enc_SetError(pEnc, NULL, "OpenH264 frame encoding failed.");
 

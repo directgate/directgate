@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -29,6 +30,7 @@
 
 #ifdef DIRECTGATE_HAVE_HWENC
 #include "fake_libav.h"
+#include "src/agent/desktop/openh264.h"
 
 /* The encoder bumps these on its own thread */
 #define AV(field) fake_av_get(&fake_av()->field)
@@ -45,6 +47,7 @@
 /* What the desktop sent, by kind */
 typedef struct {
     int nStatuses;
+    int nStreaming;     /* statuses that said "streaming" */
     int nEncoded;
     int nRawChunks;
     int nErrors;
@@ -84,6 +87,7 @@ int DirectGate_Session_Send(directgate_session_t *pSession, xjson_obj_t *pHeader
         memcpy(g_sent.sLastStatus, pPayload, nLen);
         g_sent.sLastStatus[nLen] = '\0';
         copy_field(g_sent.sLastStatus, "status", g_sent.sStatus, sizeof(g_sent.sStatus));
+        if (strcmp(g_sent.sStatus, "streaming") == 0) g_sent.nStreaming++;
         g_sent.nStatuses++;
     }
 
@@ -288,9 +292,18 @@ static int test_streaming(void)
     /* A portal that will not type characters is said once */
     stub.bKeysymRefused = XTRUE;
     int nStatuses = g_sent.nStatuses;
+    int nStreaming = g_sent.nStreaming;
     tick(NULL);
     tick(NULL);
-    CHECK(pDesktop->bWaylandNoKeysym && g_sent.nStatuses == nStatuses + 1, "a portal refusing characters is reported once");
+    if (pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_RAW)
+    {
+        CHECK(pDesktop->bWaylandNoKeysym && g_sent.nStreaming == nStreaming && status_is("error"),
+            "a session that has already failed is not told it streams because of it");
+    }
+    else
+    {
+        CHECK(pDesktop->bWaylandNoKeysym && g_sent.nStatuses == nStatuses + 1, "a portal refusing characters is reported once");
+    }
 
     /* A compositor exporting frames it was never asked to: no picture, and no buffer is kept from it */
     fake_pw_stream_t *pStream = fake_pw_stream_for_node(32);
@@ -452,6 +465,21 @@ static int stream_until(int nEncoded, buffer_t *pFrame)
     return g_sent.nEncoded >= nEncoded;
 }
 
+/* Whether there is a software encoder to fall back on: a CI image without OpenH264 has none */
+static xbool_t g_bSoftware = XTRUE;
+
+/* Without one, a session whose GPU gave up ends, and says why */
+static int ends_with_reason(buffer_t *pFrame, const char *pWhy)
+{
+    for (uint64_t nEnd = now_ms() + 30000; !status_is("error") && now_ms() < nEnd;)
+    {
+        if (pFrame != NULL) pFrame->pixels[0]++;
+        tick(pFrame);
+    }
+
+    return status_is("error") && strstr(DirectGate_Desktop_GetReason(&g_session.desktop), pWhy) != NULL;
+}
+
 static int test_gpu(void)
 {
     /* A GPU encoder takes the frames, follows a preset change, and hands over to the software encoder when it
@@ -477,8 +505,12 @@ static int test_gpu(void)
 
     fake_av_set(&fake_av()->nFailSends, 40);
     int nSends = AV(nSends);
-    CHECK(stream_until(g_sent.nEncoded + 3, &frame), "a GPU that stops taking frames is replaced");
-    CHECK(AV(nSends) == nSends && AV(nFailSends) < 40, "by the software encoder, which carries on");
+    if (g_bSoftware)
+    {
+        CHECK(stream_until(g_sent.nEncoded + 3, &frame), "a GPU that stops taking frames is replaced");
+        CHECK(AV(nSends) == nSends && AV(nFailSends) < 40, "by the software encoder, which carries on");
+    }
+    else CHECK(ends_with_reason(&frame, "OpenH264"), "a GPU that stops taking frames, with nothing to replace it, ends it");
 
     DirectGate_Desktop_Clear(&g_session.desktop);
     compositor_stop();
@@ -646,13 +678,56 @@ static int test_zero_copy(void)
     emit_param(pStream, SPA_PARAM_Format, make_format(pod, sizeof(pod), SPA_MEDIA_TYPE_video, SPA_VIDEO_FORMAT_BGRx,
         64, 32, MODIFIER_NONE, MOD_LINEAR));
     nSends = AV(nSends);
-    CHECK(stream_until(g_sent.nEncoded + 3, &frame) && AV(nSends) == nSends && status_is("streaming"),
-        "and the software encoder takes the copied frames");
+    if (g_bSoftware)
+    {
+        CHECK(stream_until(g_sent.nEncoded + 3, &frame) && AV(nSends) == nSends && status_is("streaming"),
+            "and the software encoder takes the copied frames");
+    }
+    else CHECK(ends_with_reason(&frame, "OpenH264"), "and without a software encoder the session ends, saying why");
 
     DirectGate_Desktop_Clear(&g_session.desktop);
     compositor_stop();
     fake_av_reset();
     return 0;
+}
+
+/* No encoder left at all: the GPU refuses the compositor's frames and there is no OpenH264. The session ends with
+   the reason - which lives in the encoder being stopped, so it has to be copied out first. In a child, so that a
+   missing OpenH264 is all it ever sees. */
+static int no_encoder_left(void)
+{
+    setenv("DIRECTGATE_OPENH264_LIB", "/nonexistent/libopenh264.so", 1);
+    zero_copy_session(55);
+    CHECK(DirectGate_Desktop_Start(&g_session) >= 0, "an exporting desktop starts");
+    CHECK(control("{\"action\":\"select-monitor\",\"monitorId\":\"wayland-31\"}") == XAPI_CONTINUE &&
+          status_is("streaming"), "and streams");
+
+    fake_pw_stream_t *pStream = fake_pw_stream_for_node(31);
+    fake_av_set(&fake_av()->nFailMaps, 1000);
+    fake_av_set_encoder(0, NULL);
+    CHECK(pStream != NULL && export_until_memory(pStream), "a GPU that refuses the frames has the compositor send memory");
+
+    uint8_t pod[1024];
+    emit_param(pStream, SPA_PARAM_Format, make_format(pod, sizeof(pod), SPA_MEDIA_TYPE_video, SPA_VIDEO_FORMAT_BGRx,
+        64, 32, MODIFIER_NONE, MOD_LINEAR));
+    buffer_t frame;
+    buffer_mapped(&frame, 0, 0, 1, sizeof(frame.pixels));
+    CHECK(ends_with_reason(&frame, "DIRECTGATE_OPENH264_LIB"), "and with no encoder left the session ends, saying why");
+
+    DirectGate_Desktop_Clear(&g_session.desktop);
+    compositor_stop();
+    return 0;
+}
+
+static int in_child(int (*fnCheck)(void))
+{
+    fflush(NULL);
+    pid_t nPid = fork();
+    /* exit, not _exit: the child's coverage is written by its exit handlers */
+    if (nPid == 0) exit(fnCheck());
+
+    int nStatus = 0;
+    return nPid > 0 && waitpid(nPid, &nStatus, 0) == nPid && WIFEXITED(nStatus) && WEXITSTATUS(nStatus) == 0;
 }
 #endif
 #endif
@@ -672,7 +747,15 @@ int main(void)
        the device cache keeps a device that would not open for the life of the process */
     int nFailed = 0;
 #ifdef DIRECTGATE_HWENC_HAS_FILTER
-    nFailed = test_zero_copy();
+    /* Before this process has any thread a child could inherit a held lock from */
+    nFailed = !in_child(no_encoder_left);
+#endif
+#ifdef DIRECTGATE_HAVE_HWENC
+    g_bSoftware = DirectGate_OpenH264_Load(NULL, 0) == XSTDOK ? XTRUE : XFALSE;
+    if (!g_bSoftware) puts("desktop_wayland_smoke: no OpenH264 here, GPU failures are checked to end the session");
+#endif
+#ifdef DIRECTGATE_HWENC_HAS_FILTER
+    nFailed = nFailed || test_zero_copy();
 #endif
     nFailed = nFailed || test_streaming() || test_prompt() || test_refusals();
 #ifdef DIRECTGATE_HAVE_HWENC

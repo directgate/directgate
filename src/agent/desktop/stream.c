@@ -186,10 +186,11 @@ static void DirectGate_Desktop_DemoteToRaw(directgate_session_t *pSession)
         xloge("Wayland H.264 pipeline failed and there is no raw fallback on Wayland: sid(%u), reason(%s)",
             pSession->nSessionId, xstrused(pErr) ? pErr : "unknown");
 
-        DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
-        DirectGate_Desktop_SetReason(pDesktop, xstrused(pErr) ?
-            pErr : "The desktop encoder failed and this session has no fallback.");
+        /* Copied before the encoder is stopped: the reason lives in it, and stopping frees it. */
+        DirectGate_Desktop_SetReason(pDesktop, xstrused(pErr) ? pErr :
+            "The desktop encoder failed and this session has no fallback.");
 
+        DirectGate_Desktop_LinuxEncoder_StopDesktop(pDesktop);
         DirectGate_Desktop_SendStatus(pSession, "error", DirectGate_Desktop_GetReason(pDesktop));
         return;
     }
@@ -524,7 +525,11 @@ int DirectGate_Desktop_Process(directgate_session_t *pSession)
             "Characters from another layout cannot be typed on it; switch the "
             "layout on the remote computer instead.");
 
-        DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
+        /* Said as part of the stream, and only while there is one: on
+         * Wayland the raw pipeline is a session that has already failed, and
+         * telling the viewer it streams would only hide that. */
+        if (pDesktop->ePipeline != DIRECTGATE_DESKTOP_PIPELINE_RAW)
+            DirectGate_Desktop_SendStatus(pSession, "streaming", NULL);
     }
 
     /* The grant can also end while it is being used - someone presses "Stop
