@@ -251,6 +251,96 @@ static int test_static_corners(const char *pRoot)
     return 0;
 }
 
+/* What the file manager refuses before it touches anything: empty paths, no room for a result, no session, no
+ * operation in flight, and messages that carry nothing or come from no connection */
+static int test_guards(const char *pRoot)
+{
+    char sOut[64];
+    xstat_t st;
+    memset(&st, 0, sizeof(st));
+
+    CHECK(DirectGate_Files_ResolvePasteTarget(NULL, sizeof(sOut), "x") == XSTDERR &&
+          DirectGate_Files_ResolvePasteTarget(sOut, 0, "x") == XSTDERR &&
+          DirectGate_Files_ResolvePasteTarget(sOut, sizeof(sOut), "") == XSTDERR, "a paste target needs room and a path");
+    memcpy(sOut, "kept", 5);
+    DirectGate_Files_NormalizeDirPath(NULL, sizeof(sOut), "/tmp");
+    DirectGate_Files_NormalizeDirPath(sOut, 0, "/tmp");
+    CHECK(strcmp(sOut, "kept") == 0, "a directory is normalized nowhere without room");
+    CHECK(DirectGate_Files_BuildFullPath(NULL, sizeof(sOut), "/tmp", "a") == XSTDERR &&
+          DirectGate_Files_BuildFullPath(sOut, 0, "/tmp", "a") == XSTDERR &&
+          DirectGate_Files_BuildFullPath(sOut, sizeof(sOut), "", "a") == XSTDERR &&
+          DirectGate_Files_BuildFullPath(sOut, sizeof(sOut), "/tmp", "") == XSTDERR, "a full path needs every part");
+
+    CHECK(DirectGate_Files_CreateEntryJson("", pRoot, &st) == NULL && DirectGate_Files_CreateEntryJson("a", "", &st) == NULL &&
+          DirectGate_Files_CreateEntryJson("a", pRoot, NULL) == NULL, "an entry needs a name, a directory and its details");
+    char sLong[XFILE_PATH_SIZE + 64];
+    memset(sLong, 'd', sizeof(sLong) - 1);
+    sLong[0] = '/';
+    sLong[sizeof(sLong) - 1] = '\0';
+    CHECK(DirectGate_Files_CreateEntryJson("a", sLong, &st) == NULL, "and a path that fits");
+
+    CHECK(DirectGate_Files_RenameNoReplace("", "x") == XSTDERR && DirectGate_Files_RenameNoReplace("x", "") == XSTDERR &&
+          DirectGate_Files_RenameReplace("", "x") == XSTDERR && DirectGate_Files_RenameReplace("x", "") == XSTDERR &&
+          DirectGate_Files_Rename("", "x") == XSTDERR && DirectGate_Files_Rename("x", "") == XSTDERR,
+        "nothing is renamed from or to no path");
+    CHECK(DirectGate_Files_ListDir("") == NULL && DirectGate_Files_Delete("", XTRUE) == XSTDERR &&
+          DirectGate_Files_CreateDir("") == XSTDERR, "no path is listed, deleted or made");
+    CHECK(DirectGate_Files_CopyEntry("", "x", &st, 0) == XSTDERR && DirectGate_Files_CopyEntry("x", "", &st, 0) == XSTDERR &&
+          DirectGate_Files_CopyPath("", "x") == XSTDERR, "or copied");
+    CHECK(DirectGate_Files_CreateSymlink("", "x") == XSTDERR && DirectGate_Files_CreateSymlink("x", "") == XSTDERR, "or linked");
+    CHECK(DirectGate_Files_BuildTempPath(NULL, sizeof(sOut), "x") == XSTDERR &&
+          DirectGate_Files_BuildTempPath(sOut, 0, "x") == XSTDERR &&
+          DirectGate_Files_BuildTempPath(sOut, sizeof(sOut), "") == XSTDERR, "a temporary name needs room and a target");
+    CHECK(!DirectGate_Files_IsNestedTarget(pRoot, "relative-name"), "a bare target is measured from here");
+
+    /* No session, no operation */
+    directgate_session_t session;
+    memset(&session, 0, sizeof(session));
+    xjson_obj_t *pHeader = XJSON_NewObject(NULL, NULL, XFALSE);
+    CHECK(pHeader != NULL, "make a header");
+    CHECK(DirectGate_Files_SendTransferCancel(NULL, "t", "r") == XSTDERR &&
+          DirectGate_Files_SendTransferAck(NULL, "t", 0) == XSTDERR, "no session is answered");
+    CHECK(DirectGate_Files_TransferSendCb(pHeader, NULL, 0, NULL) == XSTDERR &&
+          DirectGate_Files_TransferSendCb(NULL, NULL, 0, &session) == XSTDERR, "a chunk needs a session and a header");
+    XJSON_FreeObject(pHeader);
+    DirectGate_Files_ClearPendingSave(NULL);
+    DirectGate_Files_ProcessTransfer(NULL);
+    DirectGate_Files_ReleaseOp(NULL);
+    CHECK(DirectGate_Files_GetOpFd(NULL) == XSTDERR && DirectGate_Files_GetOpFd(&session) == XSTDERR,
+        "no operation has no descriptor");
+    CHECK(DirectGate_Files_OnOpClosed(NULL) == XAPI_NO_ACTION, "and closing none is nothing");
+    CHECK(DirectGate_Files_ProcessOp(NULL) == XAPI_DISCONNECT && DirectGate_Files_ProcessOp(&session) == XAPI_DISCONNECT,
+        "and processing none ends it");
+
+    /* Messages that carry nothing, from no connection, or for a session nobody has */
+    xapi_session_t api;
+    memset(&api, 0, sizeof(api));
+    directgate_pkg_t pkg;
+    memset(&pkg, 0, sizeof(pkg));
+    directgate_pkg_manager_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    directgate_pkg_transfer_t xfer;
+    memset(&xfer, 0, sizeof(xfer));
+
+    CHECK(DirectGate_Files_HandleManager(&api, NULL) == XAPI_CONTINUE &&
+          DirectGate_Files_HandleManager(&api, &pkg) == XAPI_CONTINUE &&
+          DirectGate_Files_HandleFile(&api, NULL) == XAPI_CONTINUE && DirectGate_Files_HandleFile(&api, &pkg) == XAPI_CONTINUE,
+        "a message with nothing in it is dropped");
+    pkg.pPackage = &mgr;
+    CHECK(DirectGate_Files_HandleManager(&api, &pkg) == XAPI_DISCONNECT, "a manager message from no connection ends it");
+    pkg.pPackage = &xfer;
+    CHECK(DirectGate_Files_HandleFile(&api, &pkg) == XAPI_DISCONNECT, "and so does a file message");
+
+    directgate_conn_t conn;
+    memset(&conn, 0, sizeof(conn));
+    api.pSessionData = &conn;
+    pkg.pPackage = &mgr;
+    CHECK(DirectGate_Files_HandleManager(&api, &pkg) == XAPI_CONTINUE, "a manager message for no session is dropped");
+    pkg.pPackage = &xfer;
+    CHECK(DirectGate_Files_HandleFile(&api, &pkg) == XAPI_CONTINUE, "and so is a file message");
+    return 0;
+}
+
 int main(void)
 {
     char sRoot[] = "/tmp/directgate_files_static.XXXXXX";
@@ -803,6 +893,7 @@ int main(void)
     }
 
     if (test_static_corners(sRoot)) return 1;
+    if (test_guards(sRoot)) return 1;
 
     CHECK(DirectGate_Files_Delete(sDirCopy, XTRUE) == XSTDOK,
         "cleanup copied directory");

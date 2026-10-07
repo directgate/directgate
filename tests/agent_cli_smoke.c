@@ -219,17 +219,23 @@ typedef struct {
     size_t nScreen;
 } tty_t;
 
-static void tty_pump(tty_t *pTty, int nWaitMs)
+/* Returns how much was read. Every wait loop here counts its turns as time, and a terminal the agent has closed
+ * polls ready at once and reads nothing: such a turn waits out its time instead, or a loop that should have waited
+ * seconds for the agent to exit would give up within a millisecond of the hangup. */
+static ssize_t tty_pump(tty_t *pTty, int nWaitMs)
 {
     struct pollfd pfd = { pTty->nMaster, POLLIN, 0 };
-    if (pTty->nMaster < 0 || poll(&pfd, 1, nWaitMs) <= 0 || !(pfd.revents & (POLLIN | POLLHUP))) return;
+    if (pTty->nMaster < 0 || poll(&pfd, 1, nWaitMs) <= 0 || !(pfd.revents & (POLLIN | POLLHUP))) return 0;
 
     size_t nRoom = sizeof(pTty->sScreen) - 1 - pTty->nScreen;
-    if (nRoom == 0) return;
+    if (nRoom == 0) return 0;
 
     ssize_t nRead = read(pTty->nMaster, pTty->sScreen + pTty->nScreen, nRoom);
     if (nRead > 0) pTty->nScreen += (size_t)nRead;
+    else usleep((useconds_t)nWaitMs * 1000U);
+
     pTty->sScreen[pTty->nScreen] = '\0';
+    return nRead > 0 ? nRead : 0;
 }
 
 static int tty_expect(tty_t *pTty, const char *pNeedle, uint32_t nTimeoutMs)
@@ -294,7 +300,10 @@ static int tty_finish(tty_t *pTty, uint32_t nTimeoutMs)
     for (uint32_t nWaited = 0; nWaited < nTimeoutMs && (nDone = waitpid(pTty->nPid, &nStatus, WNOHANG)) == 0; nWaited += 20)
         tty_pump(pTty, 20);
 
-    for (int i = 0; i < 10; i++) tty_pump(pTty, 5);
+    for (int i = 0; i < 10; i++)
+    {
+        if (tty_pump(pTty, 5) <= 0) break;
+    }
 
     if (nDone != pTty->nPid)
     {

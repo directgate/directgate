@@ -844,7 +844,9 @@ static int scan_child(int nDisplay)
     if (!write_text("/proc/self/uid_map", sMap)) return 77;
     snprintf(sMap, sizeof(sMap), "%u %u 1\n", (unsigned)nGid, (unsigned)nGid);
     if (!write_text("/proc/self/setgroups", "deny") || !write_text("/proc/self/gid_map", sMap)) return 77;
-    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) return 77;
+    /* "none" rather than NULL, as mount(8) passes: a propagation change ignores both, and valgrind 3.22 (Ubuntu
+       24.04's) reports a NULL type as an unaddressable syscall argument */
+    if (mount("none", "/", "none", MS_REC | MS_PRIVATE, NULL) != 0) return 77;
     if (mount("tmpfs", "/tmp/.X11-unix", "tmpfs", 0, "mode=1777") != 0) return 77;
     unsetenv("DISPLAY");
 

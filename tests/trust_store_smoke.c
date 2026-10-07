@@ -222,7 +222,9 @@ static int isolated_child(void)
     if (!write_text("/proc/self/uid_map", sMap)) return 77;
     snprintf(sMap, sizeof(sMap), "%u %u 1\n", (unsigned)STRANGER_UID, (unsigned)nOuterGid);
     if (!write_text("/proc/self/setgroups", "deny") || !write_text("/proc/self/gid_map", sMap)) return 77;
-    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) return 77;
+    /* "none" rather than NULL, as mount(8) passes: a propagation change ignores both, and valgrind 3.22 (Ubuntu
+       24.04's) reports a NULL type as an unaddressable syscall argument */
+    if (mount("none", "/", "none", MS_REC | MS_PRIVATE, NULL) != 0) return 77;
 
     const char *pDefaultFile = X509_get_default_cert_file();
     const char *pDefaultDir = X509_get_default_cert_dir();

@@ -18,6 +18,7 @@
 #include <pty.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -29,7 +30,7 @@
         } \
     } while (0)
 
-/* Term_Start registers an endpoint with the event loop; these tests drive the
+/* The session registers the PTY with the event loop; these tests drive the
  * terminal directly, so the api and websocket sides are inert stand-ins. */
 static xapi_t g_api;
 static xapi_session_t g_ws;
@@ -502,6 +503,117 @@ static int test_broken_pty(void)
     return 0;
 }
 
+/* Reaps what a test shut down, the way the event loop would, for at most two seconds. */
+static xbool_t reap_shell(pid_t nChild)
+{
+    for (int nPass = 0; nPass < 200 && DirectGate_Term_ReapPending() > 0; nPass++) usleep(10000);
+    return DirectGate_Term_ReapPending() == 0 && kill(nChild, 0) != 0 && errno == ESRCH;
+}
+
+/* A configured shell user the agent cannot become: the shell does not start as
+ * the agent's own account instead, and the terminal says why it closed. */
+static int test_switch_user_refused(void)
+{
+    struct passwd *pRoot = getpwuid(0);
+    if (geteuid() == 0 || pRoot == NULL || !xstrused(pRoot->pw_name)) return 0;
+
+    directgate_term_t term;
+    DirectGate_Term_Init(&term);
+    term.nSessionId = 9;
+    xstrncpy(term.sShellUser, sizeof(term.sShellUser), pRoot->pw_name);
+    xstrncpy(term.sShellHome, sizeof(term.sShellHome), "/");
+
+    CHECK(DirectGate_Term_StartNoEndpoint(&term, &g_api, &g_ws) == XSTDOK, "a terminal for another account forks its child");
+    CHECK(wait_for_output(&term, "cannot switch to the configured shell user", 200),
+        "a child that cannot become the shell user says so and runs no shell");
+
+    pid_t nChild = term.nPid;
+    DirectGate_Term_Shutdown(&term, XTRUE);
+    CHECK(reap_shell(nChild), "the refused child is reaped");
+    DirectGate_Term_Clear(&term);
+    return 0;
+}
+
+/* A spawn with no descriptor or no process to spare fails before anything is
+ * left running. Limits only bind a process that is not root, and they cannot be
+ * undone, so the checks run in a child. */
+static int spawn_limited(int nResource, rlim_t nLimit)
+{
+    struct rlimit saved, limit;
+    if (getrlimit(nResource, &saved) != 0) return 2;
+    limit = saved;
+    limit.rlim_cur = nLimit;
+    if (setrlimit(nResource, &limit) != 0) return 2;
+
+    directgate_term_t term;
+    DirectGate_Term_Init(&term);
+    XSTATUS nStatus = DirectGate_Term_StartNoEndpoint(&term, &g_api, &g_ws);
+    xbool_t bRefused = nStatus == XSTDERR && !DirectGate_Term_IsRunning(&term) && term.nPid <= 0;
+    DirectGate_Term_Clear(&term);
+
+    /* The soft limit goes back so the child can still write what it has to on exit */
+    (void)setrlimit(nResource, &saved);
+    return bRefused ? 0 : 1;
+}
+
+/* A stop asked for before the event loop took the terminal on is a shutdown on the spot */
+static int test_stop_without_event(void)
+{
+    const char *pUser = current_user();
+    if (pUser == NULL) return 0;
+
+    directgate_term_t term;
+    DirectGate_Term_Init(&term);
+    term.nSessionId = 10;
+    xstrncpy(term.sShellUser, sizeof(term.sShellUser), pUser);
+
+    CHECK(DirectGate_Term_StartNoEndpoint(&term, &g_api, &g_ws) == XSTDOK, "start a shell with no event registered");
+    pid_t nChild = term.nPid;
+    DirectGate_Term_RequestStop(&term);
+    CHECK(!DirectGate_Term_IsRunning(&term) && term.nMasterFd == (int)XSOCK_INVALID, "a stop shuts it down at once");
+    CHECK(reap_shell(nChild), "and its shell is reaped");
+
+    DirectGate_Term_RequestStop(&term);
+    DirectGate_Term_Clear(&term);
+    return 0;
+}
+
+static int test_spawn_refused(void)
+{
+    if (geteuid() == 0) return 0;
+
+    /* The lowest free descriptor is where the PTY would go; a limit at it leaves none. */
+    int nLowest = dup(STDERR_FILENO);
+    CHECK(nLowest >= 0, "find the lowest free descriptor");
+    close(nLowest);
+
+    const int resources[] = { RLIMIT_NOFILE, RLIMIT_NPROC };
+    const rlim_t limits[] = { (rlim_t)nLowest, 0 };
+    for (int i = 0; i < 2; i++)
+    {
+        /* exit(), not _exit(): a coverage build writes the child's counts at exit */
+        fflush(NULL);
+        pid_t nChild = fork();
+        CHECK(nChild >= 0, "fork a child to limit");
+        if (nChild == 0) exit(spawn_limited(resources[i], limits[i]));
+
+        int nStatus = 0;
+        CHECK(waitpid(nChild, &nStatus, 0) == nChild && WIFEXITED(nStatus), "the limited child finishes");
+        CHECK(WEXITSTATUS(nStatus) != 1, i == 0 ? "a spawn without a descriptor to spare fails" :
+            "a spawn without a process to spare fails");
+    }
+
+    /* A descriptor the event loop no longer owns goes back to blocking. */
+    int fds[2];
+    CHECK(pipe(fds) == 0, "create a pipe to switch modes on");
+    CHECK(DirectGate_Term_SetNonBlock(fds[0], XTRUE) == XSTDOK && DirectGate_Term_SetNonBlock(fds[0], XFALSE) == XSTDOK &&
+          !(fcntl(fds[0], F_GETFL) & O_NONBLOCK), "a descriptor is put back in blocking mode");
+    close(fds[0]);
+    close(fds[1]);
+    CHECK(DirectGate_Term_SetNonBlock(fds[0], XTRUE) == XSTDERR, "a closed descriptor has no mode");
+    return 0;
+}
+
 int main(void)
 {
     setup_stubs();
@@ -514,6 +626,9 @@ int main(void)
     if (test_hangup_ignored()) return 1;
     if (test_reap_queue_full()) return 1;
     if (test_broken_pty()) return 1;
+    if (test_switch_user_refused()) return 1;
+    if (test_stop_without_event()) return 1;
+    if (test_spawn_refused()) return 1;
 
     puts("term_io_smoke: OK");
     return 0;

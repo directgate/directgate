@@ -1042,6 +1042,15 @@ void DirectGate_WL_CaptureDisableDmaBuf(directgate_wl_capture_t *pCapture)
     g_pw.loopUnlock(pCapture->pLoop);
 }
 
+void DirectGate_WL_CaptureHalt(directgate_wl_capture_t *pCapture)
+{
+    XCHECK_VOID_NL((pCapture != NULL));
+
+    /* Stopping a loop that has already stopped does nothing, so the
+     * stop that follows in DirectGate_WL_CaptureStop() is harmless. */
+    if (pCapture->pLoop != NULL && g_pw.loopStop != NULL) g_pw.loopStop(pCapture->pLoop);
+}
+
 void DirectGate_WL_CaptureStop(directgate_wl_capture_t *pCapture)
 {
     if (pCapture == NULL) return;

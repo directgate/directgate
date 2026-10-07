@@ -580,6 +580,11 @@ static int DirectGate_HWEnc_LoadFilter(void)
 
     if (pMissing != NULL || (nVersion >> 16) != LIBAVFILTER_VERSION_MAJOR)
     {
+        /* Cleared first: the reason is the one thing that has to outlive the entry points */
+        dlclose(pHandle);
+        memset(pLib, 0, sizeof(*pLib));
+        pLib->bLoadAttempted = XTRUE;
+
         if (pMissing != NULL)
         {
             snprintf(pLib->sError, sizeof(pLib->sError),
@@ -591,10 +596,6 @@ static int DirectGate_HWEnc_LoadFilter(void)
                 "libavfilter %u does not match the %d this build expects",
                 nVersion >> 16, LIBAVFILTER_VERSION_MAJOR);
         }
-
-        dlclose(pHandle);
-        memset(pLib, 0, sizeof(*pLib));
-        pLib->bLoadAttempted = XTRUE;
 
         return XSTDERR;
     }

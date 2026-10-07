@@ -180,17 +180,22 @@ static xbool_t DirectGate_WL_TokenLoad(const char *pPath, char *pBuf, size_t nSi
     return pBuf[0] != '\0';
 }
 
-/* Hands one exported buffer back from inside a frame callback. Dropping is
- * the cheap way and only works on the stream whose thread this is; a buffer
- * from the stream a screen switch just replaced belongs to another loop, and
- * that one has to be locked like any other thread would. */
-static void DirectGate_WL_SourceReturn(directgate_wl_capture_t *pCapture,
-                                       directgate_wl_capture_t *pCurrent, void *pHandle)
+/* Whether the slot holds an export of a stream other than pCapture's; called with frameLock held.
+ *
+ * Two streams deliver at once only while a screen switch waits for the new one's format,
+ * each on its own loop thread and holding that loop's lock. Handing the other stream's 
+ * buffer back from a frame callback would take the other loop's lock: two loops doing
+ * that at once wait for each other for good, and the switch - which stops the old loop
+ * by joining its thread - waits with them, and the agent's event loop with it. So a loop
+ * thread never touches another stream. A frame that finds the other stream's export in
+ * the slot goes back to its own stream instead, and that export stays for the encoder or
+ * for DirectGate_WL_SourceSelect(), which give it back from outside any loop. */
+static xbool_t DirectGate_WL_SlotHeldElsewhere(const directgate_wl_source_t *pSource, const directgate_wl_capture_t *pCapture)
 {
-    if (pCapture == NULL || pHandle == NULL) return;
-
-    if (pCapture == pCurrent) DirectGate_WL_CaptureDrop(pCapture, pHandle);
-    else DirectGate_WL_CaptureRelease(pCapture, pHandle);
+    return (pSource->bFrameExported &&
+            pSource->pFrameHandle != NULL &&
+            pSource->pFrameCapture != pCapture) ?
+            XTRUE : XFALSE;
 }
 
 /* Wakes the encoder, which is either waiting for exactly this or about to
@@ -218,8 +223,16 @@ static void DirectGate_WL_OnFrame(void *pUserCtx, const directgate_wl_frame_t *p
          * into the slot, and whatever was in it goes back to the compositor. */
         XSync_Lock(&pSource->frameLock);
 
+        if (DirectGate_WL_SlotHeldElsewhere(pSource, pFrame->pCapture))
+        {
+            XSync_Unlock(&pSource->frameLock);
+            DirectGate_WL_CaptureDrop(pFrame->pCapture, pFrame->pHandle);
+            return;
+        }
+
+        /* Anything already in the slot is this stream's, so this thread
+         * drops it rather than locks for it. */
         void *pStale = pSource->bFrameExported ? pSource->pFrameHandle : NULL;
-        directgate_wl_capture_t *pStaleCapture = pSource->pFrameCapture;
 
         pSource->frameDma = pFrame->dmabuf;
         pSource->pFrameHandle = pFrame->pHandle;
@@ -231,7 +244,7 @@ static void DirectGate_WL_OnFrame(void *pUserCtx, const directgate_wl_frame_t *p
 
         XSync_Unlock(&pSource->frameLock);
 
-        DirectGate_WL_SourceReturn(pStaleCapture, pFrame->pCapture, pStale);
+        if (pStale != NULL) DirectGate_WL_CaptureDrop(pFrame->pCapture, pStale);
         DirectGate_WL_SourceSignal(pSource);
 
         return;
@@ -241,11 +254,17 @@ static void DirectGate_WL_OnFrame(void *pUserCtx, const directgate_wl_frame_t *p
 
     XSync_Lock(&pSource->frameLock);
 
+    /* Its buffer goes back to its stream when this returns. */
+    if (DirectGate_WL_SlotHeldElsewhere(pSource, pFrame->pCapture))
+    {
+        XSync_Unlock(&pSource->frameLock);
+        return;
+    }
+
     /* A renegotiation can turn an exporting stream back into a mapped one
      * mid-session; anything left over from before it belongs to the
      * compositor and goes back before this frame takes the slot. */
     void *pStale = pSource->bFrameExported ? pSource->pFrameHandle : NULL;
-    directgate_wl_capture_t *pStaleCapture = pSource->pFrameCapture;
 
     pSource->bFrameExported = XFALSE;
     pSource->pFrameHandle = NULL;
@@ -256,7 +275,7 @@ static void DirectGate_WL_OnFrame(void *pUserCtx, const directgate_wl_frame_t *p
         if (pGrown == NULL)
         {
             XSync_Unlock(&pSource->frameLock);
-            DirectGate_WL_SourceReturn(pStaleCapture, pFrame->pCapture, pStale);
+            if (pStale != NULL) DirectGate_WL_CaptureDrop(pFrame->pCapture, pStale);
 
             return;
         }
@@ -282,7 +301,7 @@ static void DirectGate_WL_OnFrame(void *pUserCtx, const directgate_wl_frame_t *p
 
     XSync_Unlock(&pSource->frameLock);
 
-    DirectGate_WL_SourceReturn(pStaleCapture, pFrame->pCapture, pStale);
+    if (pStale != NULL) DirectGate_WL_CaptureDrop(pFrame->pCapture, pStale);
     DirectGate_WL_SourceSignal(pSource);
 }
 
@@ -511,6 +530,35 @@ const directgate_wl_stream_t* DirectGate_WL_SourceScreen(directgate_wl_source_t 
     return DirectGate_WL_PortalStream(pSource->pPortal, nIndex);
 }
 
+/* A capture that was started and is not kept. A format agreed just after the
+ * wait gave up lets its stream deliver before it stops, and an export of it
+ * left in the slot would then belong to a capture about to be freed: the next
+ * frame, or the encoder, would hand it back to memory that no longer exists.
+ * Same order as a switch - its thread stops first, then the slot gives back
+ * anything of its own. */
+static void DirectGate_WL_SourceAbandon(directgate_wl_source_t *pSource, directgate_wl_capture_t *pCapture)
+{
+    DirectGate_WL_CaptureHalt(pCapture);
+
+    XSync_Lock(&pSource->frameLock);
+    void *pLeft = NULL;
+
+    if (pSource->bFrameExported && pSource->pFrameCapture == pCapture)
+    {
+        pLeft = pSource->pFrameHandle;
+        pSource->bFrameExported = XFALSE;
+        pSource->bFrameFresh = XFALSE;
+        pSource->pFrameHandle = NULL;
+        pSource->pFrameCapture = NULL;
+    }
+
+    XSync_Unlock(&pSource->frameLock);
+
+    /* From a thread that is not its loop, so this one locks rather than drops. */
+    if (pLeft != NULL) DirectGate_WL_CaptureRelease(pCapture, pLeft);
+    DirectGate_WL_CaptureStop(pCapture);
+}
+
 int DirectGate_WL_SourceSelect(directgate_wl_source_t *pSource, uint32_t nNodeId)
 {
     XCHECK((pSource != NULL && pSource->pPortal != NULL), XSTDERR);
@@ -539,7 +587,7 @@ int DirectGate_WL_SourceSelect(directgate_wl_source_t *pSource, uint32_t nNodeId
 
     if (DirectGate_WL_CaptureWaitFormat(pCapture, 4000) != XSTDOK)
     {
-        DirectGate_WL_CaptureStop(pCapture);
+        DirectGate_WL_SourceAbandon(pSource, pCapture);
         xlogw("Screen node %u never agreed on a video format", nNodeId);
         return XSTDERR;
     }
@@ -547,6 +595,12 @@ int DirectGate_WL_SourceSelect(directgate_wl_source_t *pSource, uint32_t nNodeId
     /* The old capture goes only once the new one is proven, so a screen that
      * cannot be opened leaves the session on the one that works. */
     directgate_wl_capture_t *pOld = pSource->pCapture;
+
+    /* Its thread is stopped before the slot is emptied: until then it can
+     * still put a frame there, and an export left behind by a stream that is
+     * then freed is a buffer and a capture the next frame would hand back to
+     * memory that no longer exists. */
+    if (pOld != NULL) DirectGate_WL_CaptureHalt(pOld);
 
     XSync_Lock(&pSource->frameLock);
     void *pPending = pSource->bFrameExported ? pSource->pFrameHandle : NULL;
@@ -560,7 +614,7 @@ int DirectGate_WL_SourceSelect(directgate_wl_source_t *pSource, uint32_t nNodeId
     pSource->pFrameCapture = NULL;
     XSync_Unlock(&pSource->frameLock);
 
-    /* Before the stream that owns it is stopped, and from a thread that is
+    /* Before the stream that owns it is torn down, and from a thread that is
      * not its loop - so this one locks rather than drops. */
     if (pPending != NULL && pPendingCapture != NULL)
         DirectGate_WL_CaptureRelease(pPendingCapture, pPending);

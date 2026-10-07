@@ -20,7 +20,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake build-essential pkg-config \
             libssl-dev libx11-dev libxrandr-dev libxext-dev libopus-dev \
-            libopenh264-dev libavcodec-dev libavutil-dev
+            libopenh264-dev libavcodec-dev libavutil-dev libavfilter-dev \
+            libpipewire-0.3-dev libdbus-1-dev
 
       - name: Build and run smoke tests
         run: sh ./tests/run-smoke.sh

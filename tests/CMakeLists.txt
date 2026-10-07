@@ -73,6 +73,7 @@ foreach(test
         crypto_smoke
         e2e_ccwin_smoke
         srp_smoke
+        srp_guards_smoke
         transfer_smoke
         transfer_bounds_smoke
         transfer_failure_smoke
@@ -82,6 +83,7 @@ foreach(test
         webrtc_media_smoke
         webrtc_queue_smoke
         webrtc_static_smoke
+        webrtc_guards_smoke
         webrtc_rtcp_smoke
         webrtc_audio_smoke
         api_invalid_role_smoke
@@ -143,6 +145,7 @@ directgate_smoke(enroll_smoke        ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c
 directgate_smoke(enroll_edge_smoke   ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(enroll_transport_smoke ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(enroll_api_smoke    ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
+directgate_smoke(enroll_guards_smoke ${AGENT_DIR}/config.c)
 set_tests_properties(enroll_api_smoke PROPERTIES SKIP_RETURN_CODE 77)
 directgate_smoke(add_key_smoke       ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(config_smoke        ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
@@ -192,6 +195,16 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(openh264_smoke PRIVATE ${CMAKE_DL_LIBS})
     set_tests_properties(openh264_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
+    # The same wrapper against a stand-in loaded by path, for the libraries and
+    # the frames a working OpenH264 never produces.
+    add_library(fake_openh264 MODULE fake_openh264.c)
+    target_include_directories(fake_openh264 PRIVATE ${AGENT_DIR}/openh264)
+    directgate_smoke(openh264_fake_smoke ${AGENT_DIR}/desktop/openh264.c)
+    target_include_directories(openh264_fake_smoke PRIVATE ${AGENT_DIR}/openh264)
+    target_compile_definitions(openh264_fake_smoke PRIVATE FAKE_OPENH264_PATH="$<TARGET_FILE:fake_openh264>")
+    target_link_libraries(openh264_fake_smoke PRIVATE ${CMAKE_DL_LIBS})
+    add_dependencies(openh264_fake_smoke fake_openh264)
+
     # Opus encoder wrapper: skips (77) when libopus is absent, like openh264.
     directgate_smoke(opus_smoke ${AGENT_DIR}/desktop/opus.c)
     target_link_libraries(opus_smoke PRIVATE ${CMAKE_DL_LIBS} m)
@@ -235,6 +248,40 @@ if(UNIX AND NOT APPLE)
         # agent's own encoder path leak-free.
         set_tests_properties(hwenc_smoke PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu"
             ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0:halt_on_error=1:strict_string_checks=1")
+
+        # The same encoder against stand-ins for libavcodec and libavutil under
+        # this build's sonames, so every path runs where there is no GPU - and,
+        # with libavfilter's headers, the Wayland zero-copy chain as well.
+        string(REGEX MATCH "^[0-9]+" _dg_avcodec_major "${LIBAV_libavcodec_VERSION}")
+        string(REGEX MATCH "^[0-9]+" _dg_avutil_major "${LIBAV_libavutil_VERSION}")
+        add_library(fake_avutil SHARED fake_libavutil.c)
+        add_library(fake_avcodec SHARED fake_libavcodec.c)
+        set_target_properties(fake_avutil PROPERTIES OUTPUT_NAME avutil SOVERSION ${_dg_avutil_major}
+            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fake_libav")
+        set_target_properties(fake_avcodec PROPERTIES OUTPUT_NAME avcodec SOVERSION ${_dg_avcodec_major}
+            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fake_libav")
+        target_include_directories(fake_avutil SYSTEM PRIVATE ${LIBAV_INCLUDE_DIRS})
+        target_include_directories(fake_avcodec SYSTEM PRIVATE ${LIBAV_INCLUDE_DIRS})
+        target_link_libraries(fake_avutil PRIVATE Threads::Threads)
+        target_link_libraries(fake_avcodec PRIVATE fake_avutil)
+
+        directgate_smoke(hwenc_fake_smoke ${AGENT_DIR}/desktop/hwenc.c)
+        target_compile_definitions(hwenc_fake_smoke PRIVATE DIRECTGATE_HAVE_HWENC=1)
+        target_include_directories(hwenc_fake_smoke PRIVATE ${LIBAV_INCLUDE_DIRS})
+        target_link_libraries(hwenc_fake_smoke PRIVATE fake_avcodec fake_avutil ${CMAKE_DL_LIBS})
+
+        if(LIBAVFILTER_FOUND)
+            string(REGEX MATCH "^[0-9]+" _dg_avfilter_major "${LIBAVFILTER_VERSION}")
+            add_library(fake_avfilter SHARED fake_libavfilter.c)
+            set_target_properties(fake_avfilter PROPERTIES OUTPUT_NAME avfilter SOVERSION ${_dg_avfilter_major}
+                LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fake_libav")
+            target_include_directories(fake_avfilter SYSTEM PRIVATE ${LIBAV_INCLUDE_DIRS} ${LIBAVFILTER_INCLUDE_DIRS})
+            target_link_libraries(fake_avfilter PRIVATE fake_avutil)
+
+            target_compile_definitions(hwenc_fake_smoke PRIVATE DIRECTGATE_HWENC_HAS_FILTER=1)
+            target_include_directories(hwenc_fake_smoke PRIVATE ${LIBAVFILTER_INCLUDE_DIRS})
+            target_link_libraries(hwenc_fake_smoke PRIVATE fake_avfilter)
+        endif()
     endif()
 
     # Compiles the X11 input unit directly (like files_static_smoke) to test
@@ -269,6 +316,70 @@ if(UNIX AND NOT APPLE)
         target_include_directories(wayland_portal_bus_smoke SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
         target_link_libraries(wayland_portal_bus_smoke PRIVATE ${DBUS_LIBRARIES} ${CMAKE_DL_LIBS} Threads::Threads)
         set_tests_properties(wayland_portal_bus_smoke PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
+    if(PIPEWIRE_FOUND)
+        # A stand-in for libpipewire-0.3 under its own soname, linked into the
+        # tests so the agent's dlopen() finds it already loaded and never a
+        # PipeWire that is installed. The partial build lacks an entry point.
+        foreach(_dg_fake_pw fake_pipewire fake_pipewire_partial)
+            add_library(${_dg_fake_pw} SHARED fake_pipewire.c)
+            set_target_properties(${_dg_fake_pw} PROPERTIES OUTPUT_NAME pipewire-0.3 SOVERSION 0
+                LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${_dg_fake_pw}")
+            target_include_directories(${_dg_fake_pw} SYSTEM PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
+            target_link_libraries(${_dg_fake_pw} PRIVATE Threads::Threads)
+        endforeach()
+        target_compile_definitions(fake_pipewire_partial PRIVATE FAKE_PW_PARTIAL=1)
+
+        # The PipeWire capture against the stand-in: start failures, format
+        # negotiation, every buffer check, the export path and its fallbacks.
+        directgate_smoke(wayland_capture_smoke ${AGENT_DIR}/desktop/wayland_capture.c)
+        directgate_smoke(wayland_capture_partial_smoke ${AGENT_DIR}/desktop/wayland_capture.c)
+        target_compile_definitions(wayland_capture_smoke PRIVATE DIRECTGATE_DESKTOP_HAS_WAYLAND=1)
+        target_compile_definitions(wayland_capture_partial_smoke PRIVATE DIRECTGATE_DESKTOP_HAS_WAYLAND=1)
+        target_include_directories(wayland_capture_smoke SYSTEM PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
+        target_include_directories(wayland_capture_partial_smoke SYSTEM PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
+        target_link_libraries(wayland_capture_smoke PRIVATE fake_pipewire Threads::Threads)
+        target_link_libraries(wayland_capture_partial_smoke PRIVATE fake_pipewire_partial)
+
+        # The Wayland source - remembered permission, setup, frame slot and
+        # screen switching - with the portal played by wayland_portal_stub.h.
+        directgate_smoke(wayland_source_smoke
+            ${AGENT_DIR}/desktop/desktop_wayland.c
+            ${AGENT_DIR}/desktop/wayland_capture.c
+            ${AGENT_DIR}/yuv.c)
+        target_compile_definitions(wayland_source_smoke PRIVATE DIRECTGATE_DESKTOP_HAS_WAYLAND=1)
+        target_include_directories(wayland_source_smoke SYSTEM PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
+        target_link_libraries(wayland_source_smoke PRIVATE fake_pipewire Threads::Threads)
+
+        # The desktop module set desktop_x11_smoke runs, built with Wayland
+        # streaming and driven on a Wayland session end to end.
+        directgate_smoke(desktop_wayland_smoke
+            ${AGENT_DIR}/desktop/desktop.c
+            ${AGENT_DIR}/desktop/display.c
+            ${AGENT_DIR}/desktop/input.c
+            ${AGENT_DIR}/desktop/stream.c
+            ${AGENT_DIR}/desktop/desktop_wayland.c
+            ${AGENT_DIR}/desktop/wayland_capture.c)
+        directgate_smoke_desktop(desktop_wayland_smoke)
+        target_compile_definitions(desktop_wayland_smoke PRIVATE DIRECTGATE_DESKTOP_HAS_WAYLAND=1)
+        target_include_directories(desktop_wayland_smoke SYSTEM PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
+        target_link_libraries(desktop_wayland_smoke PRIVATE fake_pipewire Threads::Threads)
+
+        # With the libavcodec stand-ins the same desktop also runs its GPU encoder.
+        if(TARGET fake_avcodec)
+            target_sources(desktop_wayland_smoke PRIVATE ${AGENT_DIR}/desktop/hwenc.c)
+            target_compile_definitions(desktop_wayland_smoke PRIVATE DIRECTGATE_HAVE_HWENC=1)
+            target_include_directories(desktop_wayland_smoke PRIVATE ${LIBAV_INCLUDE_DIRS})
+            target_link_libraries(desktop_wayland_smoke PRIVATE fake_avcodec fake_avutil)
+
+            # And with the libavfilter stand-in, the compositor's frames go to it without a copy.
+            if(TARGET fake_avfilter)
+                target_compile_definitions(desktop_wayland_smoke PRIVATE DIRECTGATE_HWENC_HAS_FILTER=1)
+                target_include_directories(desktop_wayland_smoke PRIVATE ${LIBAVFILTER_INCLUDE_DIRS})
+                target_link_libraries(desktop_wayland_smoke PRIVATE fake_avfilter)
+            endif()
+        endif()
     endif()
 
     # Same idea for the adaptive bitrate controller: compiles desktop.c and
@@ -310,12 +421,16 @@ directgate_smoke(client_devices_smoke ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/weba
 directgate_smoke(client_pick_smoke    ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/webapi.c)
 directgate_smoke(client_config_smoke  ${CLIENT_DIR}/config.c ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/webapi.c)
 directgate_smoke(client_login_smoke   ${CLIENT_DIR}/login.c ${CLIENT_DIR}/webapi.c)
+directgate_smoke(client_login_guards_smoke ${CLIENT_DIR}/webapi.c)
 directgate_smoke(client_relay_smoke   ${CLIENT_DIR}/relay.c ${CLIENT_DIR}/webapi.c)
 directgate_smoke(client_webapi_smoke  ${CLIENT_DIR}/webapi.c)
 
-# Compiles client.c itself (its main renamed away) to drive the static terminal I/O and inbound message gate.
+# Compiles client.c itself (its main renamed away) to drive the static terminal I/O and inbound message gate,
+# and everything dgcli refuses.
 if(NOT WIN32)
     directgate_smoke(client_io_smoke ${CLIENT_DIR}/config.c ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/login.c
+        ${CLIENT_DIR}/relay.c ${CLIENT_DIR}/webapi.c)
+    directgate_smoke(client_guards_smoke ${CLIENT_DIR}/config.c ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/login.c
         ${CLIENT_DIR}/relay.c ${CLIENT_DIR}/webapi.c)
 endif()
 
@@ -325,6 +440,7 @@ foreach(test
         client_pick_smoke
         client_config_smoke
         client_login_smoke
+        client_login_guards_smoke
         client_relay_smoke
         client_webapi_smoke)
     target_include_directories(${test} PRIVATE ${CLIENT_DIR})
@@ -348,6 +464,25 @@ directgate_smoke_desktop(session_files_smoke)
 target_compile_definitions(session_files_smoke PRIVATE DIRECTGATE_TESTING)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(session_files_smoke PRIVATE -Wno-unused-function)
+endif()
+
+# The connection layer's refusals. Includes directgate.c itself for its static
+# handlers, so it is not among the sources.
+directgate_smoke(directgate_guards_smoke
+    ${AGENT_DIR}/config.c
+    ${AGENT_DIR}/desktop/desktop.c
+    ${AGENT_DIR}/desktop/display.c
+    ${AGENT_DIR}/desktop/input.c
+    ${AGENT_DIR}/desktop/stream.c
+    ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/files.c
+    ${AGENT_DIR}/search.c
+    ${AGENT_DIR}/session.c
+    ${AGENT_DIR}/term.c)
+directgate_smoke_desktop(directgate_guards_smoke)
+target_compile_definitions(directgate_guards_smoke PRIVATE DIRECTGATE_TESTING)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(directgate_guards_smoke PRIVATE -Wno-unused-function)
 endif()
 
 directgate_smoke(auth_flow_smoke

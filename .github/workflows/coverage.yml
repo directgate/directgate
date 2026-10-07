@@ -17,15 +17,23 @@ jobs:
           submodules: recursive
 
       # The smoke set plus what reaches the desktop code: Xvfb for the X11
-      # tests, PipeWire and D-Bus headers for the Wayland backend, and a
-      # dbus-daemon for the fake portal.
+      # tests, PipeWire and D-Bus headers for the Wayland backend and
+      # libavfilter's for its zero-copy path, a dbus-daemon for the fake
+      # portal and libpulse for the audio backend (the tests play the sound
+      # server themselves).
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake build-essential pkg-config python3 \
             libssl-dev libx11-dev libxrandr-dev libxext-dev libopus-dev \
-            libopenh264-dev libavcodec-dev libavutil-dev \
-            libpipewire-0.3-dev libdbus-1-dev dbus xvfb
+            libopenh264-dev libavcodec-dev libavutil-dev libavfilter-dev \
+            libpipewire-0.3-dev libdbus-1-dev dbus xvfb libpulse0
+
+      # Ubuntu puts unprivileged user namespaces behind AppArmor. The trust
+      # store test and the X11 display scan cover real directories with empty
+      # ones inside a private namespace, and skip without one.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Build and run smoke tests with coverage
         run: sh ./tests/run-coverage.sh

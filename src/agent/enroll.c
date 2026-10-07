@@ -263,9 +263,9 @@ static xhttp_status_t DirectGate_Enroll_Perform(xhttp_t *pHandle, directgate_enr
 
 static void DirectGate_Enroll_SetReason(char *pReason, size_t nReasonSize, const char *pValue)
 {
-    xstrnul(pReason);
     XCHECK_VOID_NL((pReason != NULL));
     XCHECK_VOID_NL((nReasonSize > 0));
+    xstrnul(pReason);
     XCHECK_VOID_NL((xstrused(pValue)));
     xstrncpy(pReason, nReasonSize, pValue);
 }

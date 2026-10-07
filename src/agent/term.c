@@ -1107,34 +1107,6 @@ XSTATUS DirectGate_Term_StartNoEndpoint(directgate_term_t *pTerm, xapi_t *pApi, 
     return XSTDOK;
 }
 
-XSTATUS DirectGate_Term_Start(directgate_term_t *pTerm, xapi_t *pApi, xapi_session_t *pWsSession)
-{
-    XSTATUS nStatus = DirectGate_Term_StartNoEndpoint(pTerm, pApi, pWsSession);
-    XCHECK_NL((nStatus >= 0), nStatus);
-
-    xapi_endpoint_t endpt;
-    XAPI_InitEndpoint(&endpt);
-
-    endpt.eType = XAPI_EVENT;
-    endpt.eRole = XAPI_CUSTOM;
-    endpt.nFD = pTerm->nMasterFd;
-    endpt.nEvents = XPOLLIN;
-    endpt.bUnix = XTRUE;
-    endpt.pSessionData = pTerm;
-
-    if (XAPI_AddEndpoint(pApi, &endpt) < 0)
-    {
-        xloge("Failed to register PTY endpoint: sid(%u), wsfd(%d), ptfd(%d)",
-            pTerm->nSessionId, DirectGate_Term_GetWsFd(pTerm), pTerm->nMasterFd);
-
-        /* A failed registration closes the descriptor itself; only the shell is left to reap. */
-        DirectGate_Term_Shutdown(pTerm, XFALSE);
-        return XSTDERR;
-    }
-
-    return XSTDOK;
-}
-
 void DirectGate_Term_RequestStop(directgate_term_t *pTerm)
 {
     XCHECK_VOID((pTerm != NULL));

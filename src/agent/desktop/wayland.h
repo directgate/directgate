@@ -149,6 +149,11 @@ xbool_t DirectGate_WL_CaptureSize(directgate_wl_capture_t *pCapture,
  * shows the last one for ever. */
 xbool_t DirectGate_WL_CaptureLost(directgate_wl_capture_t *pCapture, char *pErrBuf, size_t nErrSize);
 
+/* Stops the stream's thread and nothing else: no frame arrives once this
+ * returns, and buffers handed out earlier can still be given back until
+ * DirectGate_WL_CaptureStop(). */
+void DirectGate_WL_CaptureHalt(directgate_wl_capture_t *pCapture);
+
 void DirectGate_WL_CaptureStop(directgate_wl_capture_t *pCapture);
 
 typedef struct directgate_wl_portal_ directgate_wl_portal_t;

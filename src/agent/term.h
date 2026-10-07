@@ -110,7 +110,6 @@ typedef struct directgate_term_ {
 void DirectGate_Term_Init(directgate_term_t *pTerm);
 void DirectGate_Term_Clear(directgate_term_t *pTerm);
 
-XSTATUS DirectGate_Term_Start(directgate_term_t *pTerm, xapi_t *pApi, xapi_session_t *pWsSession);
 XSTATUS DirectGate_Term_StartNoEndpoint(directgate_term_t *pTerm, xapi_t *pApi, xapi_session_t *pWsSession);
 
 xbool_t DirectGate_Term_IsRunning(const directgate_term_t *pTerm);
