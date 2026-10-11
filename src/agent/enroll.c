@@ -466,6 +466,7 @@ static xbool_t DirectGate_Enroll_ApplyTokenResponse(directgate_cfg_t *pCfg,
     const char *pSigUrl = XJSON_GetString(XJSON_GetObject(pRoot, "signalingUrl"));
     const char *pRoutingKey = XJSON_GetString(XJSON_GetObject(pRoot, "routingKey"));
     const char *pDeviceId = XJSON_GetString(XJSON_GetObject(pRoot, "deviceId"));
+    const char *pOrganizationId = XJSON_GetString(XJSON_GetObject(pRoot, "organizationId"));
 
     if (!xstrused(pRoutingKey))
     {
@@ -509,6 +510,9 @@ static xbool_t DirectGate_Enroll_ApplyTokenResponse(directgate_cfg_t *pCfg,
     xstrncpy(sRoutingKey, sizeof(sRoutingKey), pRoutingKey);
     if (xstrused(pDeviceId)) xstrncpy(sDeviceId, sizeof(sDeviceId), pDeviceId);
     if (xstrused(sDeviceId)) xstrncpy(pCfg->sDeviceId, sizeof(pCfg->sDeviceId), sDeviceId);
+    xstrnul(pEnroll->sOrganizationId);
+    if (xstrused(pOrganizationId))
+        xstrncpy(pEnroll->sOrganizationId, sizeof(pEnroll->sOrganizationId), pOrganizationId);
 
     xstrncpy(pEnroll->sAccessToken, sizeof(pEnroll->sAccessToken), sAccessToken);
     xstrncpy(pCfg->sRelayUrl, sizeof(pCfg->sRelayUrl), sRelayUrl);

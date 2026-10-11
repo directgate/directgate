@@ -31,6 +31,7 @@
 #include "websock.h"
 #include "webrtc.h"
 #include "enroll.h"
+#include "managed_keys.h"
 #include "files.h"
 #include "term.h"
 #include "desktop.h"
@@ -299,7 +300,11 @@ static xbool_t DirectGate_HandleRefreshStatus(directgate_conn_t *pConn,
     XCHECK((pConn != NULL), XFALSE);
     XCHECK((pConn->pCfg != NULL), XFALSE);
 
-    if (eStatus == DIRECTGATE_ENROLL_REFRESH_OK) return XTRUE;
+    if (eStatus == DIRECTGATE_ENROLL_REFRESH_OK)
+    {
+        DirectGate_ManagedKeys_UpdateEnrollment(&pConn->managedKeys, pConn->pCfg);
+        return XTRUE;
+    }
     const char *pReasonStr = xstrused(pReason) ? pReason : "token refresh failed";
 
     if (eStatus == DIRECTGATE_ENROLL_REFRESH_TERMINAL)
@@ -455,6 +460,7 @@ static xbool_t DirectGate_TryRelayReprobe(directgate_conn_t *pConn, uint64_t nNo
 
         return XFALSE;
     }
+    DirectGate_ManagedKeys_UpdateEnrollment(&pConn->managedKeys, pConn->pCfg);
 
     const char *pNewUrl = DirectGate_GetRelayUrl(pConn->pCfg);
     if (!xstrused(pNewUrl) || (xstrused(sPrevUrl) && xstrcmp(pNewUrl, sPrevUrl))) return XFALSE;
@@ -496,6 +502,7 @@ static void DirectGate_Connection_Init(directgate_conn_t *pConn, directgate_cfg_
 
     memset(pConn, 0, sizeof(directgate_conn_t));
     DirectGate_SessionMgr_Init(&pConn->mgr, pCfg);
+    DirectGate_ManagedKeys_Init(&pConn->managedKeys, pCfg);
     pConn->pCfg = pCfg;
 }
 
@@ -1308,6 +1315,15 @@ static int DirectGate_HandleAdmin(xapi_session_t *pApiSession, directgate_pkg_t 
             "temporary share cannot perform admin actions");
     }
 
+    if (pSession->bManagedKeySession)
+    {
+        xlogw("Admin message rejected for managed-key session: sid(%u), action(%s)",
+            pSession->nSessionId, pAdminPkg->pAction ? pAdminPkg->pAction : "N/A");
+
+        return DirectGate_Admin_SendActionResp(pSession, "admin-result", "error",
+            "managed key cannot perform admin actions");
+    }
+
     if (!xstrused(pAdminPkg->pAction))
     {
         xlogw("Admin message is missing action: sid(%u), wsfd(%d)",
@@ -1737,8 +1753,7 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
             return XAPI_CONTINUE;
         }
 
-        if (pCfg->keyauth.nAuthorizedKeyCount == 0 ||
-            !xstrused(pCfg->keyauth.sIdentitySeedB64) ||
+        if (!xstrused(pCfg->keyauth.sIdentitySeedB64) ||
             !xstrused(pCfg->keyauth.sIdentityPubB64))
         {
             xlogw("Key-auth not configured on agent; rejecting so client may fallback: sid(%u), wsfd(%d)",
@@ -1766,8 +1781,12 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
         for (uint8_t i = 0; i < pCfg->keyauth.nAuthorizedKeyCount; i++)
             pAuthorizedKeyPtrs[i] = pCfg->keyauth.sAuthorizedKeys[i];
 
-        if (!DirectGate_KeyAuth_IsClientAuthorized(pSession->keyauth.clientPubKey,
-                pAuthorizedKeyPtrs, pCfg->keyauth.nAuthorizedKeyCount))
+        xbool_t bLocalKey = DirectGate_KeyAuth_IsClientAuthorized(pSession->keyauth.clientPubKey,
+            pAuthorizedKeyPtrs, pCfg->keyauth.nAuthorizedKeyCount);
+        xbool_t bManagedKey = !bLocalKey && xstrused(pCfg->enroll.sOrganizationId) &&
+            DirectGate_ManagedKeys_IsAuthorized(&pConn->managedKeys, pSession->keyauth.clientPubKey);
+
+        if (!bLocalKey && !bManagedKey)
         {
             xlogw("Key-auth client not authorized: sid(%u), wsfd(%d), dev(%s)",
                 pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), pAuth->pDeviceId);
@@ -1777,6 +1796,10 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
             DirectGate_Session_SendAuthResp(pSession, "failed", NULL, "client not authorized");
             return XAPI_CONTINUE;
         }
+
+        pSession->bManagedKeyPending = bManagedKey;
+        if (bManagedKey)
+            xstrncpy(pSession->sManagedClientPub, sizeof(pSession->sManagedClientPub), pAuth->pClientPub);
 
         uint8_t agentIdentitySeed[DIRECTGATE_KEYAUTH_ED25519_SEED_SIZE];
         uint8_t agentIdentityPub[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
@@ -1902,6 +1925,8 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
 
         pSession->bKeyAuthActive = XFALSE;
         pSession->bAuthenticated = XTRUE;
+        pSession->bManagedKeySession = pSession->bManagedKeyPending;
+        pSession->bManagedKeyPending = XFALSE;
         pSession->term.bEncrypt = XTRUE;
 
         if (pSession->eRequestedMode != DIRECTGATE_SESSION_MODE_NONE)
@@ -2749,7 +2774,14 @@ static void DirectGate_CheckAuthTimeouts(directgate_conn_t *pConn)
         if (pSession != NULL && pSession->bDesktopShare &&
             pSession->nDesktopShareExpiresMs > 0 &&
             nNowMs >= pSession->nDesktopShareExpiresMs)
+        {
             DirectGate_Session_Close(pSession, "temporary desktop share expired");
+            continue;
+        }
+
+        if (pSession != NULL && pSession->bManagedKeySession &&
+            !DirectGate_ManagedKeys_Contains(&pConn->managedKeys, pSession->sManagedClientPub))
+            DirectGate_Session_Close(pSession, "managed key lease ended");
     }
 }
 
@@ -3307,6 +3339,9 @@ int DirectGate_RunAgent(int argc, char* argv[])
 
     directgate_conn_t conn;
     DirectGate_Connection_Init(&conn, &args);
+    /* ponytail: SRP remains enabled on org devices; disable it only when a customer requires password-less offboarding. */
+    if (!DirectGate_ManagedKeys_Start(&conn.managedKeys))
+        xloge("Failed to start the managed-key lease worker");
 
     xapi_endpoint_t endpt;
     XAPI_InitEndpoint(&endpt);
@@ -3321,6 +3356,7 @@ int DirectGate_RunAgent(int argc, char* argv[])
     DirectGate_InitialConnect(&api, &endpt, &conn);
     DirectGate_RunService(&api, &endpt, &conn);
 
+    DirectGate_ManagedKeys_Stop(&conn.managedKeys);
     DirectGate_SessionMgr_Destroy(&conn.mgr);
     DirectGate_ReapPending_Term();
     DirectGate_WebRTC_Cleanup();

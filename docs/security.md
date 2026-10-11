@@ -107,6 +107,14 @@ After step 6, the client initiates WebRTC P2P negotiation in parallel with the a
 
 In addition to SRP, the agent supports Ed25519 key authorization. The agent holds an identity keypair (`agentIdentity`) and a list of `authorizedKeys`; clients can be authorized by public key, and new keys can be added at runtime over the authenticated channel (`admin/add-key`), just like `ssh-copy-id` does. See [Configuration](configuration.md).
 
+An organization enrollment also polls a volatile managed-key lease about once
+a minute. The leased set is capped at 2,000 and expires within five minutes;
+network failure preserves it only until that expiry. It supplements the local
+16 `authorizedKeys` and is never saved into the agent config. A session that
+authenticated only with a managed key closes when the key disappears or the
+lease expires, even on direct WebRTC, and cannot perform `admin` actions such
+as `add-key` or temporary-share management. SRP remains enabled independently.
+
 ## Relay-visible metadata
 
 End-to-end encryption protects payload contents, not routing metadata. The relay necessarily sees the device ID / routing key used to pair endpoints, source IP addresses, connection timing, and traffic volume carried through the relay. This metadata exposure is inherent to the relay design; "zero knowledge" refers to terminal, file, editor, and signaling payload contents.

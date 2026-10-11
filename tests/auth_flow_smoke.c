@@ -1165,6 +1165,20 @@ static int test_admin_actions(void)
     CHECK(deliver_as(&fix, &peer, admin_header("reboot", NULL, 100), 100) == XAPI_CONTINUE, "unknown admin is handled");
     CHECK(expect_admin(&fix, &peer, "admin-result", "error", "unknown-action"), "an unknown admin action is refused by name");
 
+    directgate_session_t *pManagedSession = DirectGate_SessionMgr_Find(&fix.conn.mgr, 100);
+    CHECK(pManagedSession != NULL, "managed-key session exists");
+    pManagedSession->bManagedKeySession = XTRUE;
+    CHECK(deliver_as(&fix, &peer, admin_header("add-key", "AAAA", 100), 100) == XAPI_CONTINUE,
+        "managed-key add-key is handled");
+    CHECK(expect_admin(&fix, &peer, "admin-result", "error", "managed key cannot perform admin actions"),
+        "managed-key session cannot add a local key");
+    CHECK(deliver_as(&fix, &peer,
+        share_header("desktop-share-provision", "managed-share", "00", "00", 300, 100), 100) == XAPI_CONTINUE,
+        "managed-key temporary share is handled");
+    CHECK(expect_admin(&fix, &peer, "admin-result", "error", "managed key cannot perform admin actions"),
+        "managed-key session cannot open a temporary share");
+    pManagedSession->bManagedKeySession = XFALSE;
+
     /* add-key: every answer the browser can get. */
     CHECK(deliver_as(&fix, &peer, admin_header("add-key", NULL, 100), 100) == XAPI_CONTINUE, "add-key without key");
     CHECK(expect_admin(&fix, &peer, "add-key-result", "error", "missing-client-pub"), "add-key without a key is refused");
