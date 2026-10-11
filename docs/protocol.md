@@ -43,6 +43,9 @@ Type-specific fields:
 
 - `role`: `role` (agent/client), `id` (pairing identifier)
 - `auth`: SRP handshake metadata (`user`, `A`, `B`, `salt`, `nonce`, `suite`, `M1`, `M2`, `status`, `reason`). The `M1`/`M2` transcript binds both `nonce` values, so nonce tampering fails authentication (see [Security](security.md#srp-6a-authentication))
+- `auth` with `method=key`: an organization host accepts the current volatile
+  managed-key lease in addition to its local 16 authorized keys. A
+  managed-only session is closed when its lease access ends.
 - `cmd`: `action` (start/stop), `status`, `reason`
 - `resize`: `rows`, `cols`, `width`, `height`
 - `webrtc`: `sdp` (SDP string), `candidate`, `sdpMid`
@@ -51,6 +54,8 @@ Type-specific fields:
 - `file/end`: `transferId`, `sha256`
 - `file/ack`: `transferId`, `index`
 - `file/cancel`: `transferId`, `reason`
+- `admin`: managed-only key sessions receive an error for every action and
+  cannot use `add-key` or temporary desktop shares
 
 > **Note:** File size is serialized as a decimal string to cleanly handle files larger than 4 GB.
 

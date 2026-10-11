@@ -152,6 +152,7 @@ directgate_smoke(config_smoke        ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c
 directgate_smoke(config_extra_smoke  ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(config_args_smoke   ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(keyfile_apply_smoke ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
+directgate_smoke(managed_keys_smoke  ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c ${AGENT_DIR}/managed_keys.c)
 directgate_smoke(search_smoke        ${AGENT_DIR}/search.c ${AGENT_DIR}/files.c)
 directgate_smoke(search_criteria_smoke)
 directgate_smoke(yuv_smoke   ${AGENT_DIR}/yuv.c)
@@ -455,6 +456,7 @@ directgate_smoke(session_files_smoke
     ${AGENT_DIR}/desktop/input.c
     ${AGENT_DIR}/desktop/stream.c
     ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/managed_keys.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
@@ -492,6 +494,7 @@ directgate_smoke(auth_flow_smoke
     ${AGENT_DIR}/desktop/input.c
     ${AGENT_DIR}/desktop/stream.c
     ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/managed_keys.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
@@ -534,6 +537,7 @@ directgate_smoke(connection_lifecycle_smoke
     ${AGENT_DIR}/desktop/input.c
     ${AGENT_DIR}/desktop/stream.c
     ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/managed_keys.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
@@ -554,6 +558,7 @@ directgate_smoke(relay_reprobe_smoke
     ${AGENT_DIR}/desktop/input.c
     ${AGENT_DIR}/desktop/stream.c
     ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/managed_keys.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
@@ -574,6 +579,7 @@ directgate_smoke(session_lifetime_smoke
     ${AGENT_DIR}/desktop/input.c
     ${AGENT_DIR}/desktop/stream.c
     ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/managed_keys.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c

@@ -46,6 +46,7 @@ typedef enum {
 
 typedef struct directgate_enroll_ {
     char sApiUrl[XPATH_MAX];
+    char sOrganizationId[XSTR_MID];
     char sAccessToken[XSTR_MID];
     char sRefreshToken[XSTR_MIN];
     char sEnrollExpiresAt[XSTR_TINY];

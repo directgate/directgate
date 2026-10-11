@@ -688,6 +688,10 @@ xbool_t DirectGate_LoadConfig(directgate_cfg_t *pCfg, const char *pPath)
         const char *pApiUrl = XJSON_GetString(XJSON_GetObject(pEnroll, "apiUrl"));
         if (xstrused(pApiUrl)) xstrncpy(pCfg->enroll.sApiUrl, sizeof(pCfg->enroll.sApiUrl), pApiUrl);
 
+        const char *pOrganizationId = XJSON_GetString(XJSON_GetObject(pEnroll, "organizationId"));
+        if (xstrused(pOrganizationId))
+            xstrncpy(pCfg->enroll.sOrganizationId, sizeof(pCfg->enroll.sOrganizationId), pOrganizationId);
+
         const char *pAccToken = XJSON_GetString(XJSON_GetObject(pEnroll, "accessToken"));
         if (xstrused(pAccToken)) xstrncpy(pCfg->enroll.sAccessToken, sizeof(pCfg->enroll.sAccessToken), pAccToken);
 
@@ -833,6 +837,7 @@ xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
     }
 
     if (xstrused(pCfg->enroll.sApiUrl) ||
+        xstrused(pCfg->enroll.sOrganizationId) ||
         xstrused(pCfg->enroll.sAccessToken) ||
         xstrused(pCfg->enroll.sRefreshToken) ||
         xstrused(pCfg->enroll.sEnrollExpiresAt) ||
@@ -846,6 +851,9 @@ xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
         {
             if (xstrused(pCfg->enroll.sApiUrl))
                 XJSON_AddString(pEnroll, "apiUrl", pCfg->enroll.sApiUrl);
+
+            if (xstrused(pCfg->enroll.sOrganizationId))
+                XJSON_AddString(pEnroll, "organizationId", pCfg->enroll.sOrganizationId);
 
             if (xstrused(pCfg->enroll.sAccessToken))
                 XJSON_AddString(pEnroll, "accessToken", pCfg->enroll.sAccessToken);

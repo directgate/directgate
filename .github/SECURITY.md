@@ -48,9 +48,9 @@ Security fixes are issued for the latest released version of the agent. Install
 from the official package repositories (or build the source from the latest tag)
 so you receive updates through your normal system update process.
 
-See the [README](../README.md#installation) for setup.
+See the [README](../main/README.md#installation) for setup.
 
 ## Further reading
 
-- [Security model](../docs/security.md) - cryptography, authentication, and trust assumptions
+- [Security model](../main/docs/security.md) - cryptography, authentication, and trust assumptions
 - [directgate.io/security](https://directgate.io/security) - threat model, trust assumptions, and FAQ
