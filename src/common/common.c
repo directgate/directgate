@@ -281,6 +281,17 @@ size_t DirectGate_JsonEscape(char *pOut, size_t nSize, const char *pIn)
     return nPosit;
 }
 
+size_t DirectGate_DescribeEvents(const xevents_t *pEvents, xevent_status_t eStatus, char *pDst, size_t nSize)
+{
+    XCHECK_NL((pDst != NULL && nSize > 0), 0);
+    const char *pStatus = XEvents_GetStatusStr(eStatus);
+    if (pEvents == NULL || !pEvents->nSysError) return xstrncpy(pDst, nSize, pStatus);
+
+    char sError[XSOCK_INFO_MAX];
+    XSock_SysErrorStr(pEvents->nSysError, sError, sizeof(sError));
+    return xstrncpyf(pDst, nSize, "%s (%s)", pStatus, sError);
+}
+
 xbool_t DirectGate_IsRelayEndpointAllowed(const char *pUrl)
 {
     XCHECK_NL((xstrused(pUrl)), XFALSE);

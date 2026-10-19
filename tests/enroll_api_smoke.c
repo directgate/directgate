@@ -1,6 +1,7 @@
 /* Enrollment against an API on the other end of a real TLS connection: what the agent keeps when its configuration
  * cannot be saved, what it makes of error bodies it cannot read, and how many ICE servers it takes. */
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -43,6 +44,19 @@ static const char *g_pRotatedJson =
         "\"relayUrl\":\"wss://relay.example.test/websock\","
         "\"routingKey\":\"rk-1\""
     "}";
+
+/* The last enrollment failure logged. Only those lines are kept: the API thread logs as well, and nothing of its is
+ * shared with the test thread then. */
+static char g_sFailure[XSTR_MID];
+
+static int keep_failure(const char *pLog, size_t nLength, xlog_flag_t eFlag, void *pCtx)
+{
+    (void)nLength;
+    (void)eFlag;
+    (void)pCtx;
+    if (strstr(pLog, "oserr(") != NULL) xstrncpy(g_sFailure, sizeof(g_sFailure), pLog);
+    return 0;
+}
 
 static void init_cfg(directgate_cfg_t *pCfg, const char *pApiUrl, const char *pCfgPath)
 {
@@ -141,7 +155,34 @@ int main(void)
     fake_https_reply(&api, 500, "text/plain", "oops");
     CHECK(!DirectGate_Enroll_RotateAgentKey(&cfg), "a key rotation the server failed should fail");
 
+    /* A failed call reports the OS error its socket saved when the system call failed. A certificate the agent does
+     * not trust ends the handshake with none, where errno read afterwards reported whatever an earlier call left. */
+    xlog_init("enroll_api_smoke", XLOG_ALL, XTRUE);
+    xlog_screen(XFALSE);
+    xlog_callback(keep_failure, NULL);
+
+    setenv("SSL_CERT_FILE", "/nonexistent/directgate-enroll-ca.pem", 1);
+    errno = ENOENT;
+    g_sFailure[0] = '\0';
+    directgate_enroll_status_t eUntrusted = DirectGate_Enroll_Refresh(&cfg, sReason, sizeof(sReason));
+    int bNoOsError = strstr(g_sFailure, "oserr(0/none)") != NULL;
+    setenv("SSL_CERT_FILE", api.tls.sCert, 1);
+
     fake_https_end(&api);
+
+    /* An API that is gone refuses the connection, and the failure says so */
+    char sRefused[64];
+    snprintf(sRefused, sizeof(sRefused), "oserr(%d/ECONNREFUSED/", ECONNREFUSED);
+    g_sFailure[0] = '\0';
+    directgate_enroll_status_t eGone = DirectGate_Enroll_Refresh(&cfg, sReason, sizeof(sReason));
+    int bRefused = strstr(g_sFailure, sRefused) != NULL;
+    xlog_destroy();
+
+    CHECK(eUntrusted == DIRECTGATE_ENROLL_REFRESH_TRANSIENT, "an API the agent does not trust should be a transient failure");
+    CHECK(bNoOsError, "and one with no OS error behind it");
+    CHECK(eGone == DIRECTGATE_ENROLL_REFRESH_TRANSIENT, "an API that is gone should be a transient failure");
+    CHECK(bRefused, "and the refused connection should be named");
+
     unlink(sCfgPath);
     unlink(sBlocker);
     rmdir(sRoot);

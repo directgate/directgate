@@ -543,10 +543,12 @@ int DirectGate_LogStatus(xapi_ctx_t *pCtx, xapi_session_t *pSession)
     xapi_type_t eType = pCtx ? pCtx->eStatType : XAPI_NONE;
     directgate_conn_t *pConn = DirectGate_GetConn(pSession);
     const char *pType = XAPI_GetTypeStr(eType);
-    const char *pStr = XAPI_GetStatus(pCtx);
 
-    if (XAPI_IsDestroyEvent(pCtx)) xlogd("%s status: %s", pType, pStr);
-    else xlogd("%s status: %s, id(%u), fd(%d), addr(%s), port(%u)", pType, pStr,
+    char sStatus[XSTR_MIN] = "Invalid API context";
+    XAPI_DescribeStatus(pCtx, sStatus, sizeof(sStatus));
+
+    if (XAPI_IsDestroyEvent(pCtx)) xlogd("%s status: %s", pType, sStatus);
+    else xlogd("%s status: %s, id(%u), fd(%d), addr(%s), port(%u)", pType, sStatus,
         DirectGate_Conn_GetID(pConn, pSession), DirectGate_Conn_GetFD(pConn, pSession),
         DirectGate_Conn_GetAddr(pConn, pSession), DirectGate_Conn_GetPort(pConn, pSession));
 
@@ -579,12 +581,16 @@ int DirectGate_LogError(xapi_ctx_t *pCtx, xapi_session_t *pSession)
     xapi_type_t eType = pCtx ? pCtx->eStatType : XAPI_NONE;
     directgate_conn_t *pConn = DirectGate_GetConn(pSession);
     const char *pType = XAPI_GetTypeStr(eType);
-    const char *pStr = XAPI_GetStatus(pCtx);
 
-    xloge("%s error: id(%u), fd(%d), addr(%s), port(%u), errno(%d), status(%s)", pType,
+    /* The system error comes saved with the status: errno has been through the close and the
+       cleanup by now, and belongs to whatever ran last. */
+    char sStatus[XSTR_MIN] = "Invalid API context";
+    XAPI_DescribeStatus(pCtx, sStatus, sizeof(sStatus));
+
+    xloge("%s error: id(%u), fd(%d), addr(%s), port(%u), status(%s)", pType,
         DirectGate_Conn_GetID(pConn, pSession), DirectGate_Conn_GetFD(pConn, pSession),
         DirectGate_Conn_GetAddr(pConn, pSession), DirectGate_Conn_GetPort(pConn, pSession),
-        errno, pStr);
+        sStatus);
 
     if (pCtx != NULL &&
         pCtx->eStatType == XAPI_SELF &&
@@ -884,10 +890,9 @@ static int DirectGate_SendControlFrame(xapi_session_t *pApiSession, xws_frame_ty
 {
     XCHECK((pApiSession != NULL), XAPI_DISCONNECT);
     directgate_conn_t *pConn = (directgate_conn_t*)pApiSession->pSessionData;
-
     size_t nQueued = pApiSession->txBuffer.nUsed;
-    xws_status_t status = XWS_WriteFrame(&pApiSession->txBuffer, NULL, 0, eType, XTRUE, XTRUE);
 
+    xws_status_t status = XWS_WriteFrame(&pApiSession->txBuffer, NULL, 0, eType, XTRUE, XTRUE);
     if (status != XWS_ERR_NONE)
     {
         xloge("Failed to create %s frame: id(%u), fd(%d), status(%s)",
@@ -2894,10 +2899,13 @@ static void DirectGate_RunService(xapi_t *pApi, xapi_endpoint_t *pEndpt, directg
 
             if (status != XEVENTS_SUCCESS)
             {
+                char sStatus[XSTR_MIN];
+                DirectGate_DescribeEvents(&pApi->events, status, sStatus, sizeof(sStatus));
+
                 xlogw("Event loop returned error: id(%u), fd(%d), status(%s), code(%d)",
                     DirectGate_Conn_GetID(pSessData, pSessData->pWsSession),
                     DirectGate_Conn_GetFD(pSessData, pSessData->pWsSession),
-                    XEvents_GetStatusStr(status), (int)status);
+                    sStatus, (int)status);
 
                 xusleep(DirectGate_GetServiceWaitMs(pSessData) * DIRECTGATE_SLEEP_USEC_PER_MS);
                 status = XEVENTS_SUCCESS;

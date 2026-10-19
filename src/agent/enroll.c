@@ -73,25 +73,34 @@ typedef struct directgate_enroll_trace_ {
  * The status string alone cannot tell a firewall from a dead route: a blocked
  * connection, a blackholed one and a refused one all render as "Failed to
  * connect remote server", which is exactly why field reports of enrolment
- * failures have been undiagnosable. libxutils keeps only its own status enum
- * on the socket and never records the OS error, so it is read here instead.
+ * failures have been undiagnosable. The socket saves the OS error (errno,
+ * WSAGetLastError() on Windows) of the call that failed, so the request is made
+ * on a socket of our own and the error read from it before it is closed.
  *
- * Reading it after the call is sound for a failed connect(): the only call
- * between the failure and this point is closesocket(), which leaves the last
- * error alone on success. SSL is never initialised on a connect that failed,
- * so nothing else runs in between.
+ * errno read after XHTTP_EasyPerform() was right only for a failed connect():
+ * a failed read or write went on to the TLS shutdown and the close, which can
+ * leave an error of their own, and a failed name lookup sets none at all, so
+ * whatever an earlier call left was reported. The saved one is 0 for those.
  */
-static int DirectGate_Enroll_LastNetError(void)
+static xhttp_status_t DirectGate_Enroll_Exchange(xhttp_t *pHandle, const xlink_t *pLink, const uint8_t *pBody,
+                                                 size_t nBodyLen, int *pOsError)
 {
-#ifdef _WIN32
-    return WSAGetLastError();
-#else
-    return errno;
-#endif
+    /* XHTTP_Connect() fills in the defaults of the link it dials, every attempt gets the parsed one */
+    xlink_t link = *pLink;
+    xsock_t sock;
+
+    xhttp_status_t eStatus = XHTTP_Connect(pHandle, &sock, &link);
+    if (eStatus == XHTTP_CONNECTED) eStatus = XHTTP_Perform(pHandle, &sock, pBody, nBodyLen);
+
+    *pOsError = XSock_GetSysError(&sock);
+    XSock_Close(&sock);
+    return eStatus;
 }
 
 static const char* DirectGate_Enroll_NetErrorName(int nError)
 {
+    if (!nError) return "none";
+
 #ifdef _WIN32
     switch (nError)
     {
@@ -188,11 +197,11 @@ xbool_t DirectGate_Enroll_BuildRequest(xhttp_t *pHandle, const char *pUrl, const
     pHandle->nTimeout = DIRECTGATE_ENROLL_HTTP_TIMEOUT;
 
     /*
-        XHTTP_EasyPerform() uses the link only to dial, it never synthesizes
-        request headers and libxutils defaults requests to HTTP/1.0, where
-        Host is optional. That combination leaves the request routable only by
-        TLS SNI. Plain nginx accepts it, but a CDN or WAF edge answers 403
-        before the origin is ever reached, so the header is set by hand here.
+        XHTTP_Connect() uses the link only to dial, XHTTP_Perform() never
+        synthesizes request headers and libxutils defaults requests to HTTP/1.0,
+        where Host is optional. That combination leaves the request routable
+        only by TLS SNI. Plain nginx accepts it, but a CDN or WAF edge answers
+        403 before the origin is ever reached, so the header is set by hand here.
 
         XLink_Parse() folds the default port into sHost. Carrying that port
         into the header makes the value differ from the certificate name the
@@ -235,14 +244,10 @@ static xhttp_status_t DirectGate_Enroll_Perform(xhttp_t *pHandle, directgate_enr
         XCHECK((DirectGate_Enroll_BuildRequest(pHandle, pUrl, pPath)), XHTTP_EINIT);
         XHTTP_SetCallback(pHandle, DirectGate_Enroll_TraceCb, pTrace, XHTTP_STATUS);
 
-        eStatus = XHTTP_EasyPerform(pHandle, pUrl, pBody, nBodyLen);
-
+        eStatus = DirectGate_Enroll_Exchange(pHandle, &link, pBody, nBodyLen, &pTrace->nOsError);
         if (eStatus == XHTTP_COMPLETE) break;
 
-        /* Captured before anything else can overwrite it. */
-        pTrace->nOsError = DirectGate_Enroll_LastNetError();
         pTrace->pOsErrorName = DirectGate_Enroll_NetErrorName(pTrace->nOsError);
-
         if (!DirectGate_Enroll_IsTransientTransport(eStatus)) break;
         if (nAttempt + 1 >= nAttempts) break;
 

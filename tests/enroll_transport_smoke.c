@@ -46,12 +46,12 @@ static int render_request(char *pOut, size_t nOutSize, const char *pUrl, const c
 }
 
 /*
- * The agent reaches the API through XHTTP_EasyPerform(), which synthesizes no
- * request headers, and libxutils defaults requests to HTTP/1.0 where Host is
- * optional. That left the request routable by TLS SNI alone: plain nginx
- * accepted it, but a CDN or WAF edge answers 403 before the origin is reached,
- * so moving api.* behind one would have broken every enrollment at once.
- * Nothing guarded the header, which is how it went missing to begin with.
+ * The agent reaches the API through XHTTP_Connect() and XHTTP_Perform(), which
+ * synthesize no request headers, and libxutils defaults requests to HTTP/1.0
+ * where Host is optional. That left the request routable by TLS SNI alone:
+ * plain nginx accepted it, but a CDN or WAF edge answers 403 before the origin
+ * is reached, so moving api.* behind one would have broken every enrollment at
+ * once. Nothing guarded the header, which is how it went missing to begin with.
  */
 static int test_request_carries_host_header(void)
 {
