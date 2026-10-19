@@ -44,7 +44,7 @@ typedef struct {
 
 static void fake_https_copy(char *pDst, size_t nSize, const char *pSrc)
 {
-    snprintf(pDst, nSize, "%s", pSrc != NULL ? pSrc : "");
+    xstrncpy(pDst, nSize, pSrc != NULL ? pSrc : "");
 }
 
 static int fake_https_answer(fake_https_t *pFake, xapi_session_t *pSession)

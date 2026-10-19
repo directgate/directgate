@@ -43,8 +43,11 @@ xbool_t DirectGate_Relay_FetchEnvelope(directgate_cfg_t *pCfg)
     XCHECK((xstrused(pCfg->sApiToken)), XFALSE);
     XCHECK((xstrused(pCfg->sDeviceId)), XFALSE);
 
-    char sBody[XSTR_MID];
-    xstrncpyf(sBody, sizeof(sBody), "{\"deviceId\": \"%s\"}", pCfg->sDeviceId);
+    /* The device id can come from a JSON document, which gives it decoded: it is escaped to go back into one */
+    char sDeviceId[XSTR_MID];
+    char sBody[XSTR_MID + XSTR_TINY];
+    XCHECK((DirectGate_JsonEscape(sDeviceId, sizeof(sDeviceId), pCfg->sDeviceId) > 0), XFALSE);
+    xstrncpyf(sBody, sizeof(sBody), "{\"deviceId\": \"%s\"}", sDeviceId);
 
     directgate_webapi_res_t res;
     if (!DirectGate_WebApi_Request(&res, XHTTP_POST, pCfg->sApiUrl, "/api/v1/sessions/connect", pCfg->sApiToken, NULL, sBody))

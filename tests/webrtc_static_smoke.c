@@ -227,23 +227,50 @@ static int framing(void)
     return 0;
 }
 
-/* The helpers around the peer connection: SDP escaping, libdatachannel's log
-   levels, and channel errors, current and stale, through the event queue. */
+static char g_sSignal[1024];
+
+static void record_signal(const char *pJson, size_t nLen, void *pCtx)
+{
+    (void)pCtx;
+    size_t nCopy = nLen < sizeof(g_sSignal) - 1 ? nLen : sizeof(g_sSignal) - 1;
+    memcpy(g_sSignal, pJson, nCopy);
+    g_sSignal[nCopy] = '\0';
+}
+
+/* The SDP of a local description reaches the browser as it is: parsing the signal gives it back byte for byte. It
+   was escaped by hand and then again by the JSON writer, and a browser got literal \r\n where its line ends were. */
+static int local_description(void)
+{
+    const char *pSdp = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\na=x:\t\"quoted\" back\\slash\r\n";
+    directgate_webrtc_t rtc;
+    DirectGate_WebRTC_Init(&rtc);
+    rtc.signalCb = record_signal;
+
+    /* The callback only checks the id of the connection it is told about, so none is created: a real one would
+       leave libdatachannel's threads winding down past the end of the test */
+    rtc.nPeerConnectionID = 7;
+    g_sSignal[0] = '\0';
+    DirectGate_WebRTC_OnLocalDescription(7, pSdp, "answer", &rtc);
+    DirectGate_WebRTC_ProcessQueue(&rtc);
+    rtc.nPeerConnectionID = -1;
+    DirectGate_WebRTC_Clear(&rtc);
+
+    xjson_t json;
+    CHECK(XJSON_Parse(&json, NULL, g_sSignal, strlen(g_sSignal)), "the signal is JSON");
+    const char *pSent = XJSON_GetString(XJSON_GetObject(json.pRootObj, "sdp"));
+    const char *pAction = XJSON_GetString(XJSON_GetObject(json.pRootObj, "action"));
+    int bSame = pSent != NULL && !strcmp(pSent, pSdp) && pAction != NULL && !strcmp(pAction, "answer");
+    XJSON_Destroy(&json);
+
+    CHECK(bSame, "the SDP parses back exactly as it was generated");
+    CHECK(strstr(g_sSignal, "\\r\\n") != NULL && strstr(g_sSignal, "\\\\r") == NULL, "its line ends are escaped once");
+    return 0;
+}
+
+/* The helpers around the peer connection: libdatachannel's log levels,
+   and channel errors, current and stale, through the event queue. */
 static int helpers(void)
 {
-    const char *raw = "v=0\r\na=x:\t\"quoted\" back\\slash";
-    char *esc = DirectGate_JSON_Escape(raw);
-    CHECK(esc != NULL && strstr(esc, "\\t") && strstr(esc, "\\\"") && strstr(esc, "\\\\"), "control characters are escaped");
-    char *back = DirectGate_JSON_Unescape(esc);
-    CHECK(back != NULL && !strcmp(back, raw), "escaped SDP comes back unchanged");
-    free(esc);
-    free(back);
-
-    back = DirectGate_JSON_Unescape("a\\/b\\qc\\");
-    CHECK(back != NULL && !strcmp(back, "a/b\\qc\\"), "an escaped slash is unescaped, anything unknown is kept");
-    free(back);
-    CHECK(DirectGate_JSON_Escape("") == NULL && DirectGate_JSON_Unescape(NULL) == NULL, "nothing to escape is refused");
-
     char line[8];
     DirectGate_WebRTC_CopySdpLine(line, sizeof(line), NULL, 3);
     CHECK(line[0] == '\0', "a missing SDP line copies as empty");
@@ -279,7 +306,7 @@ static int helpers(void)
 
 int main(void)
 {
-    if (negotiation() || handles() || framing() || helpers()) return 1;
+    if (negotiation() || handles() || framing() || helpers() || local_description()) return 1;
     puts("webrtc_static_smoke: OK");
     return 0;
 }

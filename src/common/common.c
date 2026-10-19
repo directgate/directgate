@@ -246,6 +246,41 @@ size_t DirectGate_CopyDisplaySafe(char *pOut, size_t nSize, const char *pIn)
     return nPosit;
 }
 
+size_t DirectGate_JsonEscape(char *pOut, size_t nSize, const char *pIn)
+{
+    XCHECK_NL((pOut != NULL && nSize > 0), XSTDNON);
+    pOut[0] = XSTR_NUL;
+    XCHECK_NL((pIn != NULL), XSTDNON);
+    size_t nPosit = 0;
+
+    for (const unsigned char *pIt = (const unsigned char*)pIn; *pIt != XSTR_NUL; pIt++)
+    {
+        char sUnit[8];
+        size_t nLength = 1;
+        sUnit[0] = (char)*pIt;
+
+        if (*pIt == '"' || *pIt == '\\')
+        {
+            sUnit[0] = '\\';
+            sUnit[1] = (char)*pIt;
+            nLength = 2;
+        }
+        else if (*pIt < 0x20) nLength = (size_t)snprintf(sUnit, sizeof(sUnit), "\\u%04x", *pIt);
+
+        if (nLength >= nSize - nPosit)
+        {
+            pOut[0] = XSTR_NUL;
+            return XSTDNON;
+        }
+
+        memcpy(&pOut[nPosit], sUnit, nLength);
+        nPosit += nLength;
+    }
+
+    pOut[nPosit] = XSTR_NUL;
+    return nPosit;
+}
+
 xbool_t DirectGate_IsRelayEndpointAllowed(const char *pUrl)
 {
     XCHECK_NL((xstrused(pUrl)), XFALSE);

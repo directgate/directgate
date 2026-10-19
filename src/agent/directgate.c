@@ -886,7 +886,7 @@ static int DirectGate_SendControlFrame(xapi_session_t *pApiSession, xws_frame_ty
     directgate_conn_t *pConn = (directgate_conn_t*)pApiSession->pSessionData;
 
     size_t nQueued = pApiSession->txBuffer.nUsed;
-    xws_status_t status = XWS_AppendFrame(&pApiSession->txBuffer, NULL, 0, eType, XTRUE, XTRUE);
+    xws_status_t status = XWS_WriteFrame(&pApiSession->txBuffer, NULL, 0, eType, XTRUE, XTRUE);
 
     if (status != XWS_ERR_NONE)
     {

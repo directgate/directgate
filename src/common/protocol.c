@@ -1004,7 +1004,9 @@ xbool_t DirectGate_Proto_CheckCC(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E)
     directgate_cc_header_t hdr = { NULL, 0, 0, 0, 0 };
 
     /* Every inner header is a flat object, read in place. XJSON_ScanFlat takes nothing XJSON_Parse would not
-       and reports the same members, so anything it refuses is read from the parsed tree as it always was. */
+       and reports the same members, so anything it refuses is read from the parsed tree as it always was. It
+       gives a string as written, though, and the parser decodes its escapes: a scope written with any goes to
+       the parser, which reads "sess\u0069on" as the session scope where the scan saw no scope it knew. */
     xjson_field_t fields[] = {
         { "cc", NULL, 0, 0 },
         { "ccScope", NULL, 0, 0 },
@@ -1012,7 +1014,8 @@ xbool_t DirectGate_Proto_CheckCC(xbyte_buffer_t *pOut, directgate_e2e_t *pE2E)
         { "ce", NULL, 0, 0 }
     };
 
-    if (XJSON_ScanFlat(pJsonData, nHdrLen, fields, sizeof(fields) / sizeof(fields[0])))
+    if (XJSON_ScanFlat(pJsonData, nHdrLen, fields, sizeof(fields) / sizeof(fields[0])) &&
+        (fields[1].nType != XJSON_TYPE_STRING || memchr(fields[1].pValue, '\\', fields[1].nLength) == NULL))
     {
         hdr.nCC = DirectGate_Proto_FieldU32(&fields[0]);
         hdr.nScopedCC = DirectGate_Proto_FieldU32(&fields[2]);

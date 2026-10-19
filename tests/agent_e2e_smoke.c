@@ -226,7 +226,7 @@ static int relay_send_plain(xapi_session_t *pSession, xjson_obj_t *pHeader)
 
 static int relay_control(xapi_session_t *pSession, xws_frame_type_t eType)
 {
-    if (XWS_AppendFrame(&pSession->txBuffer, NULL, 0, eType, XFALSE, XTRUE) != XWS_ERR_NONE) return XAPI_DISCONNECT;
+    if (XWS_WriteFrame(&pSession->txBuffer, NULL, 0, eType, XFALSE, XTRUE) != XWS_ERR_NONE) return XAPI_DISCONNECT;
     return XAPI_EnableEvent(pSession, XPOLLOUT);
 }
 

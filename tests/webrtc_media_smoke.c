@@ -92,25 +92,6 @@ static directgate_webrtc_t g_agent;
 static int g_nMigrationReady;
 static int g_nTransport;
 
-/* The agent's signals arrive JSON-escaped; the browser wants plain SDP. */
-static void json_unescape(const char *pSrc, char *pDst, size_t nSize)
-{
-    size_t n = 0;
-    for (size_t i = 0; pSrc[i] != '\0' && n + 1 < nSize; i++)
-    {
-        if (pSrc[i] == '\\' && pSrc[i + 1] != '\0')
-        {
-            char c = pSrc[++i];
-            pDst[n++] = c == 'r' ? '\r' : c == 'n' ? '\n' : c == 't' ? '\t' : c;
-            continue;
-        }
-
-        pDst[n++] = pSrc[i];
-    }
-
-    pDst[n] = '\0';
-}
-
 static void parse_rtp(const uint8_t *pData, size_t nSize, rtp_t *pOut)
 {
     memset(pOut, 0, sizeof(*pOut));
@@ -328,12 +309,9 @@ static void agent_signal(const char *pJson, size_t nLen, void *pCtx)
     const char *pAction = XJSON_GetString(XJSON_GetObject(json.pRootObj, "action"));
     browser_t *pB = g_pSignalTarget;
 
+    /* The SDP is taken as JSON.parse() gives it to a browser, nothing undone by hand on top */
     if (pAction != NULL && pB != NULL && strcmp(pAction, "answer") == 0)
-    {
-        static char sSdp[16384];
-        json_unescape(XJSON_GetString(XJSON_GetObject(json.pRootObj, "sdp")), sSdp, sizeof(sSdp));
-        rtcSetRemoteDescription(pB->nPC, sSdp, "answer");
-    }
+        rtcSetRemoteDescription(pB->nPC, XJSON_GetString(XJSON_GetObject(json.pRootObj, "sdp")), "answer");
     else if (pAction != NULL && pB != NULL && strcmp(pAction, "ice") == 0)
     {
         rtcAddRemoteCandidate(pB->nPC, XJSON_GetString(XJSON_GetObject(json.pRootObj, "candidate")),

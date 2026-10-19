@@ -387,7 +387,7 @@ static int DirectGate_Client_SendFrame(xapi_session_t *pSession, const uint8_t *
                                        size_t nLength, xws_frame_type_t eType)
 {
     /* Written straight into the tx buffer, with no frame of its own to copy */
-    xws_status_t status = XWS_AppendFrame(&pSession->txBuffer, pPayload, nLength, eType, XTRUE, XTRUE);
+    xws_status_t status = XWS_WriteFrame(&pSession->txBuffer, pPayload, nLength, eType, XTRUE, XTRUE);
     if (status != XWS_ERR_NONE)
     {
         xloge("Failed to create WS frame: %s", XWebSock_GetStatusStr(status));

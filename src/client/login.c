@@ -520,13 +520,20 @@ xbool_t DirectGate_Login_Refresh(directgate_account_t *pAccount, const directgat
     XCHECK_NL((xstrused(pAccount->sRefreshToken)), XFALSE);
     XCHECK((xstrused(pCtx->pApiUrl)), XFALSE);
 
-    char sBody[XSTR_MID + XSTR_TINY];
-    xstrncpyf(sBody, sizeof(sBody), "{\"refreshToken\":\"%s\"}", pAccount->sRefreshToken);
+    /* The token came out of a JSON response decoded, and is escaped to go back into JSON */
+    char sToken[XSTR_MID + XSTR_TINY];
+    char sBody[XSTR_MID + XSTR_SUB];
+    xbool_t bOk = XFALSE;
 
-    xbool_t bOk = DirectGate_Login_Exchange(pAccount, pCtx, "/api/v1/auth/cli/refresh", sBody);
-    if (bOk) xlogi("Refreshed account session: user(%s)", pAccount->sEmail);
+    if (DirectGate_JsonEscape(sToken, sizeof(sToken), pAccount->sRefreshToken))
+    {
+        xstrncpyf(sBody, sizeof(sBody), "{\"refreshToken\":\"%s\"}", sToken);
+        bOk = DirectGate_Login_Exchange(pAccount, pCtx, "/api/v1/auth/cli/refresh", sBody);
+        if (bOk) xlogi("Refreshed account session: user(%s)", pAccount->sEmail);
+        OPENSSL_cleanse(sBody, sizeof(sBody));
+    }
 
-    OPENSSL_cleanse(sBody, sizeof(sBody));
+    OPENSSL_cleanse(sToken, sizeof(sToken));
     return bOk;
 }
 
@@ -535,12 +542,22 @@ static xbool_t DirectGate_Login_Redeem(directgate_account_t *pAccount,
                                        const char *pCode,
                                        const char *pVerifier)
 {
-    char sBody[XSTR_MID + XSTR_TINY];
-    xstrncpyf(sBody, sizeof(sBody), "{\"code\":\"%s\",\"codeVerifier\":\"%s\"}", pCode, pVerifier);
+    /* ParseRequest refuses a code with a character JSON escapes, which this keeps true of anything else passed in */
+    char sCode[XSTR_MID + XSTR_TINY];
+    char sVerifier[XSTR_SUB];
+    char sBody[XSTR_MID + XSTR_SUB + XSTR_TINY];
+    xbool_t bOk = XFALSE;
 
-    xbool_t bOk = DirectGate_Login_Exchange(pAccount, pCtx, "/api/v1/auth/cli/token", sBody);
+    if (DirectGate_JsonEscape(sCode, sizeof(sCode), pCode) &&
+        DirectGate_JsonEscape(sVerifier, sizeof(sVerifier), pVerifier))
+    {
+        xstrncpyf(sBody, sizeof(sBody), "{\"code\":\"%s\",\"codeVerifier\":\"%s\"}", sCode, sVerifier);
+        bOk = DirectGate_Login_Exchange(pAccount, pCtx, "/api/v1/auth/cli/token", sBody);
+        OPENSSL_cleanse(sBody, sizeof(sBody));
+    }
 
-    OPENSSL_cleanse(sBody, sizeof(sBody));
+    OPENSSL_cleanse(sCode, sizeof(sCode));
+    OPENSSL_cleanse(sVerifier, sizeof(sVerifier));
     return bOk;
 }
 

@@ -477,6 +477,7 @@ directgate_smoke(directgate_guards_smoke
     ${AGENT_DIR}/desktop/input.c
     ${AGENT_DIR}/desktop/stream.c
     ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/managed_keys.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
@@ -516,6 +517,7 @@ if(UNIX AND NOT APPLE)
         ${AGENT_DIR}/desktop/input.c
         ${AGENT_DIR}/desktop/stream.c
         ${AGENT_DIR}/enroll.c
+        ${AGENT_DIR}/managed_keys.c
         ${AGENT_DIR}/files.c
         ${AGENT_DIR}/search.c
         ${AGENT_DIR}/session.c
