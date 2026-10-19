@@ -107,13 +107,18 @@ After step 6, the client initiates WebRTC P2P negotiation in parallel with the a
 
 In addition to SRP, the agent supports Ed25519 key authorization. The agent holds an identity keypair (`agentIdentity`) and a list of `authorizedKeys`; clients can be authorized by public key, and new keys can be added at runtime over the authenticated channel (`admin/add-key`), just like `ssh-copy-id` does. See [Configuration](configuration.md).
 
-An organization enrollment also polls a volatile managed-key lease about once
-a minute. The leased set is capped at 2,000 and expires within five minutes;
-network failure preserves it only until that expiry. It supplements the local
-16 `authorizedKeys` and is never saved into the agent config. A session that
-authenticated only with a managed key closes when the key disappears or the
-lease expires, even on direct WebRTC, and cannot perform `admin` actions such
-as `add-key` or temporary-share management. SRP remains enabled independently.
+### Organization-managed keys
+
+A device enrolled into an organization also accepts the client keys the organization approved for it, from a lease the agent fetches from the API (the contract is in the superproject's `docs/enroll.md`, *Managed Key Lease*):
+
+- The lease is volatile. It is never written to `agent.json` and never merged into the local `authorizedKeys`, which stay the device owner's list. A key on both lists is a local login.
+- It is fetched about once a minute by a worker thread, never on the event loop, under the same endpoint rule as pairing (HTTPS in production builds), authenticated with the device refresh token. Devices outside an organization run no worker and make no request.
+- It is enforced on the agent's monotonic clock: a lease holds for at most five minutes from the moment it arrived, whatever its timestamps say, so neither a wrong host clock nor an unreachable API stretches access past that. A transient failure keeps the lease to that deadline. An explicit refusal from the API (enrollment revoked or expired, device not organization-managed, invalid refresh token) drops it at once; a `4xx` without the API's code, as a CDN or WAF in front of it answers, counts as transient.
+- A managed key is checked at the key-auth hello and again after the proof verifies, so a key the lease dropped in between never starts the mode it asked for.
+- A session that authenticated with a managed key is rechecked on every housekeeping pass, including on direct WebRTC, and closed when the lease drops its key, expires, or the organization enrollment ends (a terminal refresh clears `organizationId`). It is refused every `admin` action: it cannot add a key to the local list or manage temporary desktop shares.
+
+What this changes in the trust model: for a personal device the control plane cannot open a session, because SRP verifiers and authorized keys live only on the host and in the browser. For an organization device the API, and anyone holding an organization admin account, decides which client keys get a shell. That is the feature, and it means a compromise of either reaches the organization's devices. The API binds an approval to the exact key the approver was shown, so a key swapped in after the review is not approved with it. Two limits remain: a managed session has the same shell as any other, so removing a key ends access but does not undo what was done with it; and SRP stays enabled on organization devices, so offboarding also has to cover any SRP password the
+member knows.
 
 ## Relay-visible metadata
 

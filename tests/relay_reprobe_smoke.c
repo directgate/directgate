@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "src/agent/directgate.h"
@@ -62,6 +63,8 @@ static int api_request(xapi_session_t *pSession)
             "{\"accessToken\":\"access-new\",\"refreshTokenRotated\":false,\"accessTokenExpiresIn\":3600,"
             "\"enrollmentExpiresAt\":\"2099-01-01T00:00:00Z\",\"relayUrl\":\"%s\",\"routingKey\":\"rk-reprobe\","
             "\"deviceId\":\"dev-reprobe\"}", g_api.sRelayUrl);
+    else if (nCode == 403)
+        snprintf(sBody, sizeof(sBody), "{\"message\":\"Device enrollment revoked\",\"code\":\"DEVICE_ENROLLMENT_REVOKED\"}");
     else
         snprintf(sBody, sizeof(sBody), "{\"message\":\"the registry is having a moment\"}");
 
@@ -210,6 +213,61 @@ static int run(const char *pRoot, uint16_t nPort)
     return 0;
 }
 
+/* A revocation the API confirms clears the organization with the rest of the enrollment, and that takes the
+   managed-key lease with it: a managed session on direct WebRTC must not outlive the device's enrollment. */
+static int test_revoked_organization(const char *pRoot, uint16_t nPort)
+{
+    directgate_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.sCfgPath, sizeof(cfg.sCfgPath), "%s/agent.json", pRoot);
+    xstrncpy(cfg.sDeviceId, sizeof(cfg.sDeviceId), "dev-reprobe");
+    xstrncpy(cfg.sRelayUrl, sizeof(cfg.sRelayUrl), FIRST_RELAY);
+    xstrncpy(cfg.sRoutingKey, sizeof(cfg.sRoutingKey), "rk-reprobe");
+    snprintf(cfg.enroll.sApiUrl, sizeof(cfg.enroll.sApiUrl), "https://127.0.0.1:%u", (unsigned)nPort);
+    xstrncpy(cfg.enroll.sAccessToken, sizeof(cfg.enroll.sAccessToken), "access-expiring");
+    xstrncpy(cfg.enroll.sRefreshToken, sizeof(cfg.enroll.sRefreshToken), "refresh-revoked");
+    xstrncpy(cfg.enroll.sEnrollExpiresAt, sizeof(cfg.enroll.sEnrollExpiresAt), "2099-01-01T00:00:00Z");
+    xstrncpy(cfg.enroll.sOrganizationId, sizeof(cfg.enroll.sOrganizationId), "11111111-1111-1111-1111-111111111111");
+    cfg.enroll.nAccessTokenExp = (uint64_t)time(NULL) + 10U;
+    cfg.enroll.nRefreshSkewSec = 60;
+    cfg.enroll.bEnrolled = XTRUE;
+
+    directgate_conn_t conn;
+    memset(&conn, 0, sizeof(conn));
+    conn.pCfg = &cfg;
+    DirectGate_SessionMgr_Init(&conn.mgr, &cfg);
+
+    const char *pLease = "{\"publicKeys\":[\"G8tzS4EVKlvTqIPkKxTV/jJMHCvQkQCnYJO1B4EFRzE=\"],"
+        "\"policyId\":\"11111111-1111-1111-1111-111111111111\",\"expiresIn\":300}";
+    directgate_keymgr_lease_t lease;
+    DirectGate_KeyManager_Sync(&conn.keyMgr, &cfg, XTime_GetMonoMs());
+    CHECK(DirectGate_KeyManager_ParseLease((const uint8_t*)pLease, strlen(pLease), (uint64_t)time(NULL), &lease) &&
+        DirectGate_KeyManager_Install(&conn.keyMgr, &lease, XTime_GetMonoMs()), "install a managed-key lease");
+    DirectGate_KeyManager_FreeLease(&lease);
+
+    static xapi_session_t relay;
+    memset(&relay, 0, sizeof(relay));
+    relay.eRole = XAPI_CLIENT;
+    relay.sock.nFD = XSOCK_INVALID;
+    relay.pSessionData = &conn;
+    conn.pWsSession = &relay;
+    conn.bRoleSent = XTRUE;
+
+    XSYNC_ATOMIC_SET(&g_api.nCode, 403);
+    CHECK(!DirectGate_TestCheckTokenRefresh(&conn), "a refresh the API answers with a revocation fails");
+    CHECK(conn.bReconnectSuppressed && !cfg.enroll.bEnrolled && cfg.enroll.sRefreshToken[0] == '\0',
+        "a confirmed revocation clears the enrollment and stops reconnecting");
+    CHECK(cfg.enroll.sOrganizationId[0] == '\0', "a confirmed revocation clears the organization too");
+
+    DirectGate_TestCheckAuthTimeouts(&conn);
+    CHECK(conn.keyMgr.nDeadlineMs == 0 && conn.keyMgr.nKeyCount == 0,
+        "with the organization gone the managed-key lease is dropped on the next pass");
+
+    DirectGate_KeyManager_Destroy(&conn.keyMgr);
+    DirectGate_SessionMgr_Destroy(&conn.mgr);
+    return 0;
+}
+
 /* The relay URL the API handed out is checked before anything connects to it. */
 static int test_relay_targets(void)
 {
@@ -350,6 +408,7 @@ int main(void)
     int nResult = run(sRoot, nPort);
     if (!nResult) nResult = test_transfer_pump(sRoot);
     if (!nResult) nResult = test_relay_targets();
+    if (!nResult) nResult = test_revoked_organization(sRoot, nPort);
 
     XSYNC_ATOMIC_SET(&g_api.bStop, 1);
     XThread_Join(&thread);

@@ -29,7 +29,7 @@ extern "C" {
 #include "includes.h"
 #include "session.h"
 #include "config.h"
-#include "managed_keys.h"
+#include "keymgr.h"
 
 #define DIRECTGATE_TEMPORARY_DESKTOP_SHARE_MAX_FAILURES 5
 #define DIRECTGATE_MAX_TEMPORARY_DESKTOP_SHARES         8
@@ -48,7 +48,7 @@ typedef struct directgate_conn_ {
     xlink_t relayLink;
     directgate_cfg_t *pCfg;
     directgate_session_mgr_t mgr;
-    directgate_managed_keys_t managedKeys;
+    directgate_keymgr_t keyMgr;
     xapi_session_t *pWsSession;
     uint32_t nReconnectAttempt;
     uint64_t nNextReconnectMs;
@@ -89,6 +89,7 @@ int DirectGate_TestHandleTransportMessage(xapi_session_t *pApiSession,
                                           const uint8_t *pPayload,
                                           size_t nPayload);
 void DirectGate_TestCheckWebRTCKeepalive(directgate_conn_t *pConn);
+void DirectGate_TestCheckAuthTimeouts(directgate_conn_t *pConn);
 xbool_t DirectGate_TestCheckTokenRefresh(directgate_conn_t *pConn);
 void DirectGate_TestRetryPendingSave(directgate_conn_t *pConn);
 xbool_t DirectGate_TestPrepareEndpoint(directgate_conn_t *pConn);

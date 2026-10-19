@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <openssl/crypto.h>
@@ -220,6 +221,7 @@ static void setup(fixture_t *pFix)
 static void teardown(fixture_t *pFix)
 {
     DirectGate_SessionMgr_Destroy(&pFix->conn.mgr);
+    DirectGate_KeyManager_Destroy(&pFix->conn.keyMgr);
     XByteBuffer_Clear(&pFix->api.txBuffer);
     XByteBuffer_Clear(&pFix->pktBuf);
 }
@@ -1690,6 +1692,186 @@ static int test_dispatch_corners(void)
     return 0;
 }
 
+/* ---- organization-managed keys -------------------------------------------------- */
+
+#define MANAGED_ORG "11111111-1111-1111-1111-111111111111"
+
+/* Installs a lease of MANAGED_ORG holding pKeyB64, or no key at all, the way the worker hands one over. */
+static int lease_keys(fixture_t *pFix, const char *pKeyB64)
+{
+    char sJson[512];
+    snprintf(sJson, sizeof(sJson), "{\"publicKeys\":[%s%s%s],\"policyId\":\"%s\",\"expiresIn\":300}",
+        pKeyB64 != NULL ? "\"" : "", pKeyB64 != NULL ? pKeyB64 : "", pKeyB64 != NULL ? "\"" : "", MANAGED_ORG);
+
+    DirectGate_KeyManager_Sync(&pFix->conn.keyMgr, &pFix->cfg, XTime_GetMonoMs());
+
+    directgate_keymgr_lease_t lease;
+    if (!DirectGate_KeyManager_ParseLease((const uint8_t*)sJson, strlen(sJson), (uint64_t)time(NULL), &lease)) return 0;
+
+    int nInstalled = DirectGate_KeyManager_Install(&pFix->conn.keyMgr, &lease, XTime_GetMonoMs());
+    DirectGate_KeyManager_FreeLease(&lease);
+    return nInstalled;
+}
+
+/* The status and reason of the auth answer waiting on the wire. */
+static int take_auth(fixture_t *pFix, char *pStatus, size_t nStatusSize, char *pReason, size_t nReasonSize)
+{
+    directgate_pkg_t pkg;
+    if (!take_packet(pFix, &pkg)) return 0;
+
+    xstrncpy(pStatus, nStatusSize, XJSON_GetString(XJSON_GetObject(pkg.jsonHeader.pRootObj, "status")));
+    xstrncpy(pReason, nReasonSize, XJSON_GetString(XJSON_GetObject(pkg.jsonHeader.pRootObj, "reason")));
+    DirectGate_Package_Clear(&pkg);
+    return 1;
+}
+
+/* Sends the key hello and, when a challenge comes back, signs it. Returns 1 with the proof in pSig, 0 with the
+   refusal's reason in pReason. */
+static int key_challenge(fixture_t *pFix, const key_setup_t *pKeys, directgate_keyauth_t *pClientAuth, uint32_t nSessionId,
+                         char *pSig, size_t nSigSize, char *pReason, size_t nReasonSize)
+{
+    directgate_pkg_t chal;
+    pReason[0] = '\0';
+    if (!key_hello(pFix, pClientAuth, &pKeys->client, pKeys->sAgentPubB64, nSessionId, &chal)) return 0;
+
+    xjson_obj_t *pRoot = chal.jsonHeader.pRootObj;
+    const char *pAction = XJSON_GetString(XJSON_GetObject(pRoot, "action"));
+    int nSigned = 0;
+
+    if (strcmp(pAction, "challenge") != 0) xstrncpy(pReason, nReasonSize, XJSON_GetString(XJSON_GetObject(pRoot, "reason")));
+    else nSigned = DirectGate_KeyAuth_ClientProcessChallenge(pClientAuth, &pKeys->client,
+        XJSON_GetString(XJSON_GetObject(pRoot, "agentPubKey")), XJSON_GetString(XJSON_GetObject(pRoot, "agentEph")),
+        XJSON_GetString(XJSON_GetObject(pRoot, "nonce")), XJSON_GetString(XJSON_GetObject(pRoot, "challenge")),
+        XJSON_GetString(XJSON_GetObject(pRoot, "agentSig")), pSig, nSigSize);
+
+    DirectGate_Package_Clear(&chal);
+    return nSigned;
+}
+
+/* A whole key login on nSessionId. Returns 1 when the agent accepted it and the peer's E2E half is in pPeer,
+   0 with the refusal's reason in pReason. */
+static int managed_login(fixture_t *pFix, const key_setup_t *pKeys, uint32_t nSessionId, directgate_e2e_t *pPeer,
+                         char *pReason, size_t nReasonSize)
+{
+    directgate_keyauth_t clientAuth;
+    char sSig[DIRECTGATE_KEYAUTH_SIG_B64_SIZE];
+    char sStatus[XSTR_TINY];
+    int nOk = 0;
+
+    DirectGate_E2E_Init(pPeer);
+    if (key_challenge(pFix, pKeys, &clientAuth, nSessionId, sSig, sizeof(sSig), pReason, nReasonSize))
+    {
+        drain(pFix);
+        if (deliver(pFix, DirectGate_Proto_BuildAuthKeyProof(sSig, nSessionId)) == XAPI_CONTINUE &&
+            take_auth(pFix, sStatus, sizeof(sStatus), pReason, nReasonSize) && strcmp(sStatus, "ok") == 0)
+        {
+            nOk = DirectGate_KeyAuth_ClientAccept(&clientAuth) && DirectGate_KeyAuth_DeriveShared(&clientAuth) &&
+                DirectGate_E2E_DeriveFromKey(pPeer, clientAuth.sharedSecret, sizeof(clientAuth.sharedSecret),
+                    clientAuth.peerNonce, clientAuth.localNonce, DIRECTGATE_KEYAUTH_NONCE_SIZE, AGENT_DEVICE_ID, XFALSE);
+        }
+    }
+
+    DirectGate_KeyAuth_Cleanse(&clientAuth);
+    return nOk;
+}
+
+static int test_managed_key_login(void)
+{
+    fixture_t fix;
+    setup(&fix);
+
+    key_setup_t keys;
+    CHECK(configure_keys(&fix, &keys), "configure an agent identity and a client key");
+    fix.cfg.keyauth.nAuthorizedKeyCount = 0;
+    xstrncpy(fix.cfg.enroll.sOrganizationId, sizeof(fix.cfg.enroll.sOrganizationId), MANAGED_ORG);
+
+    directgate_e2e_t peer;
+    char sReason[XSTR_TINY];
+
+    /* With no local key an organization device still runs key auth, because a lease can authorize. */
+    CHECK(!managed_login(&fix, &keys, 120, &peer, sReason, sizeof(sReason)) && !strcmp(sReason, "client not authorized"),
+        "an organization device without a lease refuses a key as unauthorized, not as unconfigured");
+
+    CHECK(lease_keys(&fix, keys.sClientPubB64), "install a lease holding the client key");
+    CHECK(managed_login(&fix, &keys, 121, &peer, sReason, sizeof(sReason)), "a key in the organization lease logs in");
+
+    directgate_session_t *pSession = DirectGate_SessionMgr_Find(&fix.conn.mgr, 121);
+    CHECK(pSession != NULL && pSession->bAuthenticated && pSession->bManagedKeySession && !pSession->bManagedKeyPending,
+        "a lease login is marked as a managed-key session");
+    CHECK(keepalive_round_trip(&fix, &peer, 121), "the managed login produced matching E2E keys on both halves");
+
+    /* The login itself sets the flag that keeps it out of admin: it cannot make its access permanent. */
+    CHECK(deliver_as(&fix, &peer, admin_header("add-key", keys.sClientPubB64, 121), 121) == XAPI_CONTINUE,
+        "a managed session's add-key is handled");
+    CHECK(expect_admin(&fix, &peer, "admin-result", "error", "managed key cannot perform admin actions"),
+        "a managed session cannot add its key to the local list");
+    CHECK(fix.cfg.keyauth.nAuthorizedKeyCount == 0, "the local key list is untouched");
+
+    /* A renewal of the same set leaves it alone; a lease without the key closes it, with nothing from the relay. */
+    CHECK(lease_keys(&fix, keys.sClientPubB64), "renew the lease");
+    DirectGate_TestCheckAuthTimeouts(&fix.conn);
+    CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 121) != NULL, "a renewed lease keeps the managed session");
+
+    CHECK(lease_keys(&fix, NULL), "install a lease without the key");
+    DirectGate_TestCheckAuthTimeouts(&fix.conn);
+    CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 121) == NULL, "a lease that drops the key closes its session");
+    DirectGate_E2E_Clear(&peer);
+
+    /* The lease can drop the key between hello and proof: the proof is then refused, not accepted and closed later. */
+    {
+        directgate_keyauth_t clientAuth;
+        char sSig[DIRECTGATE_KEYAUTH_SIG_B64_SIZE];
+        char sStatus[XSTR_TINY];
+
+        CHECK(lease_keys(&fix, keys.sClientPubB64), "lease the key again");
+        CHECK(key_challenge(&fix, &keys, &clientAuth, 122, sSig, sizeof(sSig), sReason, sizeof(sReason)),
+            "a leased key gets a challenge");
+        CHECK(lease_keys(&fix, NULL), "drop the key from the lease before the proof");
+
+        drain(&fix);
+        CHECK(deliver(&fix, DirectGate_Proto_BuildAuthKeyProof(sSig, 122)) == XAPI_CONTINUE, "the late proof is handled");
+        CHECK(take_auth(&fix, sStatus, sizeof(sStatus), sReason, sizeof(sReason)) && !strcmp(sStatus, "failed") &&
+            !strcmp(sReason, "client not authorized"), "a valid proof for a key the lease dropped is refused");
+        CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 122) == NULL, "and its session is closed");
+        DirectGate_KeyAuth_Cleanse(&clientAuth);
+    }
+
+    /* An expired lease closes managed sessions on the next housekeeping pass. */
+    CHECK(lease_keys(&fix, keys.sClientPubB64), "lease the key again");
+    CHECK(managed_login(&fix, &keys, 123, &peer, sReason, sizeof(sReason)), "log in with the leased key");
+    DirectGate_E2E_Clear(&peer);
+    fix.conn.keyMgr.nDeadlineMs = XTime_GetMonoMs();
+    DirectGate_TestCheckAuthTimeouts(&fix.conn);
+    CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 123) == NULL && fix.conn.keyMgr.nDeadlineMs == 0,
+        "an expired lease is dropped and closes the sessions it authorized");
+
+    /* A terminal enrollment state clears the organization, which drops the lease and its sessions. */
+    CHECK(lease_keys(&fix, keys.sClientPubB64), "lease the key again");
+    CHECK(managed_login(&fix, &keys, 124, &peer, sReason, sizeof(sReason)), "log in with the leased key");
+    DirectGate_E2E_Clear(&peer);
+    fix.cfg.enroll.sOrganizationId[0] = '\0';
+    DirectGate_TestCheckAuthTimeouts(&fix.conn);
+    CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 124) == NULL, "leaving the organization closes managed sessions");
+    CHECK(!managed_login(&fix, &keys, 125, &peer, sReason, sizeof(sReason)) && !strcmp(sReason, "key auth not configured"),
+        "a device with no local key and no organization refuses key auth as unconfigured, as before");
+
+    /* A key that is both local and leased is the device owner's: a full session, admin included. */
+    xstrncpy(fix.cfg.enroll.sOrganizationId, sizeof(fix.cfg.enroll.sOrganizationId), MANAGED_ORG);
+    fix.cfg.keyauth.nAuthorizedKeyCount = 1;
+    CHECK(lease_keys(&fix, keys.sClientPubB64), "lease the locally authorized key too");
+    CHECK(managed_login(&fix, &keys, 126, &peer, sReason, sizeof(sReason)), "log in with the local key");
+    pSession = DirectGate_SessionMgr_Find(&fix.conn.mgr, 126);
+    CHECK(pSession != NULL && !pSession->bManagedKeySession, "a local key wins over the lease and keeps admin rights");
+    CHECK(lease_keys(&fix, NULL), "drop the key from the lease");
+    DirectGate_TestCheckAuthTimeouts(&fix.conn);
+    CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 126) != NULL, "the lease does not govern a local key's session");
+    DirectGate_E2E_Clear(&peer);
+
+    DirectGate_KeyAuth_KeyCleanse(&keys.client);
+    teardown(&fix);
+    return 0;
+}
+
 int main(void)
 {
     if (test_malformed()) return 1;
@@ -1701,6 +1883,7 @@ int main(void)
     if (test_duplicate_after_auth()) return 1;
     if (test_srp_login()) return 1;
     if (test_key_auth_login()) return 1;
+    if (test_managed_key_login()) return 1;
     if (test_admin_actions()) return 1;
     if (test_temporary_shares()) return 1;
     if (test_dispatch_corners()) return 1;

@@ -6,6 +6,7 @@
 #include "src/common/e2e.h"
 #include "src/common/protocol.h"
 #include "src/common/webrtc.h"
+#include "src/agent/keymgr.h"
 
 /* Messages are formatted and dropped: a log argument that points into freed memory is caught by ASan
    only when the message is actually written. */
@@ -97,7 +98,7 @@ static void check_cc(const uint8_t *header, size_t size)
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (!size) return 0;
-    unsigned mode = *data++ % 6;
+    unsigned mode = *data++ % 7;
     size--;
     if (mode == 0)
     {
@@ -134,6 +135,32 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         (void)XWebFrame_ParseData(&frame, copy, size);
         XWebFrame_Clear(&frame);
         free(copy);
+    }
+    else if (mode == 6)
+    {
+        /* An API answer as the managed-key worker sees one: the lease stays inside its caps, and a key it
+           carries is authorized once installed for its own organization. */
+        directgate_keymgr_lease_t lease;
+        if (DirectGate_KeyManager_ParseLease(data, size, 1700000000ULL, &lease))
+        {
+            if (lease.nKeyCount > DIRECTGATE_KEYMGR_MAX || lease.nTtlMs > DIRECTGATE_KEYMGR_LEASE_MAX_MS) abort();
+
+            directgate_keymgr_t keyMgr;
+            directgate_keymgr_key_t first;
+            int hasKey = lease.nKeyCount > 0;
+            if (hasKey) memcpy(first, lease.pKeys[0], sizeof(first));
+
+            DirectGate_KeyManager_Init(&keyMgr);
+            xstrncpy(keyMgr.sOrganizationId, sizeof(keyMgr.sOrganizationId), lease.sPolicyId);
+            if (DirectGate_KeyManager_Install(&keyMgr, &lease, 1) && hasKey &&
+                !DirectGate_KeyManager_IsAuthorized(&keyMgr, keyMgr.sOrganizationId, first, 1)) abort();
+
+            DirectGate_KeyManager_Destroy(&keyMgr);
+        }
+
+        DirectGate_KeyManager_FreeLease(&lease);
+        char reason[64];
+        (void)DirectGate_KeyManager_Classify(403, data, size, reason, sizeof(reason));
     }
     else if (mode == 4)
     {

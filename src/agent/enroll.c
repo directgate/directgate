@@ -302,16 +302,7 @@ static void DirectGate_Enroll_LogErrorBody(const char *pLabel, const uint8_t *pB
     XJSON_Destroy(&json);
 }
 
-typedef struct directgate_enroll_field_ {
-    const char *pKey;
-    const char *pValue;
-} directgate_enroll_field_t;
-
-/* Serializes a request body with the JSON writer instead of interpolating values into a format string. Every value
-   here is operator-supplied rather than attacker-supplied, so this is about not producing a body the API can only
-   reject: a device id or token carrying a quote or a backslash comes out escaped. Fields with an empty value are
-   left out, which is what makes agentPub optional. Returns a malloc'd buffer the caller frees. */
-static char* DirectGate_Enroll_BuildBody(const directgate_enroll_field_t *pFields, size_t nCount, size_t *pLength)
+char* DirectGate_Enroll_BuildBody(const directgate_enroll_field_t *pFields, size_t nCount, size_t *pLength)
 {
     XCHECK_NL((pFields != NULL && nCount > 0 && pLength != NULL), NULL);
     *pLength = 0;
@@ -515,8 +506,10 @@ static xbool_t DirectGate_Enroll_ApplyTokenResponse(directgate_cfg_t *pCfg,
     xstrncpy(sRoutingKey, sizeof(sRoutingKey), pRoutingKey);
     if (xstrused(pDeviceId)) xstrncpy(sDeviceId, sizeof(sDeviceId), pDeviceId);
     if (xstrused(sDeviceId)) xstrncpy(pCfg->sDeviceId, sizeof(pCfg->sDeviceId), sDeviceId);
+
+    /* The organization scopes the managed-key lease, so an id that does not fit is dropped rather than cut short. */
     xstrnul(pEnroll->sOrganizationId);
-    if (xstrused(pOrganizationId))
+    if (xstrused(pOrganizationId) && strlen(pOrganizationId) < sizeof(pEnroll->sOrganizationId))
         xstrncpy(pEnroll->sOrganizationId, sizeof(pEnroll->sOrganizationId), pOrganizationId);
 
     xstrncpy(pEnroll->sAccessToken, sizeof(pEnroll->sAccessToken), sAccessToken);
