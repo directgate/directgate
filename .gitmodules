@@ -3,4 +3,4 @@
 	url = https://github.com/paullouisageneau/libdatachannel
 [submodule "libxutils"]
 	path = libxutils
-	url = https://github.com/skala13x/libxutils.git
+	url = git@github.com:kala13x/libxutils.git
