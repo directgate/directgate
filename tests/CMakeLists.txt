@@ -573,6 +573,27 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(relay_reprobe_smoke PRIVATE -Wno-unused-function)
 endif()
 
+# The in-session token refresh on its worker, against an in-process HTTPS API
+# that can hold its answer; needs the whole connection layer as well.
+directgate_smoke(token_refresh_smoke
+    ${AGENT_DIR}/config.c
+    ${AGENT_DIR}/desktop/desktop.c
+    ${AGENT_DIR}/desktop/display.c
+    ${AGENT_DIR}/desktop/input.c
+    ${AGENT_DIR}/desktop/stream.c
+    ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/keymgr.c
+    ${AGENT_DIR}/files.c
+    ${AGENT_DIR}/search.c
+    ${AGENT_DIR}/session.c
+    ${AGENT_DIR}/term.c
+    ${AGENT_DIR}/directgate.c)
+directgate_smoke_desktop(token_refresh_smoke)
+target_compile_definitions(token_refresh_smoke PRIVATE DIRECTGATE_TESTING)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(token_refresh_smoke PRIVATE -Wno-unused-function)
+endif()
+
 # Messages that end a session inside their own handler; needs the whole
 # dispatch layer, and one case runs a real shell behind a PTY endpoint.
 directgate_smoke(session_lifetime_smoke

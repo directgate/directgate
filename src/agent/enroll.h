@@ -66,6 +66,38 @@ xbool_t DirectGate_Enroll_NeedsRefresh(const directgate_cfg_t *pCfg);
 xbool_t DirectGate_Enroll_IsEnrolled(const directgate_cfg_t *pCfg);
 
 directgate_enroll_status_t DirectGate_Enroll_Refresh(directgate_cfg_t *pCfg, char *pReason, size_t nReasonSize);
+
+/*
+ * A refresh with its request on a worker thread. The active-session refresh used to run the HTTPS round trip on the
+ * relay event loop, and that froze every live session for as long as the API took to answer: about a second and a
+ * half every hour, 15 s when the API timed out, and longer while a connect or a TLS handshake could hang.
+ *
+ * Only the request runs on the worker. Reading the configuration into it, applying the answer and saving it all stay
+ * on the event loop, in the calls below, so nothing of directgate_cfg_t is shared across threads. A caller must keep
+ * at most one refresh in flight - this or DirectGate_Enroll_Refresh() - since two requests with one refresh token
+ * read as reuse to the API the moment it rotates that token, and it revokes the device for it.
+ */
+typedef struct directgate_enroll_job_ directgate_enroll_job_t;
+
+/* Builds the request and starts the worker. Returns NULL when nothing was sent, with *pStatus the status that refresh
+   ends in: the refusals DirectGate_Enroll_Refresh() makes up front, or transient for a worker that could not start. */
+directgate_enroll_job_t* DirectGate_Enroll_StartRefresh(const directgate_cfg_t *pCfg, directgate_enroll_status_t *pStatus,
+                                                        char *pReason, size_t nReasonSize);
+
+/* XTRUE once the answer, or the transport failure, is in. Never blocks. */
+xbool_t DirectGate_Enroll_RefreshDone(directgate_enroll_job_t *pJob);
+
+/* Takes a finished job and frees it. The answer is applied and saved exactly as DirectGate_Enroll_Refresh() does,
+   unless the enrollment was cleared or its refresh token changed while the request was out: then it is dropped. */
+directgate_enroll_status_t DirectGate_Enroll_FinishRefresh(directgate_cfg_t *pCfg, directgate_enroll_job_t *pJob,
+                                                           char *pReason, size_t nReasonSize);
+
+/* Takes a job that may still be running. Waits up to nWaitMs and finishes it if the answer comes in time: an answer
+   can carry a rotated refresh token, and losing it makes the next start present the spent one. Otherwise the worker
+   is left to free the job on its own and nothing is applied. */
+directgate_enroll_status_t DirectGate_Enroll_AwaitRefresh(directgate_cfg_t *pCfg, directgate_enroll_job_t *pJob,
+                                                          uint32_t nWaitMs, char *pReason, size_t nReasonSize);
+
 directgate_enroll_status_t DirectGate_Enroll_ClassifyRefreshFailure(const directgate_cfg_t *pCfg, uint16_t nStatusCode,
                                                                     const uint8_t *pBody, size_t nBodyLen,
                                                                     char *pReason, size_t nReasonSize);

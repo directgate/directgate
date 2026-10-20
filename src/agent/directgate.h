@@ -29,6 +29,7 @@ extern "C" {
 #include "includes.h"
 #include "session.h"
 #include "config.h"
+#include "enroll.h"
 #include "keymgr.h"
 
 #define DIRECTGATE_TEMPORARY_DESKTOP_SHARE_MAX_FAILURES 5
@@ -57,6 +58,10 @@ typedef struct directgate_conn_ {
      * against nLastRelayRecvMs so exactly one probe goes out per silent
      * stretch instead of one per event loop tick. */
     uint64_t nLastRelayProbeMs;
+    /* When the event loop last reached its checks. A pass that comes much
+     * later than the loop waits for input means the loop was blocked, and
+     * could hear neither the relay nor a peer for that long. */
+    uint64_t nLoopPassMs;
     /* Force one API refresh before the first connect of this process so relay
      * assignment is re-evaluated on agent startup instead of blindly reusing
      * the relayUrl persisted in the config. */
@@ -65,11 +70,16 @@ typedef struct directgate_conn_ {
      * sustained connect failures. Set to "now + cooldown" right after a
      * probe so we don't hammer the API on every backoff tick. */
     uint64_t nNextRefreshProbeMs;
-    /* Back-off for the in-session token refresh. It is a blocking HTTP call on the
-     * event loop, so while the API cannot answer it must not be retried on every
-     * loop tick: that stalled every live session and hammered the API. */
+    /* Back-off for the in-session token refresh. While the API cannot answer it
+     * must not be retried on every loop tick: that hammered the API, and back
+     * when the request ran on the event loop it stalled every live session too. */
     uint64_t nNextTokenRefreshMs;
     uint32_t nTokenRefreshFailures;
+    /* The in-session token refresh in flight on its worker, taken by a later
+     * loop pass. While it is out no other refresh may start, the reconnect
+     * included: two requests with one refresh token read as reuse to the API
+     * the moment it rotates that token, and it revokes the device. */
+    directgate_enroll_job_t *pRefreshJob;
     /* Next retry of a config save that failed after a token refresh. */
     uint64_t nNextSaveRetryMs;
     xstr_tiny_t sDisconnectReason;
@@ -89,8 +99,12 @@ int DirectGate_TestHandleTransportMessage(xapi_session_t *pApiSession,
                                           const uint8_t *pPayload,
                                           size_t nPayload);
 void DirectGate_TestCheckWebRTCKeepalive(directgate_conn_t *pConn);
+void DirectGate_TestCheckRelayKeepalive(directgate_conn_t *pConn);
+void DirectGate_TestCheckLoopStall(directgate_conn_t *pConn, uint32_t nWaitMs);
 void DirectGate_TestCheckAuthTimeouts(directgate_conn_t *pConn);
 xbool_t DirectGate_TestCheckTokenRefresh(directgate_conn_t *pConn);
+xbool_t DirectGate_TestFinishTokenRefresh(directgate_conn_t *pConn, uint32_t nWaitMs);
+void DirectGate_TestSettleTokenRefresh(directgate_conn_t *pConn, uint32_t nWaitMs);
 void DirectGate_TestRetryPendingSave(directgate_conn_t *pConn);
 xbool_t DirectGate_TestPrepareEndpoint(directgate_conn_t *pConn);
 #endif

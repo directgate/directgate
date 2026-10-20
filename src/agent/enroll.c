@@ -28,10 +28,11 @@
 #define DIRECTGATE_ENROLL_RETRY_ATTEMPTS    3U      /* Attempts for CLI-driven calls. */
 #define DIRECTGATE_ENROLL_RETRY_DELAY_MS    1000U   /* Doubled after every failed attempt. */
 #define DIRECTGATE_ENROLL_USEC_PER_MS       1000U
+#define DIRECTGATE_ENROLL_AWAIT_POLL_MS     10U     /* How often a shutdown looks for a refresh answer. */
 
-/* Refresh runs on the relay event loop, where the in-line backoff of a retry
- * would stall every live session. It gets one attempt and the caller's own
- * transient handling drives the next one. */
+/* Refresh runs on the relay event loop, or on a worker the loop waits for,
+ * where the in-line backoff of a retry would stall every live session. It
+ * gets one attempt and the caller's own transient handling drives the next. */
 #define DIRECTGATE_ENROLL_ONESHOT           1U
 
 static const char* DirectGate_Enroll_GetDeviceId(const directgate_cfg_t *pCfg)
@@ -252,10 +253,8 @@ static xhttp_status_t DirectGate_Enroll_Perform(xhttp_t *pHandle, directgate_enr
         if (nAttempt + 1 >= nAttempts) break;
 
         xlogw("Enrollment request failed, retrying: url(%s), peer(%s), attempt(%u/%u), status(%s), oserr(%d/%s), delay(%ums)",
-            pUrl, xstrused(pTrace->sPeer) ? pTrace->sPeer : "N/A",
-            (unsigned int)(nAttempt + 1), (unsigned int)nAttempts,
-            XHTTP_GetStatusStr(eStatus), pTrace->nOsError, pTrace->pOsErrorName,
-            (unsigned int)nDelayMs);
+            pUrl, xstrused(pTrace->sPeer) ? pTrace->sPeer : "N/A", (unsigned int)(nAttempt + 1), (unsigned int)nAttempts,
+            XHTTP_GetStatusStr(eStatus), pTrace->nOsError, pTrace->pOsErrorName, (unsigned int)nDelayMs);
 
         /* The next attempt rebuilds the request from scratch. */
         XHTTP_Clear(pHandle);
@@ -806,12 +805,16 @@ xbool_t DirectGate_Enroll_AccessTokenIsUsable(const directgate_cfg_t *pCfg)
     return ((uint64_t)tNow < pEnroll->nAccessTokenExp);
 }
 
-directgate_enroll_status_t DirectGate_Enroll_Refresh(directgate_cfg_t *pCfg, char *pReason, size_t nReasonSize)
+/* Reads what a refresh needs from the configuration and builds the request. DIRECTGATE_ENROLL_REFRESH_OK when it is
+   ready to go, with the body in *ppBody for the sender to cleanse and free, otherwise the status the refresh ends in
+   without anything being sent. */
+static directgate_enroll_status_t DirectGate_Enroll_PrepareRefresh(const directgate_cfg_t *pCfg, char *pUrl, size_t nUrlSize,
+                                                                   char **ppBody, size_t *pBodyLen)
 {
-    XCHECK((pCfg != NULL), DIRECTGATE_ENROLL_REFRESH_TRANSIENT);
-    DirectGate_Enroll_SetReason(pReason, nReasonSize, NULL);
+    *ppBody = NULL;
+    *pBodyLen = 0;
 
-    directgate_enroll_t *pEnroll = &pCfg->enroll;
+    const directgate_enroll_t *pEnroll = &pCfg->enroll;
     XCHECK((pEnroll->bEnrolled), DIRECTGATE_ENROLL_REFRESH_TERMINAL);
 
     XCHECK((xstrused(pCfg->sDeviceId)), DIRECTGATE_ENROLL_REFRESH_TERMINAL);
@@ -819,8 +822,7 @@ directgate_enroll_status_t DirectGate_Enroll_Refresh(directgate_cfg_t *pCfg, cha
     XCHECK((xstrused(pEnroll->sRefreshToken)), DIRECTGATE_ENROLL_REFRESH_TERMINAL);
     XCHECK((DirectGate_Enroll_ValidateAPIEndpoint(pCfg)), DIRECTGATE_ENROLL_REFRESH_TRANSIENT);
 
-    char sUrl[XPATH_MAX + 64];
-    xstrncpyf(sUrl, sizeof(sUrl), "%s/api/v1/devices/refresh", pEnroll->sApiUrl);
+    xstrncpyf(pUrl, nUrlSize, "%s/api/v1/devices/refresh", pEnroll->sApiUrl);
 
     const directgate_enroll_field_t fields[] = {
         { "refreshToken", pEnroll->sRefreshToken },
@@ -836,10 +838,16 @@ directgate_enroll_status_t DirectGate_Enroll_Refresh(directgate_cfg_t *pCfg, cha
         return DIRECTGATE_ENROLL_REFRESH_TRANSIENT;
     }
 
-    xhttp_t handle;
-    directgate_enroll_trace_t trace;
+    *ppBody = pReqBody;
+    *pBodyLen = nReqLen;
+    return DIRECTGATE_ENROLL_REFRESH_OK;
+}
 
-    xhttp_status_t status = DirectGate_Enroll_Perform(&handle, &trace, sUrl,
+/* The request alone, without the configuration, which is what lets it run off the event loop. Takes the body. */
+static xhttp_status_t DirectGate_Enroll_SendRefresh(xhttp_t *pHandle, directgate_enroll_trace_t *pTrace,
+                                                    const char *pUrl, char *pReqBody, size_t nReqLen)
+{
+    xhttp_status_t status = DirectGate_Enroll_Perform(pHandle, pTrace, pUrl,
         "/api/v1/devices/refresh", (const uint8_t*)pReqBody, nReqLen,
         DIRECTGATE_ENROLL_ONESHOT);
 
@@ -847,40 +855,48 @@ directgate_enroll_status_t DirectGate_Enroll_Refresh(directgate_cfg_t *pCfg, cha
     OPENSSL_cleanse(pReqBody, nReqLen);
     free(pReqBody);
 
+    return status;
+}
+
+/* What the answer does to the configuration. Clears the handle. */
+static directgate_enroll_status_t DirectGate_Enroll_ProcessRefresh(directgate_cfg_t *pCfg, xhttp_t *pHandle, xhttp_status_t status,
+                                                                   const directgate_enroll_trace_t *pTrace, const char *pUrl,
+                                                                   char *pReason, size_t nReasonSize)
+{
     if (status != XHTTP_COMPLETE)
     {
         xloge("Token refresh request failed: dev(%s), url(%s), peer(%s), status(%s), oserr(%d/%s)",
-            DirectGate_Enroll_GetDeviceId(pCfg), sUrl,
-            xstrused(trace.sPeer) ? trace.sPeer : "N/A", XHTTP_GetStatusStr(status),
-            trace.nOsError, trace.pOsErrorName);
+            DirectGate_Enroll_GetDeviceId(pCfg), pUrl,
+            xstrused(pTrace->sPeer) ? pTrace->sPeer : "N/A", XHTTP_GetStatusStr(status),
+            pTrace->nOsError, pTrace->pOsErrorName);
 
-        XHTTP_Clear(&handle);
+        XHTTP_Clear(pHandle);
         return DIRECTGATE_ENROLL_REFRESH_TRANSIENT;
     }
 
-    if (!XHTTP_IsSuccessCode(&handle))
+    if (!XHTTP_IsSuccessCode(pHandle))
     {
-        const uint8_t *pBody = XHTTP_GetBody(&handle);
-        size_t nBodySize = XHTTP_GetBodySize(&handle);
+        const uint8_t *pBody = XHTTP_GetBody(pHandle);
+        size_t nBodySize = XHTTP_GetBodySize(pHandle);
 
         xloge("Token refresh API returned HTTP error: dev(%s), url(%s), code(%u)",
-            DirectGate_Enroll_GetDeviceId(pCfg), sUrl, handle.nStatusCode);
+            DirectGate_Enroll_GetDeviceId(pCfg), pUrl, pHandle->nStatusCode);
 
         directgate_enroll_status_t eStatus = DirectGate_Enroll_ClassifyRefreshFailure(pCfg,
-            handle.nStatusCode, (const uint8_t*)pBody, nBodySize, pReason, nReasonSize);
+            pHandle->nStatusCode, (const uint8_t*)pBody, nBodySize, pReason, nReasonSize);
 
         if (eStatus == DIRECTGATE_ENROLL_REFRESH_TRANSIENT && pBody != NULL && nBodySize > 0)
             DirectGate_Enroll_LogErrorBody("Token refresh error", pBody, nBodySize);
 
-        XHTTP_Clear(&handle);
+        XHTTP_Clear(pHandle);
         return eStatus;
     }
 
-    const uint8_t *pRespBody = XHTTP_GetBody(&handle);
-    size_t nRespSize = XHTTP_GetBodySize(&handle);
+    const uint8_t *pRespBody = XHTTP_GetBody(pHandle);
+    size_t nRespSize = XHTTP_GetBodySize(pHandle);
 
     xbool_t bOk = DirectGate_Enroll_ApplyRefreshResponse(pCfg, pRespBody, nRespSize);
-    XHTTP_Clear(&handle);
+    XHTTP_Clear(pHandle);
 
     if (bOk)
     {
@@ -900,6 +916,194 @@ directgate_enroll_status_t DirectGate_Enroll_Refresh(directgate_cfg_t *pCfg, cha
         return DIRECTGATE_ENROLL_REFRESH_OK;
     }
 
+    return DIRECTGATE_ENROLL_REFRESH_TRANSIENT;
+}
+
+directgate_enroll_status_t DirectGate_Enroll_Refresh(directgate_cfg_t *pCfg, char *pReason, size_t nReasonSize)
+{
+    XCHECK((pCfg != NULL), DIRECTGATE_ENROLL_REFRESH_TRANSIENT);
+    DirectGate_Enroll_SetReason(pReason, nReasonSize, NULL);
+
+    char sUrl[XPATH_MAX + 64];
+    char *pReqBody = NULL;
+    size_t nReqLen = 0;
+
+    directgate_enroll_status_t eStatus = DirectGate_Enroll_PrepareRefresh(pCfg, sUrl, sizeof(sUrl), &pReqBody, &nReqLen);
+    if (eStatus != DIRECTGATE_ENROLL_REFRESH_OK) return eStatus;
+
+    xhttp_t handle;
+    directgate_enroll_trace_t trace;
+
+    xhttp_status_t status = DirectGate_Enroll_SendRefresh(&handle, &trace, sUrl, pReqBody, nReqLen);
+    return DirectGate_Enroll_ProcessRefresh(pCfg, &handle, status, &trace, sUrl, pReason, nReasonSize);
+}
+
+/*
+ * One refresh request on a thread of its own. The event loop and the worker share it under the lock: the event loop
+ * fills the inputs before the thread starts and reads the outputs only once bDone is set, and the worker touches
+ * nothing of the configuration. Whoever sees the other side finished frees it, which is what lets a shutdown leave
+ * a request that is stuck in the network behind (bOrphaned) instead of waiting on it.
+ */
+struct directgate_enroll_job_ {
+    xsync_mutex_t lock;
+    xthread_t thread;
+
+    /* Inputs. The body carries the refresh token: the worker cleanses and frees it once sent. */
+    char sUrl[XPATH_MAX + 64];
+    char sRefreshToken[XSTR_MIN];
+    char *pReqBody;
+    size_t nReqLen;
+
+    /* Outputs, valid once bDone is set. */
+    xhttp_t handle;
+    directgate_enroll_trace_t trace;
+    xhttp_status_t eStatus;
+
+    xbool_t bDone;
+    xbool_t bOrphaned;
+};
+
+static void DirectGate_Enroll_FreeJob(directgate_enroll_job_t *pJob)
+{
+    if (pJob->pReqBody != NULL)
+    {
+        OPENSSL_cleanse(pJob->pReqBody, pJob->nReqLen);
+        free(pJob->pReqBody);
+    }
+
+    XHTTP_Clear(&pJob->handle);
+    XSync_Destroy(&pJob->lock);
+    OPENSSL_cleanse(pJob, sizeof(*pJob));
+    free(pJob);
+}
+
+static void* DirectGate_Enroll_RefreshWorker(void *pArg)
+{
+    directgate_enroll_job_t *pJob = (directgate_enroll_job_t*)pArg;
+    char *pReqBody = pJob->pReqBody;
+    size_t nReqLen = pJob->nReqLen;
+
+    pJob->pReqBody = NULL;
+    pJob->nReqLen = 0;
+
+    xhttp_status_t eStatus = DirectGate_Enroll_SendRefresh(&pJob->handle, &pJob->trace, pJob->sUrl, pReqBody, nReqLen);
+
+    XSync_Lock(&pJob->lock);
+    pJob->eStatus = eStatus;
+    pJob->bDone = XTRUE;
+    xbool_t bOrphaned = pJob->bOrphaned;
+    XSync_Unlock(&pJob->lock);
+
+    /* Nothing of the job is touched after bDone unless it was left to this thread to free. */
+    if (bOrphaned) DirectGate_Enroll_FreeJob(pJob);
+    return NULL;
+}
+
+directgate_enroll_job_t* DirectGate_Enroll_StartRefresh(const directgate_cfg_t *pCfg, directgate_enroll_status_t *pStatus,
+                                                        char *pReason, size_t nReasonSize)
+{
+    DirectGate_Enroll_SetReason(pReason, nReasonSize, NULL);
+    XCHECK((pStatus != NULL), NULL);
+
+    *pStatus = DIRECTGATE_ENROLL_REFRESH_TRANSIENT;
+    XCHECK((pCfg != NULL), NULL);
+
+    directgate_enroll_job_t *pJob = (directgate_enroll_job_t*)calloc(1, sizeof(directgate_enroll_job_t));
+    if (pJob == NULL)
+    {
+        xloge("Failed to allocate the token refresh job: dev(%s), errno(%d)", DirectGate_Enroll_GetDeviceId(pCfg), errno);
+        return NULL;
+    }
+
+    *pStatus = DirectGate_Enroll_PrepareRefresh(pCfg, pJob->sUrl, sizeof(pJob->sUrl), &pJob->pReqBody, &pJob->nReqLen);
+    if (*pStatus != DIRECTGATE_ENROLL_REFRESH_OK)
+    {
+        free(pJob);
+        return NULL;
+    }
+
+    xstrncpy(pJob->sRefreshToken, sizeof(pJob->sRefreshToken), pCfg->enroll.sRefreshToken);
+    *pStatus = DIRECTGATE_ENROLL_REFRESH_TRANSIENT;
+
+    /* XSync_Init() exits the process when the mutex cannot be created, and this runs on the live event loop. */
+    if (XSync_InitAdv(&pJob->lock, XFALSE) != XSTDOK)
+    {
+        xloge("Failed to create the token refresh lock: dev(%s), errno(%d)", DirectGate_Enroll_GetDeviceId(pCfg), errno);
+        OPENSSL_cleanse(pJob->pReqBody, pJob->nReqLen);
+        free(pJob->pReqBody);
+        OPENSSL_cleanse(pJob, sizeof(*pJob));
+        free(pJob);
+        return NULL;
+    }
+
+    /* Detached: nobody joins it. The lock hands the job over in either direction, see FreeJob's callers. */
+    if (XThread_Create(&pJob->thread, DirectGate_Enroll_RefreshWorker, pJob, XTRUE) != XSTDOK)
+    {
+        xloge("Failed to start the token refresh worker: dev(%s), errno(%d)", DirectGate_Enroll_GetDeviceId(pCfg), errno);
+        DirectGate_Enroll_FreeJob(pJob);
+        return NULL;
+    }
+
+    *pStatus = DIRECTGATE_ENROLL_REFRESH_OK;
+    return pJob;
+}
+
+xbool_t DirectGate_Enroll_RefreshDone(directgate_enroll_job_t *pJob)
+{
+    XCHECK((pJob != NULL), XTRUE);
+    XSync_Lock(&pJob->lock);
+    xbool_t bDone = pJob->bDone;
+    XSync_Unlock(&pJob->lock);
+    return bDone;
+}
+
+directgate_enroll_status_t DirectGate_Enroll_FinishRefresh(directgate_cfg_t *pCfg, directgate_enroll_job_t *pJob,
+                                                           char *pReason, size_t nReasonSize)
+{
+    DirectGate_Enroll_SetReason(pReason, nReasonSize, NULL);
+    XCHECK((pJob != NULL), DIRECTGATE_ENROLL_REFRESH_TRANSIENT);
+    directgate_enroll_status_t eStatus = DIRECTGATE_ENROLL_REFRESH_TRANSIENT;
+
+    /* Applying an answer to an enrollment that was cleared while the request was out would bring it back. */
+    if (pCfg != NULL && pCfg->enroll.bEnrolled && xstrcmp(pCfg->enroll.sRefreshToken, pJob->sRefreshToken))
+    {
+        eStatus = DirectGate_Enroll_ProcessRefresh(pCfg, &pJob->handle, pJob->eStatus, &pJob->trace,
+            pJob->sUrl, pReason, nReasonSize);
+    }
+    else
+    {
+        xlogw("Dropping a token refresh answer, the enrollment changed while it was in flight: dev(%s)",
+            pCfg != NULL ? DirectGate_Enroll_GetDeviceId(pCfg) : "N/A");
+
+        DirectGate_Enroll_SetReason(pReason, nReasonSize, "enrollment-changed");
+    }
+
+    DirectGate_Enroll_FreeJob(pJob);
+    return eStatus;
+}
+
+directgate_enroll_status_t DirectGate_Enroll_AwaitRefresh(directgate_cfg_t *pCfg, directgate_enroll_job_t *pJob,
+                                                          uint32_t nWaitMs, char *pReason, size_t nReasonSize)
+{
+    DirectGate_Enroll_SetReason(pReason, nReasonSize, NULL);
+    XCHECK((pJob != NULL), DIRECTGATE_ENROLL_REFRESH_TRANSIENT);
+
+    uint64_t nDeadlineMs = XTime_GetMonoMs() + nWaitMs;
+    while (!DirectGate_Enroll_RefreshDone(pJob) && XTime_GetMonoMs() < nDeadlineMs)
+        xusleep(DIRECTGATE_ENROLL_AWAIT_POLL_MS * DIRECTGATE_ENROLL_USEC_PER_MS);
+
+    /* Decided under the lock, so exactly one side frees the job: here, or the worker when it returns. */
+    XSync_Lock(&pJob->lock);
+    xbool_t bDone = pJob->bDone;
+    if (!bDone) pJob->bOrphaned = XTRUE;
+    XSync_Unlock(&pJob->lock);
+
+    if (bDone) return DirectGate_Enroll_FinishRefresh(pCfg, pJob, pReason, nReasonSize);
+
+    xlogw("Token refresh still in flight, leaving it to finish on its own: dev(%s), waitMs(%u)",
+        pCfg != NULL ? DirectGate_Enroll_GetDeviceId(pCfg) : "N/A", nWaitMs);
+
+    DirectGate_Enroll_SetReason(pReason, nReasonSize, "refresh-abandoned");
     return DIRECTGATE_ENROLL_REFRESH_TRANSIENT;
 }
 

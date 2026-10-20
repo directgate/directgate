@@ -193,10 +193,13 @@ cmake -S . -B build-tsan -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DDIRECTGATE_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_C_FLAGS=-fsanitize=thread -DCMAKE_CXX_FLAGS=-fsanitize=thread
 cmake --build build-tsan --target webrtc_queue_smoke search_smoke audio_lifecycle_smoke \
-  session_lifetime_smoke client_io_smoke -j4
+  session_lifetime_smoke client_io_smoke token_refresh_smoke -j4
 TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure \
-  -R '^(webrtc_queue_smoke|search_smoke|audio_lifecycle_smoke|session_lifetime_smoke|client_io_smoke)$'
+  -R '^(webrtc_queue_smoke|search_smoke|audio_lifecycle_smoke|session_lifetime_smoke|client_io_smoke|token_refresh_smoke)$'
 ```
+
+`token_refresh_smoke` hands an in-session token refresh to its worker thread and takes the answer back on the loop,
+against an in-process HTTPS API that holds its answer.
 
 Where the D-Bus development headers are installed, add `wayland_portal_smoke` to both lists: it cancels a portal wait from a second thread.
 

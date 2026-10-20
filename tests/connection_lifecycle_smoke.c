@@ -45,6 +45,142 @@ static int send_header(directgate_conn_t *pConn, xapi_session_t *pSession, xjson
     return nStatus;
 }
 
+static char g_sLogged[16384];
+
+static int collect_log(const char *pLog, size_t nLength, xlog_flag_t eFlag, void *pCtx)
+{
+    (void)eFlag;
+    (void)pCtx;
+    size_t nUsed = strlen(g_sLogged);
+    if (nUsed + nLength >= sizeof(g_sLogged)) return 0;
+
+    memcpy(g_sLogged + nUsed, pLog, nLength);
+    g_sLogged[nUsed + nLength] = '\0';
+    return 0;
+}
+
+/* A blocked event loop reads nothing, so what the relay and the peers sent meanwhile waits unread, and no pong can
+   even be on its way: the pings it would answer are not sent. That wait is not silence. The checks used to run right
+   after the block and close live links over it; the time the loop was blocked now comes off every liveness clock. */
+static int test_loop_stall(void)
+{
+    xlog_init("connection_lifecycle_smoke", XLOG_ALL, XFALSE);
+    xlog_screen(XFALSE);
+    xlog_callback(collect_log, NULL);
+
+    directgate_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    xstrncpy(cfg.auth.sSaltHex, sizeof(cfg.auth.sSaltHex),
+        "00000000000000000000000000000000"
+        "00000000000000000000000000000000");
+    xstrncpy(cfg.auth.sVerifierHex, sizeof(cfg.auth.sVerifierHex), "configured");
+    cfg.nKAInterval = 25;
+
+    directgate_conn_t conn;
+    memset(&conn, 0, sizeof(conn));
+    conn.pCfg = &cfg;
+    DirectGate_SessionMgr_Init(&conn.mgr, &cfg);
+
+    xapi_session_t relay;
+    CHECK(dispatch(&conn, &relay, XAPI_CB_CONNECTED) == XAPI_CONTINUE, "the stall test relay connects");
+    relay.nEvents = XPOLLIO;
+    conn.bRoleSent = XTRUE;
+
+    directgate_session_t *pPeer = DirectGate_SessionMgr_Create(&conn.mgr, 91);
+    directgate_session_t *pIdle = DirectGate_SessionMgr_Create(&conn.mgr, 92);
+    directgate_session_t *pRecent = DirectGate_SessionMgr_Create(&conn.mgr, 93);
+    CHECK(pPeer != NULL && pIdle != NULL && pRecent != NULL, "the stall test sessions are created");
+    pPeer->pWsSession = &relay;
+    pPeer->bAuthenticated = XTRUE;
+    pPeer->webrtc.bConnected = XTRUE;
+    pPeer->webrtc.nDataChannelID = 0;
+    pIdle->pWsSession = &relay;
+    pRecent->pWsSession = &relay;
+
+    /* The first pass has nothing to measure from */
+    conn.nLoopPassMs = 0;
+    conn.nLastRelayRecvMs = XTime_GetMonoMs() - 30000ULL;
+    uint64_t nRecvMs = conn.nLastRelayRecvMs;
+    DirectGate_TestCheckLoopStall(&conn, 100);
+    CHECK(conn.nLoopPassMs > 0 && conn.nLastRelayRecvMs == nRecvMs, "the first pass only stamps the loop");
+
+    /* Gaps the loop spends waiting for input, or not much more, move no clock */
+    conn.nLoopPassMs = XTime_GetMonoMs() - 600ULL;
+    g_sLogged[0] = '\0';
+    DirectGate_TestCheckLoopStall(&conn, 100);
+    CHECK(conn.nLastRelayRecvMs == nRecvMs && g_sLogged[0] == '\0', "a loop that kept listening moves no clock");
+
+    /* 80 s blocked: the relay was last heard, and the last pong came, just before the block */
+    uint64_t nNowMs = XTime_GetMonoMs();
+    conn.nLoopPassMs = nNowMs - 80000ULL;
+    conn.nLastRelayRecvMs = nNowMs - 80500ULL;
+    conn.nLastRelayProbeMs = 0;
+    pPeer->nLastKAPingMs = nNowMs - 80600ULL;
+    pPeer->nLastKAPongMs = nNowMs - 80500ULL;
+    pIdle->nLastKAPongMs = 0;
+    pRecent->nLastKAPongMs = nNowMs - 100ULL;
+
+    g_sLogged[0] = '\0';
+    DirectGate_TestCheckLoopStall(&conn, 100);
+    uint64_t nAfterMs = XTime_GetMonoMs();
+    CHECK(nAfterMs - conn.nLastRelayRecvMs < 5000ULL && conn.nLastRelayRecvMs <= nAfterMs,
+        "the blocked time comes off the relay clock, never past now");
+    CHECK(nAfterMs - pPeer->nLastKAPongMs < 5000ULL && pPeer->nLastKAPongMs <= nAfterMs,
+        "and off the peer's pong clock");
+    CHECK(pIdle->nLastKAPongMs == 0, "a pong clock that was never armed stays unarmed");
+    CHECK(pRecent->nLastKAPongMs <= nAfterMs && nAfterMs - pRecent->nLastKAPongMs < 5000ULL,
+        "a pong read just before the block is moved up to now, not into the future");
+    CHECK(strstr(g_sLogged, "Event loop was blocked") != NULL, "the block is reported");
+
+    g_sLogged[0] = '\0';
+    DirectGate_TestCheckRelayKeepalive(&conn);
+    CHECK(strstr(g_sLogged, "Relay keepalive timeout") == NULL, "so the relay is not taken for dead");
+    DirectGate_TestCheckWebRTCKeepalive(&conn);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 91) == pPeer, "nor is the peer");
+    CHECK(pPeer->nLastKAPingMs >= nNowMs, "and the peer is pinged at once, there being no ping out since the block");
+
+    /* Only the time beyond the wait for input counts as blocked: 10 s between passes that each wait up to 5 s is 5 s
+       blocked. And a relay frame read just before the block moves the clock up to now, not into the future. */
+    nNowMs = XTime_GetMonoMs();
+    conn.nLoopPassMs = nNowMs - 10000ULL;
+    conn.nLastRelayRecvMs = nNowMs - 10000ULL;
+    DirectGate_TestCheckLoopStall(&conn, 5000);
+    nAfterMs = XTime_GetMonoMs();
+    CHECK(nAfterMs - conn.nLastRelayRecvMs >= 4000ULL && nAfterMs - conn.nLastRelayRecvMs < 6000ULL,
+        "the time the loop spent waiting for input is not taken off the clocks");
+
+    nNowMs = XTime_GetMonoMs();
+    conn.nLoopPassMs = nNowMs - 80000ULL;
+    conn.nLastRelayRecvMs = nNowMs - 100ULL;
+    DirectGate_TestCheckLoopStall(&conn, 100);
+    nAfterMs = XTime_GetMonoMs();
+    CHECK(conn.nLastRelayRecvMs <= nAfterMs && nAfterMs - conn.nLastRelayRecvMs < 5000ULL,
+        "a relay frame read just before the block is moved up to now, not into the future");
+
+    /* The same silence while the loop was listening all along is a dead link, as it always was. The ping above went
+       to a data channel that is not really there, which marked it down. */
+    pPeer->webrtc.bConnected = XTRUE;
+    nNowMs = XTime_GetMonoMs();
+    conn.nLoopPassMs = nNowMs - 100ULL;
+    conn.nLastRelayRecvMs = nNowMs - 80000ULL;
+    pPeer->nLastKAPingMs = nNowMs - 1000ULL;
+    pPeer->nLastKAPongMs = nNowMs - 80000ULL;
+
+    g_sLogged[0] = '\0';
+    DirectGate_TestCheckLoopStall(&conn, 100);
+    CHECK(conn.nLastRelayRecvMs == nNowMs - 80000ULL && pPeer->nLastKAPongMs == nNowMs - 80000ULL,
+        "a loop that was listening moves no clock");
+    DirectGate_TestCheckRelayKeepalive(&conn);
+    CHECK(strstr(g_sLogged, "Relay keepalive timeout") != NULL, "a relay silent while the loop listened is taken for dead");
+    DirectGate_TestCheckWebRTCKeepalive(&conn);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 91) == NULL, "and so is a peer that stopped answering");
+
+    XByteBuffer_Clear(&relay.txBuffer);
+    DirectGate_SessionMgr_Destroy(&conn.mgr);
+    xlog_destroy();
+    return 0;
+}
+
 int main(void)
 {
     directgate_desktop_t desktop;
@@ -375,6 +511,7 @@ int main(void)
     CHECK(!revokeConn.bEnrollmentDoubt, "an error about something else casts no doubt on the enrollment");
 
     DirectGate_SessionMgr_Destroy(&revokeConn.mgr);
+    if (test_loop_stall() != 0) return 1;
 
     puts("connection_lifecycle_smoke: OK");
     return 0;

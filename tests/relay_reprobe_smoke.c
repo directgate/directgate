@@ -255,7 +255,8 @@ static int test_revoked_organization(const char *pRoot, uint16_t nPort)
     conn.bRoleSent = XTRUE;
 
     XSYNC_ATOMIC_SET(&g_api.nCode, 403);
-    CHECK(!DirectGate_TestCheckTokenRefresh(&conn), "a refresh the API answers with a revocation fails");
+    CHECK(DirectGate_TestCheckTokenRefresh(&conn) && conn.pRefreshJob != NULL, "the refresh goes out on the worker");
+    CHECK(!DirectGate_TestFinishTokenRefresh(&conn, 30000), "a refresh the API answers with a revocation fails");
     CHECK(conn.bReconnectSuppressed && !cfg.enroll.bEnrolled && cfg.enroll.sRefreshToken[0] == '\0',
         "a confirmed revocation clears the enrollment and stops reconnecting");
     CHECK(cfg.enroll.sOrganizationId[0] == '\0', "a confirmed revocation clears the organization too");

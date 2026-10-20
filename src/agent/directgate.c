@@ -65,10 +65,12 @@
 #define DIRECTGATE_TRANSFER_RTC_BUFFER_MAX  (1U * 1024U * 1024U)
 #define DIRECTGATE_RELAY_KA_TIMEOUT_MS      60000ULL
 #define DIRECTGATE_RELAY_KA_PROBE_MS        20000ULL
+#define DIRECTGATE_LOOP_STALL_MS            1000ULL  /* A loop blocked this long stops counting as silence. */
 
 /* In-session refresh retry: doubled from the base after every failed attempt. */
 #define DIRECTGATE_TOKEN_REFRESH_RETRY_MS     5000U
 #define DIRECTGATE_TOKEN_REFRESH_RETRY_MAX_MS 30000U
+#define DIRECTGATE_TOKEN_REFRESH_STOP_WAIT_MS 15000U  /* The API gives up on a request after 15 s itself. */
 #define DIRECTGATE_CONFIG_SAVE_RETRY_MS       10000U
 
 #define DIRECTGATE_NO_ANSWER                "N/A"
@@ -343,6 +345,15 @@ static xbool_t DirectGate_HandleRefreshStatus(directgate_conn_t *pConn,
     return XFALSE;
 }
 
+/* A refresh in-line on the loop, for the paths that run with no session live. Never next to one already in flight:
+   two requests with one refresh token read as reuse the moment the API rotates it, and the device is revoked. */
+static directgate_enroll_status_t DirectGate_RefreshInline(directgate_conn_t *pConn, char *pReason, size_t nReasonSize)
+{
+    if (pConn->pRefreshJob == NULL) return DirectGate_Enroll_Refresh(pConn->pCfg, pReason, nReasonSize);
+    xstrncpy(pReason, nReasonSize, "refresh-in-flight");
+    return DIRECTGATE_ENROLL_REFRESH_TRANSIENT;
+}
+
 static xbool_t DirectGate_PrepareEndpoint(directgate_conn_t *pConn, xapi_endpoint_t *pEndpt)
 {
     XCHECK((pConn != NULL), XFALSE);
@@ -418,7 +429,7 @@ static xbool_t DirectGate_PreConnectRefresh(directgate_conn_t *pConn)
         xstrused(pCfg->sRelayUrl) ? pCfg->sRelayUrl : DIRECTGATE_NO_ANSWER);
 
     char sReason[XSTR_TINY];
-    directgate_enroll_status_t eStatus = DirectGate_Enroll_Refresh(pCfg, sReason, sizeof(sReason));
+    directgate_enroll_status_t eStatus = DirectGate_RefreshInline(pConn, sReason, sizeof(sReason));
 
     const char *pStage = bDoubt ? "relay-reported enrollment check" :
         (bStartupRefresh ? "startup relay refresh" : "pre-connect token refresh");
@@ -438,6 +449,7 @@ static xbool_t DirectGate_TryRelayReprobe(directgate_conn_t *pConn, uint64_t nNo
 
     if (pConn->nReconnectAttempt < DIRECTGATE_RECONNECT_REPROBE_AFTER) return XFALSE;
     if (nNowMs < pConn->nNextRefreshProbeMs) return XFALSE;
+    if (pConn->pRefreshJob != NULL) return XFALSE;
 
     char sPrevUrl[XPATH_MAX];
     sPrevUrl[0] = XSTR_NUL;
@@ -448,7 +460,7 @@ static xbool_t DirectGate_TryRelayReprobe(directgate_conn_t *pConn, uint64_t nNo
     char sReason[XSTR_TINY];
     sReason[0] = XSTR_NUL;
 
-    directgate_enroll_status_t eStatus = DirectGate_Enroll_Refresh(pConn->pCfg, sReason, sizeof(sReason));
+    directgate_enroll_status_t eStatus = DirectGate_RefreshInline(pConn, sReason, sizeof(sReason));
     if (eStatus != DIRECTGATE_ENROLL_REFRESH_OK)
     {
         xlogw("Relay reprobe via API refresh failed: id(%u), attempt(%u), status(%d), reason(%s)",
@@ -769,7 +781,7 @@ int DirectGate_HandshakeRequest(xapi_ctx_t *pCtx, xapi_session_t *pApiSession)
         /* Never let the status handler disconnect the socket here: this runs inside the session's own upgrade
            callback, and libxutils keeps using the session after it returns. XAPI_DISCONNECT tears it down. */
         char sReason[XSTR_TINY];
-        directgate_enroll_status_t eStatus = DirectGate_Enroll_Refresh((directgate_cfg_t*)pCfg, sReason, sizeof(sReason));
+        directgate_enroll_status_t eStatus = DirectGate_RefreshInline(pConn, sReason, sizeof(sReason));
         if (!DirectGate_HandleRefreshStatus(pConn, eStatus, sReason, "pre-role token refresh", XFALSE)) return XAPI_DISCONNECT;
     }
 
@@ -2665,10 +2677,71 @@ static int DirectGate_SendVerifyUpdate(directgate_conn_t *pConn)
     return nStatus;
 }
 
+/* Where an in-session refresh ends, whether its request ran on the worker or never left. */
+static xbool_t DirectGate_EndTokenRefresh(directgate_conn_t *pConn, directgate_enroll_status_t eStatus, const char *pReason)
+{
+    if (eStatus != DIRECTGATE_ENROLL_REFRESH_OK)
+    {
+        uint32_t nShift = pConn->nTokenRefreshFailures < 3U ? pConn->nTokenRefreshFailures : 3U;
+        uint32_t nDelayMs = DIRECTGATE_TOKEN_REFRESH_RETRY_MS << nShift;
+        if (nDelayMs > DIRECTGATE_TOKEN_REFRESH_RETRY_MAX_MS) nDelayMs = DIRECTGATE_TOKEN_REFRESH_RETRY_MAX_MS;
+
+        if (pConn->nTokenRefreshFailures < UINT32_MAX) pConn->nTokenRefreshFailures++;
+        pConn->nNextTokenRefreshMs = XTime_GetMonoMs() + nDelayMs;
+
+        xlogw("Token refresh failed: id(%u), fd(%d), status(%d), reason(%s), retryMs(%u)",
+            DirectGate_Conn_GetID(pConn, pConn->pWsSession),
+            DirectGate_Conn_GetFD(pConn, pConn->pWsSession),
+            eStatus, pReason, nDelayMs);
+
+        return DirectGate_HandleRefreshStatus(pConn, eStatus, pReason, "active-session token refresh", XTRUE);
+    }
+
+    pConn->nTokenRefreshFailures = 0;
+    pConn->nNextTokenRefreshMs = 0;
+
+    /* A relay that went away while the request was out has nothing to update: the reconnect presents the new token. */
+    if (pConn->pWsSession == NULL || !pConn->bRoleSent) return XTRUE;
+
+    if (DirectGate_SendVerifyUpdate(pConn) < 0)
+    {
+        xloge("Failed to send verify update after token refresh: id(%u), fd(%d)",
+            DirectGate_Conn_GetID(pConn, pConn->pWsSession),
+            DirectGate_Conn_GetFD(pConn, pConn->pWsSession));
+
+        return XFALSE;
+    }
+
+    xlogi("Sent verify update to relay: id(%u), fd(%d)",
+        DirectGate_Conn_GetID(pConn, pConn->pWsSession),
+        DirectGate_Conn_GetFD(pConn, pConn->pWsSession));
+
+    return XTRUE;
+}
+
+/* Takes the answer of the refresh in flight once it is in. It is applied whatever became of the relay meanwhile: it
+   can carry a rotated refresh token, and losing that one makes the next refresh read as reuse. */
+static xbool_t DirectGate_CollectTokenRefresh(directgate_conn_t *pConn)
+{
+    if (!DirectGate_Enroll_RefreshDone(pConn->pRefreshJob)) return XTRUE;
+
+    directgate_enroll_job_t *pJob = pConn->pRefreshJob;
+    pConn->pRefreshJob = NULL;
+
+    char sReason[XSTR_TINY];
+    directgate_enroll_status_t eStatus;
+
+    eStatus = DirectGate_Enroll_FinishRefresh(pConn->pCfg, pJob, sReason, sizeof(sReason));
+    return DirectGate_EndTokenRefresh(pConn, eStatus, sReason);
+}
+
 static xbool_t DirectGate_CheckTokenRefresh(directgate_conn_t *pConn)
 {
     XCHECK((pConn != NULL), XFALSE);
     XCHECK((pConn->pCfg != NULL), XFALSE);
+
+    if (pConn->pRefreshJob != NULL)
+        return DirectGate_CollectTokenRefresh(pConn);
 
     XCHECK_NL((pConn->pWsSession != NULL), XFALSE);
     XCHECK_NL((pConn->bRoleSent), XFALSE);
@@ -2694,41 +2767,26 @@ static xbool_t DirectGate_CheckTokenRefresh(directgate_conn_t *pConn)
     char sReason[XSTR_TINY];
     directgate_enroll_status_t eStatus;
 
-    eStatus = DirectGate_Enroll_Refresh(pCfg, sReason, sizeof(sReason));
-    if (eStatus != DIRECTGATE_ENROLL_REFRESH_OK)
-    {
-        uint32_t nShift = pConn->nTokenRefreshFailures < 3U ? pConn->nTokenRefreshFailures : 3U;
-        uint32_t nDelayMs = DIRECTGATE_TOKEN_REFRESH_RETRY_MS << nShift;
-        if (nDelayMs > DIRECTGATE_TOKEN_REFRESH_RETRY_MAX_MS) nDelayMs = DIRECTGATE_TOKEN_REFRESH_RETRY_MAX_MS;
+    /* The request goes out on a worker and a later pass takes the answer. */
+    pConn->pRefreshJob = DirectGate_Enroll_StartRefresh(pCfg, &eStatus, sReason, sizeof(sReason));
+    if (pConn->pRefreshJob != NULL) return XTRUE;
 
-        if (pConn->nTokenRefreshFailures < UINT32_MAX) pConn->nTokenRefreshFailures++;
-        pConn->nNextTokenRefreshMs = XTime_GetMonoMs() + nDelayMs;
+    return DirectGate_EndTokenRefresh(pConn, eStatus, sReason);
+}
 
-        xlogw("Token refresh failed: id(%u), fd(%d), status(%d), reason(%s), retryMs(%u)",
-            DirectGate_Conn_GetID(pConn, pConn->pWsSession),
-            DirectGate_Conn_GetFD(pConn, pConn->pWsSession),
-            eStatus, sReason, nDelayMs);
+/* A refresh still out when the agent stops gets a bounded wait for its answer, which can carry a rotated refresh
+   token the next start needs. */
+static void DirectGate_SettleTokenRefresh(directgate_conn_t *pConn, uint32_t nWaitMs)
+{
+    XCHECK_VOID_NL((pConn != NULL && pConn->pRefreshJob != NULL));
+    directgate_enroll_job_t *pJob = pConn->pRefreshJob;
+    pConn->pRefreshJob = NULL;
 
-        return DirectGate_HandleRefreshStatus(pConn, eStatus, sReason, "active-session token refresh", XTRUE);
-    }
+    char sReason[XSTR_TINY];
+    directgate_enroll_status_t eStatus;
 
-    pConn->nTokenRefreshFailures = 0;
-    pConn->nNextTokenRefreshMs = 0;
-
-    if (DirectGate_SendVerifyUpdate(pConn) < 0)
-    {
-        xloge("Failed to send verify update after token refresh: id(%u), fd(%d)",
-            DirectGate_Conn_GetID(pConn, pConn->pWsSession),
-            DirectGate_Conn_GetFD(pConn, pConn->pWsSession));
-
-        return XFALSE;
-    }
-
-    xlogi("Sent verify update to relay: id(%u), fd(%d)",
-        DirectGate_Conn_GetID(pConn, pConn->pWsSession),
-        DirectGate_Conn_GetFD(pConn, pConn->pWsSession));
-
-    return XTRUE;
+    eStatus = DirectGate_Enroll_AwaitRefresh(pConn->pCfg, pJob, nWaitMs, sReason, sizeof(sReason));
+    DirectGate_HandleRefreshStatus(pConn, eStatus, sReason, "shutdown token refresh", XFALSE);
 }
 
 static void DirectGate_RetryPendingSave(directgate_conn_t *pConn)
@@ -2748,6 +2806,48 @@ static void DirectGate_RetryPendingSave(directgate_conn_t *pConn)
     pConn->pCfg->bSavePending = XFALSE;
     pConn->nNextSaveRetryMs = 0;
     xlogn("Persisted refreshed tokens after an earlier failure: cfg(%s)", pConn->pCfg->sCfgPath);
+}
+
+/*
+ * The liveness clocks measure silence: no frame from the relay, no pong from a peer. While the loop is blocked -
+ * a slow disk, a call that hangs - it reads nothing, so whatever the relay and the peers sent meanwhile waits unread
+ * in their sockets, and the checks that ran right after a block used to take that wait for silence and close links
+ * that were alive. A pong cannot even be on its way then, since the pings it answers are not sent while the loop is
+ * blocked. So the time the loop could not listen is taken off every clock: a link is declared dead only after it
+ * stayed silent for as long while the loop was listening.
+ *
+ * Deadlines that bound something rather than measure silence - authentication, temporary shares, managed key
+ * leases - are left as they are.
+ */
+static void DirectGate_CheckLoopStall(directgate_conn_t *pConn, uint32_t nWaitMs)
+{
+    XCHECK_VOID((pConn != NULL));
+    uint64_t nNowMs = XTime_GetMonoMs();
+    uint64_t nLastMs = pConn->nLoopPassMs;
+    pConn->nLoopPassMs = nNowMs;
+
+    XCHECK_VOID_NL((nLastMs > 0 && nNowMs > nLastMs));
+    uint64_t nGapMs = nNowMs - nLastMs;
+    XCHECK_VOID_NL((nGapMs >= (uint64_t)nWaitMs + DIRECTGATE_LOOP_STALL_MS));
+
+    /* Up to nWaitMs of the gap went to waiting for input, which is listening */
+    uint64_t nBlockedMs = nGapMs - nWaitMs;
+
+    if (pConn->pWsSession != NULL && pConn->bRoleSent)
+    {
+        xlogw("Event loop was blocked, not counting it as relay or peer silence: id(%u), fd(%d), blockedMs(%" PRIu64 ")",
+            DirectGate_Conn_GetID(pConn, pConn->pWsSession), DirectGate_Conn_GetFD(pConn, pConn->pWsSession), nBlockedMs);
+    }
+
+    if (pConn->nLastRelayRecvMs > 0)
+        pConn->nLastRelayRecvMs = XSTD_MIN(nNowMs, pConn->nLastRelayRecvMs + nBlockedMs);
+
+    for (int i = 0; i < DIRECTGATE_MAX_SESSIONS; i++)
+    {
+        directgate_session_t *pSession = pConn->mgr.pSessions[i];
+        if (pSession == NULL || !pSession->nLastKAPongMs) continue;
+        pSession->nLastKAPongMs = XSTD_MIN(nNowMs, pSession->nLastKAPongMs + nBlockedMs);
+    }
 }
 
 static void DirectGate_CheckRelayKeepalive(directgate_conn_t *pConn)
@@ -2891,9 +2991,34 @@ void DirectGate_TestCheckAuthTimeouts(directgate_conn_t *pConn)
     DirectGate_CheckAuthTimeouts(pConn);
 }
 
+void DirectGate_TestCheckRelayKeepalive(directgate_conn_t *pConn)
+{
+    DirectGate_CheckRelayKeepalive(pConn);
+}
+
+void DirectGate_TestCheckLoopStall(directgate_conn_t *pConn, uint32_t nWaitMs)
+{
+    DirectGate_CheckLoopStall(pConn, nWaitMs);
+}
+
 xbool_t DirectGate_TestCheckTokenRefresh(directgate_conn_t *pConn)
 {
     return DirectGate_CheckTokenRefresh(pConn);
+}
+
+/* The loop pass that takes the answer of the refresh in flight, made once that answer is in or nWaitMs ran out. */
+xbool_t DirectGate_TestFinishTokenRefresh(directgate_conn_t *pConn, uint32_t nWaitMs)
+{
+    uint64_t nDeadlineMs = XTime_GetMonoMs() + nWaitMs;
+    while (pConn->pRefreshJob != NULL && !DirectGate_Enroll_RefreshDone(pConn->pRefreshJob) &&
+        XTime_GetMonoMs() < nDeadlineMs) xusleep(5U * DIRECTGATE_SLEEP_USEC_PER_MS);
+
+    return DirectGate_CheckTokenRefresh(pConn);
+}
+
+void DirectGate_TestSettleTokenRefresh(directgate_conn_t *pConn, uint32_t nWaitMs)
+{
+    DirectGate_SettleTokenRefresh(pConn, nWaitMs);
 }
 
 void DirectGate_TestRetryPendingSave(directgate_conn_t *pConn)
@@ -2914,10 +3039,11 @@ static void DirectGate_RunService(xapi_t *pApi, xapi_endpoint_t *pEndpt, directg
     while (!g_bFinish)
     {
         xevent_status_t status = XEVENTS_SUCCESS;
+        uint32_t nWaitMs = DirectGate_GetServiceWaitMs(pSessData);
 
         if (pApi->bHaveEvents)
         {
-            status = XAPI_Service(pApi, (int)DirectGate_GetServiceWaitMs(pSessData));
+            status = XAPI_Service(pApi, (int)nWaitMs);
             if (g_bFinish) break;
 
             if (status != XEVENTS_SUCCESS)
@@ -2936,9 +3062,11 @@ static void DirectGate_RunService(xapi_t *pApi, xapi_endpoint_t *pEndpt, directg
         }
         else
         {
-            xusleep(DirectGate_GetServiceWaitMs(pSessData) * DIRECTGATE_SLEEP_USEC_PER_MS);
+            xusleep(nWaitMs * DIRECTGATE_SLEEP_USEC_PER_MS);
         }
 
+        /* First, before any check reads a liveness clock */
+        DirectGate_CheckLoopStall(pSessData, nWaitMs);
         DirectGate_CheckTokenRefresh(pSessData);
         DirectGate_CheckAuthTimeouts(pSessData);
         DirectGate_CheckRelayKeepalive(pSessData);
@@ -2946,7 +3074,10 @@ static void DirectGate_RunService(xapi_t *pApi, xapi_endpoint_t *pEndpt, directg
         DirectGate_RetryPendingSave(pSessData);
         DirectGate_Term_ReapPending();
 
+        /* Not while a refresh is out: the reconnect would refresh as well, with the same refresh token. The pass
+           above takes the answer as soon as it is in, and the reconnect then goes with the token it brought. */
         if (pSessData->pWsSession == NULL &&
+            pSessData->pRefreshJob == NULL &&
             !pSessData->bReconnectSuppressed &&
             pSessData->nNextReconnectMs > 0)
         {
@@ -3385,6 +3516,7 @@ int DirectGate_RunAgent(int argc, char* argv[])
     DirectGate_InitialConnect(&api, &endpt, &conn);
     DirectGate_RunService(&api, &endpt, &conn);
 
+    DirectGate_SettleTokenRefresh(&conn, DIRECTGATE_TOKEN_REFRESH_STOP_WAIT_MS);
     DirectGate_KeyManager_Destroy(&conn.keyMgr);
     DirectGate_SessionMgr_Destroy(&conn.mgr);
     DirectGate_ReapPending_Term();
