@@ -222,6 +222,15 @@ int main(void)
         CHECK(DirectGate_LoadConfig(&reloaded, sOrgCfgPath) && !strcmp(reloaded.keyauth.sManagedOrgId, ORG_ID),
             "the allowance should load back from the config");
 
+        /* The Manager's unticked box: pairing with an empty -m takes the allowance back and keeps the enrollment */
+        char *pPairClearArgv[] = { sArg0, sArgC, sOrgCfgPath, sArgE, sArgT, sToken, sArgM, sEmpty, NULL };
+        CHECK(DirectGate_ParseArgs(&cfg2, 8, pPairClearArgv) && cfg2.bSetManagedOrg && cfg2.keyauth.sManagedOrgId[0] == '\0',
+            "a pairing with an empty -m should parse");
+        fake_https_reply(&api, 200, "application/json", g_pOrgPairJson);
+        CHECK(DirectGate_ApplyConfig(&cfg2) == XSTDNON, "a pairing with an empty -m should succeed");
+        CHECK(!file_has(sOrgCfgPath, "managedOrganizationId") && file_has(sOrgCfgPath, "\"organizationId\": \"" ORG_ID "\""),
+            "a pairing with an empty -m should take the allowance back and still record the organization");
+
         /* A typo fails before the pairing token is spent, and leaves the config alone */
         char *pBadArgv[] = { sArg0, sArgC, sPersonalCfgPath, sArgS, sArgE, sArgT, sToken, sArgM, sBad, NULL };
         int nRequests = fake_https_last(&api, NULL);
