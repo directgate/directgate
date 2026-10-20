@@ -228,6 +228,7 @@ static int test_revoked_organization(const char *pRoot, uint16_t nPort)
     xstrncpy(cfg.enroll.sRefreshToken, sizeof(cfg.enroll.sRefreshToken), "refresh-revoked");
     xstrncpy(cfg.enroll.sEnrollExpiresAt, sizeof(cfg.enroll.sEnrollExpiresAt), "2099-01-01T00:00:00Z");
     xstrncpy(cfg.enroll.sOrganizationId, sizeof(cfg.enroll.sOrganizationId), "11111111-1111-1111-1111-111111111111");
+    xstrncpy(cfg.keyauth.sManagedOrgId, sizeof(cfg.keyauth.sManagedOrgId), "11111111-1111-1111-1111-111111111111");
     cfg.enroll.nAccessTokenExp = (uint64_t)time(NULL) + 10U;
     cfg.enroll.nRefreshSkewSec = 60;
     cfg.enroll.bEnrolled = XTRUE;
@@ -258,6 +259,8 @@ static int test_revoked_organization(const char *pRoot, uint16_t nPort)
     CHECK(conn.bReconnectSuppressed && !cfg.enroll.bEnrolled && cfg.enroll.sRefreshToken[0] == '\0',
         "a confirmed revocation clears the enrollment and stops reconnecting");
     CHECK(cfg.enroll.sOrganizationId[0] == '\0', "a confirmed revocation clears the organization too");
+    CHECK(!strcmp(cfg.keyauth.sManagedOrgId, "11111111-1111-1111-1111-111111111111"),
+        "the operator's managed-key allowance is the operator's: only -m changes it");
 
     DirectGate_TestCheckAuthTimeouts(&conn);
     CHECK(conn.keyMgr.nDeadlineMs == 0 && conn.keyMgr.nKeyCount == 0,

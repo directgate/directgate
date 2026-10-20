@@ -1788,6 +1788,17 @@ static int test_managed_key_login(void)
     directgate_e2e_t peer;
     char sReason[XSTR_TINY];
 
+    /* The API naming an organization is not enough: without the operator's allowance there is no lease to run,
+       and a device with no local key answers key auth as unconfigured, exactly like a personal one. */
+    CHECK(!lease_keys(&fix, keys.sClientPubB64), "no lease is installed for an organization the operator did not allow");
+    CHECK(!managed_login(&fix, &keys, 119, &peer, sReason, sizeof(sReason)) && !strcmp(sReason, "key auth not configured"),
+        "an organization device without the operator's allowance refuses key auth as unconfigured");
+
+    xstrncpy(fix.cfg.keyauth.sManagedOrgId, sizeof(fix.cfg.keyauth.sManagedOrgId), "22222222-2222-2222-2222-222222222222");
+    CHECK(!lease_keys(&fix, keys.sClientPubB64), "an allowance for another organization installs no lease either");
+
+    xstrncpy(fix.cfg.keyauth.sManagedOrgId, sizeof(fix.cfg.keyauth.sManagedOrgId), MANAGED_ORG);
+
     /* With no local key an organization device still runs key auth, because a lease can authorize. */
     CHECK(!managed_login(&fix, &keys, 120, &peer, sReason, sizeof(sReason)) && !strcmp(sReason, "client not authorized"),
         "an organization device without a lease refuses a key as unauthorized, not as unconfigured");
@@ -1854,6 +1865,10 @@ static int test_managed_key_login(void)
     CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 124) == NULL, "leaving the organization closes managed sessions");
     CHECK(!managed_login(&fix, &keys, 125, &peer, sReason, sizeof(sReason)) && !strcmp(sReason, "key auth not configured"),
         "a device with no local key and no organization refuses key auth as unconfigured, as before");
+
+    /* The API moving the device to another organization switches managed keys off rather than over. */
+    xstrncpy(fix.cfg.enroll.sOrganizationId, sizeof(fix.cfg.enroll.sOrganizationId), "22222222-2222-2222-2222-222222222222");
+    CHECK(!lease_keys(&fix, keys.sClientPubB64), "an organization the API names later does not inherit the allowance");
 
     /* A key that is both local and leased is the device owner's: a full session, admin included. */
     xstrncpy(fix.cfg.enroll.sOrganizationId, sizeof(fix.cfg.enroll.sOrganizationId), MANAGED_ORG);

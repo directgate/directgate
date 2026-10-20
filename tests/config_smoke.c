@@ -169,6 +169,50 @@ int main(void)
     CHECK(!DirectGate_ParseArgs(&cfg, 2, pMissingValueArgv),
         "missing -c value must fail");
 
+    /* -m alone saves into an existing config: missing, it is refused rather than starting from an empty one */
+    char *pManagedMissingArgv[] = { "xagent", "-c", sMissingPath, "-m", "11111111-2222-3333-4444-555555555555", NULL };
+    CHECK(!DirectGate_ParseArgs(&cfg, 5, pManagedMissingArgv), "-m with a missing explicit config must fail");
+
+    /* The organization id is checked as a UUID and kept in lowercase, the way the API reports it */
+    char *pManagedUpperArgv[] = { "xagent", "-c", sMissingPath, "-e", "-m", "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", NULL };
+    CHECK(DirectGate_ParseArgs(&cfg, 6, pManagedUpperArgv) && cfg.bSetManagedOrg &&
+        !strcmp(cfg.keyauth.sManagedOrgId, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"), "-m should normalize the id to lowercase");
+
+    static const char *pBadOrgIds[] = {
+        "11111111-2222-3333-4444-55555555555",
+        "11111111-2222-3333-4444-5555555555555",
+        "11111111+2222-3333-4444-555555555555",
+        "1111111g-2222-3333-4444-555555555555",
+        "111111112222333344445555555555555555"
+    };
+
+    for (size_t i = 0; i < sizeof(pBadOrgIds) / sizeof(pBadOrgIds[0]); i++)
+    {
+        char *pBadArgv[] = { "xagent", "-c", sMissingPath, "-e", "-m", (char*)pBadOrgIds[i], NULL };
+        CHECK(!DirectGate_ParseArgs(&cfg, 6, pBadArgv), "an -m value that is not a UUID must fail");
+    }
+
+    /* The managed-key allowance only loads whole: one that does not fit is dropped, never cut into another id */
+    char sManagedPath[600];
+    char sManagedJson[XSTR_TINY + 256];
+    char sLongOrg[XSTR_TINY + 16];
+    memset(sLongOrg, 'o', sizeof(sLongOrg) - 1);
+    sLongOrg[sizeof(sLongOrg) - 1] = '\0';
+    snprintf(sManagedPath, sizeof(sManagedPath), "%s/managed.json", sRoot);
+
+    snprintf(sManagedJson, sizeof(sManagedJson), "{\"auth\":{\"key\":{\"managedOrganizationId\":\"org-a\"}}}");
+    CHECK(write_file(sManagedPath, sManagedJson), "write a config with a managed-key allowance");
+    DirectGate_InitConfig(&cfg);
+    CHECK(DirectGate_LoadConfig(&cfg, sManagedPath) && !strcmp(cfg.keyauth.sManagedOrgId, "org-a"),
+        "a managed-key allowance should load");
+
+    snprintf(sManagedJson, sizeof(sManagedJson), "{\"auth\":{\"key\":{\"managedOrganizationId\":\"%s\"}}}", sLongOrg);
+    CHECK(write_file(sManagedPath, sManagedJson), "write a config with an oversized managed-key allowance");
+    DirectGate_InitConfig(&cfg);
+    CHECK(DirectGate_LoadConfig(&cfg, sManagedPath) && cfg.keyauth.sManagedOrgId[0] == '\0',
+        "an oversized managed-key allowance should be dropped, not truncated");
+    unlink(sManagedPath);
+
     unlink(sExplicitPath);
     unlink(sKeyPath);
     rmdir(sConfigDir);

@@ -120,6 +120,24 @@ body {
   color: var(--muted);
 }
 
+.org-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.org-row[hidden] {
+  display: none;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
 .link {
   color: var(--primary);
   text-decoration: none;

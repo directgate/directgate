@@ -1754,9 +1754,9 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
             return XAPI_CONTINUE;
         }
 
-        /* An organization enrollment can authorize keys through its lease with no local key configured. */
-        if ((pCfg->keyauth.nAuthorizedKeyCount == 0 &&
-            !xstrused(pCfg->enroll.sOrganizationId)) ||
+        /* An organization enrollment the operator allowed managed keys for can authorize keys through its lease
+           with no local key configured. */
+        if ((pCfg->keyauth.nAuthorizedKeyCount == 0 && !xstrused(DirectGate_KeyManager_Organization(pCfg))) ||
             !xstrused(pCfg->keyauth.sIdentitySeedB64) ||
             !xstrused(pCfg->keyauth.sIdentityPubB64))
         {
@@ -1789,7 +1789,7 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
         xbool_t bLocalKey = DirectGate_KeyAuth_IsClientAuthorized(pSession->keyauth.clientPubKey,
             pAuthorizedKeyPtrs, pCfg->keyauth.nAuthorizedKeyCount);
         xbool_t bManagedKey = !bLocalKey && DirectGate_KeyManager_IsAuthorized(&pConn->keyMgr,
-            pCfg->enroll.sOrganizationId, pSession->keyauth.clientPubKey, XTime_GetMonoMs());
+            DirectGate_KeyManager_Organization(pCfg), pSession->keyauth.clientPubKey, XTime_GetMonoMs());
 
         if (!bLocalKey && !bManagedKey)
         {
@@ -1894,7 +1894,7 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
         /* The lease can drop the key between hello and proof. Checked again here, a revoked key never gets as far
            as starting the mode it asked for, rather than being closed by the next housekeeping pass. */
         if (pSession->bManagedKeyPending && !DirectGate_KeyManager_IsAuthorized(&pConn->keyMgr,
-                pCfg->enroll.sOrganizationId, pSession->managedClientPub, XTime_GetMonoMs()))
+                DirectGate_KeyManager_Organization(pCfg), pSession->managedClientPub, XTime_GetMonoMs()))
         {
             xlogw("Key-auth managed key left the lease before the proof: sid(%u), wsfd(%d)",
                 pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));

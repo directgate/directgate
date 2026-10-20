@@ -69,11 +69,17 @@ typedef struct directgate_keymgr_ {
     directgate_keymgr_key_t *pKeys;
     directgate_keymgr_poll_t eLastPoll; /* Last worker result, so a failure that repeats is logged once */
     char sOrganizationId[XSTR_TINY];
+    char sRefusedOrgId[XSTR_TINY];      /* Enrollment organization not allowed here, so it is logged once */
     uint64_t nDeadlineMs;               /* XTime_GetMonoMs() deadline, 0 while no lease is installed */
     uint32_t nGeneration;               /* Bumped every time the authorized set changes or is dropped */
     uint16_t nKeyCount;
     xbool_t bWorkerAllowed;
 } directgate_keymgr_t;
+
+/* The organization whose lease this device enforces: the enrollment's organizationId, but only while it is the
+   one the operator allowed on the device (auth.key.managedOrganizationId); otherwise empty and managed keys are
+   off. The API reports the organization, it cannot pick it: naming another one switches the keys off. */
+const char* DirectGate_KeyManager_Organization(const directgate_cfg_t *pCfg);
 
 void DirectGate_KeyManager_Init(directgate_keymgr_t *pKeyMgr);
 void DirectGate_KeyManager_Clear(directgate_keymgr_t *pKeyMgr);

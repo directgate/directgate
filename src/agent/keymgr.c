@@ -82,6 +82,14 @@ void DirectGate_KeyManager_FreeLease(directgate_keymgr_lease_t *pLease)
     memset(pLease, 0, sizeof(*pLease));
 }
 
+const char* DirectGate_KeyManager_Organization(const directgate_cfg_t *pCfg)
+{
+    XCHECK_NL((pCfg != NULL), XSTR_EMPTY);
+    const char *pAllowed = pCfg->keyauth.sManagedOrgId;
+    const char *pEnrolled = pCfg->enroll.sOrganizationId;
+    return (xstrused(pAllowed) && xstrcmp(pAllowed, pEnrolled)) ? pEnrolled : XSTR_EMPTY;
+}
+
 void DirectGate_KeyManager_Init(directgate_keymgr_t *pKeyMgr)
 {
     XCHECK_VOID_NL((pKeyMgr != NULL));
@@ -607,7 +615,8 @@ static void DirectGate_KeyManager_HandleResult(directgate_keymgr_t *pKeyMgr, dir
 static void DirectGate_KeyManager_SyncWorker(directgate_keymgr_t *pKeyMgr, const directgate_cfg_t *pCfg, uint64_t nNowMs)
 {
     const directgate_enroll_t *pEnroll = &pCfg->enroll;
-    xbool_t bWanted = pEnroll->bEnrolled && xstrused(pEnroll->sOrganizationId) &&
+    const char *pAllowedOrgId = DirectGate_KeyManager_Organization(pCfg);
+    xbool_t bWanted = pEnroll->bEnrolled && xstrused(pAllowedOrgId) &&
         xstrused(pEnroll->sApiUrl) && xstrused(pEnroll->sRefreshToken);
 
     if (pKeyMgr->pWorker == NULL)
@@ -627,7 +636,7 @@ static void DirectGate_KeyManager_SyncWorker(directgate_keymgr_t *pKeyMgr, const
     directgate_keymgr_worker_t *pWorker = pKeyMgr->pWorker;
     const char *pApiUrl = bWanted ? pEnroll->sApiUrl : XSTR_EMPTY;
     const char *pRefreshToken = bWanted ? pEnroll->sRefreshToken : XSTR_EMPTY;
-    const char *pOrganizationId = bWanted ? pEnroll->sOrganizationId : XSTR_EMPTY;
+    const char *pOrganizationId = bWanted ? pAllowedOrgId : XSTR_EMPTY;
 
     directgate_keymgr_poll_t eResult = DIRECTGATE_KEYMGR_POLL_NONE;
     directgate_keymgr_lease_t lease;
@@ -672,7 +681,20 @@ static void DirectGate_KeyManager_SyncWorker(directgate_keymgr_t *pKeyMgr, const
 void DirectGate_KeyManager_Sync(directgate_keymgr_t *pKeyMgr, const directgate_cfg_t *pCfg, uint64_t nNowMs)
 {
     XCHECK_VOID_NL((pKeyMgr != NULL && pCfg != NULL));
-    const char *pOrganizationId = pCfg->enroll.sOrganizationId;
+    const char *pOrganizationId = DirectGate_KeyManager_Organization(pCfg);
+
+    /* Said once per organization: an enrollment the operator did not allow managed keys for stays without them. */
+    const char *pRefusedOrgId = xstrused(pOrganizationId) ? XSTR_EMPTY : pCfg->enroll.sOrganizationId;
+    if (!xstrcmp(pKeyMgr->sRefusedOrgId, pRefusedOrgId))
+    {
+        if (xstrused(pRefusedOrgId))
+        {
+            xlogn("Organization-managed keys are off, the operator has not allowed them for this organization: org(%s), allowed(%s)",
+                pRefusedOrgId, xstrused(pCfg->keyauth.sManagedOrgId) ? pCfg->keyauth.sManagedOrgId : "N/A");
+        }
+
+        xstrncpy(pKeyMgr->sRefusedOrgId, sizeof(pKeyMgr->sRefusedOrgId), pRefusedOrgId);
+    }
 
     /* A lease belongs to one organization enrollment. Leaving it, being revoked out of it or re-pairing into
        another one drops it before any key-auth can see it again. */

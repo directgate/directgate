@@ -11,12 +11,22 @@ function pairDevice(
   deviceId: string,
   pairingToken: string,
   authPassword: string,
+  organizationId: string | null,
 ): Promise<string> {
-  return invoke<string>("pair_device", { deviceId, pairingToken, authPassword });
+  return invoke<string>("pair_device", {
+    deviceId,
+    pairingToken,
+    authPassword,
+    organizationId,
+  });
 }
 
 function getPairingStatus(): Promise<string> {
   return invoke<string>("get_pairing_status");
+}
+
+function getManagedOrganization(): Promise<string> {
+  return invoke<string>("get_managed_organization");
 }
 
 function getServiceStatus(): Promise<string> {
@@ -81,23 +91,35 @@ const NOT_INSTALLED_MSG =
  * pairing token, so the user copies one value instead of two:
  *
  *     dg1_<base64url( deviceId + "\n" + pairingToken )>
+ *     dg2_<base64url( deviceId + "\n" + organizationId + "\n" + pairingToken )>
  *
  *   - "dg1_" is a version prefix (v1). It is accepted but optional on input.
+ *   - "dg2_" is an organization device: the code also names the organization,
+ *     and pairing passes it to the agent as `-m <organizationId>` (when the
+ *     operator leaves "Let the organization manage access keys" checked). Its
+ *     prefix is required.
  *   - The payload is base64url (RFC 4648 §5), padding optional.
- *   - deviceId and token are split on the FIRST newline, so the token may
- *     contain any character (':', '.', '/', etc.) without escaping.
+ *   - The token comes last and takes everything after the separators before
+ *     it, so it may contain any character (':', '.', '/', etc.) without
+ *     escaping.
  */
 const PAIR_CODE_PREFIX = "dg1_";
+const ORG_PAIR_CODE_PREFIX = "dg2_";
+const ORGANIZATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 interface PairParts {
   deviceId: string;
   token: string;
+  organizationId: string | null;
 }
 
-/** Decodes a `dg1_` pairing code into its device ID and pairing token. */
+/** Decodes a `dg1_` or `dg2_` pairing code into its device ID, organization and pairing token. */
 function decodePairCode(code: string): PairParts {
   let body = code.trim();
-  if (body.startsWith(PAIR_CODE_PREFIX)) {
+  const isOrganization = body.startsWith(ORG_PAIR_CODE_PREFIX);
+  if (isOrganization) {
+    body = body.slice(ORG_PAIR_CODE_PREFIX.length);
+  } else if (body.startsWith(PAIR_CODE_PREFIX)) {
     body = body.slice(PAIR_CODE_PREFIX.length);
   }
   if (!body) throw new Error("Pairing code is empty.");
@@ -115,16 +137,24 @@ function decodePairCode(code: string): PairParts {
     throw new Error("Pairing code is not valid. Copy it again from directgate.io.");
   }
 
+  const invalid = "Pairing code is not valid. Copy it again from directgate.io.";
   const nl = text.indexOf("\n");
-  if (nl < 0) {
-    throw new Error("Pairing code is not valid. Copy it again from directgate.io.");
-  }
+  if (nl < 0) throw new Error(invalid);
   const deviceId = text.slice(0, nl).trim();
-  const token = text.slice(nl + 1).trim();
-  if (!deviceId || !token) {
-    throw new Error("Pairing code is not valid. Copy it again from directgate.io.");
+  let rest = text.slice(nl + 1);
+
+  let organizationId: string | null = null;
+  if (isOrganization) {
+    const orgNl = rest.indexOf("\n");
+    if (orgNl < 0) throw new Error(invalid);
+    organizationId = rest.slice(0, orgNl).trim();
+    rest = rest.slice(orgNl + 1);
+    if (!ORGANIZATION_ID.test(organizationId)) throw new Error(invalid);
   }
-  return { deviceId, token };
+
+  const token = rest.trim();
+  if (!deviceId || !token) throw new Error(invalid);
+  return { deviceId, token, organizationId };
 }
 
 // --- element handles ---------------------------------------------------------
@@ -145,6 +175,9 @@ const confirmEl = $<HTMLInputElement>("confirm-password");
 const pairBtn = $<HTMLButtonElement>("pair-btn");
 const pairBackBtn = $<HTMLButtonElement>("pair-back-btn");
 const pairMsg = $<HTMLParagraphElement>("pair-msg");
+const orgRow = $<HTMLDivElement>("org-row");
+const orgKeysEl = $<HTMLInputElement>("org-keys");
+const orgKeysStatus = $<HTMLParagraphElement>("org-keys-status");
 
 const changeSrpBtn = $<HTMLButtonElement>("change-srp-btn");
 const srpForm = $<HTMLDivElement>("srp-form");
@@ -213,6 +246,7 @@ async function refreshPairing(): Promise<void> {
     const status = await getPairingStatus();
     if (status === "Paired") {
       showPairedView();
+      await refreshManagedOrganization();
     } else {
       showPairForm();
     }
@@ -220,6 +254,30 @@ async function refreshPairing(): Promise<void> {
     // If we can't tell, default to showing the form.
     showPairForm();
   }
+}
+
+// The paired view says whether the organization manages access keys here, so
+// an operator can confirm what the pairing code enabled.
+async function refreshManagedOrganization(): Promise<void> {
+  try {
+    const organizationId = await getManagedOrganization();
+    orgKeysStatus.hidden = !organizationId;
+  } catch {
+    orgKeysStatus.hidden = true;
+  }
+}
+
+// An organization code shows what it will enable before anything is sent; the
+// checkbox lets the operator pair into the organization without it.
+function onPairCodeInput(): void {
+  let organizationId: string | null = null;
+  try {
+    organizationId = decodePairCode(pairCodeEl.value).organizationId;
+  } catch {
+    organizationId = null;
+  }
+  orgRow.hidden = !organizationId;
+  if (!organizationId) orgKeysEl.checked = true;
 }
 
 // --- version / updates -------------------------------------------------------
@@ -403,8 +461,9 @@ async function onPair(): Promise<void> {
   // Split the single pasted code back into device ID + pairing token.
   let deviceId: string;
   let token: string;
+  let organizationId: string | null;
   try {
-    ({ deviceId, token } = decodePairCode(pairCodeEl.value));
+    ({ deviceId, token, organizationId } = decodePairCode(pairCodeEl.value));
   } catch (err) {
     setMsg(pairMsg, String(err instanceof Error ? err.message : err), "err");
     pairCodeEl.focus();
@@ -425,7 +484,12 @@ async function onPair(): Promise<void> {
   pairBtn.disabled = true;
   setMsg(pairMsg, "Pairing…", "info");
   try {
-    await pairDevice(deviceId, token, authPassword);
+    await pairDevice(
+      deviceId,
+      token,
+      authPassword,
+      organizationId && orgKeysEl.checked ? organizationId : null,
+    );
     // Pairing succeeded: switch to the paired view and restart the service so
     // it picks up the new enrollment.
     showPairedView();
@@ -445,7 +509,9 @@ async function onPair(): Promise<void> {
     pairCodeEl.value = "";
     authEl.value = "";
     confirmEl.value = "";
+    onPairCodeInput();
     pairBtn.disabled = false;
+    await refreshManagedOrganization();
   }
 }
 
@@ -509,6 +575,7 @@ async function runServiceAction(
 
 // --- wiring ------------------------------------------------------------------
 pairBtn.addEventListener("click", onPair);
+pairCodeEl.addEventListener("input", onPairCodeInput);
 
 repairBtn.addEventListener("click", () => {
   showPairForm();

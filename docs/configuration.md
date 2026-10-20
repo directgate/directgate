@@ -63,7 +63,8 @@ The default log directory is platform-specific: `/var/log/directgate` on Linux a
       },
       "authorizedKeys": [
         "<base64_ed25519_client_public_key>"
-      ]
+      ],
+      "managedOrganizationId": "<organization_uuid>"
     }
   }
 }
@@ -85,6 +86,7 @@ The default log directory is platform-specific: `/var/log/directgate` on Linux a
 | `auth.key.agentIdentity.seed` | string   | Agent Ed25519 identity seed for key auth   |
 | `auth.key.agentIdentity.pub`  | string   | Agent Ed25519 public identity for key auth |
 | `auth.key.authorizedKeys`     | string[] | Authorized client Ed25519 public keys      |
+| `auth.key.managedOrganizationId` | string | The organization this device's operator allowed to authorize client keys through the managed-key lease, as given with `-m <org_id>`. Only `-m` changes it - not an API response, not a re-pairing without `-m`, not a revoked enrollment - and it applies only while the enrollment is in that same organization. Absent: managed keys are off; `-m ""` removes it. See [Security](security.md#organization-managed-keys) |
 
 ### Terminal sessions
 
@@ -121,6 +123,8 @@ Options are:
   -w            Enable WebRTC verbose logging (works with -v)
   -i            Init config and exit
   -e            Enroll device and exit
+  -m <org_id>   Enable organization-managed client keys for this organization (a UUID). With -e it is saved
+                with the pairing; on its own it is saved into the existing config, then exit. "" disables
   -s            Init SRP verifier and exit
   -h            Print version and usage
 ```
@@ -129,6 +133,9 @@ Common one-shot commands:
 
 ```bash
 directgate -sed <id> -t <token>  # pair this device with your account and init config
+directgate -sed <id> -t <token> -m <org_id>  # pair into an organization and let it manage client keys here
+directgate -m <org_id>           # enable organization-managed keys on an already paired device
+directgate -m ""                 # disable them again
 directgate -i                    # create/update the agent config interactively
 directgate -s                    # set/change the SRP password (regenerates the verifier)
 directgate -r                    # rotate the agent identity keypair

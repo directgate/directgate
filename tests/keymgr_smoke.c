@@ -56,10 +56,12 @@ static int install(directgate_keymgr_t *pKeyMgr, const char *pJson, uint64_t nNo
     return nInstalled;
 }
 
+/* An enrollment in pOrganizationId whose operator allowed managed keys for it. */
 static void init_cfg(directgate_cfg_t *pCfg, const char *pOrganizationId)
 {
     memset(pCfg, 0, sizeof(*pCfg));
     xstrncpy(pCfg->enroll.sOrganizationId, sizeof(pCfg->enroll.sOrganizationId), pOrganizationId);
+    xstrncpy(pCfg->keyauth.sManagedOrgId, sizeof(pCfg->keyauth.sManagedOrgId), pOrganizationId);
 }
 
 static int test_parse(void)
@@ -247,6 +249,49 @@ static int test_install(void)
     DirectGate_KeyManager_Destroy(NULL);
     CHECK(!DirectGate_KeyManager_Install(NULL, NULL, 0) && !DirectGate_KeyManager_Recheck(&keyMgr, keyA, NULL, 0),
         "missing arguments install and pass nothing");
+    return 0;
+}
+
+/* The API reports the organization and the operator allows it. Without that allowance nothing is fetched or
+   trusted, and an allowance made for one organization does not pass to another the API names later. */
+static int test_consent(void)
+{
+    uint8_t keyA[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
+    CHECK(decode(KEY_A, keyA), "the fixture key decodes");
+
+    directgate_cfg_t cfg;
+    init_cfg(&cfg, ORG_ID);
+    CHECK(!strcmp(DirectGate_KeyManager_Organization(&cfg), ORG_ID), "the organization the operator allowed is enforced");
+
+    cfg.keyauth.sManagedOrgId[0] = '\0';
+    CHECK(!strcmp(DirectGate_KeyManager_Organization(&cfg), ""), "an organization the operator did not allow is not");
+
+    xstrncpy(cfg.keyauth.sManagedOrgId, sizeof(cfg.keyauth.sManagedOrgId), OTHER_ORG);
+    CHECK(!strcmp(DirectGate_KeyManager_Organization(&cfg), ""), "an allowance for another organization does not carry over");
+
+    xstrncpy(cfg.keyauth.sManagedOrgId, sizeof(cfg.keyauth.sManagedOrgId), ORG_ID);
+    cfg.enroll.sOrganizationId[0] = '\0';
+    CHECK(!strcmp(DirectGate_KeyManager_Organization(&cfg), ""), "an allowance outlives no organization enrollment");
+    CHECK(!strcmp(DirectGate_KeyManager_Organization(NULL), ""), "no configuration allows nothing");
+
+    /* The attack the allowance exists for: the API calling a personal device an organization one. */
+    init_cfg(&cfg, ORG_ID);
+    cfg.keyauth.sManagedOrgId[0] = '\0';
+    cfg.enroll.bEnrolled = XTRUE;
+    xstrncpy(cfg.enroll.sApiUrl, sizeof(cfg.enroll.sApiUrl), "https://127.0.0.1:1");
+    xstrncpy(cfg.enroll.sRefreshToken, sizeof(cfg.enroll.sRefreshToken), "refresh-unallowed");
+
+    directgate_keymgr_t keyMgr;
+    DirectGate_KeyManager_Init(&keyMgr);
+    DirectGate_KeyManager_AllowWorker(&keyMgr);
+    DirectGate_KeyManager_Sync(&keyMgr, &cfg, 1000);
+    CHECK(keyMgr.pWorker == NULL, "an organization the operator did not allow starts no worker and asks the API nothing");
+    CHECK(!install(&keyMgr, "{\"publicKeys\":[\"" KEY_A "\"],\"policyId\":\"" ORG_ID "\",\"expiresIn\":300}", 1000),
+        "and installs no lease, even one naming that organization");
+    CHECK(!DirectGate_KeyManager_IsAuthorized(&keyMgr, DirectGate_KeyManager_Organization(&cfg), keyA, 1000),
+        "so no managed key is authorized");
+
+    DirectGate_KeyManager_Destroy(&keyMgr);
     return 0;
 }
 
@@ -485,6 +530,7 @@ int main(void)
 {
     if (test_parse()) return 1;
     if (test_install()) return 1;
+    if (test_consent()) return 1;
     if (test_classify()) return 1;
     if (test_stuck_worker()) return 1;
 

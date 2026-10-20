@@ -19,6 +19,9 @@
         <!-- Shown when the device is already enrolled -->
         <div id="paired-view" hidden>
           <p class="msg msg--ok">Device is paired. You can now access it remotely at <a id="paired-workspace-link" class="link" href="https://directgate.io/workspace">directgate.io/workspace</a>.</p>
+          <p id="org-keys-status" class="field__hint" hidden>
+            Your organization manages access keys on this device.
+          </p>
 
           <div class="btn-row">
             <button id="repair-btn" class="btn" type="button">Re-Pair</button>
@@ -63,8 +66,20 @@
             <span class="field__label">Pairing Code</span>
             <input id="pair-code" class="field__input" type="text"
                    autocomplete="off" spellcheck="false"
-                   placeholder="paste the dg1_… code from directgate.io" />
+                   placeholder="paste the code from directgate.io" />
           </label>
+
+          <!-- Shown only for an organization's pairing code (dg2_…) -->
+          <div id="org-row" class="org-row" hidden>
+            <p class="field__hint">
+              This is an organization device. Its administrators can let
+              organization members in with their approved access keys.
+            </p>
+            <label class="check">
+              <input id="org-keys" type="checkbox" checked />
+              <span>Let the organization manage access keys on this device</span>
+            </label>
+          </div>
 
           <label class="field">
             <span class="field__label">Auth Password</span>
