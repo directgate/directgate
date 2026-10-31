@@ -78,8 +78,6 @@ static int check_sdp(void)
     DirectGate_WebRTC_CopySdpLine(NULL, sizeof(sLine), "x", 1);
     DirectGate_WebRTC_CopySdpLine(sLine, 0, "x", 1);
     CHECK(strcmp(sLine, "kept") == 0, "a line is copied nowhere without room");
-
-    CHECK(DirectGate_JSON_Unescape(NULL) == NULL && DirectGate_JSON_Unescape("") == NULL, "nothing to unescape");
     return 0;
 }
 

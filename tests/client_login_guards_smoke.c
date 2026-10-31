@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "src/client/login.c"
+#include "fake_https.h"
 
 #define CHECK(c, msg) \
     do { if (!(c)) { fprintf(stderr, "client_login_guards_smoke: %s (line %d)\n", msg, __LINE__); return 1; } } while (0)
@@ -142,9 +143,58 @@ static int check_flows(void)
     return 0;
 }
 
+/* The token requests are put together on the stack, where the secrets are wiped after use. What goes in comes
+   decoded from JSON or from the sign-in callback, and is escaped again: the body says what it was given. */
+static int check_bodies(void)
+{
+    fake_https_t api;
+    CHECK(fake_https_begin(&api), "start the API");
+    fake_https_reply(&api, 403, "application/json", "{\"message\":\"no\"}");
+    directgate_login_ctx_t ctx = { api.sUrl, "", NULL, XTRUE };
+
+    directgate_account_t account;
+    DirectGate_Account_Init(&account);
+    xstrncpy(account.sRefreshToken, sizeof(account.sRefreshToken), "re\"fr\\esh");
+    int bRefused = !DirectGate_Login_Refresh(&account, &ctx);
+    int bAsked = fake_https_last(&api, NULL) == 1;
+
+    fake_https_t last;
+    fake_https_last(&api, &last);
+    xjson_t json;
+    int bParsed = XJSON_Parse(&json, NULL, last.sBody, strlen(last.sBody));
+    int bToken = bParsed && strcmp(XJSON_GetString(XJSON_GetObject(json.pRootObj, "refreshToken")), "re\"fr\\esh") == 0;
+    if (bParsed) XJSON_Destroy(&json);
+
+    /* A token too long to escape into its body is not sent cut short */
+    memset(account.sRefreshToken, '"', sizeof(account.sRefreshToken) - 1);
+    account.sRefreshToken[sizeof(account.sRefreshToken) - 1] = '\0';
+    int bLongRefused = !DirectGate_Login_Refresh(&account, &ctx) && fake_https_last(&api, NULL) == 1;
+
+    int bRedeemed = !DirectGate_Login_Redeem(&account, &ctx, "co\"de", "veri\\fier");
+    fake_https_last(&api, &last);
+    bParsed = XJSON_Parse(&json, NULL, last.sBody, strlen(last.sBody));
+    int bCode = bParsed && strcmp(XJSON_GetString(XJSON_GetObject(json.pRootObj, "code")), "co\"de") == 0 &&
+        strcmp(XJSON_GetString(XJSON_GetObject(json.pRootObj, "codeVerifier")), "veri\\fier") == 0;
+    if (bParsed) XJSON_Destroy(&json);
+
+    char sLong[XSTR_MID * 2];
+    memset(sLong, '"', sizeof(sLong) - 1);
+    sLong[sizeof(sLong) - 1] = '\0';
+    int bLongCode = !DirectGate_Login_Redeem(&account, &ctx, sLong, "v") && fake_https_last(&api, NULL) == 2;
+    int bLongVerifier = !DirectGate_Login_Redeem(&account, &ctx, "c", sLong) && fake_https_last(&api, NULL) == 2;
+    fake_https_end(&api);
+    DirectGate_Account_Cleanse(&account);
+
+    CHECK(bRefused && bAsked && bToken, "the refresh token goes into its body as it is");
+    CHECK(bLongRefused, "a refresh token too long to escape is not sent");
+    CHECK(bRedeemed && bCode, "so do the code and its verifier");
+    CHECK(bLongCode && bLongVerifier, "neither is sent when it does not fit");
+    return 0;
+}
+
 int main(void)
 {
-    if (check_account() || check_parsers() || check_requests() || check_flows()) return 1;
+    if (check_account() || check_parsers() || check_requests() || check_flows() || check_bodies()) return 1;
     puts("client_login_guards_smoke: OK");
     return 0;
 }

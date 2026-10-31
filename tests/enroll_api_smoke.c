@@ -1,6 +1,7 @@
 /* Enrollment against an API on the other end of a real TLS connection: what the agent keeps when its configuration
  * cannot be saved, what it makes of error bodies it cannot read, and how many ICE servers it takes. */
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -43,6 +44,46 @@ static const char *g_pRotatedJson =
         "\"relayUrl\":\"wss://relay.example.test/websock\","
         "\"routingKey\":\"rk-1\""
     "}";
+
+#define ORG_ID "33333333-3333-3333-3333-333333333333"
+
+static const char *g_pOrgPairJson =
+    "{"
+        "\"deviceId\":\"device-api\","
+        "\"accessToken\":\"access-org\","
+        "\"accessTokenExpiresAt\":\"2099-04-01T12:00:00.000Z\","
+        "\"refreshToken\":\"refresh-org\","
+        "\"refreshTokenExpiresAt\":\"2099-05-01T12:00:00.000Z\","
+        "\"enrollmentExpiresAt\":\"2099-05-01T12:00:00.000Z\","
+        "\"relayUrl\":\"wss://relay.example.test/websock\","
+        "\"routingKey\":\"rk-org\","
+        "\"organizationId\":\"" ORG_ID "\""
+    "}";
+
+static const char *g_pOrgRefreshJson =
+    "{"
+        "\"deviceId\":\"device-api\","
+        "\"accessToken\":\"access-org-2\","
+        "\"accessTokenExpiresAt\":\"2099-04-01T12:10:00.000Z\","
+        "\"refreshTokenRotated\":false,"
+        "\"enrollmentExpiresAt\":\"2099-05-01T12:00:00.000Z\","
+        "\"relayUrl\":\"wss://relay.example.test/websock\","
+        "\"routingKey\":\"rk-org\","
+        "\"organizationId\":\"" ORG_ID "\""
+    "}";
+
+/* The last enrollment failure logged. Only those lines are kept: the API thread logs as well, and nothing of its is
+ * shared with the test thread then. */
+static char g_sFailure[XSTR_MID];
+
+static int keep_failure(const char *pLog, size_t nLength, xlog_flag_t eFlag, void *pCtx)
+{
+    (void)nLength;
+    (void)eFlag;
+    (void)pCtx;
+    if (strstr(pLog, "oserr(") != NULL) xstrncpy(g_sFailure, sizeof(g_sFailure), pLog);
+    return 0;
+}
 
 static void init_cfg(directgate_cfg_t *pCfg, const char *pApiUrl, const char *pCfgPath)
 {
@@ -130,6 +171,97 @@ int main(void)
     CHECK(!strcmp(cfg.enroll.sRefreshToken, "refresh-2") && cfg.enroll.bEnrolled,
         "a failed refresh should keep the tokens it had");
 
+    /* Organization-managed keys are the operator's -m <organization id> and never the API's: a pairing without -m
+     * switches nothing on, a pairing with it saves the allowance in the config it creates, and the allowance only
+     * applies to an enrollment in that same organization. */
+    {
+        char sOrgCfgPath[160];
+        char sPersonalCfgPath[160];
+        snprintf(sOrgCfgPath, sizeof(sOrgCfgPath), "%s/org-agent.json", sRoot);
+        snprintf(sPersonalCfgPath, sizeof(sPersonalCfgPath), "%s/personal-agent.json", sRoot);
+
+        /* The first pairing creates the config: there is no file before it, so -m travels on the command line */
+        char sArg0[] = "directgate", sArgC[] = "-c", sArgS[] = "-s", sArgE[] = "-e", sArgT[] = "-t";
+        char sArgM[] = "-m", sToken[] = "pairing-token", sOrg[] = ORG_ID, sEmpty[] = "", sBad[] = "not-a-uuid";
+        char *pPairArgv[] = { sArg0, sArgC, sOrgCfgPath, sArgE, sArgT, sToken, sArgM, sOrg, NULL };
+
+        directgate_cfg_t cfg2;
+        CHECK(DirectGate_ParseArgs(&cfg2, 8, pPairArgv) && cfg2.bSetManagedOrg && !strcmp(cfg2.keyauth.sManagedOrgId, ORG_ID),
+            "-m should parse with no config file yet");
+        xstrncpy(cfg2.sDeviceId, sizeof(cfg2.sDeviceId), "device-api");
+        xstrncpy(cfg2.enroll.sApiUrl, sizeof(cfg2.enroll.sApiUrl), api.sUrl);
+        CHECK(DirectGate_AuthGenerateRecord(&cfg2.auth, "org-password"), "an SRP record for the organization device");
+
+        fake_https_reply(&api, 200, "application/json", g_pOrgPairJson);
+        CHECK(DirectGate_ApplyConfig(&cfg2) == XSTDNON, "a pairing into an organization with -m should succeed");
+        CHECK(file_has(sOrgCfgPath, "\"organizationId\": \"" ORG_ID "\"") &&
+            file_has(sOrgCfgPath, "\"managedOrganizationId\": \"" ORG_ID "\""),
+            "the pairing should save the organization and the operator's allowance into the config it creates");
+
+        /* Pairing again without -m changes nothing about it */
+        char *pRepairArgv[] = { sArg0, sArgC, sOrgCfgPath, sArgE, sArgT, sToken, NULL };
+        CHECK(DirectGate_ParseArgs(&cfg2, 6, pRepairArgv) && !cfg2.bSetManagedOrg, "a pairing without -m should parse");
+        CHECK(DirectGate_ApplyConfig(&cfg2) == XSTDNON, "pairing again without -m should succeed");
+        CHECK(file_has(sOrgCfgPath, "\"managedOrganizationId\": \"" ORG_ID "\""),
+            "a pairing without -m should leave the allowance as it was");
+
+        /* -m on its own: an empty value takes the allowance back, an organization id puts it in place */
+        char *pClearArgv[] = { sArg0, sArgC, sOrgCfgPath, sArgM, sEmpty, NULL };
+        CHECK(DirectGate_ParseArgs(&cfg2, 5, pClearArgv) && cfg2.bSetManagedOrg && cfg2.keyauth.sManagedOrgId[0] == '\0',
+            "-m with an empty value should parse");
+        CHECK(DirectGate_ApplyConfig(&cfg2) == XSTDNON && !file_has(sOrgCfgPath, "managedOrganizationId"),
+            "-m with an empty value should take the allowance back");
+
+        char *pSetArgv[] = { sArg0, sArgC, sOrgCfgPath, sArgM, sOrg, NULL };
+        CHECK(DirectGate_ParseArgs(&cfg2, 5, pSetArgv) && DirectGate_ApplyConfig(&cfg2) == XSTDNON,
+            "-m with an organization id on its own should succeed");
+        CHECK(file_has(sOrgCfgPath, "\"managedOrganizationId\": \"" ORG_ID "\""), "and save the allowance");
+
+        directgate_cfg_t reloaded;
+        DirectGate_InitConfig(&reloaded);
+        CHECK(DirectGate_LoadConfig(&reloaded, sOrgCfgPath) && !strcmp(reloaded.keyauth.sManagedOrgId, ORG_ID),
+            "the allowance should load back from the config");
+
+        /* The Manager's unticked box: pairing with an empty -m takes the allowance back and keeps the enrollment */
+        char *pPairClearArgv[] = { sArg0, sArgC, sOrgCfgPath, sArgE, sArgT, sToken, sArgM, sEmpty, NULL };
+        CHECK(DirectGate_ParseArgs(&cfg2, 8, pPairClearArgv) && cfg2.bSetManagedOrg && cfg2.keyauth.sManagedOrgId[0] == '\0',
+            "a pairing with an empty -m should parse");
+        fake_https_reply(&api, 200, "application/json", g_pOrgPairJson);
+        CHECK(DirectGate_ApplyConfig(&cfg2) == XSTDNON, "a pairing with an empty -m should succeed");
+        CHECK(!file_has(sOrgCfgPath, "managedOrganizationId") && file_has(sOrgCfgPath, "\"organizationId\": \"" ORG_ID "\""),
+            "a pairing with an empty -m should take the allowance back and still record the organization");
+
+        /* A typo fails before the pairing token is spent, and leaves the config alone */
+        char *pBadArgv[] = { sArg0, sArgC, sPersonalCfgPath, sArgS, sArgE, sArgT, sToken, sArgM, sBad, NULL };
+        int nRequests = fake_https_last(&api, NULL);
+        CHECK(!DirectGate_ParseArgs(&cfg2, 9, pBadArgv), "an organization id that is not a UUID should be refused");
+        CHECK(fake_https_last(&api, NULL) == nRequests && access(sPersonalCfgPath, F_OK) != 0,
+            "a refused -m should make no request and write no config");
+
+        /* A personal device: pairing without -m allows nothing, and a refresh naming an organization allows nothing */
+        directgate_cfg_t personal;
+        init_cfg(&personal, api.sUrl, sPersonalCfgPath);
+        CHECK(DirectGate_AuthGenerateRecord(&personal.auth, "personal-password"), "an SRP record for the personal device");
+        xstrncpy(personal.sPairingToken, sizeof(personal.sPairingToken), "pairing-token");
+        personal.bEnroll = XTRUE;
+
+        fake_https_reply(&api, 200, "application/json", g_pPairJson);
+        CHECK(DirectGate_ApplyConfig(&personal) == XSTDNON, "a personal pairing should succeed");
+        CHECK(!file_has(sPersonalCfgPath, "managedOrganizationId") && !file_has(sPersonalCfgPath, "organizationId"),
+            "a personal pairing should record no organization and allow nothing");
+
+        DirectGate_InitConfig(&personal);
+        CHECK(DirectGate_LoadConfig(&personal, sPersonalCfgPath), "load the paired personal device");
+        fake_https_reply(&api, 200, "application/json", g_pOrgRefreshJson);
+        CHECK(DirectGate_Enroll_Refresh(&personal, sReason, sizeof(sReason)) == DIRECTGATE_ENROLL_REFRESH_OK,
+            "a refresh naming an organization should succeed");
+        CHECK(!strcmp(personal.enroll.sOrganizationId, ORG_ID) && personal.keyauth.sManagedOrgId[0] == '\0',
+            "the organization the refresh names should be recorded without being allowed");
+
+        unlink(sOrgCfgPath);
+        unlink(sPersonalCfgPath);
+    }
+
     /* The agent key rotation reports what the API said */
     xstrncpy(cfg.keyauth.sIdentityPubB64, sizeof(cfg.keyauth.sIdentityPubB64), "AGENTPUB");
     fake_https_reply(&api, 200, "application/json", "{}");
@@ -141,7 +273,34 @@ int main(void)
     fake_https_reply(&api, 500, "text/plain", "oops");
     CHECK(!DirectGate_Enroll_RotateAgentKey(&cfg), "a key rotation the server failed should fail");
 
+    /* A failed call reports the OS error its socket saved when the system call failed. A certificate the agent does
+     * not trust ends the handshake with none, where errno read afterwards reported whatever an earlier call left. */
+    xlog_init("enroll_api_smoke", XLOG_ALL, XTRUE);
+    xlog_screen(XFALSE);
+    xlog_callback(keep_failure, NULL);
+
+    setenv("SSL_CERT_FILE", "/nonexistent/directgate-enroll-ca.pem", 1);
+    errno = ENOENT;
+    g_sFailure[0] = '\0';
+    directgate_enroll_status_t eUntrusted = DirectGate_Enroll_Refresh(&cfg, sReason, sizeof(sReason));
+    int bNoOsError = strstr(g_sFailure, "oserr(0/none)") != NULL;
+    setenv("SSL_CERT_FILE", api.tls.sCert, 1);
+
     fake_https_end(&api);
+
+    /* An API that is gone refuses the connection, and the failure says so */
+    char sRefused[64];
+    snprintf(sRefused, sizeof(sRefused), "oserr(%d/ECONNREFUSED/", ECONNREFUSED);
+    g_sFailure[0] = '\0';
+    directgate_enroll_status_t eGone = DirectGate_Enroll_Refresh(&cfg, sReason, sizeof(sReason));
+    int bRefused = strstr(g_sFailure, sRefused) != NULL;
+    xlog_destroy();
+
+    CHECK(eUntrusted == DIRECTGATE_ENROLL_REFRESH_TRANSIENT, "an API the agent does not trust should be a transient failure");
+    CHECK(bNoOsError, "and one with no OS error behind it");
+    CHECK(eGone == DIRECTGATE_ENROLL_REFRESH_TRANSIENT, "an API that is gone should be a transient failure");
+    CHECK(bRefused, "and the refused connection should be named");
+
     unlink(sCfgPath);
     unlink(sBlocker);
     rmdir(sRoot);

@@ -151,6 +151,23 @@ When you click **Pair Device**, the app:
    service** so it picks up the new enrollment (this restart needs admin
    privileges; pairing itself does not).
 
+**Organization devices.** In an organization workspace directgate.io shows a
+`dg2_` code that also names the organization (see
+[Pairing code format](#pairing-code-format)). When one is pasted, the form shows
+that it is an organization device and a **Let the organization manage access
+keys on this device** checkbox, checked. Pairing then runs
+
+```
+directgate -sed <deviceId> -t <pairingToken> -m <organizationId>
+```
+
+and the agent lets that organization's approved member keys in. Unchecked, the
+device still pairs into the organization, without `-m`, and members can connect
+only with the device password. The agent takes the organization only from this
+command line, never from the API, so a personal (`dg1_`) code can never turn it
+on. Afterwards the paired view says *Your organization manages access keys on
+this device* when the agent config carries `auth.key.managedOrganizationId`.
+
 The already-paired state is detected by reading `enrollment.enrolled` from the
 agent's config file. On Windows this is the machine-wide
 `%PROGRAMDATA%/directgate/agent.json` (`C:\ProgramData\directgate\agent.json`),
@@ -166,9 +183,14 @@ one-time pairing token, so you copy one value instead of two:
 
 ```
 dg1_<base64url( deviceId + "\n" + pairingToken )>
+dg2_<base64url( deviceId + "\n" + organizationId + "\n" + pairingToken )>
 ```
 
 - `dg1_` is a version prefix (v1); it is accepted but optional on input.
+- `dg2_` is an organization device's code: the organization id (a UUID) sits
+  between the two, and pairing passes it to the agent as `-m`. Its prefix is
+  required. Managers older than this format reject a `dg2_` code as invalid
+  rather than pairing with part of it; personal devices keep `dg1_`.
 - The payload is base64url (RFC 4648 §5), padding optional.
 - The device ID and token are split on the **first** newline, so the token may
   contain any character (`:`, `.`, `/`, …) without escaping.

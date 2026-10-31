@@ -152,6 +152,8 @@ directgate_smoke(config_smoke        ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c
 directgate_smoke(config_extra_smoke  ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(config_args_smoke   ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
 directgate_smoke(keyfile_apply_smoke ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c)
+directgate_smoke(keymgr_smoke        ${AGENT_DIR}/config.c ${AGENT_DIR}/enroll.c ${AGENT_DIR}/keymgr.c)
+set_tests_properties(keymgr_smoke PROPERTIES SKIP_RETURN_CODE 77)
 directgate_smoke(search_smoke        ${AGENT_DIR}/search.c ${AGENT_DIR}/files.c)
 directgate_smoke(search_criteria_smoke)
 directgate_smoke(yuv_smoke   ${AGENT_DIR}/yuv.c)
@@ -455,6 +457,7 @@ directgate_smoke(session_files_smoke
     ${AGENT_DIR}/desktop/input.c
     ${AGENT_DIR}/desktop/stream.c
     ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/keymgr.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
@@ -475,6 +478,7 @@ directgate_smoke(directgate_guards_smoke
     ${AGENT_DIR}/desktop/input.c
     ${AGENT_DIR}/desktop/stream.c
     ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/keymgr.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
@@ -492,6 +496,7 @@ directgate_smoke(auth_flow_smoke
     ${AGENT_DIR}/desktop/input.c
     ${AGENT_DIR}/desktop/stream.c
     ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/keymgr.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
@@ -513,6 +518,7 @@ if(UNIX AND NOT APPLE)
         ${AGENT_DIR}/desktop/input.c
         ${AGENT_DIR}/desktop/stream.c
         ${AGENT_DIR}/enroll.c
+        ${AGENT_DIR}/keymgr.c
         ${AGENT_DIR}/files.c
         ${AGENT_DIR}/search.c
         ${AGENT_DIR}/session.c
@@ -534,6 +540,7 @@ directgate_smoke(connection_lifecycle_smoke
     ${AGENT_DIR}/desktop/input.c
     ${AGENT_DIR}/desktop/stream.c
     ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/keymgr.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
@@ -554,6 +561,7 @@ directgate_smoke(relay_reprobe_smoke
     ${AGENT_DIR}/desktop/input.c
     ${AGENT_DIR}/desktop/stream.c
     ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/keymgr.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
@@ -565,6 +573,27 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(relay_reprobe_smoke PRIVATE -Wno-unused-function)
 endif()
 
+# The in-session token refresh on its worker, against an in-process HTTPS API
+# that can hold its answer; needs the whole connection layer as well.
+directgate_smoke(token_refresh_smoke
+    ${AGENT_DIR}/config.c
+    ${AGENT_DIR}/desktop/desktop.c
+    ${AGENT_DIR}/desktop/display.c
+    ${AGENT_DIR}/desktop/input.c
+    ${AGENT_DIR}/desktop/stream.c
+    ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/keymgr.c
+    ${AGENT_DIR}/files.c
+    ${AGENT_DIR}/search.c
+    ${AGENT_DIR}/session.c
+    ${AGENT_DIR}/term.c
+    ${AGENT_DIR}/directgate.c)
+directgate_smoke_desktop(token_refresh_smoke)
+target_compile_definitions(token_refresh_smoke PRIVATE DIRECTGATE_TESTING)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(token_refresh_smoke PRIVATE -Wno-unused-function)
+endif()
+
 # Messages that end a session inside their own handler; needs the whole
 # dispatch layer, and one case runs a real shell behind a PTY endpoint.
 directgate_smoke(session_lifetime_smoke
@@ -574,6 +603,7 @@ directgate_smoke(session_lifetime_smoke
     ${AGENT_DIR}/desktop/input.c
     ${AGENT_DIR}/desktop/stream.c
     ${AGENT_DIR}/enroll.c
+    ${AGENT_DIR}/keymgr.c
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
@@ -594,9 +624,10 @@ if(DIRECTGATE_BUILD_FUZZERS)
     endif()
     add_executable(fuzz_wire fuzz_wire.c
         ${COMMON_DIR}/protocol.c ${COMMON_DIR}/webrtc.c
+        ${AGENT_DIR}/keymgr.c ${AGENT_DIR}/enroll.c ${AGENT_DIR}/config.c
         ${CMAKE_SOURCE_DIR}/libxutils/src/data/json.c
         ${CMAKE_SOURCE_DIR}/libxutils/src/net/ws.c)
-    target_include_directories(fuzz_wire PRIVATE ${CMAKE_SOURCE_DIR})
+    target_include_directories(fuzz_wire PRIVATE ${CMAKE_SOURCE_DIR} ${AGENT_DIR})
     target_link_libraries(fuzz_wire PRIVATE xcommon)
     target_compile_options(fuzz_wire PRIVATE -fsanitize=fuzzer-no-link)
     target_link_options(fuzz_wire PRIVATE -fsanitize=fuzzer)

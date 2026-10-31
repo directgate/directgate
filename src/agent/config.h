@@ -46,6 +46,7 @@ typedef enum {
 
 typedef struct directgate_enroll_ {
     char sApiUrl[XPATH_MAX];
+    char sOrganizationId[XSTR_TINY];
     char sAccessToken[XSTR_MID];
     char sRefreshToken[XSTR_MIN];
     char sEnrollExpiresAt[XSTR_TINY];
@@ -66,6 +67,12 @@ typedef struct directgate_keyauth_cfg_ {
     directgate_auth_key_t sAuthorizedKeys[DIRECTGATE_MAX_AUTHORIZED_KEYS];
     char sIdentitySeedB64[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
     char sIdentityPubB64[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
+
+    /* The organization the device operator allowed to authorize client keys here through the managed-key lease,
+       as typed with -m <organization id>. Nothing but -m changes it: not an API response, not a re-pairing without
+       -m, not a revoked enrollment. The lease applies only while the enrollment's organizationId is this same id,
+       so the API alone can never switch managed keys on or move them to another organization. Empty: off. */
+    char sManagedOrgId[XSTR_TINY];
     uint8_t nAuthorizedKeyCount;
 } directgate_keyauth_cfg_t;
 
@@ -110,6 +117,7 @@ typedef struct directgate_cfg_ {
     xbool_t bGenKey;
     xbool_t bEnrollKey;
     xbool_t bEnroll;
+    xbool_t bSetManagedOrg;
     xbool_t bRotateAgentKey;
     xbool_t bAllowTCP;
     xbool_t bHelp;

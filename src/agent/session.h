@@ -80,6 +80,10 @@ typedef struct directgate_session_ {
     directgate_srp_t srp;
     directgate_keyauth_t keyauth;
     xbool_t bKeyAuthActive;
+    xbool_t bManagedKeyPending;     /* Key-auth hello matched the organization lease, not a local key */
+    xbool_t bManagedKeySession;     /* Authenticated by a managed key: no admin actions, closed when the lease drops it */
+    uint32_t nManagedKeyGen;        /* Lease generation this session's key was last found in */
+    uint8_t managedClientPub[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
     uint32_t nSessionId;
     uint64_t nCreatedMs;
     uint64_t nLastKAPingMs;

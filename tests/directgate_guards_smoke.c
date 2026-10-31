@@ -350,6 +350,65 @@ static int root_child(void)
     return 0;
 }
 
+static char g_sLogged[4096];
+
+static int collect_log(const char *pLog, size_t nLength, xlog_flag_t eFlag, void *pCtx)
+{
+    (void)eFlag;
+    (void)pCtx;
+    size_t nUsed = strlen(g_sLogged);
+    if (nUsed + nLength >= sizeof(g_sLogged)) return 0;
+
+    memcpy(g_sLogged + nUsed, pLog, nLength);
+    g_sLogged[nUsed + nLength] = '\0';
+    return 0;
+}
+
+/* A status and an error are logged with the system error saved when the call failed. errno was logged
+ * beside them, and by then it belonged to the close and the cleanup that ran after the failure. */
+static int check_status_logs(void)
+{
+    xlog_init("directgate_guards_smoke", XLOG_ALL, XFALSE);
+    xlog_screen(XFALSE);
+    xlog_callback(collect_log, NULL);
+
+    xapi_session_t sess;
+    orphan(&sess);
+
+    xapi_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.eCbType = XAPI_CB_ERROR;
+    ctx.eStatType = XAPI_SOCK;
+    ctx.nStatus = XSOCK_ERR_CONNECT;
+    ctx.nSysError = ECONNREFUSED;
+
+    char sExpect[XSTR_MIN];
+    snprintf(sExpect, sizeof(sExpect), "status(%s (%s))", XSock_GetStatusStr(XSOCK_ERR_CONNECT), strerror(ECONNREFUSED));
+
+    errno = ENOENT;
+    g_sLogged[0] = '\0';
+    CHECK(DirectGate_LogError(&ctx, &sess) == XAPI_CONTINUE, "an error is logged and the loop goes on");
+    int bSaved = strstr(g_sLogged, sExpect) != NULL;
+    int bErrno = strstr(g_sLogged, "errno(") != NULL;
+
+    snprintf(sExpect, sizeof(sExpect), "status: %s (%s)", XSock_GetStatusStr(XSOCK_ERR_CONNECT), strerror(ECONNREFUSED));
+    g_sLogged[0] = '\0';
+    ctx.eCbType = XAPI_CB_STATUS;
+    CHECK(DirectGate_LogStatus(&ctx, &sess) == XAPI_CONTINUE, "a status is logged and the loop goes on");
+    int bStatus = strstr(g_sLogged, sExpect) != NULL;
+
+    g_sLogged[0] = '\0';
+    CHECK(DirectGate_LogError(NULL, &sess) == XAPI_CONTINUE, "an error without its context is logged too");
+    int bNoCtx = strstr(g_sLogged, "status(Invalid API context)") != NULL;
+
+    xlog_destroy();
+    CHECK(bSaved, "the error carries the saved system error");
+    CHECK(!bErrno, "and not errno, which belongs to whatever ran last");
+    CHECK(bStatus, "so does the status");
+    CHECK(bNoCtx, "and one without a context says so");
+    return 0;
+}
+
 static int check_as_root(void)
 {
     pid_t nPid = fork();
@@ -370,7 +429,7 @@ int main(void)
     DirectGate_Connection_Init(&g_conn, &g_cfg);
 
     int nFailed = check_handlers() || check_sessions() || check_shares() || check_connection() || check_startup() ||
-        check_as_root();
+        check_status_logs() || check_as_root();
 
     DirectGate_SessionMgr_Destroy(&g_conn.mgr);
     if (nFailed) return 1;

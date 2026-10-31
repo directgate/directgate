@@ -158,21 +158,27 @@ static void DirectGate_Client_CleanseSecretCtx(directgate_ctx_t *pCli)
 static int DirectGate_Client_LogStatus(xapi_ctx_t *pCtx, xapi_session_t *pSession)
 {
     int nFD = pSession ? (int)pSession->sock.nFD : XSTDERR;
-    const char *pStr = XAPI_GetStatus(pCtx);
+
+    char sStatus[XSTR_MIN] = "Invalid API context";
+    XAPI_DescribeStatus(pCtx, sStatus, sizeof(sStatus));
 
     xbool_t nDestroyEvent = pCtx && pCtx->eStatType == XAPI_SELF &&
                             pCtx->nStatus == XAPI_DESTROY ? XTRUE : XFALSE;
 
-    if (nDestroyEvent) xlogn("%s", pStr);
-    else xlogn("%s: fd(%d)", pStr, nFD);
+    if (nDestroyEvent) xlogn("%s", sStatus);
+    else xlogn("%s: fd(%d)", sStatus, nFD);
     return XAPI_CONTINUE;
 }
 
 static int DirectGate_Client_LogError(xapi_ctx_t *pCtx, xapi_session_t *pSession)
 {
     int nFD = pSession ? (int)pSession->sock.nFD : XSTDERR;
-    const char *pStr = XAPI_GetStatus(pCtx);
-    xloge("%s: fd(%d), errno(%d)", pStr, nFD, errno);
+
+    /* With the system error saved by the failed call, not errno after the cleanup */
+    char sStatus[XSTR_MIN] = "Invalid API context";
+    XAPI_DescribeStatus(pCtx, sStatus, sizeof(sStatus));
+
+    xloge("%s: fd(%d)", sStatus, nFD);
     return XAPI_CONTINUE;
 }
 
@@ -387,7 +393,7 @@ static int DirectGate_Client_SendFrame(xapi_session_t *pSession, const uint8_t *
                                        size_t nLength, xws_frame_type_t eType)
 {
     /* Written straight into the tx buffer, with no frame of its own to copy */
-    xws_status_t status = XWS_AppendFrame(&pSession->txBuffer, pPayload, nLength, eType, XTRUE, XTRUE);
+    xws_status_t status = XWS_WriteFrame(&pSession->txBuffer, pPayload, nLength, eType, XTRUE, XTRUE);
     if (status != XWS_ERR_NONE)
     {
         xloge("Failed to create WS frame: %s", XWebSock_GetStatusStr(status));
@@ -2170,8 +2176,11 @@ static XSTATUS DirectGate_Client_Run(directgate_ctx_t *pClient, directgate_cfg_t
         printf("\n  The session ended before authentication completed.\n");
         printf("  Re-run with -v 5 to see the exchange.\n\n");
 
-        xlogn("Session ended unauthenticated: status(%d), relay(%s)",
-            (int)status, pArgs->sSignalingUrl);
+        char sStatus[XSTR_MIN];
+        DirectGate_DescribeEvents(&api.events, status, sStatus, sizeof(sStatus));
+
+        xlogn("Session ended unauthenticated: status(%s), code(%d), relay(%s)",
+            sStatus, (int)status, pArgs->sSignalingUrl);
     }
 
     pClient->pPipeSession = NULL;

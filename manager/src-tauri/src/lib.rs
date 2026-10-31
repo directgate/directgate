@@ -131,9 +131,11 @@ fn pair_device(
     device_id: String,
     pairing_token: String,
     auth_password: String,
+    organization_id: Option<String>,
 ) -> Result<String, String> {
     let device_id = device_id.trim();
     let pairing_token = pairing_token.trim();
+    let organization_id = organization_id.as_deref().map(str::trim).unwrap_or("");
 
     if device_id.is_empty() {
         return Err("Device ID is required.".into());
@@ -145,6 +147,11 @@ fn pair_device(
     if auth_password.trim().is_empty() {
         return Err("Auth password is required.".into());
     }
+    // The agent checks it too; refusing here keeps a bad code from spending the
+    // one-time pairing token.
+    if !organization_id.is_empty() && !is_organization_id(organization_id) {
+        return Err("Pairing code is not valid. Copy it again from directgate.io.".into());
+    }
 
     let agent = find_agent().ok_or_else(|| {
         "DirectGate agent binary was not found. Install the DirectGate Agent or \
@@ -154,11 +161,49 @@ fn pair_device(
 
     run_agent_with_password(
         &agent,
-        &["-sed", device_id, "-t", pairing_token],
+        &pair_args(device_id, pairing_token, organization_id),
         &auth_password,
         "Pairing",
     )?;
     Ok("Device paired successfully.".to_string())
+}
+
+/// The agent arguments for a pairing. An organization id adds `-m <id>`: the
+/// agent enables organization-managed access keys only for an organization
+/// named on its command line, never for one the API reports on its own.
+fn pair_args<'a>(device_id: &'a str, pairing_token: &'a str, organization_id: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["-sed", device_id, "-t", pairing_token];
+    if !organization_id.is_empty() {
+        args.push("-m");
+        args.push(organization_id);
+    }
+    args
+}
+
+/// An organization id as directgate.io issues it: a UUID (8-4-4-4-12 hex).
+fn is_organization_id(value: &str) -> bool {
+    value.len() == 36
+        && value.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+/// The organization this device lets manage its access keys, read from the
+/// agent config (`auth.key.managedOrganizationId`), or "" when there is none.
+/// Shown in the paired view so an operator can see what the pairing enabled.
+#[tauri::command]
+fn get_managed_organization() -> Result<String, String> {
+    let data = match agent_config_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(d) => d,
+        None => return Ok(String::new()),
+    };
+    let json: serde_json::Value = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
+    Ok(json
+        .pointer("/auth/key/managedOrganizationId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string())
 }
 
 /// Changes the SRP auth password on an already-paired device by invoking
@@ -895,6 +940,7 @@ pub fn run() {
             pair_device,
             change_srp_password,
             get_pairing_status,
+            get_managed_organization,
             get_service_status,
             start_service,
             stop_service,
@@ -905,4 +951,29 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running DirectGate Manager");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn organization_ids_are_uuids() {
+        assert!(is_organization_id("11111111-2222-3333-4444-555555555555"));
+        assert!(is_organization_id("AAAAAAAA-bbbb-4ccc-8DDD-eeeeeeeeeeee"));
+        assert!(!is_organization_id(""));
+        assert!(!is_organization_id("11111111-2222-3333-4444-55555555555"));
+        assert!(!is_organization_id("11111111+2222-3333-4444-555555555555"));
+        assert!(!is_organization_id("1111111g-2222-3333-4444-555555555555"));
+        assert!(!is_organization_id("11111111-2222-3333-4444-555555555555 -c x"));
+    }
+
+    #[test]
+    fn only_an_organization_pairing_passes_m() {
+        assert_eq!(pair_args("dev", "tok", ""), vec!["-sed", "dev", "-t", "tok"]);
+        assert_eq!(
+            pair_args("dev", "tok", "11111111-2222-3333-4444-555555555555"),
+            vec!["-sed", "dev", "-t", "tok", "-m", "11111111-2222-3333-4444-555555555555"]
+        );
+    }
 }

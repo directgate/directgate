@@ -417,7 +417,7 @@ static int host_send_sealed(xapi_session_t *pSession, xjson_obj_t *pHeader, cons
 /* A binary frame that is not a protocol message at all. */
 static int host_send_bytes(xapi_session_t *pSession, const char *pBytes)
 {
-    if (XWS_AppendFrame(&pSession->txBuffer, (const uint8_t*)pBytes, strlen(pBytes), XWS_BINARY, XFALSE, XTRUE) != XWS_ERR_NONE)
+    if (XWS_WriteFrame(&pSession->txBuffer, (const uint8_t*)pBytes, strlen(pBytes), XWS_BINARY, XFALSE, XTRUE) != XWS_ERR_NONE)
         return XAPI_DISCONNECT;
 
     return XAPI_EnableEvent(pSession, XPOLLOUT);
@@ -625,7 +625,7 @@ static int host_after_start(xapi_session_t *pSession)
             else XJSON_FreeObject(pOpen);
 
             /* A WebSocket ping, which a live client answers; the greeting and the close wait for the pong. */
-            if (nStatus >= 0 && XWS_AppendFrame(&pSession->txBuffer, NULL, 0, XWS_PING, XFALSE, XTRUE) == XWS_ERR_NONE)
+            if (nStatus >= 0 && XWS_WriteFrame(&pSession->txBuffer, NULL, 0, XWS_PING, XFALSE, XTRUE) == XWS_ERR_NONE)
                 nStatus = XAPI_EnableEvent(pSession, XPOLLOUT);
 
             return nStatus >= 0 ? XAPI_NO_ACTION : nStatus;

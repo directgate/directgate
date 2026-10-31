@@ -34,7 +34,7 @@ extern int optopt;
 #define DIRECTGATE_AGENT_CONFIG     ".config/directgate/agent.json"
 #define DIRECTGATE_RELAY_URL        "wss://relay1.directgate.io/websock"
 #define DIRECTGATE_API_URL          "https://api.directgate.io"
-#define DIRECTGATE_HOST_OPTSTRING   "a:c:d:g:l:t:v:u:e1:i1:r1:s1:v:w1:h1"
+#define DIRECTGATE_HOST_OPTSTRING   "a:c:d:g:l:m:t:v:u:e1:i1:r1:s1:v:w1:h1"
 
 static xbool_t DirectGate_EnsureagentIdentity(directgate_cfg_t *pCfg);
 
@@ -68,6 +68,7 @@ void DirectGate_DisplayUsage(const char *pName)
     printf("  -w                   # Enable WebRTC verbose logging (works with -v)\n");
     printf("  -i                   # Init config and exit\n");
     printf("  -e                   # Enroll device and exit\n");
+    printf("  -m <org_id>          # Enable organization-managed client keys for this organization (\"\" disables)\n");
     printf("  -s                   # Init SRP verifier and exit\n");
     printf("  -h                   # Version and usage\n\n");
 }
@@ -184,6 +185,85 @@ static int DirectGate_StoreAuthFromPrompt(directgate_cfg_t *pCfg)
     return XSTDOK;
 }
 
+/* Says what the configuration means for organization-managed keys. The allowance is the operator's -m and nothing
+   else; the organization the API enrolled the device in only has to be that one for the lease to apply. */
+static void DirectGate_ReportManagedKeys(const directgate_cfg_t *pCfg)
+{
+    XCHECK_VOID_NL((pCfg != NULL));
+    const char *pAllowed = pCfg->keyauth.sManagedOrgId;
+    const char *pEnrolled = pCfg->enroll.sOrganizationId;
+
+    if (xstrused(pAllowed) && xstrcmp(pAllowed, pEnrolled))
+    {
+        xlogn("Organization-managed keys enabled: dev(%s), org(%s)", pCfg->sDeviceId, pAllowed);
+    }
+    else if (xstrused(pAllowed) && xstrused(pEnrolled))
+    {
+        xlogw("Organization-managed keys stay off, the device is enrolled in another organization than -m names: "
+            "dev(%s), org(%s), allowed(%s)", pCfg->sDeviceId, pEnrolled, pAllowed);
+    }
+    else if (xstrused(pAllowed))
+    {
+        xlogn("Organization-managed keys allowed, they start once the device is enrolled in that organization: "
+            "dev(%s), allowed(%s)", pCfg->sDeviceId, pAllowed);
+    }
+    else if (xstrused(pEnrolled))
+    {
+        xlogn("Device is in an organization, its managed keys stay off until enabled with -m <organization id>: "
+            "dev(%s), org(%s)", pCfg->sDeviceId, pEnrolled);
+    }
+}
+
+/* -m <organization id> on its own: saves the allowance into the existing configuration and exits. An empty value
+   takes it back. Pairing with -m saves it with the enrollment instead, so it needs no configuration beforehand. */
+static int DirectGate_SetManagedOrgFromCli(const directgate_cfg_t *pCfg)
+{
+    XCHECK((pCfg != NULL), XSTDERR);
+
+    if (!DirectGate_SaveConfig(pCfg))
+    {
+        xloge("Failed to save the organization-managed key setting: cfg(%s), dev(%s)", pCfg->sCfgPath, pCfg->sDeviceId);
+        return XSTDERR;
+    }
+
+    if (xstrused(pCfg->keyauth.sManagedOrgId)) DirectGate_ReportManagedKeys(pCfg);
+    else xlogn("Organization-managed keys disabled: cfg(%s), dev(%s)", pCfg->sCfgPath, pCfg->sDeviceId);
+
+    DirectGate_LogRestartHint();
+    return XSTDOK;
+}
+
+/* An organization id as the API issues it: a UUID, kept in lowercase so it compares with what the API reports.
+   Checked before anything is saved or sent, so a typo fails here and not after the pairing token is spent. */
+static xbool_t DirectGate_SetManagedOrgArg(directgate_cfg_t *pCfg, const char *pValue)
+{
+    XCHECK_NL((pCfg != NULL), XFALSE);
+    pCfg->bSetManagedOrg = XTRUE;
+    pCfg->keyauth.sManagedOrgId[0] = XSTR_NUL;
+    if (!xstrused(pValue)) return XTRUE;
+
+    size_t nLength = strlen(pValue);
+    xbool_t bValid = (nLength == 36);
+
+    for (size_t i = 0; bValid && i < nLength; i++)
+    {
+        xbool_t bDash = (i == 8 || i == 13 || i == 18 || i == 23);
+        bValid = bDash ? (pValue[i] == '-') : (isxdigit((unsigned char)pValue[i]) != 0);
+    }
+
+    if (!bValid)
+    {
+        xloge("Invalid organization id for -m, expected a UUID like 11111111-2222-3333-4444-555555555555");
+        return XFALSE;
+    }
+
+    for (size_t i = 0; i < nLength; i++)
+        pCfg->keyauth.sManagedOrgId[i] = (char)tolower((unsigned char)pValue[i]);
+
+    pCfg->keyauth.sManagedOrgId[nLength] = XSTR_NUL;
+    return XTRUE;
+}
+
 static int DirectGate_EnrollFromPrompt(const directgate_cfg_t *pCfg)
 {
     XCHECK((pCfg != NULL), XSTDERR);
@@ -248,6 +328,7 @@ static int DirectGate_EnrollFromPrompt(const directgate_cfg_t *pCfg)
         cfg.sCfgPath, cfg.sDeviceId, cfg.sRelayUrl);
 
     OPENSSL_cleanse(sPairingToken, sizeof(sPairingToken));
+    DirectGate_ReportManagedKeys(&cfg);
     DirectGate_LogRestartHint();
 
     return XSTDOK;
@@ -318,6 +399,13 @@ static void DirectGate_LoadKeyAuthConfig(directgate_keyauth_cfg_t *pKeyAuth, xjs
     /* Backward compatibility for configs written before auth.key existed. */
     if (pIdentity == NULL) pIdentity = XJSON_GetObject(pRoot, "agentIdentity");
     if (pAuthKeys == NULL) pAuthKeys = XJSON_GetObject(pRoot, "authorizedKeys");
+
+    /* Only this file and the operator's own -m put it here; a value that does not fit is dropped, not cut short. */
+    const char *pManagedOrgId = pKeyAuthObj != NULL ?
+        XJSON_GetString(XJSON_GetObject(pKeyAuthObj, "managedOrganizationId")) : NULL;
+
+    if (xstrused(pManagedOrgId) && strlen(pManagedOrgId) < sizeof(pKeyAuth->sManagedOrgId))
+        xstrncpy(pKeyAuth->sManagedOrgId, sizeof(pKeyAuth->sManagedOrgId), pManagedOrgId);
 
     if (pIdentity != NULL && pIdentity->nType == XJSON_TYPE_OBJECT)
     {
@@ -688,6 +776,10 @@ xbool_t DirectGate_LoadConfig(directgate_cfg_t *pCfg, const char *pPath)
         const char *pApiUrl = XJSON_GetString(XJSON_GetObject(pEnroll, "apiUrl"));
         if (xstrused(pApiUrl)) xstrncpy(pCfg->enroll.sApiUrl, sizeof(pCfg->enroll.sApiUrl), pApiUrl);
 
+        const char *pOrganizationId = XJSON_GetString(XJSON_GetObject(pEnroll, "organizationId"));
+        if (xstrused(pOrganizationId))
+            xstrncpy(pCfg->enroll.sOrganizationId, sizeof(pCfg->enroll.sOrganizationId), pOrganizationId);
+
         const char *pAccToken = XJSON_GetString(XJSON_GetObject(pEnroll, "accessToken"));
         if (xstrused(pAccToken)) xstrncpy(pCfg->enroll.sAccessToken, sizeof(pCfg->enroll.sAccessToken), pAccToken);
 
@@ -758,6 +850,7 @@ xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
         xstrused(pCfg->auth.sVerifierHex);
     xbool_t bHasKeyAuth = xstrused(pCfg->keyauth.sIdentitySeedB64) ||
         xstrused(pCfg->keyauth.sIdentityPubB64) ||
+        xstrused(pCfg->keyauth.sManagedOrgId) ||
         pCfg->keyauth.nAuthorizedKeyCount > 0;
 
     if (bHasSrpAuth || bHasKeyAuth)
@@ -794,6 +887,9 @@ xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
                             XJSON_AddString(pIdentity, "pub", pCfg->keyauth.sIdentityPubB64);
                     }
                 }
+
+                if (xstrused(pCfg->keyauth.sManagedOrgId))
+                    XJSON_AddString(pKeyAuth, "managedOrganizationId", pCfg->keyauth.sManagedOrgId);
 
                 if (pCfg->keyauth.nAuthorizedKeyCount > 0)
                 {
@@ -833,6 +929,7 @@ xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
     }
 
     if (xstrused(pCfg->enroll.sApiUrl) ||
+        xstrused(pCfg->enroll.sOrganizationId) ||
         xstrused(pCfg->enroll.sAccessToken) ||
         xstrused(pCfg->enroll.sRefreshToken) ||
         xstrused(pCfg->enroll.sEnrollExpiresAt) ||
@@ -846,6 +943,9 @@ xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
         {
             if (xstrused(pCfg->enroll.sApiUrl))
                 XJSON_AddString(pEnroll, "apiUrl", pCfg->enroll.sApiUrl);
+
+            if (xstrused(pCfg->enroll.sOrganizationId))
+                XJSON_AddString(pEnroll, "organizationId", pCfg->enroll.sOrganizationId);
 
             if (xstrused(pCfg->enroll.sAccessToken))
                 XJSON_AddString(pEnroll, "accessToken", pCfg->enroll.sAccessToken);
@@ -949,7 +1049,7 @@ static xbool_t DirectGate_ArgsAllowMissingConfig(int argc, char *argv[])
             /* The options that take a value, exactly as the option string has them:
                the rest of this word, or the next one, is that value and not options. */
             if (ch == 'a' || ch == 'c' || ch == 'd' || ch == 'g' ||
-                ch == 'l' || ch == 't' || ch == 'u' || ch == 'v')
+                ch == 'l' || ch == 'm' || ch == 't' || ch == 'u' || ch == 'v')
             {
                 if (pArg[j + 1] == XSTR_NUL && i + 1 < argc)
                     i++;
@@ -1005,6 +1105,9 @@ xbool_t DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
                 xstrncpy(pCfg->sEnrollKeyPath, sizeof(pCfg->sEnrollKeyPath), optarg);
                 pCfg->bEnrollKey = XTRUE;
                 break;
+            case 'm':
+                if (!DirectGate_SetManagedOrgArg(pCfg, optarg)) return XFALSE;
+                break;
             case 'v':
                 pCfg->nVerbose = (uint16_t)atoi(optarg);
                 break;
@@ -1052,6 +1155,7 @@ xbool_t DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
     }
 
     if (pCfg->bEnroll ||
+        pCfg->bSetManagedOrg ||
         pCfg->bSetSRP ||
         pCfg->bGenKey ||
         pCfg->bEnrollKey ||
@@ -1144,6 +1248,13 @@ XSTATUS DirectGate_ApplyConfig(const directgate_cfg_t *pCfg)
     {
         xlog_timing(XLOG_DISABLE);
         if (DirectGate_EnrollFromPrompt(pCfg) != XSTDOK) return XSTDERR;
+        return XSTDNON;
+    }
+
+    if (pCfg->bSetManagedOrg)
+    {
+        xlog_timing(XLOG_DISABLE);
+        if (DirectGate_SetManagedOrgFromCli(pCfg) != XSTDOK) return XSTDERR;
         return XSTDNON;
     }
 

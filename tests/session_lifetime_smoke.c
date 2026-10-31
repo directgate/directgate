@@ -362,8 +362,8 @@ int main(void)
 
     /* ---- in-session token refresh backs off --------------------------------------------------------- */
 
-    /* A refresh is a blocking HTTP call on the event loop. With the API unreachable it used to be retried on
-       every loop pass - stalling every live session and hammering the API ten times a second. */
+    /* With the API unreachable a refresh used to be retried on every loop pass, hammering the API ten times a
+       second - and, back when the request ran on the event loop, stalling every live session as well. */
     {
         fix.conn.bRoleSent = XTRUE;
         fix.cfg.enroll.bEnrolled = XTRUE;
@@ -373,7 +373,10 @@ int main(void)
         xstrncpy(fix.cfg.enroll.sRefreshToken, sizeof(fix.cfg.enroll.sRefreshToken), "refresh");
         xstrncpy(fix.cfg.enroll.sApiUrl, sizeof(fix.cfg.enroll.sApiUrl), "https://127.0.0.1:1");
 
-        CHECK(DirectGate_TestCheckTokenRefresh(&fix.conn), "a transient refresh failure keeps a usable token");
+        CHECK(DirectGate_TestCheckTokenRefresh(&fix.conn), "a refresh that is due starts");
+        CHECK(fix.conn.pRefreshJob != NULL, "its request goes out on the worker");
+        CHECK(DirectGate_TestFinishTokenRefresh(&fix.conn, 30000), "a transient refresh failure keeps a usable token");
+        CHECK(fix.conn.pRefreshJob == NULL, "the answer is taken once it is in");
         CHECK(fix.conn.nTokenRefreshFailures == 1, "the failed attempt is counted");
         CHECK(fix.conn.nNextTokenRefreshMs > XTime_GetMonoMs(), "the next attempt is scheduled in the future");
         CHECK(fix.conn.nNextTokenRefreshMs < XTime_GetMonoMs() + DIRECTGATE_TEST_HOUR_MS,

@@ -112,74 +112,6 @@ static int DirectGate_WebRTC_GetDataChannelForPeer(const directgate_webrtc_t *pR
     return DirectGate_WebRTC_GetDC(pRTC);
 }
 
-/* Unescape JSON string sequences (\r \n \t \\ \") in place.
-   The xutils JSON parser does not unescape string values, so
-   SDP strings arrive with literal \r\n instead of CR/LF. */
-static char *DirectGate_JSON_Unescape(const char *pSrc)
-{
-    XCHECK(xstrused(pSrc), NULL);
-    size_t nLen = strlen(pSrc);
-    XCHECK((nLen <= (SIZE_MAX - 1) / 2), NULL);
-
-    char *pDst = (char*)malloc(nLen + 1);
-    XCHECK((pDst != NULL), NULL);
-
-    size_t j = 0;
-    for (size_t i = 0; i < nLen; i++)
-    {
-        if (pSrc[i] == '\\' && i + 1 < nLen)
-        {
-            switch (pSrc[i + 1])
-            {
-                case 'r':  pDst[j++] = '\r'; i++; break;
-                case 'n':  pDst[j++] = '\n'; i++; break;
-                case 't':  pDst[j++] = '\t'; i++; break;
-                case '\\': pDst[j++] = '\\'; i++; break;
-                case '"':  pDst[j++] = '"';  i++; break;
-                case '/':  pDst[j++] = '/';  i++; break;
-                default:   pDst[j++] = pSrc[i]; break;
-            }
-        }
-        else
-        {
-            pDst[j++] = pSrc[i];
-        }
-    }
-
-    pDst[j] = '\0';
-    return pDst;
-}
-
-/* Escape special characters for JSON string values.
-   The xutils JSON writer does not escape strings,
-   so \r\n in SDP would produce invalid JSON. */
-static char *DirectGate_JSON_Escape(const char *pSrc)
-{
-    XCHECK(xstrused(pSrc), NULL);
-    size_t nLen = strlen(pSrc);
-    XCHECK((nLen <= (SIZE_MAX - 1) / 2), NULL);
-
-    char *pDst = (char*)malloc(nLen * 2 + 1);
-    XCHECK((pDst != NULL), NULL);
-
-    size_t j = 0;
-    for (size_t i = 0; i < nLen; i++)
-    {
-        switch (pSrc[i])
-        {
-            case '\r': pDst[j++] = '\\'; pDst[j++] = 'r';  break;
-            case '\n': pDst[j++] = '\\'; pDst[j++] = 'n';  break;
-            case '\t': pDst[j++] = '\\'; pDst[j++] = 't';  break;
-            case '\\': pDst[j++] = '\\'; pDst[j++] = '\\'; break;
-            case '"':  pDst[j++] = '\\'; pDst[j++] = '"';  break;
-            default:   pDst[j++] = pSrc[i]; break;
-        }
-    }
-
-    pDst[j] = '\0';
-    return pDst;
-}
-
 static uint32_t DirectGate_WebRTC_RandomU32(uint32_t nFallback)
 {
     uint32_t nValue = 0;
@@ -1332,29 +1264,18 @@ static void DirectGate_WebRTC_OnLocalDescription(int nPC, const char *pSdp, cons
     xjson_obj_t *pHeader = XJSON_NewObject(NULL, NULL, XSTDNON);
     XCHECK_VOID((pHeader != NULL));
 
-    /* Escape SDP for JSON (xutils writer does not escape string values) */
-    char *pEscaped = DirectGate_JSON_Escape(pSdp);
-    if (pEscaped == NULL)
-    {
-        xloge("Failed to escape WebRTC SDP for JSON: pc(%d), dc(%d), type(%s)",
-            DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC), pType);
-
-        XJSON_FreeObject(pHeader);
-        return;
-    }
-
+    /* The SDP goes in as it is: the JSON writer escapes its CR LF, quotes and backslashes. Escaped here as
+       well, it reached the browser with literal \r\n in place of line ends, which no browser can apply. */
     XJSON_SetStrict(pHeader, XTRUE);
     XJSON_AddString(pHeader, "type", "webrtc");
     XJSON_AddString(pHeader, "action", pType);
-    XJSON_AddString(pHeader, "sdp", pEscaped);
+    XJSON_AddString(pHeader, "sdp", pSdp);
     XJSON_AddBool(pHeader, "p2pMigration", XTRUE);
 
     uint32_t nGeneration = DirectGate_WebRTC_IsPendingPeerConnection(pRTC, nPC) ?
         pRTC->nPendingSignalGeneration : pRTC->nSignalGeneration;
 
     if (nGeneration) XJSON_AddU32(pHeader, "generation", nGeneration);
-
-    free(pEscaped);
     size_t nLen = 0;
 
     char *pJson = XJSON_DumpObj(pHeader, 0, &nLen);
@@ -2119,18 +2040,8 @@ XSTATUS DirectGate_WebRTC_HandleAnswer(directgate_webrtc_t *pRTC, const char *pS
         return XSTDERR;
     }
 
-    char *pUnescaped = DirectGate_JSON_Unescape(pSdp);
-    if (pUnescaped == NULL)
-    {
-        xloge("Failed to allocate memory for answer SDP: pc(%d), dc(%d)",
-            DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC));
-
-        return XSTDERR;
-    }
-
-    int nRet = rtcSetRemoteDescription(pRTC->nPeerConnectionID, pUnescaped, "answer");
-    free(pUnescaped);
-
+    /* The SDP comes from the JSON parser, which has decoded its escapes */
+    int nRet = rtcSetRemoteDescription(pRTC->nPeerConnectionID, pSdp, "answer");
     if (nRet < 0)
     {
         xloge("Failed to set remote WebRTC answer: pc(%d), dc(%d), ret(%d)",
@@ -2240,28 +2151,15 @@ XSTATUS DirectGate_WebRTC_HandleOffer(directgate_webrtc_t *pRTC, const char *pSd
     rtcSetGatheringStateChangeCallback(nPC, DirectGate_WebRTC_QueueGatheringStateChange);
     rtcSetSignalingStateChangeCallback(nPC, DirectGate_WebRTC_QueueSignalingStateChange);
 
-    /* Unescape JSON string (xutils parser does not unescape \r\n etc.) */
-    char *pUnescaped = DirectGate_JSON_Unescape(pSdp);
-    if (pUnescaped == NULL)
-    {
-        xloge("Failed to allocate memory for offer SDP: pc(%d), dc(%d)",
-            DirectGate_WebRTC_GetPC(pRTC), DirectGate_WebRTC_GetDC(pRTC));
-
-        if (bPending) DirectGate_WebRTC_DestroyPending(pRTC);
-        else DirectGate_WebRTC_Destroy(pRTC);
-        return XSTDERR;
-    }
-
+    /* The SDP comes from the JSON parser, which has decoded its escapes */
     if (pRTC->bVideoEnabled)
-        (void)DirectGate_WebRTC_AddDesktopVideoTrack(pRTC, nPC, pUnescaped, bPending);
+        (void)DirectGate_WebRTC_AddDesktopVideoTrack(pRTC, nPC, pSdp, bPending);
 
     if (pRTC->bAudioEnabled)
-        (void)DirectGate_WebRTC_AddDesktopAudioTrack(pRTC, nPC, pUnescaped, bPending);
+        (void)DirectGate_WebRTC_AddDesktopAudioTrack(pRTC, nPC, pSdp, bPending);
 
     /* Set the remote description (offer from client) - this triggers answer generation */
-    int nRet = rtcSetRemoteDescription(nPC, pUnescaped, "offer");
-    free(pUnescaped);
-
+    int nRet = rtcSetRemoteDescription(nPC, pSdp, "offer");
     if (nRet < 0)
     {
         xloge("Failed to set remote WebRTC offer: pc(%d), dc(%d), ret(%d)",

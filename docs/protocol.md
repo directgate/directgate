@@ -43,6 +43,7 @@ Type-specific fields:
 
 - `role`: `role` (agent/client), `id` (pairing identifier)
 - `auth`: SRP handshake metadata (`user`, `A`, `B`, `salt`, `nonce`, `suite`, `M1`, `M2`, `status`, `reason`). The `M1`/`M2` transcript binds both `nonce` values, so nonce tampering fails authentication (see [Security](security.md#srp-6a-authentication))
+- `auth` with `method=key`: a host whose operator allowed managed keys for its organization (`auth.key.managedOrganizationId`) also accepts the keys of its current managed-key lease, next to its local authorized keys; a device with neither answers `key auth not configured`. A managed key is checked at the hello and again after the proof (`client not authorized` when the lease dropped it in between). A session authenticated only by a managed key is closed when the lease drops the key, expires or changes organization
 - `cmd`: `action` (start/stop), `status`, `reason`
 - `resize`: `rows`, `cols`, `width`, `height`
 - `webrtc`: `sdp` (SDP string), `candidate`, `sdpMid`
@@ -51,6 +52,9 @@ Type-specific fields:
 - `file/end`: `transferId`, `sha256`
 - `file/ack`: `transferId`, `index`
 - `file/cancel`: `transferId`, `reason`
+- `admin`: a session authenticated only by a managed key gets `admin-result`
+  `error` / `managed key cannot perform admin actions` for every action,
+  `add-key` and temporary desktop shares included
 
 > **Note:** File size is serialized as a decimal string to cleanly handle files larger than 4 GB.
 

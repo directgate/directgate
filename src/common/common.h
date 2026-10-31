@@ -40,6 +40,18 @@ xbool_t DirectGate_IsAPIEndpointAllowed(const char *pUrl);
  * Such text must never reach the terminal as an escape sequence. Returns the length written. */
 size_t DirectGate_CopyDisplaySafe(char *pOut, size_t nSize, const char *pIn);
 
+/* Writes pIn as the inside of a JSON string, the way the JSON writer escapes it: a quote, a backslash and the control
+ * characters escaped, the rest as it is. For a body put together with a format string on the stack, where the JSON
+ * writer would leave copies of a secret in freed memory. Values parsed from JSON come decoded, so one carrying any of
+ * those characters has to be escaped again before it goes back into JSON. Returns the length written, or 0 with an
+ * empty pOut when it does not fit: a value cut short would say something else. */
+size_t DirectGate_JsonEscape(char *pOut, size_t nSize, const char *pIn);
+
+/* What XAPI_DescribeStatus() is to a callback, for a status the event loop returned: "Failed to call
+ * poll()/epoll_wait() (Bad file descriptor)", or the status alone when no system call failed. The error is the
+ * one pEvents saved when the call failed, so it is valid only right after the call that returned eStatus. */
+size_t DirectGate_DescribeEvents(const xevents_t *pEvents, xevent_status_t eStatus, char *pDst, size_t nSize);
+
 /* The relay counterpart: wss only in production, ws as well in debug builds. The relay socket carries the access
  * token in its first message, so the agent and dgcli refuse a plaintext relay through the same rule. */
 xbool_t DirectGate_IsRelayEndpointAllowed(const char *pUrl);

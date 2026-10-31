@@ -33,6 +33,22 @@ static int test_envelopes(fake_https_t *pApi)
     CHECK(strcmp(last.sAuth, "Bearer api-token") == 0, "the API token goes as a bearer token");
     CHECK(strstr(last.sBody, "\"deviceId\": \"dev-42\"") != NULL, "the device is named in the body");
 
+    /* A device id comes decoded from a JSON document, and is escaped to go back into one */
+    xstrncpy(cfg.sDeviceId, sizeof(cfg.sDeviceId), "dev\"4\\2");
+    CHECK(!DirectGate_Relay_FetchEnvelope(&cfg), "the refused connect fails again");
+    CHECK(fake_https_last(pApi, &last) == 2, "the API was asked");
+    xjson_t json;
+    CHECK(XJSON_Parse(&json, NULL, last.sBody, strlen(last.sBody)), "the body is JSON");
+    int bSame = strcmp(XJSON_GetString(XJSON_GetObject(json.pRootObj, "deviceId")), "dev\"4\\2") == 0;
+    XJSON_Destroy(&json);
+    CHECK(bSame, "and names the device as it is");
+
+    /* One that could not be escaped into the body is not sent cut short */
+    memset(cfg.sDeviceId, '"', sizeof(cfg.sDeviceId) - 1);
+    cfg.sDeviceId[sizeof(cfg.sDeviceId) - 1] = '\0';
+    CHECK(!DirectGate_Relay_FetchEnvelope(&cfg) && fake_https_last(pApi, NULL) == 2, "a device id too long to escape is not sent");
+    xstrncpy(cfg.sDeviceId, sizeof(cfg.sDeviceId), "dev-42");
+
     /* Each part the relay socket needs is required. */
     static const struct { const char *pBody; const char *pWhy; } broken[] = {
         { "{\"relay\":{\"browserJwt\":\"j\",\"routingKey\":\"r\"}}", "an envelope without a sessionId is refused" },

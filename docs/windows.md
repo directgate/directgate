@@ -126,6 +126,8 @@ Finish setup after installing:
    directgate.exe -c C:\ProgramData\directgate\agent.json -sed <device_id> -t <token>
    ```
 
+   For an organization device add `-m <org_id>` to let the organization manage access keys on it. The DirectGate Manager does this for you: an organization's `dg2_` pairing code carries the id (see `manager/README.md`).
+
 2. Set `shell.user` in that config to the account whose sessions the agent should own (the logged-on user).
 
 There is no third step: the service is already running and picks the configuration up on its own within a couple of seconds. It does not need to be started by hand and the machine does not need a reboot. Until a config with a `shell.user` exists the launcher simply waits, which is also why a fresh install never reports a failed service start.
@@ -225,6 +227,11 @@ What that agent may do is deliberately narrow, because it is SYSTEM:
   and `file-manager` outright, so the pre-logon window never yields a SYSTEM
   shell or a SYSTEM file manager. Clients are told before they pick a mode: the
   auth result carries `preLogon: true`.
+- **The same keys as the user's agent, no more.** It authenticates with the SRP
+  record, `authorizedKeys` and, only where `auth.key.managedOrganizationId`
+  allows it, the organization's managed keys - all from `agent.json`, all
+  already in `shell.user`'s hands - and none of them reaches past a desktop
+  session here.
 - **A session that is being torn down is not spawned into twice.** For a second
   or two after a sign-out, the dying session still answers `WTSQueryUserToken`,
   so the supervisor would start an agent straight back into it and watch that

@@ -1,4 +1,5 @@
 #include <dirent.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -270,6 +271,54 @@ int main(void)
         DirectGate_CopyDisplaySafe(sShown, 4, "abcdef");
         CHECK(strcmp(sShown, "abc") == 0, "output is bounded and terminated");
         CHECK(DirectGate_CopyDisplaySafe(sShown, sizeof(sShown), NULL) == 0 && sShown[0] == '\0', "NULL gives empty");
+    }
+
+    /* A value put into a JSON body by hand: what the JSON parser decodes is escaped again, so the body says it */
+    {
+        const char *pValue = "a\"b\\c\n\x01\xc4\x85/";
+        char sEscaped[64], sBody[96];
+        size_t nEscaped = DirectGate_JsonEscape(sEscaped, sizeof(sEscaped), pValue);
+        CHECK(nEscaped == strlen(sEscaped) && strcmp(sEscaped, "a\\\"b\\\\c\\u000a\\u0001\xc4\x85/") == 0,
+            "a quote, a backslash and the controls are escaped, the rest is kept");
+
+        snprintf(sBody, sizeof(sBody), "{\"v\":\"%s\"}", sEscaped);
+        xjson_t json;
+        CHECK(XJSON_Parse(&json, NULL, sBody, strlen(sBody)), "the body is JSON");
+        int bSame = strcmp(XJSON_GetString(XJSON_GetObject(json.pRootObj, "v")), pValue) == 0;
+        XJSON_Destroy(&json);
+        CHECK(bSame, "and parses back to the value");
+
+        CHECK(DirectGate_JsonEscape(sEscaped, sizeof(sEscaped), "plain") == 5 && strcmp(sEscaped, "plain") == 0,
+            "plain text is copied as it is");
+        CHECK(DirectGate_JsonEscape(sEscaped, 6, "plain") == 5 && DirectGate_JsonEscape(sEscaped, 5, "plain") == 0 &&
+            sEscaped[0] == '\0', "a value that does not fit is not written at all");
+        CHECK(DirectGate_JsonEscape(sEscaped, 7, "\x01") == 6 && DirectGate_JsonEscape(sEscaped, 6, "\x01") == 0,
+            "nor is an escape cut short");
+        CHECK(DirectGate_JsonEscape(sEscaped, sizeof(sEscaped), NULL) == 0 && sEscaped[0] == '\0' &&
+            DirectGate_JsonEscape(NULL, 8, "x") == 0 && DirectGate_JsonEscape(sEscaped, 0, "x") == 0, "nothing goes nowhere");
+    }
+
+    /* An event loop status says why with the error saved when the system call failed, whatever errno is by then */
+    {
+        xevents_t events;
+        memset(&events, 0, sizeof(events));
+        char sStatus[XSTR_MIN], sExpect[XSTR_MIN];
+
+        CHECK(DirectGate_DescribeEvents(&events, XEVENTS_EWAIT, sStatus, sizeof(sStatus)) == strlen(sStatus) &&
+            strcmp(sStatus, XEvents_GetStatusStr(XEVENTS_EWAIT)) == 0, "with no system error it is the status alone");
+        CHECK(DirectGate_DescribeEvents(NULL, XEVENTS_EINTR, sStatus, sizeof(sStatus)) > 0 &&
+            strcmp(sStatus, XEvents_GetStatusStr(XEVENTS_EINTR)) == 0, "as it is without the events");
+
+        errno = EINTR;
+        events.nSysError = EBADF;
+        snprintf(sExpect, sizeof(sExpect), "%s (%s)", XEvents_GetStatusStr(XEVENTS_EWAIT), strerror(EBADF));
+        CHECK(DirectGate_DescribeEvents(&events, XEVENTS_EWAIT, sStatus, sizeof(sStatus)) == strlen(sExpect) &&
+            strcmp(sStatus, sExpect) == 0, "a failed call names its saved error");
+
+        CHECK(DirectGate_DescribeEvents(&events, XEVENTS_EWAIT, sStatus, 8) == 7 && strlen(sStatus) == 7,
+            "a short buffer gets the start of it");
+        CHECK(DirectGate_DescribeEvents(&events, XEVENTS_EWAIT, NULL, sizeof(sStatus)) == 0 &&
+            DirectGate_DescribeEvents(&events, XEVENTS_EWAIT, sStatus, 0) == 0, "nothing goes nowhere");
     }
 
     char sTrim[] = "abc \t\r\n";
