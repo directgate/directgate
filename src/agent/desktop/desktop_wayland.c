@@ -39,6 +39,11 @@ struct directgate_wl_source_ {
     directgate_wl_portal_t *pPortal;
     directgate_wl_capture_t *pCapture;
 
+    /* Set instead of pCapture on a wlroots compositor, whose portal has no
+     * RemoteDesktop: the screen is copied straight from the compositor, and
+     * pPortal is then a stand-in that sends input there too. */
+    directgate_wlr_capture_t *pWlrCapture;
+
     xthread_t setupThread;
     xbool_t bThreadStarted;
     xvolatile_t nCancel;      /* raised by SourceDestroy so the join does not wait out a portal prompt */
@@ -305,6 +310,67 @@ static void DirectGate_WL_OnFrame(void *pUserCtx, const directgate_wl_frame_t *p
     DirectGate_WL_SourceSignal(pSource);
 }
 
+/* The fallback for a portal that has no RemoteDesktop interface at all - the
+ * wlroots compositors, Raspberry Pi OS among them. XSTDNON when the portal does
+ * have one, or might: then its own failure stands, because the compositor's
+ * protocols ask nobody, and must never stand in for a prompt that was there.
+ * Otherwise the result is published here, ready or failed. */
+static int DirectGate_WL_SetupWlroots(directgate_wl_source_t *pSource)
+{
+    char sReason[512] = { 0 };
+    if (DirectGate_WL_PortalRemoteDesktop(sReason, sizeof(sReason)) != DIRECTGATE_WL_REMOTE_ABSENT) return XSTDNON;
+
+    xlogi("The desktop portal cannot share input here, using the compositor's own protocols: reason(%s)", sReason);
+
+    char sError[512] = { 0 };
+    directgate_wlr_input_t *pInput = DirectGate_WLR_InputOpen(sError, sizeof(sError));
+
+    if (pInput == NULL)
+    {
+        char sMessage[640];
+        snprintf(sMessage, sizeof(sMessage), "This Wayland desktop cannot be shared: its desktop portal has no "
+            "remote desktop support, and the compositor's own screen sharing is not available either - %s", sError);
+
+        DirectGate_WL_SourcePublish(pSource, DIRECTGATE_WL_FAILED, sMessage);
+        return XSTDERR;
+    }
+
+    pSource->pPortal = DirectGate_WL_PortalFromWlr(pInput);
+    if (pSource->pPortal == NULL)
+    {
+        DirectGate_WL_SourcePublish(pSource, DIRECTGATE_WL_FAILED, "Out of memory opening the Wayland compositor.");
+        return XSTDERR;
+    }
+
+    if (XSYNC_ATOMIC_GET(&pSource->nCancel))
+    {
+        DirectGate_WL_SourcePublish(pSource, DIRECTGATE_WL_FAILED, "The screen sharing request was abandoned.");
+        return XSTDERR;
+    }
+
+    uint32_t nNode = DirectGate_WL_PortalNodeId(pSource->pPortal);
+    pSource->pWlrCapture = DirectGate_WLR_CaptureStart(nNode, DirectGate_WL_OnFrame, pSource, sError, sizeof(sError));
+
+    if (pSource->pWlrCapture == NULL)
+    {
+        DirectGate_WL_SourcePublish(pSource, DIRECTGATE_WL_FAILED, sError);
+        return XSTDERR;
+    }
+
+    if (DirectGate_WLR_CaptureWaitFormat(pSource->pWlrCapture, 4000) != XSTDOK)
+    {
+        if (!DirectGate_WLR_CaptureLost(pSource->pWlrCapture, sError, sizeof(sError)))
+            xstrncpy(sError, sizeof(sError), "The compositor never described the screen to copy.");
+
+        DirectGate_WL_SourcePublish(pSource, DIRECTGATE_WL_FAILED, sError);
+        return XSTDERR;
+    }
+
+    pSource->nActiveNode = nNode;
+    DirectGate_WL_SourcePublish(pSource, DIRECTGATE_WL_READY, NULL);
+    return XSTDOK;
+}
+
 static void* DirectGate_WL_SetupWorker(void *pCtx)
 {
     directgate_wl_source_t *pSource = (directgate_wl_source_t*)pCtx;
@@ -343,6 +409,11 @@ static void* DirectGate_WL_SetupWorker(void *pCtx)
         pSource->pPortal = DirectGate_WL_PortalOpen(NULL, sNewToken, sizeof(sNewToken), &bDeclined,
             &pSource->nCancel, sError, sizeof(sError));
     }
+
+    /* Not after a refusal or a cancel either, and only where the portal has no
+     * RemoteDesktop to offer at all - see DirectGate_WL_SetupWlroots. */
+    if (pSource->pPortal == NULL && !bDeclined && !XSYNC_ATOMIC_GET(&pSource->nCancel) &&
+        DirectGate_WL_SetupWlroots(pSource) != XSTDNON) return NULL;
 
     if (pSource->pPortal == NULL)
     {
@@ -491,6 +562,9 @@ const char* DirectGate_WL_SourceError(directgate_wl_source_t *pSource)
 
 xbool_t DirectGate_WL_SourceSize(directgate_wl_source_t *pSource, uint32_t *pWidth, uint32_t *pHeight)
 {
+    if (pSource != NULL && pSource->pWlrCapture != NULL)
+        return DirectGate_WLR_CaptureSize(pSource->pWlrCapture, pWidth, pHeight);
+
     XCHECK_NL((pSource != NULL && pSource->pCapture != NULL), XFALSE);
     return DirectGate_WL_CaptureSize(pSource->pCapture, pWidth, pHeight);
 }
@@ -509,6 +583,12 @@ xbool_t DirectGate_WL_SourceHasInput(directgate_wl_source_t *pSource)
 
 xbool_t DirectGate_WL_SourceLost(directgate_wl_source_t *pSource, char *pErrBuf, size_t nErrSize)
 {
+    if (pSource != NULL && pSource->pWlrCapture != NULL)
+    {
+        if (DirectGate_WL_SourceState(pSource) != DIRECTGATE_WL_READY) return XFALSE;
+        return DirectGate_WLR_CaptureLost(pSource->pWlrCapture, pErrBuf, nErrSize);
+    }
+
     XCHECK_NL((pSource != NULL && pSource->pCapture != NULL), XFALSE);
 
     /* Only a live source can be lost. While the setup thread is still working
@@ -559,10 +639,49 @@ static void DirectGate_WL_SourceAbandon(directgate_wl_source_t *pSource, directg
     DirectGate_WL_CaptureStop(pCapture);
 }
 
+/* SourceSelect for a compositor copy: the same order as the PipeWire switch
+ * below - the new screen proven first, the old one stopped before the slot is
+ * cleared - and then one whole frame asked for, because a copy that waits for
+ * something to change would leave a viewer looking at an idle screen with
+ * nothing of it on theirs. */
+static int DirectGate_WL_SourceSelectWlr(directgate_wl_source_t *pSource, uint32_t nNodeId)
+{
+    char sError[256] = { 0 };
+    directgate_wlr_capture_t *pCapture = DirectGate_WLR_CaptureStart(nNodeId, DirectGate_WL_OnFrame, pSource, sError, sizeof(sError));
+    if (pCapture == NULL)
+    {
+        xlogw("Failed to switch to screen %u: reason(%s)", nNodeId, sError);
+        return XSTDERR;
+    }
+
+    if (DirectGate_WLR_CaptureWaitFormat(pCapture, 4000) != XSTDOK)
+    {
+        DirectGate_WLR_CaptureStop(pCapture);
+        xlogw("Screen %u never described its buffer", nNodeId);
+        return XSTDERR;
+    }
+
+    directgate_wlr_capture_t *pOld = pSource->pWlrCapture;
+    if (pOld != NULL) DirectGate_WLR_CaptureHalt(pOld);
+
+    XSync_Lock(&pSource->frameLock);
+    pSource->pWlrCapture = pCapture;
+    pSource->nActiveNode = nNodeId;
+    pSource->bFrameFresh = XFALSE;
+    XSync_Unlock(&pSource->frameLock);
+
+    DirectGate_WLR_CaptureRefresh(pCapture);
+    if (pOld != NULL) DirectGate_WLR_CaptureStop(pOld);
+
+    xlogi("Wayland capture switched screen: node(%u)", nNodeId);
+    return XSTDOK;
+}
+
 int DirectGate_WL_SourceSelect(directgate_wl_source_t *pSource, uint32_t nNodeId)
 {
     XCHECK((pSource != NULL && pSource->pPortal != NULL), XSTDERR);
     if (nNodeId == 0 || nNodeId == pSource->nActiveNode) return XSTDOK;
+    if (pSource->pWlrCapture != NULL) return DirectGate_WL_SourceSelectWlr(pSource, nNodeId);
 
     /* Only the PipeWire stream is rebuilt. The portal grant covers every
      * screen the person allowed, so moving between them is not a permission
@@ -786,6 +905,7 @@ void DirectGate_WL_SourceDestroy(directgate_wl_source_t *pSource)
     }
 
     if (pSource->pCapture != NULL) DirectGate_WL_CaptureStop(pSource->pCapture);
+    if (pSource->pWlrCapture != NULL) DirectGate_WLR_CaptureStop(pSource->pWlrCapture);
     if (pSource->pPortal != NULL) DirectGate_WL_PortalClose(pSource->pPortal);
 
     XSync_Destroy(&pSource->stateLock);

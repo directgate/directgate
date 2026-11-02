@@ -22,6 +22,9 @@ jobs:
             libssl-dev libx11-dev libxrandr-dev libxext-dev libopus-dev \
             libopenh264-dev libavcodec-dev libavutil-dev libavfilter-dev \
             libpipewire-0.3-dev libdbus-1-dev
+          # A wlroots compositor for wayland_wlr_smoke, started headless; sway
+          # runs without Xwayland, and Ubuntu's older wlroots is closer to a Pi's.
+          sudo apt-get install -y --no-install-recommends sway
 
       - name: Build and run smoke tests
         run: sh ./tests/run-smoke.sh

@@ -64,11 +64,11 @@ void DirectGate_DisplayUsage(const char *pName)
     printf("  -v <number>          # Set/override verbosity level\n");
     printf("  -g <path>            # Generate a client key file and exit\n");
     printf("  -a <path>            # Authorize this agent against an existing key file and exit\n");
+    printf("  -m <org_id>          # Enable organization-managed client keys for this organization (\"\" disables)\n");
     printf("  -r                   # Rotate agent identity keypair and push new pub to API, then exit\n");
     printf("  -w                   # Enable WebRTC verbose logging (works with -v)\n");
     printf("  -i                   # Init config and exit\n");
     printf("  -e                   # Enroll device and exit\n");
-    printf("  -m <org_id>          # Enable organization-managed client keys for this organization (\"\" disables)\n");
     printf("  -s                   # Init SRP verifier and exit\n");
     printf("  -h                   # Version and usage\n\n");
 }

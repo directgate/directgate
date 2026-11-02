@@ -7,6 +7,12 @@
  * grants, whether its PipeWire descriptor opens, and a record of the input it
  * was asked to inject. wayland_portal_bus_smoke covers the real D-Bus client;
  * this covers what the agent does with its answers. Include in one file only.
+ *
+ * It also plays the wlroots fallback (DirectGate_WLR_*): whether the portal has
+ * a RemoteDesktop interface at all, whether the compositor opens, and a screen
+ * copy the test feeds frames into by hand. By default the portal has one, so
+ * the fallback is never reached unless a test asks for it - which is what
+ * every GNOME and KDE host looks like. wayland_wlr_smoke covers the real thing.
  */
 
 #ifndef DIRECTGATE_TESTS_WAYLAND_PORTAL_STUB_H
@@ -29,6 +35,17 @@ typedef enum {
 
 struct directgate_wl_portal_ {
     int nId;
+    directgate_wlr_input_t *pWlr;   /* a wlroots stand-in, closed with it */
+};
+
+struct directgate_wlr_input_ {
+    int nId;
+};
+
+struct directgate_wlr_capture_ {
+    uint32_t nOutput;
+    directgate_wl_frame_cb_t fnFrame;
+    void *pUserCtx;
 };
 
 typedef struct {
@@ -55,6 +72,21 @@ typedef struct {
     int32_t nLastButton, nLastKeysym, nLastKeycode;
     xbool_t bLastPressed;
     int nInputResult;           /* what every injection returns */
+
+    /* The wlroots fallback */
+    directgate_wl_remote_t eRemote;     /* what the RemoteDesktop probe answers */
+    int nRemoteProbes;
+    int bWlrOpenFails;
+    int nWlrOpens;
+    int nWlrClosed;
+    int nWlrCaptureFails;               /* this many captures fail to start */
+    int bWlrNoFormat;
+    int nWlrCaptures;
+    int nWlrStopped;
+    int nWlrRefreshes;
+    xbool_t bWlrLost;
+    uint32_t nWlrLastOutput;
+    directgate_wlr_capture_t *pWlrLast;
 } stub_portal_t;
 
 static stub_portal_t stub;
@@ -70,6 +102,7 @@ static void stub_portal_reset(void)
 
     stub.bHasInput = XTRUE;
     stub.nInputResult = XSTDOK;
+    stub.eRemote = DIRECTGATE_WL_REMOTE_PRESENT;
     stub.nStreams = 1;
     stub.streams[0].nNodeId = 31;
     stub.streams[0].nWidth = 64;
@@ -189,9 +222,148 @@ void DirectGate_WL_PortalClose(directgate_wl_portal_t *pPortal)
 
     XSync_Lock(&stub.lock);
     stub.nClosed++;
+    if (pPortal->pWlr != NULL) stub.nWlrClosed++;
     XSync_Unlock(&stub.lock);
+
+    free(pPortal->pWlr);
     free(pPortal);
 }
+
+directgate_wl_remote_t DirectGate_WL_PortalRemoteDesktop(char *pReason, size_t nReasonSize)
+{
+    XSync_Lock(&stub.lock);
+    stub.nRemoteProbes++;
+    directgate_wl_remote_t eRemote = stub.eRemote;
+    XSync_Unlock(&stub.lock);
+
+    xstrncpy(pReason, nReasonSize, "stub probe");
+    return eRemote;
+}
+
+directgate_wlr_input_t* DirectGate_WLR_InputOpen(char *pErrBuf, size_t nErrSize)
+{
+    XSync_Lock(&stub.lock);
+    stub.nWlrOpens++;
+    int bFail = stub.bWlrOpenFails;
+    XSync_Unlock(&stub.lock);
+
+    if (bFail)
+    {
+        xstrncpy(pErrBuf, nErrSize, "this compositor offers no screen capture protocol.");
+        return NULL;
+    }
+
+    return (directgate_wlr_input_t*)calloc(1, sizeof(directgate_wlr_input_t));
+}
+
+void DirectGate_WLR_InputClose(directgate_wlr_input_t *pInput)
+{
+    if (pInput == NULL) return;
+
+    XSync_Lock(&stub.lock);
+    stub.nWlrClosed++;
+    XSync_Unlock(&stub.lock);
+    free(pInput);
+}
+
+directgate_wl_portal_t* DirectGate_WL_PortalFromWlr(directgate_wlr_input_t *pInput)
+{
+    if (pInput == NULL) return NULL;
+
+    directgate_wl_portal_t *pPortal = (directgate_wl_portal_t*)calloc(1, sizeof(*pPortal));
+    if (pPortal == NULL)
+    {
+        DirectGate_WLR_InputClose(pInput);
+        return NULL;
+    }
+
+    pPortal->nId = 100;
+    pPortal->pWlr = pInput;
+    return pPortal;
+}
+
+directgate_wlr_capture_t* DirectGate_WLR_CaptureStart(uint32_t nOutput, directgate_wl_frame_cb_t fnFrame,
+                                                      void *pUserCtx, char *pErrBuf, size_t nErrSize)
+{
+    XSync_Lock(&stub.lock);
+    int bFail = stub.nWlrCaptureFails > 0;
+    if (bFail) stub.nWlrCaptureFails--;
+    XSync_Unlock(&stub.lock);
+
+    if (bFail)
+    {
+        xstrncpy(pErrBuf, nErrSize, "The screen could not be copied: stub.");
+        return NULL;
+    }
+
+    directgate_wlr_capture_t *pCapture = (directgate_wlr_capture_t*)calloc(1, sizeof(*pCapture));
+    if (pCapture == NULL) return NULL;
+
+    pCapture->nOutput = nOutput;
+    pCapture->fnFrame = fnFrame;
+    pCapture->pUserCtx = pUserCtx;
+
+    XSync_Lock(&stub.lock);
+    stub.nWlrCaptures++;
+    stub.nWlrLastOutput = nOutput;
+    stub.pWlrLast = pCapture;
+    XSync_Unlock(&stub.lock);
+
+    return pCapture;
+}
+
+int DirectGate_WLR_CaptureWaitFormat(directgate_wlr_capture_t *pCapture, uint32_t nTimeoutMs)
+{
+    (void)nTimeoutMs;
+    return (pCapture != NULL && !stub.bWlrNoFormat) ? XSTDOK : XSTDERR;
+}
+
+xbool_t DirectGate_WLR_CaptureSize(directgate_wlr_capture_t *pCapture, uint32_t *pWidth, uint32_t *pHeight)
+{
+    if (pCapture == NULL) return XFALSE;
+
+    for (uint32_t i = 0; i < stub.nStreams; i++)
+    {
+        if (stub.streams[i].nNodeId != pCapture->nOutput) continue;
+        if (pWidth != NULL) *pWidth = stub.streams[i].nWidth;
+        if (pHeight != NULL) *pHeight = stub.streams[i].nHeight;
+        return XTRUE;
+    }
+
+    return XFALSE;
+}
+
+xbool_t DirectGate_WLR_CaptureLost(directgate_wlr_capture_t *pCapture, char *pErrBuf, size_t nErrSize)
+{
+    if (pCapture == NULL || !stub.bWlrLost) return XFALSE;
+    if (pErrBuf != NULL) xstrncpy(pErrBuf, nErrSize, "The shared screen was disconnected on the remote computer.");
+    return XTRUE;
+}
+
+void DirectGate_WLR_CaptureRefresh(directgate_wlr_capture_t *pCapture)
+{
+    (void)pCapture;
+    XSync_Lock(&stub.lock);
+    stub.nWlrRefreshes++;
+    XSync_Unlock(&stub.lock);
+}
+
+void DirectGate_WLR_CaptureHalt(directgate_wlr_capture_t *pCapture)
+{
+    (void)pCapture;
+}
+
+void DirectGate_WLR_CaptureStop(directgate_wlr_capture_t *pCapture)
+{
+    if (pCapture == NULL) return;
+
+    XSync_Lock(&stub.lock);
+    stub.nWlrStopped++;
+    if (stub.pWlrLast == pCapture) stub.pWlrLast = NULL;
+    XSync_Unlock(&stub.lock);
+    free(pCapture);
+}
+
 
 int DirectGate_WL_PortalPointerMotion(directgate_wl_portal_t *pPortal, uint32_t nStream, double nX, double nY)
 {

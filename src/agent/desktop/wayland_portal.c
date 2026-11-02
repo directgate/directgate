@@ -38,6 +38,11 @@
 #define DIRECTGATE_PORTAL_CALL_MS   10000
 #define DIRECTGATE_PORTAL_GRANT_MS  120000
 
+/* Reading one property off a portal that has just answered (or been found
+ * missing) takes milliseconds. Short, because it runs on the thread that is
+ * joined before a session can be torn down. */
+#define DIRECTGATE_PORTAL_PROBE_MS  3000
+
 /* Portal enumerations, spelled out so the call sites read as intent. */
 #define DIRECTGATE_PORTAL_SOURCE_MONITOR  1U
 #define DIRECTGATE_PORTAL_CURSOR_HIDDEN   1U
@@ -154,6 +159,9 @@ struct directgate_wl_portal_ {
     /* The caller's too: raised when whoever asked has gone, so a grant wait that could run two minutes ends at the
      * next 100ms step instead of holding the thread that has to be joined before the session can be torn down. */
     xvolatile_t *pCancel;
+    /* Set only on a handle that stands in for a portal on a wlroots compositor (DirectGate_WL_PortalFromWlr):
+     * there is no D-Bus session then, and every input call goes to the compositor instead. Owned. */
+    directgate_wlr_input_t *pWlr;
 };
 
 static void DirectGate_WL_PortalSetError(char *pErrBuf, size_t nErrSize, const char *pFmt, ...)
@@ -880,6 +888,7 @@ xbool_t DirectGate_WL_PortalHasInput(const directgate_wl_portal_t *pPortal)
 
 xbool_t DirectGate_WL_PortalKeysymRefused(const directgate_wl_portal_t *pPortal)
 {
+    if (pPortal != NULL && pPortal->pWlr != NULL) return DirectGate_WLR_KeysymRefused(pPortal->pWlr);
     return (pPortal != NULL && pPortal->bKeysymRefused) ? XTRUE : XFALSE;
 }
 
@@ -1152,6 +1161,97 @@ directgate_wl_portal_t* DirectGate_WL_PortalOpen(const char *pRestoreToken,
     return pPortal;
 }
 
+directgate_wl_remote_t DirectGate_WL_PortalRemoteDesktop(char *pReason, size_t nReasonSize)
+{
+    /* Without D-Bus there is no portal, and so no prompt it could have shown. */
+    if (DirectGate_WL_DBusLoad(pReason, nReasonSize) != XSTDOK) return DIRECTGATE_WL_REMOTE_ABSENT;
+
+    DBusError error;
+    g_dbus.errorInit(&error);
+
+    DBusConnection *pConn = g_dbus.busGet(DBUS_BUS_SESSION, &error);
+    if (pConn == NULL)
+    {
+        DirectGate_WL_PortalSetError(pReason, nReasonSize, "no session bus: %s",
+            (error.message != NULL) ? error.message : "unavailable");
+
+        if (g_dbus.errorFree != NULL) g_dbus.errorFree(&error);
+        return DIRECTGATE_WL_REMOTE_ABSENT;
+    }
+
+    if (g_dbus.setExitOnDisconnect != NULL) g_dbus.setExitOnDisconnect(pConn, FALSE);
+
+    /* The version property, because every RemoteDesktop interface has one and
+     * reading it asks nobody anything. A portal that does not have the
+     * interface says so by name; anything else - a timeout, a portal that
+     * failed to start - is not proof of absence and is not treated as one. */
+    directgate_wl_remote_t eRemote = DIRECTGATE_WL_REMOTE_UNKNOWN;
+    DBusMessage *pCall = g_dbus.newCall(DIRECTGATE_PORTAL_BUS, DIRECTGATE_PORTAL_PATH, "org.freedesktop.DBus.Properties", "Get");
+    if (pCall != NULL)
+    {
+        const char *pInterface = DIRECTGATE_PORTAL_REMOTE;
+        const char *pProperty = "version";
+        DBusMessageIter args;
+
+        g_dbus.iterInitAppend(pCall, &args);
+        g_dbus.iterAppend(&args, DBUS_TYPE_STRING, &pInterface);
+        g_dbus.iterAppend(&args, DBUS_TYPE_STRING, &pProperty);
+
+        DBusMessage *pReply = g_dbus.sendBlock(pConn, pCall, DIRECTGATE_PORTAL_PROBE_MS, &error);
+        g_dbus.msgUnref(pCall);
+
+        if (pReply != NULL)
+        {
+            eRemote = DIRECTGATE_WL_REMOTE_PRESENT;
+            g_dbus.msgUnref(pReply);
+        }
+        else
+        {
+            const char *pName = error.name != NULL ? error.name : "";
+            DirectGate_WL_PortalSetError(pReason, nReasonSize, "%s: %s", xstrused(pName) ? pName : "no reply",
+                (error.message != NULL) ? error.message : "no reason given");
+
+            if (xstrcmp(pName, DBUS_ERROR_SERVICE_UNKNOWN) || xstrcmp(pName, DBUS_ERROR_NAME_HAS_NO_OWNER) ||
+                xstrcmp(pName, DBUS_ERROR_UNKNOWN_INTERFACE) || xstrcmp(pName, DBUS_ERROR_UNKNOWN_METHOD) ||
+                xstrcmp(pName, DBUS_ERROR_UNKNOWN_OBJECT) || xstrcmp(pName, DBUS_ERROR_UNKNOWN_PROPERTY) ||
+                xstrcmp(pName, DBUS_ERROR_INVALID_ARGS))
+                eRemote = DIRECTGATE_WL_REMOTE_ABSENT;
+        }
+    }
+
+    if (g_dbus.errorFree != NULL) g_dbus.errorFree(&error);
+    if (g_dbus.connClose != NULL) g_dbus.connClose(pConn);
+    if (g_dbus.connUnref != NULL) g_dbus.connUnref(pConn);
+
+    return eRemote;
+}
+
+directgate_wl_portal_t* DirectGate_WL_PortalFromWlr(directgate_wlr_input_t *pInput)
+{
+    if (pInput == NULL) return NULL;
+
+    directgate_wl_portal_t *pPortal = (directgate_wl_portal_t*)calloc(1, sizeof(*pPortal));
+    if (pPortal == NULL)
+    {
+        DirectGate_WLR_InputClose(pInput);
+        return NULL;
+    }
+
+    pPortal->pWlr = pInput;
+    uint32_t nScreens = DirectGate_WLR_InputScreenCount(pInput);
+
+    for (uint32_t i = 0; i < nScreens && pPortal->nStreamCount < DIRECTGATE_WL_MAX_STREAMS; i++)
+    {
+        const directgate_wl_stream_t *pScreen = DirectGate_WLR_InputScreen(pInput, i);
+        if (pScreen != NULL) pPortal->streams[pPortal->nStreamCount++] = *pScreen;
+    }
+
+    if (DirectGate_WLR_InputHasKeyboard(pInput)) pPortal->nDevices |= DIRECTGATE_PORTAL_DEVICE_KEYBOARD;
+    if (DirectGate_WLR_InputHasPointer(pInput)) pPortal->nDevices |= DIRECTGATE_PORTAL_DEVICE_POINTER;
+
+    return pPortal;
+}
+
 int DirectGate_WL_PortalOpenPipeWire(directgate_wl_portal_t *pPortal, char *pErrBuf, size_t nErrSize)
 {
     XCHECK((pPortal != NULL && pPortal->pConn != NULL), -1);
@@ -1356,6 +1456,8 @@ int DirectGate_WL_PortalPointerMotion(directgate_wl_portal_t *pPortal, uint32_t 
     /* The one input call that touches the portal before sending: check here
      * rather than leave it to the shared sender, as every other call does. */
     XCHECK((pPortal != NULL), XSTDERR);
+    if (pPortal->pWlr != NULL)
+        return DirectGate_WLR_PointerMotion(pPortal->pWlr, nStream ? nStream : DirectGate_WL_PortalNodeId(pPortal), nX, nY);
 
     directgate_wl_motion_t motion = { nStream ? nStream : DirectGate_WL_PortalNodeId(pPortal), nX, nY };
     pPortal->nLastMotionX = nX;
@@ -1365,12 +1467,14 @@ int DirectGate_WL_PortalPointerMotion(directgate_wl_portal_t *pPortal, uint32_t 
 
 int DirectGate_WL_PortalPointerButton(directgate_wl_portal_t *pPortal, int32_t nButton, xbool_t bPressed)
 {
+    if (pPortal != NULL && pPortal->pWlr != NULL) return DirectGate_WLR_PointerButton(pPortal->pWlr, nButton, bPressed);
     directgate_wl_button_t button = { (dbus_int32_t)nButton, bPressed ? 1U : 0U };
     return DirectGate_WL_PortalNotify(pPortal, "NotifyPointerButton", DirectGate_WL_ButtonArgs, &button);
 }
 
 int DirectGate_WL_PortalPointerMotionRelative(directgate_wl_portal_t *pPortal, double nDx, double nDy)
 {
+    if (pPortal != NULL && pPortal->pWlr != NULL) return DirectGate_WLR_PointerMotionRelative(pPortal->pWlr, nDx, nDy);
     /* Same wire shape as the axis call - two doubles after the session and
      * the options - so the one argument writer serves both. */
     directgate_wl_axis_t motion = { nDx, nDy };
@@ -1380,6 +1484,8 @@ int DirectGate_WL_PortalPointerMotionRelative(directgate_wl_portal_t *pPortal, d
 int DirectGate_WL_PortalPointerAxis(directgate_wl_portal_t *pPortal, double nDx, double nDy)
 {
     XCHECK((pPortal != NULL), XSTDERR);
+    if (pPortal->pWlr != NULL) return DirectGate_WLR_PointerAxis(pPortal->pWlr, nDx, nDy);
+
     /* KDE's requestPointerAxis sends -y to KWin, but leaves x unchanged.
      * GNOME forwards both signs unchanged. Compensate only the affected
      * backend/axis; relative pointer motion uses the same argument writer.
@@ -1390,12 +1496,14 @@ int DirectGate_WL_PortalPointerAxis(directgate_wl_portal_t *pPortal, double nDx,
 
 int DirectGate_WL_PortalKeysym(directgate_wl_portal_t *pPortal, int32_t nKeysym, xbool_t bPressed)
 {
+    if (pPortal != NULL && pPortal->pWlr != NULL) return DirectGate_WLR_Keysym(pPortal->pWlr, nKeysym, bPressed);
     directgate_wl_key_t key = { (dbus_int32_t)nKeysym, bPressed ? 1U : 0U };
     return DirectGate_WL_PortalNotify(pPortal, "NotifyKeyboardKeysym", DirectGate_WL_KeyArgs, &key);
 }
 
 int DirectGate_WL_PortalKeycode(directgate_wl_portal_t *pPortal, int32_t nKeycode, xbool_t bPressed)
 {
+    if (pPortal != NULL && pPortal->pWlr != NULL) return DirectGate_WLR_Keycode(pPortal->pWlr, nKeycode, bPressed);
     /* Same wire shape as the keysym call - an int32 and a state,
      * so the one argument writer serves both. */
     directgate_wl_key_t key = { (dbus_int32_t)nKeycode, bPressed ? 1U : 0U };
@@ -1426,6 +1534,9 @@ uint32_t DirectGate_WL_PortalNodeId(const directgate_wl_portal_t *pPortal)
 void DirectGate_WL_PortalClose(directgate_wl_portal_t *pPortal)
 {
     if (pPortal == NULL) return;
+
+    /* A wlroots stand-in has no D-Bus session; everything below is skipped. */
+    if (pPortal->pWlr != NULL) DirectGate_WLR_InputClose(pPortal->pWlr);
 
     /* Tell the portal the session is over. Without this the compositor keeps
      * the grant - and its "your screen is being shared" indicator - alive

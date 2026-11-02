@@ -2,7 +2,7 @@
 
 # Linux desktop sessions
 
-The agent streams an Xorg desktop with XShm capture and XTest input, and a Wayland desktop through `xdg-desktop-portal` + PipeWire. Which one is used is decided from the session type, not from what happens to be installed.
+The agent streams an Xorg desktop with XShm capture and XTest input, and a Wayland desktop through `xdg-desktop-portal` + PipeWire - or, on wlroots compositors such as Raspberry Pi OS's labwc, whose portal cannot inject input, through the compositor's own capture and virtual-input protocols. Which one is used is decided from the session type, not from what happens to be installed.
 
 ## Xorg
 
@@ -35,7 +35,7 @@ The agent streams a Wayland desktop through `xdg-desktop-portal`: the compositor
 Requirements on the streamed machine:
 
 - `pipewire` and `dbus` runtime libraries (both already present on a normal desktop install). They are loaded at runtime, not linked, so an X11-only host without them runs the same binary unchanged.
-- A desktop portal with a ScreenCast **and** RemoteDesktop backend - `xdg-desktop-portal-gnome` or `xdg-desktop-portal-kde`. A wlroots-only setup (`xdg-desktop-portal-wlr`) can capture but cannot inject input.
+- A desktop portal with a ScreenCast **and** RemoteDesktop backend - `xdg-desktop-portal-gnome` or `xdg-desktop-portal-kde`. A wlroots compositor's portal (`xdg-desktop-portal-wlr`) has no RemoteDesktop at all; those desktops are streamed without the portal instead - see [wlroots compositors](#wlroots-compositors-raspberry-pi-os-labwc-wayfire-sway).
 
 Nothing here talks to a compositor directly, so the backend is interchangeable in principle - but backends differ in what they implement, and three differences are worth knowing about. Each says so in the log rather than failing quietly:
 
@@ -100,6 +100,41 @@ Keys are released, not just injected. Every key the browser presses is tracked b
 Nothing else about the X11 path changes. The session type is decided before the display is opened, because XWayland sets `DISPLAY` on a Wayland session too and capturing that would silently produce a black screen: a machine that reports `XDG_SESSION_TYPE=x11` is always treated as X11.
 
 The permission prompt is answered by a person, so the session waits for them rather than failing. A start that finds the prompt unanswered reports `starting` with that message and keeps the timer running; the moment the grant lands the agent reports `ready` and the viewer picks a screen. Nothing has to be reconnected - which is what used to be required, because a start that gave up left nothing behind to look again.
+
+## wlroots compositors (Raspberry Pi OS, labwc, Wayfire, sway)
+
+Raspberry Pi OS runs labwc (Wayfire on releases before late 2024), and like every wlroots compositor it ships `xdg-desktop-portal-wlr`, which implements ScreenCast and Screenshot and **no RemoteDesktop**. The portal path above fails at its very first call there - `The desktop portal refused CreateSession: No such interface "org.freedesktop.portal.RemoteDesktop"` - so a desktop that streams fine everywhere else showed nothing.
+
+These compositors offer the same two capabilities directly, as Wayland protocols any client of the session may bind, and the agent uses them when - and only when - the portal has no RemoteDesktop to offer:
+
+- **Capture:** `zwlr_screencopy_manager_v1`, into shared memory. The first frame is copied at once; after that a copy waits for something on the screen to change, so an idle desktop costs nothing, exactly like the PipeWire push model. Frames reach the same encoder pipeline as every other source (`desktop_linux.c`); a compositor that hands out RGBA instead of BGRA, or an upside-down buffer, is converted in place first. There is no DMA-BUF zero-copy on this path: the compositor reads the screen back into the shared buffer.
+- **Pointer:** `zwlr_virtual_pointer_manager_v1`, one virtual pointer per screen (version 2), which the compositor maps onto that screen - so an absolute position is that screen's own pixel, wherever it sits in the layout. Relative motion is not accelerated.
+- **Keyboard:** `zwp_virtual_keyboard_manager_v1`. Its keymap is the one of the keyboard attached to the machine; with none attached - common for a Pi reached remotely - it is compiled from `/etc/default/keyboard` (which Raspberry Pi OS keeps current), `XKB_DEFAULT_*` when the agent has them, else `us`. wlroots takes a virtual keyboard's keys without working out what they do to the modifiers, so the agent tracks Shift, Ctrl, AltGr and the locks against the same keymap and sends the modifier state itself.
+
+`libwayland-client` and `libxkbcommon` are loaded at runtime like everything else here; every wlroots desktop already has both. No headers are needed to build it - it is part of every agent built with Wayland support.
+
+**When it is used.** Only after the portal has failed, only when nobody declined and the request was not abandoned, and only when the portal answers that it has no RemoteDesktop interface (or there is no portal or session bus at all). GNOME and KDE answer that they have one, so the agent never even connects to their compositor; a portal that has the interface but failed, timed out or is still starting keeps its own error.
+
+**There is no permission prompt.** The compositor has none to show: these protocols are open to every client of the user's session, just as any X11 client can read the screen and synthesise input. The agent connects as the same user any desktop application runs as (the service's `User=`), and the session is still behind DirectGate's own end-to-end authentication. labwc withholds these protocols from sandboxed (Flatpak) clients only.
+
+**Typing other scripts.** The hybrid layout model below applies unchanged. A character the keymap has goes in on its own key; one it does not - a Georgian letter on a GB-layout Pi - is put on a spare key in the virtual keyboard's own keymap, which is then handed to the compositor. Spare keys are the media and launcher keys the browser can never send by position (evdev 128-182 and 195-247), about a hundred on a standard keymap, so letters keep their keys for the whole session; the physical keyboard's keymap is not touched. When the keymap is opened the agent rebuilds it with every spare key in use and compiles it, and lends nothing unless each spare key types what it was given and every other key types exactly what it did before - a keymap the compositor cannot compile ends the connection, and with it every later keystroke. Each first use of a character rewrites the keymap, which the focused application recompiles: about 0.1 ms in the agent, a few milliseconds in the application, once per character per session.
+
+The screen socket is found the way the session type is: `WAYLAND_DISPLAY` when the agent has it, else the first of `$XDG_RUNTIME_DIR/wayland-0` to `wayland-3` (labwc uses `wayland-0`, Wayfire and sway `wayland-1`).
+
+What the log says:
+
+```
+The desktop portal cannot share input here, using the compositor's own protocols: reason(org.freedesktop.DBus.Error.InvalidArgs: No such interface ...)
+Wayland compositor opened directly: display(wayland-0), screens(1), pointer(yes), keyboard(yes), layout(/etc/default/keyboard), spareKeys(104)
+```
+
+Differences from the portal path:
+
+- **Every active screen is offered**, not just the ones picked in a prompt.
+- **A rotated screen is streamed as the panel scans it out** - sideways for a portrait monitor - and the log says so (`Wayland screen is rotated`).
+- **Unplugging the screen being shared, or the compositor exiting,** ends the session with that reason, as revoking a portal grant does. A screen that is switched off refuses to be copied for a while; that is retried, backing off to once a second, not treated as lost.
+
+A compositor that has neither a RemoteDesktop portal nor `zwlr_screencopy_manager_v1` reports both: *"This Wayland desktop cannot be shared: its desktop portal has no remote desktop support, and the compositor's own screen sharing is not available either"*.
 
 ## Keyboard layout
 

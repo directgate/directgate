@@ -19,8 +19,9 @@ jobs:
       # The smoke set plus what reaches the desktop code: Xvfb for the X11
       # tests, PipeWire and D-Bus headers for the Wayland backend and
       # libavfilter's for its zero-copy path, a dbus-daemon for the fake
-      # portal and libpulse for the audio backend (the tests play the sound
-      # server themselves).
+      # portal, libpulse for the audio backend (the tests play the sound
+      # server themselves) and sway, a wlroots compositor the wlroots backend
+      # is run against headless - without Xwayland, unlike labwc.
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -28,6 +29,7 @@ jobs:
             libssl-dev libx11-dev libxrandr-dev libxext-dev libopus-dev \
             libopenh264-dev libavcodec-dev libavutil-dev libavfilter-dev \
             libpipewire-0.3-dev libdbus-1-dev dbus xvfb libpulse0
+          sudo apt-get install -y --no-install-recommends sway
 
       # Ubuntu puts unprivileged user namespaces behind AppArmor. The trust
       # store test and the X11 display scan cover real directories with empty

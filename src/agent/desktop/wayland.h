@@ -249,6 +249,100 @@ int32_t DirectGate_WL_PortalButtonCode(uint32_t nX11Button);
 
 void DirectGate_WL_PortalClose(directgate_wl_portal_t *pPortal);
 
+/* Whether the session's desktop portal has a RemoteDesktop interface at all,
+ * as opposed to having one that said no. Asked only after the portal has
+ * already failed: the wlroots fallback below grants itself without anyone
+ * being asked, so it may only stand in for a portal that has no prompt to
+ * show, never for one whose prompt went unanswered or broke.
+ *
+ * ABSENT: no RemoteDesktop interface, no portal on the bus, or no session bus.
+ * PRESENT: the interface answered. UNKNOWN: anything else, treated as present. */
+typedef enum {
+    DIRECTGATE_WL_REMOTE_UNKNOWN = 0,
+    DIRECTGATE_WL_REMOTE_PRESENT,
+    DIRECTGATE_WL_REMOTE_ABSENT
+} directgate_wl_remote_t;
+
+directgate_wl_remote_t DirectGate_WL_PortalRemoteDesktop(char *pReason, size_t nReasonSize);
+
+/* wlroots compositors - labwc, Wayfire and sway, and with them Raspberry Pi
+ * OS - ship a desktop portal that can share the screen but cannot inject
+ * input, so the portal session above cannot even be created there. They offer
+ * both capabilities directly instead, as Wayland protocols any client of the
+ * session may bind: zwlr_screencopy_manager_v1 for the pixels, and the virtual
+ * pointer and keyboard protocols for input. The same trust as X11, where any
+ * client of the display can read the screen and synthesise input: there is
+ * no prompt, because the compositor has none to show.
+ *
+ * libwayland-client and libxkbcommon are opened at runtime like everything
+ * else here, so a host without them is not affected.
+ *
+ * The input half owns its own connection to the compositor and is used only
+ * by the thread that owns input (the setup worker until the source is ready,
+ * the agent's event loop after). A screen is addressed by its wl_output global
+ * name, which takes the place of the PipeWire node id. */
+typedef struct directgate_wlr_input_ directgate_wlr_input_t;
+typedef struct directgate_wlr_capture_ directgate_wlr_capture_t;
+
+/* Connects, lists the screens, and prepares the virtual pointer and keyboard.
+ * Fails when the compositor offers no screen capture protocol or no screen.
+ * Every wait is bounded, so a compositor that stops answering costs seconds,
+ * not the thread. Returns NULL with the reason in pErrBuf. */
+directgate_wlr_input_t* DirectGate_WLR_InputOpen(char *pErrBuf, size_t nErrSize);
+
+uint32_t DirectGate_WLR_InputScreenCount(const directgate_wlr_input_t *pInput);
+const directgate_wl_stream_t* DirectGate_WLR_InputScreen(const directgate_wlr_input_t *pInput, uint32_t nIndex);
+xbool_t DirectGate_WLR_InputHasPointer(const directgate_wlr_input_t *pInput);
+xbool_t DirectGate_WLR_InputHasKeyboard(const directgate_wlr_input_t *pInput);
+
+/* Same contracts as the portal calls they stand in for. Coordinates are in
+ * the pixels of the screen's capture; @p nOutput is its global name. */
+int DirectGate_WLR_PointerMotion(directgate_wlr_input_t *pInput, uint32_t nOutput, double nX, double nY);
+int DirectGate_WLR_PointerMotionRelative(directgate_wlr_input_t *pInput, double nDx, double nDy);
+int DirectGate_WLR_PointerButton(directgate_wlr_input_t *pInput, int32_t nButton, xbool_t bPressed);
+int DirectGate_WLR_PointerAxis(directgate_wlr_input_t *pInput, double nDx, double nDy);
+int DirectGate_WLR_Keycode(directgate_wlr_input_t *pInput, int32_t nKeycode, xbool_t bPressed);
+
+/* A character by keysym. One the virtual keyboard's layout already types with
+ * the modifiers held right now goes in on that key; anything else gets a spare
+ * key of its own in the keyboard's keymap. XTRUE from KeysymRefused once one
+ * could not be typed at all. */
+int DirectGate_WLR_Keysym(directgate_wlr_input_t *pInput, int32_t nKeysym, xbool_t bPressed);
+xbool_t DirectGate_WLR_KeysymRefused(const directgate_wlr_input_t *pInput);
+
+void DirectGate_WLR_InputClose(directgate_wlr_input_t *pInput);
+
+/* Wraps a wlroots input in the portal handle the rest of the agent already
+ * drives, so input.c and stream.c work on it unchanged: the screens become the
+ * portal's streams, and every input call is routed to the compositor instead
+ * of over D-Bus. Takes ownership of @p pInput, also when it fails. */
+directgate_wl_portal_t* DirectGate_WL_PortalFromWlr(directgate_wlr_input_t *pInput);
+
+/* Copies screen @p nOutput on a thread with its own connection, delivering
+ * every frame to @p fnFrame as MAPPED BGRA - converted first when the
+ * compositor hands out the other byte order, flipped when it is upside down.
+ * The first frame is copied at once; after it, only once something changed.
+ * Returns NULL with the reason in pErrBuf. */
+directgate_wlr_capture_t* DirectGate_WLR_CaptureStart(uint32_t nOutput,
+                                                      directgate_wl_frame_cb_t fnFrame,
+                                                      void *pUserCtx,
+                                                      char *pErrBuf,
+                                                      size_t nErrSize);
+
+/* Blocks until the compositor has described the screen's buffer, or @p
+ * nTimeoutMs passes. Must not be called from the agent's event loop. */
+int DirectGate_WLR_CaptureWaitFormat(directgate_wlr_capture_t *pCapture, uint32_t nTimeoutMs);
+xbool_t DirectGate_WLR_CaptureSize(directgate_wlr_capture_t *pCapture, uint32_t *pWidth, uint32_t *pHeight);
+xbool_t DirectGate_WLR_CaptureLost(directgate_wlr_capture_t *pCapture, char *pErrBuf, size_t nErrSize);
+
+/* Asks for one whole frame even if nothing on screen changed, for a viewer
+ * that has just switched to this screen and has nothing of it yet. */
+void DirectGate_WLR_CaptureRefresh(directgate_wlr_capture_t *pCapture);
+
+/* Halt stops the thread, after which no frame is delivered; Stop also frees. */
+void DirectGate_WLR_CaptureHalt(directgate_wlr_capture_t *pCapture);
+void DirectGate_WLR_CaptureStop(directgate_wlr_capture_t *pCapture);
+
 /* Portal grant plus PipeWire stream, driven to readiness on a thread of its
  * own and then presented to the encoder as "here is the newest frame".
  *
