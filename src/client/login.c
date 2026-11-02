@@ -497,13 +497,15 @@ xbool_t DirectGate_Login_ApplyToken(directgate_account_t *pAccount, xjson_obj_t 
 static xbool_t DirectGate_Login_Exchange(directgate_account_t *pAccount,
                                          const directgate_login_ctx_t *pCtx,
                                          const char *pPath,
-                                         const char *pBody)
+                                         const char *pBody,
+                                         xbool_t *pRejected)
 {
     directgate_webapi_res_t res;
     xbool_t bOk = DirectGate_WebApi_Request(&res, XHTTP_POST, pCtx->pApiUrl, pPath, NULL, NULL, pBody);
 
     if (!bOk)
     {
+        if (pRejected != NULL) *pRejected = res.nStatusCode == 401 ? XTRUE : XFALSE;
         xloge("Token request failed: path(%s), reason(%s)", pPath, res.sError);
         DirectGate_WebApi_Clear(&res);
         return XFALSE;
@@ -514,8 +516,9 @@ static xbool_t DirectGate_Login_Exchange(directgate_account_t *pAccount,
     return bOk;
 }
 
-xbool_t DirectGate_Login_Refresh(directgate_account_t *pAccount, const directgate_login_ctx_t *pCtx)
+xbool_t DirectGate_Login_Refresh(directgate_account_t *pAccount, const directgate_login_ctx_t *pCtx, xbool_t *pRejected)
 {
+    if (pRejected != NULL) *pRejected = XFALSE;
     XCHECK((pAccount != NULL && pCtx != NULL), XFALSE);
     XCHECK_NL((xstrused(pAccount->sRefreshToken)), XFALSE);
     XCHECK((xstrused(pCtx->pApiUrl)), XFALSE);
@@ -528,7 +531,7 @@ xbool_t DirectGate_Login_Refresh(directgate_account_t *pAccount, const directgat
     if (DirectGate_JsonEscape(sToken, sizeof(sToken), pAccount->sRefreshToken))
     {
         xstrncpyf(sBody, sizeof(sBody), "{\"refreshToken\":\"%s\"}", sToken);
-        bOk = DirectGate_Login_Exchange(pAccount, pCtx, "/api/v1/auth/cli/refresh", sBody);
+        bOk = DirectGate_Login_Exchange(pAccount, pCtx, "/api/v1/auth/cli/refresh", sBody, pRejected);
         if (bOk) xlogi("Refreshed account session: user(%s)", pAccount->sEmail);
         OPENSSL_cleanse(sBody, sizeof(sBody));
     }
@@ -552,7 +555,7 @@ static xbool_t DirectGate_Login_Redeem(directgate_account_t *pAccount,
         DirectGate_JsonEscape(sVerifier, sizeof(sVerifier), pVerifier))
     {
         xstrncpyf(sBody, sizeof(sBody), "{\"code\":\"%s\",\"codeVerifier\":\"%s\"}", sCode, sVerifier);
-        bOk = DirectGate_Login_Exchange(pAccount, pCtx, "/api/v1/auth/cli/token", sBody);
+        bOk = DirectGate_Login_Exchange(pAccount, pCtx, "/api/v1/auth/cli/token", sBody, NULL);
         OPENSSL_cleanse(sBody, sizeof(sBody));
     }
 
@@ -972,7 +975,7 @@ xbool_t DirectGate_Login_Ensure(directgate_account_t *pAccount,
     if (bLoaded && !DirectGate_Account_IsExpired(pAccount, DIRECTGATE_LOGIN_EXPIRY_SKEW))
         return XTRUE;
 
-    if (bLoaded && xstrused(pAccount->sRefreshToken) && DirectGate_Login_Refresh(pAccount, pCtx))
+    if (bLoaded && xstrused(pAccount->sRefreshToken) && DirectGate_Login_Refresh(pAccount, pCtx, NULL))
     {
         if (!DirectGate_Account_Save(pAccount, pPath))
             xlogw("Signed in but failed to persist the session: %s", pPath);

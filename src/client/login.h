@@ -84,8 +84,14 @@ xbool_t DirectGate_Login_Ensure(directgate_account_t *pAccount,
 xbool_t DirectGate_Login_Interactive(directgate_account_t *pAccount,
                                      const directgate_login_ctx_t *pCtx);
 
+/*
+ * Trades the stored refresh token for new tokens. pRejected, when given, is set when the API turned the token down
+ * (HTTP 401): the sign-in it belonged to is gone - signed out from another device, or ended by the provider - and
+ * no retry will bring it back. A request that failed any other way leaves it XFALSE.
+ */
 xbool_t DirectGate_Login_Refresh(directgate_account_t *pAccount,
-                                 const directgate_login_ctx_t *pCtx);
+                                 const directgate_login_ctx_t *pCtx,
+                                 xbool_t *pRejected);
 
 xbool_t DirectGate_Login_NewVerifier(char *pOut, size_t nSize);
 xbool_t DirectGate_Login_Challenge(const char *pVerifier, char *pOut, size_t nSize);

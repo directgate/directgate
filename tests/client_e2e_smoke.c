@@ -1560,6 +1560,36 @@ static int scenario_login(tty_t *pTty, const char *pCfg, const char *pRoot)
         "the refresh was tried once, then the new sign-in redeemed once");
     CHECK(strstr(pTty->sScreen, CLI_DEVICE_NAME) != NULL, "the devices are listed with the new session");
 
+    /* A sign-in signed out from another device: its access token has not run out, so it is used, but the API turns
+       it down and the refresh token is gone. The client signs in again and goes on, as above. */
+    static const char sSignedOut[] = "{\"accessToken\":\"acct-access-signed-out\",\"refreshToken\":\"acct-refresh-gone\","
+        "\"expiresAt\":4102444800,\"email\":\"" CLI_EMAIL "\",\"userId\":\"u-1\"}";
+    write_file(sAuth, sSignedOut);
+    chmod(sAuth, 0600);
+
+    reset_outputs();
+    CHECK(tty_start(pTty, stale, XFALSE), "start with a session signed out from another device");
+    CHECK(tty_expect(pTty, "paste the code", 20000), "a signed-out session leads to a new sign-in");
+    CHECK(strstr(pTty->sScreen, "signed out, signing in again") != NULL, "and the client says why");
+    CHECK(tty_type(pTty, "pasted-code\n"), "paste the code for the new sign-in");
+    CHECK(tty_finish(pTty, 20000) == 0, "after signing in again the command goes on");
+    CHECK(XSYNC_ATOMIC_GET(&g_cli.nRefreshes) == 1 && XSYNC_ATOMIC_GET(&g_cli.nTokenRedeems) == 1,
+        "the refresh was tried once, then the new sign-in redeemed once");
+    CHECK(strstr(pTty->sScreen, CLI_DEVICE_NAME) != NULL, "the devices are listed with the new session");
+    CHECK(XPath_LoadBuffer(sAuth, &saved) > 0, "the new session is stored");
+    bRotated = strstr((const char*)saved.pData, "acct-refresh-1") != NULL;
+    XByteBuffer_Clear(&saved);
+    CHECK(bRotated, "the new session replaces the signed-out one");
+
+    /* Without a terminal there is nobody to sign in: it says how, and the dead session is not kept to fail again */
+    write_file(sAuth, sSignedOut);
+    chmod(sAuth, 0600);
+    const char *signedOut[] = { "devices", "-c", pCfg, NULL };
+    CHECK(tty_start(pTty, signedOut, XTRUE), "start without a terminal on a signed-out session");
+    CHECK(tty_finish(pTty, 10000) != 0, "a signed-out session without a terminal fails");
+    CHECK(strstr(pTty->sScreen, "Run 'dgcli login'") != NULL, "and says how to sign in again");
+    CHECK(access(sAuth, F_OK) != 0, "the signed-out session is forgotten");
+
     /* A stored session that is not JSON is ignored, not trusted and not fatal. */
     write_file(sAuth, "{ this is not a session");
     chmod(sAuth, 0600);

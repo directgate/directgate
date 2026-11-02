@@ -171,7 +171,10 @@ dgcli login
 ```
 
 This runs an OAuth 2.0 authorization code flow with PKCE. The CLI opens a short-lived listener on `127.0.0.1` (ports 40777-40784), opens your browser, and exchanges the returned authorization code for a session. Tokens are written
-to `~/.config/directgate/auth/auth.json` with `0600` permissions inside a `0700` directory, created on demand alongside the client key, and refreshed automatically as they expire - you only sign in again when the refresh token is gone.
+to `~/.config/directgate/auth/auth.json` with `0600` permissions inside a `0700` directory, created on demand alongside the client key, and refreshed automatically as they expire - you only sign in again when the refresh token is gone. That includes a
+sign-in ended from another device (Settings → Signed-in devices on the web): the API then refuses even an access token
+that has not run out, the refresh is refused too, and `dgcli` forgets the dead session and starts a new sign-in - or,
+without a terminal, exits telling you to run `dgcli login`.
 
 The CLI holds no identity-provider configuration of its own. It knows exactly two hosts - the API and the web app - and the code exchange and refresh go through `POST /api/v1/auth/cli/token` and `/api/v1/auth/cli/refresh`, which the
 API performs against the provider on its behalf. Swapping the provider therefore needs no new CLI release, and the repository carries no provider credentials.

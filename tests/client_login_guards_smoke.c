@@ -118,10 +118,13 @@ static int check_flows(void)
     directgate_login_ctx_t ctx = { "", "", NULL, XTRUE };
     char sCode[64];
 
-    CHECK(!DirectGate_Login_Refresh(NULL, &ctx) && !DirectGate_Login_Refresh(&account, NULL), "a refresh needs an account");
-    CHECK(!DirectGate_Login_Refresh(&account, &ctx), "and a refresh token");
+    xbool_t bRejected = XTRUE;
+    CHECK(!DirectGate_Login_Refresh(NULL, &ctx, &bRejected) && !DirectGate_Login_Refresh(&account, NULL, NULL),
+        "a refresh needs an account");
+    CHECK(!bRejected, "a refresh that never asked was not turned down");
+    CHECK(!DirectGate_Login_Refresh(&account, &ctx, NULL), "and a refresh token");
     xstrncpy(account.sRefreshToken, sizeof(account.sRefreshToken), "refresh");
-    CHECK(!DirectGate_Login_Refresh(&account, &ctx), "and an API");
+    CHECK(!DirectGate_Login_Refresh(&account, &ctx, NULL), "and an API");
 
     xsock_t sock;
     uint16_t nPort = 0;
@@ -155,8 +158,10 @@ static int check_bodies(void)
     directgate_account_t account;
     DirectGate_Account_Init(&account);
     xstrncpy(account.sRefreshToken, sizeof(account.sRefreshToken), "re\"fr\\esh");
-    int bRefused = !DirectGate_Login_Refresh(&account, &ctx);
+    xbool_t bRejected = XTRUE;
+    int bRefused = !DirectGate_Login_Refresh(&account, &ctx, &bRejected);
     int bAsked = fake_https_last(&api, NULL) == 1;
+    int bNotRejected = !bRejected;
 
     fake_https_t last;
     fake_https_last(&api, &last);
@@ -168,7 +173,7 @@ static int check_bodies(void)
     /* A token too long to escape into its body is not sent cut short */
     memset(account.sRefreshToken, '"', sizeof(account.sRefreshToken) - 1);
     account.sRefreshToken[sizeof(account.sRefreshToken) - 1] = '\0';
-    int bLongRefused = !DirectGate_Login_Refresh(&account, &ctx) && fake_https_last(&api, NULL) == 1;
+    int bLongRefused = !DirectGate_Login_Refresh(&account, &ctx, NULL) && fake_https_last(&api, NULL) == 1;
 
     int bRedeemed = !DirectGate_Login_Redeem(&account, &ctx, "co\"de", "veri\\fier");
     fake_https_last(&api, &last);
@@ -186,15 +191,49 @@ static int check_bodies(void)
     DirectGate_Account_Cleanse(&account);
 
     CHECK(bRefused && bAsked && bToken, "the refresh token goes into its body as it is");
+    CHECK(bNotRejected, "a refusal that is not a 401 does not mean the sign-in is gone");
     CHECK(bLongRefused, "a refresh token too long to escape is not sent");
     CHECK(bRedeemed && bCode, "so do the code and its verifier");
     CHECK(bLongCode && bLongVerifier, "neither is sent when it does not fit");
     return 0;
 }
 
+/* A 401 to a refresh is the API saying the sign-in is gone - signed out from another device - and the caller drops
+   it. Nothing else may read that way: not another refusal, and not a request that never got an answer. */
+static int check_rejection(void)
+{
+    directgate_account_t account;
+    DirectGate_Account_Init(&account);
+    xstrncpy(account.sRefreshToken, sizeof(account.sRefreshToken), "refresh");
+
+    fake_https_t api;
+    CHECK(fake_https_begin(&api), "start the API");
+    directgate_login_ctx_t ctx = { api.sUrl, "", NULL, XTRUE };
+
+    fake_https_reply(&api, 401, "application/json", "{\"message\":\"Invalid Refresh Token: Refresh Token Not Found\"}");
+    xbool_t bGone = XFALSE;
+    int bRefused = !DirectGate_Login_Refresh(&account, &ctx, &bGone);
+
+    fake_https_reply(&api, 503, "application/json", "{\"message\":\"Identity provider is unreachable\"}");
+    xbool_t bOutage = XTRUE;
+    int bOutageRefused = !DirectGate_Login_Refresh(&account, &ctx, &bOutage);
+    fake_https_end(&api);
+
+    /* Nobody listens there any more */
+    xbool_t bUnreachable = XTRUE;
+    int bUnreachableRefused = !DirectGate_Login_Refresh(&account, &ctx, &bUnreachable);
+    DirectGate_Account_Cleanse(&account);
+
+    CHECK(bRefused && bGone, "a 401 to a refresh says the sign-in is gone");
+    CHECK(bOutageRefused && !bOutage, "an outage does not");
+    CHECK(bUnreachableRefused && !bUnreachable, "nor does an API that cannot be reached");
+    return 0;
+}
+
 int main(void)
 {
-    if (check_account() || check_parsers() || check_requests() || check_flows() || check_bodies()) return 1;
+    if (check_account() || check_parsers() || check_requests() || check_flows() || check_bodies() || check_rejection())
+        return 1;
     puts("client_login_guards_smoke: OK");
     return 0;
 }

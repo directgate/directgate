@@ -1835,9 +1835,32 @@ static xbool_t DirectGate_Client_IsInteractive(void)
 }
 
 /*
+ * The API turned the stored sign-in down for good: it was signed out from another device, so its access token is
+ * refused before it has run out, and its refresh token is gone. The dead session is forgotten rather than tried
+ * again on every run, and the user signs in again here when there is a terminal to do it in.
+ */
+static xbool_t DirectGate_Client_SignInAgain(directgate_account_t *pAccount,
+                                             const directgate_cfg_t *pCfg,
+                                             const directgate_login_ctx_t *pLogin)
+{
+    if (!DirectGate_Account_Forget(pCfg->sAuthPath))
+        xlogw("Failed to remove the signed-out session: %s", pCfg->sAuthPath);
+
+    if (!DirectGate_Client_IsInteractive())
+    {
+        xloge("This sign-in was signed out. Run 'dgcli login' from an interactive terminal.");
+        return XFALSE;
+    }
+
+    printf("\n  This sign-in was signed out, signing in again.\n");
+    return DirectGate_Login_Interactive(pAccount, pLogin);
+}
+
+/*
  * Fetches the account device list, refreshing the session once if the API
  * turns the token down. Ensure() already refreshes ahead of the expiry, so
- * this only covers a token that went stale between the two calls.
+ * this covers a token that went stale between the two calls, and one whose
+ * sign-in was signed out before it expired.
  */
 static xbool_t DirectGate_Client_LoadDevices(directgate_device_list_t *pList,
                                              directgate_cfg_t *pCfg,
@@ -1849,10 +1872,16 @@ static xbool_t DirectGate_Client_LoadDevices(directgate_device_list_t *pList,
     if (DirectGate_Devices_Fetch(pList, pCfg->sApiUrl, pCfg->sApiToken, sError, sizeof(sError)))
         return XTRUE;
 
-    if (pAccount == NULL || !xstrused(pAccount->sRefreshToken) || !DirectGate_Login_Refresh(pAccount, pLogin))
+    xbool_t bRejected = XFALSE;
+    if (pAccount == NULL || !xstrused(pAccount->sRefreshToken) || !DirectGate_Login_Refresh(pAccount, pLogin, &bRejected))
     {
-        xloge("Failed to list devices: %s", sError);
-        return XFALSE;
+        if (!bRejected)
+        {
+            xloge("Failed to list devices: %s", sError);
+            return XFALSE;
+        }
+
+        if (!DirectGate_Client_SignInAgain(pAccount, pCfg, pLogin)) return XFALSE;
     }
 
     DirectGate_Account_Save(pAccount, pCfg->sAuthPath);
