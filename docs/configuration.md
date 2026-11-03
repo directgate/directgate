@@ -119,12 +119,12 @@ Options are:
   -v <number>   Set/override verbosity level (0-5)
   -g <path>     Generate a client key file and exit
   -a <path>     Authorize this agent against an existing key file and exit
+  -m <org_id>   Enable organization-managed client keys for this organization (a UUID). With -e it is saved
+                with the pairing; on its own it is saved into the existing config, then exit. "" disables
   -r            Rotate agent identity keypair, push new pub to API, and exit
   -w            Enable WebRTC verbose logging (works with -v)
   -i            Init config and exit
   -e            Enroll device and exit
-  -m <org_id>   Enable organization-managed client keys for this organization (a UUID). With -e it is saved
-                with the pairing; on its own it is saved into the existing config, then exit. "" disables
   -s            Init SRP verifier and exit
   -h            Print version and usage
 ```

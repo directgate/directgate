@@ -623,6 +623,167 @@ static int check_guards(void)
     return 0;
 }
 
+/* Delivers one solid BGRA frame from @p pCapture, the way its thread would. */
+static void wlr_frame(directgate_wlr_capture_t *pCapture, uint32_t nWidth, uint32_t nHeight, uint32_t nPixel)
+{
+    uint32_t *pPixels = (uint32_t*)calloc((size_t)nWidth * nHeight, 4U);
+    if (pPixels == NULL) return;
+    for (size_t i = 0; i < (size_t)nWidth * nHeight; i++) pPixels[i] = nPixel;
+
+    directgate_wl_frame_t frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.eKind = DIRECTGATE_WL_FRAME_MAPPED;
+    frame.nWidth = nWidth;
+    frame.nHeight = nHeight;
+    frame.pPixels = (const uint8_t*)pPixels;
+    frame.nStride = nWidth * 4U;
+
+    pCapture->fnFrame(pCapture->pUserCtx, &frame);
+    free(pPixels);
+}
+
+/* ---------------- the wlroots fallback ---------------- */
+
+/* A portal that failed: the compositor is tried only when the portal has no
+ * RemoteDesktop interface at all, and the person did not say no. */
+static int wlr_decision(stub_answer_t eAnswer, directgate_wl_remote_t eRemote, const char *pExpect, const char *pWhat)
+{
+    stub_portal_reset();
+    fake_pw_reset();
+    stub.answers[0] = eAnswer;
+    stub.eRemote = eRemote;
+
+    directgate_wl_source_t *pSource = DirectGate_WL_SourceCreate(NULL, XFALSE);
+    CHECK(pSource != NULL && wait_state(pSource, DIRECTGATE_WL_FAILED), pWhat);
+    CHECK(stub.nWlrOpens == 0 && stub.nWlrCaptures == 0, "the compositor is never opened behind a portal that could ask");
+    CHECK(strstr(DirectGate_WL_SourceError(pSource), pExpect) != NULL, "and the portal's own reason is what is reported");
+
+    int nProbes = stub.nRemoteProbes;
+    DirectGate_WL_SourceDestroy(pSource);
+
+    if (eAnswer == STUB_DECLINE) CHECK(nProbes == 0, "a refusal does not even ask what the portal supports");
+    return 0;
+}
+
+static int check_wlroots(void)
+{
+    /* GNOME and KDE: the portal has RemoteDesktop, so whatever it said stands */
+    CHECK(wlr_decision(STUB_REFUSE, DIRECTGATE_WL_REMOTE_PRESENT, "refused", "a portal with RemoteDesktop that fails") == 0,
+        "a portal with RemoteDesktop keeps its failure");
+    CHECK(wlr_decision(STUB_REFUSE, DIRECTGATE_WL_REMOTE_UNKNOWN, "refused", "a portal that may have it fails") == 0,
+        "and so does one that may have it");
+    CHECK(wlr_decision(STUB_DECLINE, DIRECTGATE_WL_REMOTE_ABSENT, "declined", "a refusal fails") == 0,
+        "no means no, without even asking what the portal supports");
+
+    /* A portal that worked is never second-guessed */
+    stub_portal_reset();
+    fake_pw_reset();
+    stub.eRemote = DIRECTGATE_WL_REMOTE_ABSENT;
+    fake_pw_stream_t *pStream = NULL;
+    directgate_wl_source_t *pSource = DirectGate_WL_SourceCreate(NULL, XFALSE);
+    CHECK(pSource != NULL && (pStream = wait_node(31)) != NULL, "a granting portal");
+    serve(pStream, 0);
+    CHECK(wait_state(pSource, DIRECTGATE_WL_READY), "is used");
+    CHECK(stub.nRemoteProbes == 0 && stub.nWlrOpens == 0, "and nothing about the compositor is even asked");
+    DirectGate_WL_SourceDestroy(pSource);
+
+    /* Raspberry Pi OS: no RemoteDesktop, so the compositor's own protocols */
+    stub_portal_reset();
+    fake_pw_reset();
+    stub.answers[0] = STUB_REFUSE;
+    stub.eRemote = DIRECTGATE_WL_REMOTE_ABSENT;
+    stub.nStreams = 2;
+    stub.streams[1].nNodeId = 32;
+    stub.streams[1].nWidth = 32;
+    stub.streams[1].nHeight = 16;
+
+    pSource = DirectGate_WL_SourceCreate(NULL, XFALSE);
+    CHECK(pSource != NULL && wait_state(pSource, DIRECTGATE_WL_READY), "a portal without RemoteDesktop falls back");
+    CHECK(stub.nRemoteProbes == 1 && stub.nWlrOpens == 1 && stub.nWlrCaptures == 1, "to the compositor, once");
+    CHECK(stub.nWlrLastOutput == 31 && DirectGate_WL_SourceActiveNode(pSource) == 31, "copying the first screen");
+
+    uint32_t nWidth = 0, nHeight = 0;
+    CHECK(DirectGate_WL_SourceSize(pSource, &nWidth, &nHeight) && nWidth == 64 && nHeight == 32, "at its size");
+    CHECK(DirectGate_WL_SourceHasInput(pSource) && DirectGate_WL_SourceScreenCount(pSource) == 2, "with input, both screens");
+    CHECK(DirectGate_WL_SourcePortal(pSource) != NULL && !DirectGate_WL_SourceIsDmaBuf(pSource, NULL, NULL),
+        "input goes through the portal handle; nothing is exported");
+    CHECK(!DirectGate_WL_SourceLost(pSource, NULL, 0), "nothing lost");
+
+    uint8_t *pDst = (uint8_t*)calloc(1, 64 * 32 * 4);
+    CHECK(pDst != NULL, "allocate a frame");
+    wlr_frame(stub.pWlrLast, 64, 32, 0x00112233U);
+    CHECK(DirectGate_WL_SourceWaitFrame(pSource, 1000000) == XSTDOK, "a copied frame wakes the encoder");
+    CHECK(DirectGate_WL_SourceTakeFrame(pSource, &pDst, 64 * 32 * 4, 64, 32) == XSTDOK && pDst[0] == 0x33 && pDst[2] == 0x11,
+        "and is taken as BGRA");
+
+    CHECK(DirectGate_WL_SourceSelect(pSource, 32) == XSTDOK, "switch screens");
+    CHECK(stub.nWlrCaptures == 2 && stub.nWlrStopped == 1 && stub.nWlrLastOutput == 32, "the old copy stops, the new one runs");
+    CHECK(stub.nWlrRefreshes == 1 && DirectGate_WL_SourceActiveNode(pSource) == 32, "and is asked for a whole frame at once");
+    CHECK(DirectGate_WL_SourceSize(pSource, &nWidth, &nHeight) && nWidth == 32 && nHeight == 16, "at the new size");
+    CHECK(stub.nPipeWire == 0, "PipeWire is never involved");
+
+    stub.nWlrCaptureFails = 1;
+    CHECK(DirectGate_WL_SourceSelect(pSource, 31) == XSTDERR, "a screen that cannot be copied is refused");
+    CHECK(DirectGate_WL_SourceActiveNode(pSource) == 32 && stub.nWlrStopped == 1, "and the one that works stays");
+
+    stub.bWlrNoFormat = 1;
+    CHECK(DirectGate_WL_SourceSelect(pSource, 31) == XSTDERR, "so is one that never describes itself");
+    CHECK(stub.nWlrStopped == 2 && DirectGate_WL_SourceActiveNode(pSource) == 32, "its copy is stopped, the old one kept");
+    stub.bWlrNoFormat = 0;
+
+    char sLost[128] = { 0 };
+    stub.bWlrLost = XTRUE;
+    CHECK(DirectGate_WL_SourceLost(pSource, sLost, sizeof(sLost)) && strstr(sLost, "disconnected") != NULL,
+        "a copy that stopped is reported, with its reason");
+
+    free(pDst);
+    DirectGate_WL_SourceDestroy(pSource);
+    CHECK(stub.nWlrStopped == stub.nWlrCaptures && stub.nWlrClosed == 1, "everything stopped and closed with it");
+
+    /* Every way the fallback itself can fail is a failed source with a reason */
+    stub_portal_reset();
+    stub.answers[0] = STUB_REFUSE;
+    stub.eRemote = DIRECTGATE_WL_REMOTE_ABSENT;
+    stub.bWlrOpenFails = 1;
+    pSource = DirectGate_WL_SourceCreate(NULL, XFALSE);
+    CHECK(pSource != NULL && wait_state(pSource, DIRECTGATE_WL_FAILED), "a compositor without the protocols fails");
+    CHECK(strstr(DirectGate_WL_SourceError(pSource), "no remote desktop support") != NULL &&
+          strstr(DirectGate_WL_SourceError(pSource), "screen capture protocol") != NULL, "naming both halves of why");
+    DirectGate_WL_SourceDestroy(pSource);
+
+    stub_portal_reset();
+    stub.answers[0] = STUB_REFUSE;
+    stub.eRemote = DIRECTGATE_WL_REMOTE_ABSENT;
+    stub.nWlrCaptureFails = 1;
+    pSource = DirectGate_WL_SourceCreate(NULL, XFALSE);
+    CHECK(pSource != NULL && wait_state(pSource, DIRECTGATE_WL_FAILED), "a screen that cannot be copied fails");
+    CHECK(strstr(DirectGate_WL_SourceError(pSource), "could not be copied") != NULL, "and says so");
+    DirectGate_WL_SourceDestroy(pSource);
+    CHECK(stub.nWlrClosed == 1, "the compositor is closed again");
+
+    stub_portal_reset();
+    stub.answers[0] = STUB_REFUSE;
+    stub.eRemote = DIRECTGATE_WL_REMOTE_ABSENT;
+    stub.bWlrNoFormat = 1;
+    pSource = DirectGate_WL_SourceCreate(NULL, XFALSE);
+    CHECK(pSource != NULL && wait_state(pSource, DIRECTGATE_WL_FAILED), "a screen never described fails");
+    CHECK(strstr(DirectGate_WL_SourceError(pSource), "never described") != NULL, "and says so");
+    DirectGate_WL_SourceDestroy(pSource);
+    CHECK(stub.nWlrStopped == stub.nWlrCaptures && stub.nWlrClosed == 1, "with nothing left running");
+
+    /* Abandoned while the portal was still failing: nothing is opened after */
+    stub_portal_reset();
+    stub.answers[0] = STUB_HOLD_REFUSE;
+    stub.eRemote = DIRECTGATE_WL_REMOTE_ABSENT;
+    pSource = DirectGate_WL_SourceCreate(NULL, XFALSE);
+    CHECK(pSource != NULL, "a source that waits");
+    for (int i = 0; i < 2000 && !stub_portal_get(&stub.bHolding); i++) usleep(1000);
+    DirectGate_WL_SourceDestroy(pSource);
+    CHECK(stub.nWlrOpens == 0, "an abandoned request does not go on to the compositor");
+
+    return 0;
+}
+
 /* ---------------- both screens delivering at once ---------------- */
 
 typedef struct {
@@ -733,7 +894,7 @@ int main(void)
     CHECK(nStatus == 0, "two screens delivering at once during a switch do not deadlock it");
 
     int nFailed = check_fresh_grant() || check_remembered() || check_unwritable() || check_setup_failures() ||
-        check_mapped_frames() || check_exported_frames() || check_select() || check_guards();
+        check_mapped_frames() || check_exported_frames() || check_select() || check_guards() || check_wlroots();
 
     unlink(g_sToken);
     char sDeep[300];

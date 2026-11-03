@@ -491,7 +491,10 @@ elseif(UNIX)
     # libpipewire-0.3 and libdbus-1 are dlopen'd at runtime and never linked,
     # so this adds no package dependency and an X11 host without either
     # library runs exactly as it does today. Without the headers the feature
-    # is simply absent and the X11 build is unchanged.
+    # is simply absent and the X11 build is unchanged. wayland_wlr.c is the
+    # same feature on wlroots compositors (labwc, Wayfire, sway - Raspberry Pi
+    # OS), whose portal has no RemoteDesktop: libwayland-client and
+    # libxkbcommon are dlopen'd too and need no headers at all.
     if(PKG_CONFIG_FOUND)
         pkg_check_modules(PIPEWIRE libpipewire-0.3)
         pkg_check_modules(DBUS dbus-1)
@@ -502,6 +505,7 @@ elseif(UNIX)
         target_sources(directgate PRIVATE
             ${AGENT_DIR}/desktop/wayland_capture.c
             ${AGENT_DIR}/desktop/wayland_portal.c
+            ${AGENT_DIR}/desktop/wayland_wlr.c
             ${AGENT_DIR}/desktop/desktop_wayland.c)
         target_compile_definitions(directgate PRIVATE DIRECTGATE_DESKTOP_HAS_WAYLAND=1)
         # SYSTEM, so the warning settings this project builds itself with do

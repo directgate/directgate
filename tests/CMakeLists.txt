@@ -305,7 +305,7 @@ if(UNIX AND NOT APPLE)
 
     if(DBUS_FOUND)
         # Serialize actual portal messages, without connecting to a desktop.
-        directgate_smoke(wayland_portal_smoke)
+        directgate_smoke(wayland_portal_smoke ${AGENT_DIR}/desktop/wayland_wlr.c)
         target_compile_definitions(wayland_portal_smoke PRIVATE DIRECTGATE_DESKTOP_HAS_WAYLAND=1)
         target_include_directories(wayland_portal_smoke SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
         target_link_libraries(wayland_portal_smoke PRIVATE ${DBUS_LIBRARIES} ${CMAKE_DL_LIBS})
@@ -313,11 +313,23 @@ if(UNIX AND NOT APPLE)
         # The same client against a fake portal on a private dbus-daemon: the
         # whole handshake, input and every refusal a real portal can give.
         # Skips (77) where there is no dbus-daemon to start.
-        directgate_smoke(wayland_portal_bus_smoke ${AGENT_DIR}/desktop/wayland_portal.c)
+        directgate_smoke(wayland_portal_bus_smoke ${AGENT_DIR}/desktop/wayland_portal.c ${AGENT_DIR}/desktop/wayland_wlr.c)
         target_compile_definitions(wayland_portal_bus_smoke PRIVATE DIRECTGATE_DESKTOP_HAS_WAYLAND=1)
         target_include_directories(wayland_portal_bus_smoke SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
         target_link_libraries(wayland_portal_bus_smoke PRIVATE ${DBUS_LIBRARIES} ${CMAKE_DL_LIBS} Threads::Threads)
         set_tests_properties(wayland_portal_bus_smoke PROPERTIES SKIP_RETURN_CODE 77)
+
+        # The wlroots backend - what runs on Raspberry Pi OS, labwc, Wayfire and
+        # sway, whose portal has no RemoteDesktop - against a real compositor
+        # started headless: capture, damage pacing, pointer, keyboard, lent keys
+        # for other scripts, and the compositor going away. Includes
+        # wayland_wlr.c itself. Skips (77) without labwc or sway; point
+        # DIRECTGATE_WLR_COMPOSITOR at one that is not on the PATH.
+        directgate_smoke(wayland_wlr_smoke ${AGENT_DIR}/desktop/wayland_portal.c)
+        target_compile_definitions(wayland_wlr_smoke PRIVATE DIRECTGATE_DESKTOP_HAS_WAYLAND=1)
+        target_include_directories(wayland_wlr_smoke SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
+        target_link_libraries(wayland_wlr_smoke PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+        set_tests_properties(wayland_wlr_smoke PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
     if(PIPEWIRE_FOUND)

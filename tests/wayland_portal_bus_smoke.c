@@ -15,6 +15,11 @@
  * answer, leave out the session or the streams, be too old to remember a
  * grant, refuse input events (and have the refusal pinned on the right one),
  * be KDE (vertical scroll is inverted there), not be running, or lose the bus.
+ * It can also be the portal a wlroots compositor runs - xdg-desktop-portal-wlr,
+ * Raspberry Pi OS - which has ScreenCast and no RemoteDesktop at all, answered
+ * with the errors the real frontend gives; the probe that decides whether the
+ * agent may use the compositor's own protocols must tell that apart from a
+ * portal that merely failed.
  *
  * The bus is private and has no service directories, so nothing installed on
  * the machine - the real portal included - can be activated onto it.
@@ -83,6 +88,7 @@ typedef struct {
     int nPipeWire;            /* 0 an fd, 1 an error, 2 a reply without one */
     int bRefuseKeysym;
     int bRefuseMotion;
+    int nRemote;              /* 0 RemoteDesktop exists, 1 it does not (wlroots), 2 it errors */
 
     /* What was asked of it. */
     int nCreate, nSelectDevices, nSelectSources, nStart, nOpenPipeWire, nClose;
@@ -278,6 +284,16 @@ static DBusHandlerResult handle_properties(DBusMessage *pMsg)
         return DBUS_HANDLER_RESULT_HANDLED;
     }
 
+    /* What xdg-desktop-portal answers when no backend implements the interface */
+    if (g_portal.nRemote && pOn != NULL && strcmp(pOn, PORTAL_REMOTE) == 0)
+    {
+        send_reply(g_portal.nRemote == 1 ?
+            dbus_message_new_error(pMsg, DBUS_ERROR_INVALID_ARGS, "No such interface \u201c" PORTAL_REMOTE "\u201d") :
+            dbus_message_new_error(pMsg, DBUS_ERROR_FAILED, "the portal is still starting"));
+
+        return DBUS_HANDLER_RESULT_HANDLED;
+    }
+
     dbus_uint32_t nValue = 0;
     if (pProp != NULL && strcmp(pProp, "version") == 0) nValue = (pOn != NULL && strcmp(pOn, PORTAL_SCREEN) == 0) ? 5 : 2;
     else if (pProp != NULL && strcmp(pProp, "AvailableCursorModes") == 0) nValue = 7;
@@ -397,6 +413,14 @@ static DBusHandlerResult handle_call(DBusConnection *pConn, DBusMessage *pMsg, v
 
     if (strcmp(pIface, PORTAL_REMOTE) != 0 && strcmp(pIface, PORTAL_SCREEN) != 0)
         return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+
+    if (g_portal.nRemote == 1 && strcmp(pIface, PORTAL_REMOTE) == 0)
+    {
+        send_reply(dbus_message_new_error(pMsg, DBUS_ERROR_UNKNOWN_METHOD,
+            "No such interface \u201c" PORTAL_REMOTE "\u201d on object at path " PORTAL_PATH));
+
+        return DBUS_HANDLER_RESULT_HANDLED;
+    }
 
     if (strcmp(pMember, "OpenPipeWireRemote") == 0) return handle_pipewire(pMsg);
 
@@ -523,7 +547,7 @@ static void portal_reset(void)
     g_portal.bRejectRestoredGrant = g_portal.bRejectMultiple = g_portal.bRejectDevices = g_portal.bRejectSources = 0;
     g_portal.bDevicesError = g_portal.bStartOtherPath = g_portal.bNoSessionHandle = g_portal.bNoStreams = 0;
     g_portal.bNoToken = g_portal.bNoDevices = g_portal.bPropsError = g_portal.nPipeWire = 0;
-    g_portal.bRefuseKeysym = g_portal.bRefuseMotion = g_portal.nStartResponse = 0;
+    g_portal.bRefuseKeysym = g_portal.bRefuseMotion = g_portal.nStartResponse = g_portal.nRemote = 0;
     g_portal.nCreate = g_portal.nSelectDevices = g_portal.nSelectSources = g_portal.nStart = 0;
     g_portal.nOpenPipeWire = g_portal.nClose = g_portal.nDevicesWithToken = g_portal.nDevicesPersist = 0;
     g_portal.nSourcesMultiple = g_portal.nMotions = g_portal.nButtons = g_portal.nAxis = g_portal.nRelative = 0;
@@ -1000,6 +1024,35 @@ static int scenario_kde(void)
     return 0;
 }
 
+static int scenario_wlroots(void)
+{
+    char sErr[512];
+    portal_reset();
+
+    /* GNOME and KDE: the interface is there, so the compositor is never used */
+    CHECK(DirectGate_WL_PortalRemoteDesktop(sErr, sizeof(sErr)) == DIRECTGATE_WL_REMOTE_PRESENT,
+        "a portal with RemoteDesktop says so");
+    CHECK(g_portal.nCreate == 0 && g_portal.nStart == 0, "and is asked nothing for it - no session, no prompt");
+
+    /* Raspberry Pi OS: the session cannot even be created, and the probe says why */
+    g_portal.nRemote = 1;
+    CHECK(DirectGate_WL_PortalOpen(NULL, NULL, 0, NULL, NULL, sErr, sizeof(sErr)) == NULL,
+        "a portal without RemoteDesktop cannot open a session");
+    CHECK(strstr(sErr, "No such interface") != NULL, "and the refusal names the missing interface");
+    CHECK(DirectGate_WL_PortalRemoteDesktop(sErr, sizeof(sErr)) == DIRECTGATE_WL_REMOTE_ABSENT,
+        "the probe finds no RemoteDesktop");
+    CHECK(strstr(sErr, DBUS_ERROR_INVALID_ARGS) != NULL, "and reports the portal's answer");
+
+    /* An error that is not "there is no such interface" proves nothing */
+    g_portal.nRemote = 2;
+    CHECK(DirectGate_WL_PortalRemoteDesktop(sErr, sizeof(sErr)) == DIRECTGATE_WL_REMOTE_UNKNOWN,
+        "a failing portal is not taken for a missing one");
+
+    portal_reset();
+    CHECK(DirectGate_WL_PortalFromWlr(NULL) == NULL, "there is no stand-in without a compositor");
+    return 0;
+}
+
 static int scenario_no_portal(void)
 {
     char sErr[512];
@@ -1009,6 +1062,8 @@ static int scenario_no_portal(void)
     CHECK(DirectGate_WL_PortalOpen(NULL, NULL, 0, NULL, NULL, sErr, sizeof(sErr)) == NULL,
         "without a portal nothing opens");
     CHECK(strstr(sErr, "refused CreateSession") != NULL, "the missing portal is explained");
+    CHECK(DirectGate_WL_PortalRemoteDesktop(sErr, sizeof(sErr)) == DIRECTGATE_WL_REMOTE_ABSENT,
+        "no portal at all has no RemoteDesktop either");
     return 0;
 }
 
@@ -1099,6 +1154,7 @@ int main(void)
         if (!nResult) nResult = scenario_refusals();
         if (!nResult) nResult = scenario_old_portal();
         if (!nResult) nResult = scenario_kde();
+        if (!nResult) nResult = scenario_wlroots();
         if (!nResult) nResult = scenario_no_portal();
         if (!nResult) nResult = scenario_bus_lost();
     }
