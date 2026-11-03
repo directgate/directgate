@@ -125,11 +125,31 @@ The relay can never read terminal, file, editor, desktop, or signaling payloads.
 
 See [Security model](docs/security.md) for the full design and trust assumptions, and [directgate.io/security](https://directgate.io/security) for the threat model and FAQ.
 
+## Supported platforms
+
+The agent is officially supported on Windows, macOS and Linux, with remote desktop on both Xorg and Wayland - from an x64 workstation to a Raspberry Pi.
+
+| | Supported |
+|---|---|
+| **Operating systems** | `Windows` `macOS` `Linux` |
+| **CPU architectures** | `x86` `x64` `ARM64` `ARMHF` |
+| **Display servers** | `X11 / Xorg` `Wayland` |
+| **Wayland compositors** | `KWin` `Mutter` `wlroots` `labwc` `Wayfire` `Sway` |
+| **Screen capture** | `X11` `XDG portals` `PipeWire` |
+| **Linux packages** | `Debian-based (apt)` `RPM-based (dnf)` |
+| **Any other Linux distribution** | `Build from source` |
+
+On Linux the agent picks the capture and input path from the session it runs in, not from what happens to be installed:
+
+- **Xorg** - XShm capture and XTest input.
+- **KDE Plasma (KWin) and GNOME (Mutter)** - the XDG desktop portal's screen cast over PipeWire, with input through the RemoteDesktop portal. The first connection asks for permission on the remote machine; the grant is remembered after that.
+- **wlroots compositors** - labwc (Raspberry Pi OS), Wayfire and Sway - the compositor's own screencopy with a virtual keyboard and pointer, since their portal has no RemoteDesktop.
+
+All three feed the same H.264 pipeline, with the same GPU encoder probe. See [Linux desktop sessions](docs/linux.md) for requirements and the differences between them.
+
 ## Installation
 
 The easiest way to install the agent is from the official DirectGate package repositories. Once added, the agent stays up to date through your normal system updates. The debugsource packages are published for every release, so you can rebuild from source and compare against the distributed binaries.
-
-Supported on Linux, Windows and macOS across x86, x86_64, ARMHF and ARM64 architectures.
 
 **Debian / Ubuntu / Raspbian (apt)**
 
