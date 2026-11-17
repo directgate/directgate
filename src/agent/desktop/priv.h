@@ -102,6 +102,14 @@ int DirectGate_Desktop_OpenX11(directgate_session_t *pSession);
 #ifdef DIRECTGATE_DESKTOP_HAS_WAYLAND
 int DirectGate_Desktop_ResumeWayland(directgate_session_t *pSession);
 #endif
+
+#ifdef DIRECTGATE_TESTING
+/* The X11 raw capture's frame conversion (stream.c), for images of any
+ * layout a test can build without a server. */
+struct _XImage;
+void DirectGate_Desktop_TestConvertRaw(uint8_t *pFrame, uint32_t nFrameWidth, uint32_t nFrameHeight,
+                                       struct _XImage *pImage, uint32_t nCaptureWidth, uint32_t nCaptureHeight);
+#endif
 #elif defined(__APPLE__)
 int DirectGate_Desktop_OpenMacOS(directgate_session_t *pSession);
 #elif defined(_WIN32)

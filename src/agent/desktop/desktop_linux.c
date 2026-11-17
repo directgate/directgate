@@ -839,8 +839,18 @@ static void DirectGate_Desktop_X11Enc_CaptureFrame(directgate_x11enc_t *pEnc, ui
 
     uint64_t nCapturedUs = DirectGate_Desktop_X11Enc_MonotonicUs();
 
-    /* Normalize into BGRA, scaling to the encode size when needed. */
-    if (pEnc->pCaptureBGRA != NULL)
+    /* Normalize into BGRA, scaling to the encode size when needed. Rows that
+     * already are BGRA are scaled straight out of the captured image: the
+     * scaler takes their stride, and copying them into pCaptureBGRA first
+     * would only hand it the same bytes, a full-screen copy later. The image
+     * is the capture rectangle's size either way (it is created or requested
+     * at that size), which Normalize relies on as well. */
+    if (pEnc->pCaptureBGRA != NULL && pEnc->bDirectBGRA)
+    {
+        DirectGate_YUV_ScaleBGRA(pEnc->pFrameBGRA, pEnc->nEncodeWidth, pEnc->nEncodeHeight,
+            (const uint8_t*)pImage->data, pEnc->nCaptureWidth, pEnc->nCaptureHeight, (size_t)pImage->bytes_per_line);
+    }
+    else if (pEnc->pCaptureBGRA != NULL)
     {
         DirectGate_Desktop_X11Enc_Normalize(pEnc, pImage, pEnc->pCaptureBGRA);
         DirectGate_YUV_ScaleBGRA(pEnc->pFrameBGRA, pEnc->nEncodeWidth, pEnc->nEncodeHeight,
