@@ -83,6 +83,8 @@ The pipeline degrades in this order, and the desktop status payload reports whic
 2. `h264-datachannel` - `desktop-frame-encoded` H.264 chunks over the AES-SIV-encrypted DataChannel
 3. `raw-rgba` - `desktop-frame-chunk` raw frames (debug / legacy fallback)
 
+A `h264-datachannel` pipeline the browser asked for (`fallback-datachannel`, sent when a media track delivered no picture) is kept for the rest of the desktop session, so the browser only asks while the viewer is actually looking: page visible and window focused. Such a session sends nothing on the video track, and its background TURN -> P2P migration commits without waiting for media there; the agent's side never required it (`migration-ready` and `migration-commit` need the candidate's data channel and an open track, not packets on it).
+
 Desktop input, control, status, terminal, file-manager, and file-transfer messages all stay on the encrypted DirectGate protocol over the DataChannel. TURN relays forward only encrypted WebRTC media/DataChannel packets - they never see plaintext desktop video or control messages.
 
 Desktop status is a `type: "data"` packet with `payloadType: "desktop-status"` and a JSON payload; key fields are `status`, `pipeline`
