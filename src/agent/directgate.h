@@ -58,6 +58,9 @@ typedef struct directgate_conn_ {
      * against nLastRelayRecvMs so exactly one probe goes out per silent
      * stretch instead of one per event loop tick. */
     uint64_t nLastRelayProbeMs;
+    /* When the outstanding probe must have been answered by, or 0 when it is only held
+     * to the idle timeout: it went out behind queued data, which it has to wait for. */
+    uint64_t nRelayProbeDeadlineMs;
     /* When the event loop last reached its checks. A pass that comes much
      * later than the loop waits for input means the loop was blocked, and
      * could hear neither the relay nor a peer for that long. */
@@ -89,7 +92,9 @@ typedef struct directgate_conn_ {
        DirectGate_HandleRefreshStatus is what may then clear the enrollment. */
     xbool_t bEnrollmentDoubt;
     xbool_t bRoleSent;
-
+    /* What detached session holds in place of a relay link: no socket and never registered with the event loop,
+       it only lets the data channel's messages through the usual dispatch, which finds this connection from it. */
+    xapi_session_t detachLink;
     /* Temporary desktop share with one time access, limited fail attempts and expiration time window */
     directgate_temporary_desktop_share_t temporaryDesktopShares[DIRECTGATE_MAX_TEMPORARY_DESKTOP_SHARES];
 } directgate_conn_t;
@@ -100,6 +105,9 @@ int DirectGate_TestHandleTransportMessage(xapi_session_t *pApiSession,
                                           size_t nPayload);
 void DirectGate_TestCheckWebRTCKeepalive(directgate_conn_t *pConn);
 void DirectGate_TestCheckRelayKeepalive(directgate_conn_t *pConn);
+void DirectGate_TestCheckWebRTCDrops(directgate_conn_t *pConn);
+void DirectGate_TestCheckDetachedSessions(directgate_conn_t *pConn);
+void DirectGate_TestHandleDataChannelMessage(directgate_session_t *pSession, const uint8_t *pData, size_t nLen);
 void DirectGate_TestCheckLoopStall(directgate_conn_t *pConn, uint32_t nWaitMs);
 void DirectGate_TestCheckAuthTimeouts(directgate_conn_t *pConn);
 xbool_t DirectGate_TestCheckTokenRefresh(directgate_conn_t *pConn);

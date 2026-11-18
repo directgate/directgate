@@ -462,11 +462,12 @@ int DirectGate_Session_Close(directgate_session_t *pSession, const char *pReason
         xstrused(pReason) ? pReason : "session error");
 
     /* NOTE: Send closed status via WebSocket directly to avoid WebRTC because
-       Session_Remove destroys WebRTC immediately after, racing the async send */
+       Session_Remove destroys WebRTC immediately after, racing the async send.
+       A detached session has no relay route, and its id may belong to another client of the relay by now. */
     xjson_obj_t *pHeader = DirectGate_Proto_BuildStatus("closed", pSession->nSessionId);
     if (pHeader != NULL)
     {
-        if (pSession->pWsSession != NULL)
+        if (pSession->pWsSession != NULL && !pSession->bDetached)
         {
             xbyte_buffer_t msg;
             XByteBuffer_Init(&msg, XSTDNON, XFALSE);
@@ -533,6 +534,13 @@ int DirectGate_Session_Send(directgate_session_t *pSession, xjson_obj_t *pHeader
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), msg.nUsed);
 
         DirectGate_WebRTC_NoteSendFailure(pRTC);
+    }
+
+    /* Nowhere else to go: the relay may have handed this session's id to another client */
+    if (pSession->bDetached)
+    {
+        XByteBuffer_Clear(&msg);
+        return XAPI_DISCONNECT;
     }
 
     nStatus = DirectGate_WebSock_Send(pApiSession, msg.pData, msg.nUsed);

@@ -181,6 +181,461 @@ static int test_loop_stall(void)
     return 0;
 }
 
+static int count_pings(const xbyte_buffer_t *pBuffer)
+{
+    /* Unmasked control frames from the agent: 0x89 is a final PING */
+    int nPings = 0;
+    for (size_t i = 0; i + 1 < pBuffer->nUsed; i++)
+        if (pBuffer->pData[i] == 0x89 && (pBuffer->pData[i + 1] & 0x7F) == 0) nPings++;
+    return nPings;
+}
+
+/* A relay link can die without a word: the agent then went on sending into it, and only noticed when a minute passed
+   with nothing read. A probe that has nothing queued ahead of it is now owed an answer within seconds, and a data
+   channel going down sends one at once, since the same network change usually takes the relay link with it. */
+static int test_relay_probe(void)
+{
+    xlog_init("connection_lifecycle_smoke", XLOG_ALL, XFALSE);
+    xlog_screen(XFALSE);
+    xlog_callback(collect_log, NULL);
+
+    directgate_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    xstrncpy(cfg.auth.sSaltHex, sizeof(cfg.auth.sSaltHex),
+        "00000000000000000000000000000000"
+        "00000000000000000000000000000000");
+    xstrncpy(cfg.auth.sVerifierHex, sizeof(cfg.auth.sVerifierHex), "configured");
+
+    directgate_conn_t conn;
+    memset(&conn, 0, sizeof(conn));
+    conn.pCfg = &cfg;
+    DirectGate_SessionMgr_Init(&conn.mgr, &cfg);
+
+    /* A real socket under the relay session, so the kernel queue behind it can be read */
+    XSOCKET pair[2] = {XSOCK_INVALID, XSOCK_INVALID};
+    CHECK(XSock_CreatePair(pair) == XSTDOK, "the probe test socket pair is created");
+
+    xapi_session_t relay;
+    CHECK(dispatch(&conn, &relay, XAPI_CB_CONNECTED) == XAPI_CONTINUE, "the probe test relay connects");
+    CHECK(conn.nRelayProbeDeadlineMs == 0, "a fresh link owes no answer");
+    relay.sock.nFD = pair[0];
+    relay.nEvents = XPOLLIO;
+    conn.bRoleSent = XTRUE;
+
+    /* Silent for the probe interval with nothing queued: the probe is owed an answer within seconds */
+    uint64_t nNowMs = XTime_GetMonoMs();
+    conn.nLastRelayRecvMs = nNowMs - 21000ULL;
+    DirectGate_TestCheckRelayKeepalive(&conn);
+    CHECK(count_pings(&relay.txBuffer) == 1, "an idle link is probed");
+    CHECK(conn.nRelayProbeDeadlineMs >= nNowMs + 7000ULL && conn.nRelayProbeDeadlineMs <= nNowMs + 9000ULL,
+        "a probe with nothing ahead of it is owed an answer within seconds");
+
+    g_sLogged[0] = '\0';
+    DirectGate_TestCheckRelayKeepalive(&conn);
+    CHECK(count_pings(&relay.txBuffer) == 1, "no second probe goes out while the first is unanswered");
+    CHECK(strstr(g_sLogged, "unanswered") == NULL, "nor is the link given up before the answer is due");
+
+    /* Answered in time: a frame read since the probe ends the wait, even with a deadline left behind */
+    nNowMs = XTime_GetMonoMs();
+    conn.nLastRelayProbeMs = nNowMs - 2000ULL;
+    conn.nLastRelayRecvMs = nNowMs - 1000ULL;
+    conn.nRelayProbeDeadlineMs = nNowMs - 1ULL;
+    g_sLogged[0] = '\0';
+    DirectGate_TestCheckRelayKeepalive(&conn);
+    CHECK(strstr(g_sLogged, "unanswered") == NULL && strstr(g_sLogged, "keepalive timeout") == NULL,
+        "a link that answered after the probe is kept, whatever the deadline says");
+
+    /* Not answered: the link is given up long before the idle timeout */
+    XByteBuffer_Clear(&relay.txBuffer);
+    nNowMs = XTime_GetMonoMs();
+    conn.nLastRelayRecvMs = nNowMs - 30000ULL;
+    conn.nLastRelayProbeMs = nNowMs - 9000ULL;
+    conn.nRelayProbeDeadlineMs = nNowMs - 1000ULL;
+    g_sLogged[0] = '\0';
+    DirectGate_TestCheckRelayKeepalive(&conn);
+    CHECK(strstr(g_sLogged, "Relay probe went unanswered") != NULL, "an unanswered probe gives the link up");
+
+    /* The same probe behind queued data is held to the idle timeout only: a slow link that drains is not dead */
+    conn.nLastRelayProbeMs = 0;
+    conn.nRelayProbeDeadlineMs = 0;
+    conn.nLastRelayRecvMs = XTime_GetMonoMs() - 21000ULL;
+    CHECK(XByteBuffer_Add(&relay.txBuffer, (const uint8_t*)"queued", 6) > 0, "data is queued for the relay");
+    DirectGate_TestCheckRelayKeepalive(&conn);
+    CHECK(conn.nLastRelayProbeMs > 0 && conn.nRelayProbeDeadlineMs == 0, "a probe behind queued data owes no prompt answer");
+    XByteBuffer_Clear(&relay.txBuffer);
+
+    /* Data the kernel still holds counts as queued too */
+    char sUnread[256];
+    memset(sUnread, 'k', sizeof(sUnread));
+    CHECK(send(pair[0], sUnread, sizeof(sUnread), 0) == (ssize_t)sizeof(sUnread), "data waits unread in the kernel");
+    conn.nLastRelayProbeMs = 0;
+    conn.nLastRelayRecvMs = XTime_GetMonoMs() - 21000ULL;
+    DirectGate_TestCheckRelayKeepalive(&conn);
+    CHECK(conn.nLastRelayProbeMs > 0 && conn.nRelayProbeDeadlineMs == 0, "a probe behind kernel data owes no prompt answer");
+    CHECK(recv(pair[1], sUnread, sizeof(sUnread), 0) > 0, "the kernel queue drains");
+
+    /* A blocked loop moves the deadline on by the block: an answer may be sitting unread */
+    conn.nRelayProbeDeadlineMs = 5000ULL;
+    nNowMs = XTime_GetMonoMs();
+    conn.nLoopPassMs = nNowMs - 3100ULL;
+    DirectGate_TestCheckLoopStall(&conn, 100);
+    CHECK(conn.nRelayProbeDeadlineMs >= 7900ULL && conn.nRelayProbeDeadlineMs <= 8100ULL,
+        "a blocked loop moves the answer deadline by the time it was blocked");
+    conn.nRelayProbeDeadlineMs = 0;
+    nNowMs = XTime_GetMonoMs();
+    conn.nLoopPassMs = nNowMs - 3100ULL;
+    DirectGate_TestCheckLoopStall(&conn, 100);
+    CHECK(conn.nRelayProbeDeadlineMs == 0, "and arms none that was not set");
+
+    /* A data channel going down probes the relay at once, recently heard from or not */
+    XByteBuffer_Clear(&relay.txBuffer);
+    directgate_session_t *pPeer = DirectGate_SessionMgr_Create(&conn.mgr, 81);
+    CHECK(pPeer != NULL, "the drop test session is created");
+    pPeer->webrtc.bConnected = XTRUE;
+    pPeer->webrtc.nDataChannelID = 0;
+    conn.nLastRelayRecvMs = XTime_GetMonoMs();
+    conn.nLastRelayProbeMs = 0;
+    DirectGate_TestCheckWebRTCDrops(&conn);
+    CHECK(count_pings(&relay.txBuffer) == 0 && pPeer->bWebRTCWasUp, "a channel that is up probes nothing");
+    DirectGate_TestCheckWebRTCDrops(&conn);
+    CHECK(count_pings(&relay.txBuffer) == 0, "nor does one that stays up");
+
+    pPeer->webrtc.bConnected = XFALSE;
+    DirectGate_TestCheckWebRTCDrops(&conn);
+    CHECK(count_pings(&relay.txBuffer) == 1, "a channel that went down probes the relay");
+    CHECK(conn.nRelayProbeDeadlineMs > 0, "and the probe is owed a prompt answer");
+    DirectGate_TestCheckWebRTCDrops(&conn);
+    CHECK(count_pings(&relay.txBuffer) == 1 && !pPeer->bWebRTCWasUp, "the drop is seen once");
+
+    /* A second drop while the first probe is out sends nothing more */
+    pPeer->webrtc.bConnected = XTRUE;
+    DirectGate_TestCheckWebRTCDrops(&conn);
+    pPeer->webrtc.bConnected = XFALSE;
+    DirectGate_TestCheckWebRTCDrops(&conn);
+    CHECK(count_pings(&relay.txBuffer) == 1, "no second probe while the first is unanswered");
+
+    /* Once answered, a channel that stays down sends no further probe */
+    conn.nLastRelayRecvMs = XTime_GetMonoMs();
+    conn.nLastRelayProbeMs = conn.nLastRelayRecvMs - 1ULL;
+    DirectGate_TestCheckWebRTCDrops(&conn);
+    CHECK(count_pings(&relay.txBuffer) == 1, "a channel that stays down probes nothing more once answered");
+
+    /* The relay liveness check that runs every pass looks for drops itself */
+    XByteBuffer_Clear(&relay.txBuffer);
+    conn.nLastRelayRecvMs = XTime_GetMonoMs();
+    conn.nLastRelayProbeMs = 0;
+    pPeer->webrtc.bConnected = XTRUE;
+    DirectGate_TestCheckRelayKeepalive(&conn);
+    pPeer->webrtc.bConnected = XFALSE;
+    DirectGate_TestCheckRelayKeepalive(&conn);
+    CHECK(count_pings(&relay.txBuffer) == 1, "the per-pass relay check probes on a drop");
+
+    /* Without a relay link there is nothing to probe */
+    xapi_session_t *pSaved = conn.pWsSession;
+    conn.pWsSession = NULL;
+    conn.nLastRelayProbeMs = 0;
+    pPeer->webrtc.bConnected = XTRUE;
+    DirectGate_TestCheckWebRTCDrops(&conn);
+    pPeer->webrtc.bConnected = XFALSE;
+    DirectGate_TestCheckWebRTCDrops(&conn);
+    CHECK(conn.nLastRelayProbeMs == 0, "a drop with no relay link probes nothing");
+    conn.pWsSession = pSaved;
+
+    XByteBuffer_Clear(&relay.txBuffer);
+    DirectGate_SessionMgr_Destroy(&conn.mgr);
+    xclosesock(pair[0]);
+    xclosesock(pair[1]);
+
+#if defined(__linux__)
+    /* On a real TCP link the kernel is told to give up on data that stays unacknowledged */
+    xsock_t server, client;
+    uint16_t nPort = 0;
+    for (uint16_t nTry = 39700; nTry < 39800 && !nPort; nTry++)
+    {
+        if (XSock_Create(&server, XSOCK_TCP_SERVER | XSOCK_REUSEADDR, "127.0.0.1", nTry) != XSOCK_INVALID &&
+            XSock_Status(&server) == XSOCK_ERR_NONE) nPort = nTry;
+        else XSock_Close(&server);
+    }
+
+    if (nPort)
+    {
+        CHECK(XSock_Create(&client, XSOCK_TCP_CLIENT, "127.0.0.1", nPort) != XSOCK_INVALID, "the TCP client connects");
+
+        xapi_ctx_t ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.eCbType = XAPI_CB_CONNECTED;
+        memset(&relay, 0, sizeof(relay));
+        relay.pSessionData = &conn;
+        relay.sock = client;
+        CHECK(DirectGate_ServiceCallback(&ctx, &relay) == XAPI_CONTINUE, "a TCP relay link connects");
+
+        unsigned int nValue = 0;
+        socklen_t nLen = sizeof(nValue);
+        CHECK(getsockopt(client.nFD, IPPROTO_TCP, TCP_USER_TIMEOUT, &nValue, &nLen) == 0 && nValue == 20000U,
+            "the relay link gives up on data unacknowledged for 20 s");
+
+        XByteBuffer_Clear(&relay.txBuffer);
+        XSock_Close(&client);
+        XSock_Close(&server);
+    }
+#endif
+
+    xlog_destroy();
+    return 0;
+}
+
+#define DETACH_DEVICE_ID "device-detach"
+
+/* An authenticated desktop with its data channel up, keys on both halves, as a finished handshake leaves it */
+static directgate_session_t* detach_session(directgate_conn_t *pConn, xapi_session_t *pRelay, uint32_t nSessionId,
+                                            directgate_e2e_t *pPeer)
+{
+    directgate_session_t *pSession = DirectGate_SessionMgr_Create(&pConn->mgr, nSessionId);
+    if (pSession == NULL) return NULL;
+
+    uint8_t sKey[32], agentNonce[DIRECTGATE_SRP_NONCE_SIZE], clientNonce[DIRECTGATE_SRP_NONCE_SIZE];
+    memset(sKey, 0x5c, sizeof(sKey));
+    memset(agentNonce, 0x11, sizeof(agentNonce));
+    memset(clientNonce, 0x22, sizeof(clientNonce));
+
+    DirectGate_E2E_Init(&pSession->e2e);
+    if (pPeer != NULL) DirectGate_E2E_Init(pPeer);
+    if (!DirectGate_E2E_DeriveFromSRP(&pSession->e2e, sKey, sizeof(sKey), agentNonce, clientNonce,
+            sizeof(agentNonce), DETACH_DEVICE_ID, XTRUE) ||
+        (pPeer != NULL && !DirectGate_E2E_DeriveFromSRP(pPeer, sKey, sizeof(sKey), agentNonce, clientNonce,
+            sizeof(agentNonce), DETACH_DEVICE_ID, XFALSE))) return NULL;
+
+    pSession->pWsSession = pRelay;
+    pSession->bAuthenticated = XTRUE;
+    pSession->eActiveMode = DIRECTGATE_SESSION_MODE_DESKTOP;
+    pSession->webrtc.bConnected = XTRUE;
+    pSession->webrtc.nDataChannelID = 0;
+    return pSession;
+}
+
+static int relay_status(directgate_conn_t *pConn, xapi_session_t *pRelay, uint32_t nSessionId, const char *pReason)
+{
+    xjson_obj_t *pHeader = DirectGate_Proto_BuildStatus("closed", nSessionId);
+    if (pHeader != NULL && pReason != NULL) XJSON_AddString(pHeader, "reason", pReason);
+    return send_header(pConn, pRelay, pHeader);
+}
+
+/* What the browser puts on the data channel: sealed with the session keys */
+static void data_channel(directgate_session_t *pSession, directgate_e2e_t *pPeer, xjson_obj_t *pHeader,
+                         const char *pPayload)
+{
+    xbyte_buffer_t packet;
+    XByteBuffer_Init(&packet, XSTDNON, XFALSE);
+    size_t nPayload = pPayload != NULL ? strlen(pPayload) : 0;
+
+    DirectGate_Proto_AddCC(pHeader, pPeer, 0);
+    if (DirectGate_Proto_Build(&packet, pHeader, (const uint8_t*)pPayload, nPayload, XFALSE) &&
+        DirectGate_Proto_EncryptPackage(&packet, pPeer, pSession->nSessionId))
+        DirectGate_TestHandleDataChannelMessage(pSession, packet.pData, packet.nUsed);
+
+    XJSON_FreeObject(pHeader);
+    XByteBuffer_Clear(&packet);
+}
+
+static int relay_closes(xapi_session_t *pRelay)
+{
+    xapi_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.eCbType = XAPI_CB_CLOSED;
+    return DirectGate_ServiceCallback(&ctx, pRelay);
+}
+
+/* A desktop watched over a working data channel used to end with its relay route: the relay told the agent the
+   browser's socket was gone, or the agent's own link dropped, and the picture froze until a new session came up. It
+   now carries on over the data channel alone, for a bounded time, never touching the relay. A client the relay ends
+   on purpose - a sign-out above all - still ends at once. */
+static int test_detach(void)
+{
+    xlog_init("connection_lifecycle_smoke", XLOG_ALL, XFALSE);
+    xlog_screen(XFALSE);
+    xlog_callback(collect_log, NULL);
+
+    directgate_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    xstrncpy(cfg.auth.sSaltHex, sizeof(cfg.auth.sSaltHex),
+        "00000000000000000000000000000000"
+        "00000000000000000000000000000000");
+    xstrncpy(cfg.auth.sVerifierHex, sizeof(cfg.auth.sVerifierHex), "configured");
+
+    directgate_conn_t conn;
+    memset(&conn, 0, sizeof(conn));
+    conn.pCfg = &cfg;
+    DirectGate_SessionMgr_Init(&conn.mgr, &cfg);
+
+    xapi_session_t relay;
+    CHECK(dispatch(&conn, &relay, XAPI_CB_CONNECTED) == XAPI_CONTINUE, "the detach test relay connects");
+    relay.nEvents = XPOLLIO;
+    conn.bRoleSent = XTRUE;
+
+    /* The browser's socket went away: a watched desktop stays, on its data channel */
+    directgate_e2e_t peer;
+    directgate_session_t *pDesk = detach_session(&conn, &relay, 61, &peer);
+    CHECK(pDesk != NULL, "the detach test desktop is up");
+    relay_status(&conn, &relay, 61, "lost");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 61) == pDesk && pDesk->bDetached, "a lost browser socket detaches it");
+    CHECK(pDesk->pWsSession == &conn.detachLink, "and it lets go of the relay link");
+    CHECK(conn.detachLink.pSessionData == &conn && conn.detachLink.eRole == XAPI_CLIENT &&
+        conn.detachLink.sock.nFD == XSOCK_INVALID, "for a stand-in that dispatch reads as this connection, without a socket");
+
+    /* The relay ending the browser itself ends the session as before */
+    directgate_session_t *pKicked = detach_session(&conn, &relay, 62, NULL);
+    CHECK(pKicked != NULL, "the kick test desktop is up");
+    relay_status(&conn, &relay, 62, NULL);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 62) == NULL, "a closed status without lost ends the session");
+
+    /* Only a watched desktop on a working data channel detaches */
+    directgate_session_t *pTerm = detach_session(&conn, &relay, 63, NULL);
+    directgate_session_t *pDown = detach_session(&conn, &relay, 64, NULL);
+    directgate_session_t *pGuest = detach_session(&conn, &relay, 65, NULL);
+    CHECK(pTerm != NULL && pDown != NULL && pGuest != NULL, "the excluded sessions are up");
+    pTerm->eActiveMode = DIRECTGATE_SESSION_MODE_TERMINAL;
+    pDown->webrtc.bConnected = XFALSE;
+    pGuest->bDesktopShare = XTRUE;
+    relay_status(&conn, &relay, 63, "lost");
+    relay_status(&conn, &relay, 64, "lost");
+    relay_status(&conn, &relay, 65, "lost");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 63) == NULL, "a terminal ends with its browser's socket");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 64) == NULL, "a desktop without a data channel ends");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 65) == NULL, "a temporary share's guest ends");
+
+    /* What the viewer sends while it watches reaches the detached desktop; nothing that would need the relay does */
+    g_sLogged[0] = '\0';
+    data_channel(pDesk, &peer, DirectGate_Proto_BuildKeepalive("pong", 61), NULL);
+    CHECK(strstr(g_sLogged, "not taken by a detached session") == NULL, "a keepalive answer is taken");
+    CHECK(pDesk->nLastKAPongMs > 0, "and counts as one");
+    xjson_obj_t *pInput = DirectGate_Proto_BuildData(61);
+    XJSON_AddString(pInput, "payloadType", "desktop-input/json");
+    data_channel(pDesk, &peer, pInput, "{}");
+    CHECK(strstr(g_sLogged, "not taken by a detached session") == NULL, "desktop input is taken");
+    data_channel(pDesk, &peer, DirectGate_Proto_BuildCmd("start", NULL, NULL, "terminal", 61), NULL);
+    CHECK(strstr(g_sLogged, "not taken by a detached session") != NULL, "a start command is not");
+    g_sLogged[0] = '\0';
+    xjson_obj_t *pFile = DirectGate_Proto_BuildData(61);
+    XJSON_AddString(pFile, "payloadType", "terminal/raw");
+    data_channel(pDesk, &peer, pFile, "ls\n");
+    CHECK(strstr(g_sLogged, "not taken by a detached session") != NULL, "nor is anything that is not the desktop's");
+
+    /* An answer it cannot put on the data channel goes nowhere else: never to the relay */
+    XByteBuffer_Clear(&relay.txBuffer);
+    data_channel(pDesk, &peer, DirectGate_Proto_BuildKeepalive("ping", 61), NULL);
+    CHECK(relay.txBuffer.nUsed == 0 && conn.detachLink.txBuffer.nUsed == 0, "a detached session never writes to a relay");
+    pDesk->webrtc.bConnected = XTRUE;
+
+    /* The relay repeating that the socket is lost changes nothing; anything else for the id ends the session */
+    relay_status(&conn, &relay, 61, "lost");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 61) == pDesk, "a repeated lost notice leaves it detached");
+    relay_status(&conn, &relay, 61, NULL);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 61) == NULL, "the relay ending that client ends the detached session");
+    CHECK(relay.txBuffer.nUsed == 0, "and nothing is announced on the relay for an id that is no longer its own");
+
+    pDesk = detach_session(&conn, &relay, 66, &peer);
+    CHECK(pDesk != NULL, "a second desktop is up");
+    relay_status(&conn, &relay, 66, "lost");
+    CHECK(pDesk->bDetached, "and detached");
+    send_header(&conn, &relay, DirectGate_Proto_BuildData(66));
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 66) == NULL, "a relay message for its id, now another client's, ends it");
+
+    /* It ends with its data channel, after its time, or with the enrollment */
+    pDesk = detach_session(&conn, &relay, 67, NULL);
+    relay_status(&conn, &relay, 67, "lost");
+    DirectGate_TestCheckDetachedSessions(&conn);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 67) == pDesk, "a detached session with its channel up stays");
+    pDesk->webrtc.bConnected = XFALSE;
+    DirectGate_TestCheckDetachedSessions(&conn);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 67) == NULL, "it ends with its data channel");
+
+    pDesk = detach_session(&conn, &relay, 68, NULL);
+    relay_status(&conn, &relay, 68, "lost");
+    pDesk->nDetachedMs = XTime_GetMonoMs() - 59000ULL;
+    DirectGate_TestCheckDetachedSessions(&conn);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 68) == pDesk, "a session detached under a minute ago stays");
+    pDesk->nDetachedMs = XTime_GetMonoMs() - 60000ULL;
+    DirectGate_TestCheckAuthTimeouts(&conn);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 68) == NULL, "it ends a minute after it was detached, with the other deadlines");
+
+    pDesk = detach_session(&conn, &relay, 69, NULL);
+    relay_status(&conn, &relay, 69, "lost");
+    conn.bReconnectSuppressed = XTRUE;
+    DirectGate_TestCheckDetachedSessions(&conn);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 69) == NULL, "an ended enrollment keeps nothing");
+    conn.bReconnectSuppressed = XFALSE;
+    CHECK(relay.txBuffer.nUsed == 0 && conn.detachLink.txBuffer.nUsed == 0,
+        "none of those endings were announced on the relay, nor written to its stand-in");
+
+    /* The agent's own relay link drops: watched desktops detach, the rest ends, the detached stay detached */
+    directgate_session_t *pKept = detach_session(&conn, &relay, 71, NULL);
+    directgate_session_t *pEnded = detach_session(&conn, &relay, 72, NULL);
+    directgate_session_t *pEarlier = detach_session(&conn, &relay, 73, NULL);
+    CHECK(pKept != NULL && pEnded != NULL && pEarlier != NULL, "the relay loss sessions are up");
+    pEnded->eActiveMode = DIRECTGATE_SESSION_MODE_FILE_MANAGER;
+    relay_status(&conn, &relay, 73, "lost");
+    pEarlier->nDetachedMs = XTime_GetMonoMs() - 30000ULL;
+    uint64_t nEarlierMs = pEarlier->nDetachedMs;
+    xapi_t api;
+    memset(&api, 0, sizeof(api));
+    relay.pApi = &api;
+    relay_closes(&relay);
+    CHECK(conn.pWsSession == NULL, "the relay link is gone");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 71) == pKept && pKept->bDetached, "a watched desktop outlives the link");
+    CHECK(pKept->pWsSession == &conn.detachLink && conn.detachLink.pApi == &api, "and keeps nothing of it but the loop");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 72) == NULL, "a file manager ends with the link");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 73) == pEarlier && pEarlier->nDetachedMs == nEarlierMs,
+        "a session detached before stays as it is, its time still running from then");
+
+    /* The next link keeps them; anything attached that was left behind is cleaned */
+    xapi_session_t next;
+    directgate_session_t *pStale = DirectGate_SessionMgr_Create(&conn.mgr, 74);
+    CHECK(pStale != NULL, "a stale session is left behind");
+    CHECK(dispatch(&conn, &next, XAPI_CB_CONNECTED) == XAPI_CONTINUE, "the next relay link connects");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 74) == NULL, "a stale attached session is cleaned");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 71) == pKept && pKept->pWsSession == &conn.detachLink,
+        "the detached ones carry on, still off the relay");
+
+    /* A link the relay ended on purpose, or one under an enrollment in doubt, detaches nothing */
+    next.nEvents = XPOLLIO;
+    conn.bRoleSent = XTRUE;
+    directgate_session_t *pReasoned = detach_session(&conn, &next, 75, NULL);
+    CHECK(pReasoned != NULL, "a desktop on the next link is up");
+    xstrncpy(conn.sDisconnectReason, sizeof(conn.sDisconnectReason), "turn-quota-reached");
+    relay_closes(&next);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 75) == NULL, "a link ended with a reason takes its sessions along");
+
+    xapi_session_t fourth;
+    CHECK(dispatch(&conn, &fourth, XAPI_CB_CONNECTED) == XAPI_CONTINUE, "a fourth relay link connects");
+    fourth.nEvents = XPOLLIO;
+    directgate_session_t *pRevoked = detach_session(&conn, &fourth, 77, NULL);
+    CHECK(pRevoked != NULL, "a desktop on the fourth link is up");
+    conn.bReconnectSuppressed = XTRUE;
+    relay_closes(&fourth);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 77) == NULL, "a link lost after the enrollment ended detaches nothing");
+    conn.bReconnectSuppressed = XFALSE;
+    conn.nNextReconnectMs = 0;
+
+    xapi_session_t third;
+    CHECK(dispatch(&conn, &third, XAPI_CB_CONNECTED) == XAPI_CONTINUE, "a third relay link connects");
+    third.nEvents = XPOLLIO;
+    directgate_session_t *pDoubt = detach_session(&conn, &third, 76, NULL);
+    CHECK(pDoubt != NULL, "a desktop on the third link is up");
+    conn.bEnrollmentDoubt = XTRUE;
+    relay_closes(&third);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 76) == NULL, "a link lost with the enrollment in doubt detaches nothing");
+    conn.bEnrollmentDoubt = XFALSE;
+
+    XByteBuffer_Clear(&relay.txBuffer);
+    XByteBuffer_Clear(&next.txBuffer);
+    XByteBuffer_Clear(&third.txBuffer);
+    XByteBuffer_Clear(&fourth.txBuffer);
+    DirectGate_E2E_Clear(&peer);
+    DirectGate_SessionMgr_Destroy(&conn.mgr);
+    xlog_destroy();
+    return 0;
+}
+
 int main(void)
 {
     directgate_desktop_t desktop;
@@ -512,6 +967,8 @@ int main(void)
 
     DirectGate_SessionMgr_Destroy(&revokeConn.mgr);
     if (test_loop_stall() != 0) return 1;
+    if (test_relay_probe() != 0) return 1;
+    if (test_detach() != 0) return 1;
 
     puts("connection_lifecycle_smoke: OK");
     return 0;

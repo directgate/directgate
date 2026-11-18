@@ -45,6 +45,7 @@ Type-specific fields:
 - `auth`: SRP handshake metadata (`user`, `A`, `B`, `salt`, `nonce`, `suite`, `M1`, `M2`, `status`, `reason`). The `M1`/`M2` transcript binds both `nonce` values, so nonce tampering fails authentication (see [Security](security.md#srp-6a-authentication))
 - `auth` with `method=key`: a host whose operator allowed managed keys for its organization (`auth.key.managedOrganizationId`) also accepts the keys of its current managed-key lease, next to its local authorized keys; a device with neither answers `key auth not configured`. A managed key is checked at the hello and again after the proof (`client not authorized` when the lease dropped it in between). A session authenticated only by a managed key is closed when the lease drops the key, expires or changes organization
 - `cmd`: `action` (start/stop), `status`, `reason`
+- `status`: `status` (`closed`), and from the relay to the host an optional `reason`: `lost` when the client's socket went away without the relay ending the session. A host keeps an authenticated desktop whose data channel is up for at most 60 s after a `lost` notice, or after its own relay link drops, and ends it at once on a plain `closed` (see [Detached desktop sessions](../../docs/protocol.md#detached-desktop-sessions))
 - `resize`: `rows`, `cols`, `width`, `height`
 - `webrtc`: `sdp` (SDP string), `candidate`, `sdpMid`
 - `file/start`: `transferId`, `name`, `size` (decimal string), `chunks`, `chunkSize`

@@ -88,6 +88,11 @@ typedef struct directgate_session_ {
     uint64_t nCreatedMs;
     uint64_t nLastKAPingMs;
     uint64_t nLastKAPongMs;
+    xbool_t bWebRTCWasUp;           /* Data channel up at the last pass, so a drop is seen once */
+    /* The relay route is gone and the session lives on its data channel alone, for a bounded time while its client
+       reconnects. It never sends to the relay, and no relay message reaches it: see DirectGate_DetachSession. */
+    xbool_t bDetached;
+    uint64_t nDetachedMs;
     uint8_t nAuthMessages;
     xbool_t bAuthenticated;
     xbool_t bDesktopShare;
