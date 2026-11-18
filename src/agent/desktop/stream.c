@@ -373,6 +373,78 @@ static int DirectGate_Desktop_StartLinuxPipeline(directgate_session_t *pSession)
     return XSTDOK;
 }
 
+/* One raw RGBA frame of nFrameWidth x nFrameHeight from an image of the
+ * capture rectangle: the nearest source pixel, each channel scaled from its
+ * mask to eight bits, red first. */
+static void DirectGate_Desktop_ConvertRaw(uint8_t *pFrame, uint32_t nFrameWidth, uint32_t nFrameHeight,
+                                          XImage *pImage, uint32_t nCaptureWidth, uint32_t nCaptureHeight)
+{
+    uint32_t nRShift = DirectGate_Desktop_MaskShift(pImage->red_mask);
+    uint32_t nGShift = DirectGate_Desktop_MaskShift(pImage->green_mask);
+    uint32_t nBShift = DirectGate_Desktop_MaskShift(pImage->blue_mask);
+
+    /* The common 24-bit layout: 32 bits a pixel, least significant byte first,
+     * a whole byte a channel. There PixelComponent's (v * 255) / 255 is v, so
+     * the bytes are read straight from the image rather than through
+     * XGetPixel and three divisions a pixel, which kept the event loop - and
+     * with it the viewer's input - busy for ~40 ms on every 720p frame. Any
+     * other layout keeps the general conversion. */
+    xbool_t bDirect = (pImage->format == ZPixmap &&
+                       pImage->bits_per_pixel == 32 &&
+                       pImage->byte_order == LSBFirst &&
+                       pImage->red_mask == 0xFF0000UL &&
+                       pImage->green_mask == 0x00FF00UL &&
+                       pImage->blue_mask == 0x0000FFUL) ? XTRUE : XFALSE;
+
+    for (uint32_t y = 0; y < nFrameHeight; y++)
+    {
+        uint32_t nSrcY = (uint32_t)(((uint64_t)y * nCaptureHeight) / nFrameHeight);
+        const uint8_t *pRow = (const uint8_t*)pImage->data + (size_t)nSrcY * (size_t)pImage->bytes_per_line;
+
+        /* nSrcX is x * nCaptureWidth / nFrameWidth, carried as a quotient and
+         * a remainder from one pixel to the next instead of divided out. */
+        uint32_t nSrcX = 0;
+        uint32_t nRemainder = 0;
+
+        for (uint32_t x = 0; x < nFrameWidth; x++)
+        {
+            size_t nDst = ((size_t)y * nFrameWidth + x) * 4U;
+
+            if (bDirect)
+            {
+                const uint8_t *pPixel = pRow + (size_t)nSrcX * 4U;
+                pFrame[nDst + 0] = pPixel[2];
+                pFrame[nDst + 1] = pPixel[1];
+                pFrame[nDst + 2] = pPixel[0];
+            }
+            else
+            {
+                unsigned long nPixel = XGetPixel(pImage, (int)nSrcX, (int)nSrcY);
+                pFrame[nDst + 0] = DirectGate_Desktop_PixelComponent(nPixel, pImage->red_mask, nRShift);
+                pFrame[nDst + 1] = DirectGate_Desktop_PixelComponent(nPixel, pImage->green_mask, nGShift);
+                pFrame[nDst + 2] = DirectGate_Desktop_PixelComponent(nPixel, pImage->blue_mask, nBShift);
+            }
+
+            pFrame[nDst + 3] = 255;
+            nRemainder += nCaptureWidth;
+
+            while (nRemainder >= nFrameWidth)
+            {
+                nRemainder -= nFrameWidth;
+                nSrcX++;
+            }
+        }
+    }
+}
+
+#ifdef DIRECTGATE_TESTING
+void DirectGate_Desktop_TestConvertRaw(uint8_t *pFrame, uint32_t nFrameWidth, uint32_t nFrameHeight,
+                                       struct _XImage *pImage, uint32_t nCaptureWidth, uint32_t nCaptureHeight)
+{
+    DirectGate_Desktop_ConvertRaw(pFrame, nFrameWidth, nFrameHeight, pImage, nCaptureWidth, nCaptureHeight);
+}
+#endif
+
 static int DirectGate_Desktop_CaptureFrame(directgate_session_t *pSession)
 {
     directgate_desktop_t *pDesktop = &pSession->desktop;
@@ -436,24 +508,8 @@ static int DirectGate_Desktop_CaptureFrame(directgate_session_t *pSession)
         return XAPI_CONTINUE;
     }
 
-    uint32_t nRShift = DirectGate_Desktop_MaskShift(pImage->red_mask);
-    uint32_t nGShift = DirectGate_Desktop_MaskShift(pImage->green_mask);
-    uint32_t nBShift = DirectGate_Desktop_MaskShift(pImage->blue_mask);
-
-    for (uint32_t y = 0; y < pDesktop->nFrameHeight; y++)
-    {
-        uint32_t nSrcY = (uint32_t)(((uint64_t)y * pDesktop->nCaptureHeight) / pDesktop->nFrameHeight);
-        for (uint32_t x = 0; x < pDesktop->nFrameWidth; x++)
-        {
-            uint32_t nSrcX = (uint32_t)(((uint64_t)x * pDesktop->nCaptureWidth) / pDesktop->nFrameWidth);
-            unsigned long nPixel = XGetPixel(pImage, (int)nSrcX, (int)nSrcY);
-            size_t nDst = ((size_t)y * pDesktop->nFrameWidth + x) * 4U;
-            pFrame[nDst + 0] = DirectGate_Desktop_PixelComponent(nPixel, pImage->red_mask, nRShift);
-            pFrame[nDst + 1] = DirectGate_Desktop_PixelComponent(nPixel, pImage->green_mask, nGShift);
-            pFrame[nDst + 2] = DirectGate_Desktop_PixelComponent(nPixel, pImage->blue_mask, nBShift);
-            pFrame[nDst + 3] = 255;
-        }
-    }
+    DirectGate_Desktop_ConvertRaw(pFrame, pDesktop->nFrameWidth, pDesktop->nFrameHeight,
+        pImage, pDesktop->nCaptureWidth, pDesktop->nCaptureHeight);
 
     XDestroyImage(pImage);
     int nStatus = DirectGate_Desktop_SendFrameChunks(pSession, pFrame, nFrameSize);

@@ -11,6 +11,9 @@
  * touches the display the test was started from: DISPLAY is replaced by the
  * private server's, the session type is pinned to x11, and the server gets a
  * display number nothing else holds.
+ *
+ * Built with the linker wrapping DirectGate_YUV_BGRAToI420, so the frame the
+ * encoder is handed can be compared with the screen.
  */
 
 #ifndef _GNU_SOURCE
@@ -40,6 +43,7 @@
 #include "src/agent/desktop/priv.h"
 #include "src/agent/session.h"
 #include "src/agent/config.h"
+#include "src/agent/yuv.h"
 
 #include "xvfb_fixture.h"
 
@@ -98,13 +102,50 @@ static void copy_field(const char *pJson, const char *pKey, char *pOut, size_t n
     pOut[i] = '\0';
 }
 
+/* The next whole raw frame, put back together from its chunks when g_bRawWanted is set. */
+static int g_bRawWanted;
+static int g_bRawSeen;
+static uint8_t *g_pRaw;
+static size_t g_nRawUsed;
+static size_t g_nRawSize;
+static uint32_t g_nRawWidth;
+static uint32_t g_nRawHeight;
+
+static void record_raw_chunk(xjson_obj_t *pHeader, const uint8_t *pPayload, size_t nPayloadLength)
+{
+    if (!g_bRawWanted || g_bRawSeen) return;
+
+    uint32_t nIndex = XJSON_GetU32(XJSON_GetObject(pHeader, "chunkIndex"));
+    uint32_t nChunks = XJSON_GetU32(XJSON_GetObject(pHeader, "chunks"));
+
+    if (nIndex == 0)
+    {
+        g_nRawWidth = XJSON_GetU32(XJSON_GetObject(pHeader, "width"));
+        g_nRawHeight = XJSON_GetU32(XJSON_GetObject(pHeader, "height"));
+        g_nRawSize = (size_t)g_nRawWidth * g_nRawHeight * 4U;
+        g_nRawUsed = 0;
+        free(g_pRaw);
+        g_pRaw = (uint8_t*)malloc(g_nRawSize);
+    }
+
+    if (g_pRaw == NULL || g_nRawUsed + nPayloadLength > g_nRawSize) return;
+    memcpy(g_pRaw + g_nRawUsed, pPayload, nPayloadLength);
+    g_nRawUsed += nPayloadLength;
+
+    if (nIndex + 1U == nChunks && g_nRawUsed == g_nRawSize) g_bRawSeen = 1;
+}
+
 int DirectGate_Session_Send(directgate_session_t *pSession, xjson_obj_t *pHeader,
                             const uint8_t *pPayload, size_t nPayloadLength)
 {
     (void)pSession;
     const char *pType = XJSON_GetString(XJSON_GetObject(pHeader, "payloadType"));
 
-    if (pType != NULL && strcmp(pType, "desktop-frame-chunk") == 0) g_sent.nRawChunks++;
+    if (pType != NULL && strcmp(pType, "desktop-frame-chunk") == 0)
+    {
+        g_sent.nRawChunks++;
+        record_raw_chunk(pHeader, pPayload, nPayloadLength);
+    }
     else if (pType != NULL && strcmp(pType, "desktop-frame-encoded") == 0) g_sent.nEncoded++;
     else if (pType != NULL && strcmp(pType, "desktop-cursor") == 0) g_sent.nCursors++;
     else if (pType != NULL && strcmp(pType, "desktop-status") == 0 && pPayload != NULL)
@@ -125,6 +166,35 @@ int DirectGate_Session_SendErrorMsg(directgate_session_t *pSession, const char *
     g_sent.nErrors++;
     return XSTDOK;
 }
+
+/* ---- what the encoder is handed ---- */
+
+/* The linker routes desktop_linux.c's call to the converter here (--wrap), so the BGRA frame the X11 pipeline built
+   can be held against the screen. It runs on the encoder thread; g_nFrameSeen hands the copy to the test. */
+void __real_DirectGate_YUV_BGRAToI420(uint8_t *pY, uint8_t *pU, uint8_t *pV, const uint8_t *pBGRA,
+                                      uint32_t nWidth, uint32_t nHeight);
+
+static uint8_t *g_pFrame;
+static uint32_t g_nFrameWidth;
+static uint32_t g_nFrameHeight;
+static uint32_t g_nFrameWanted;
+static uint32_t g_nFrameSeen;
+
+void __wrap_DirectGate_YUV_BGRAToI420(uint8_t *pY, uint8_t *pU, uint8_t *pV, const uint8_t *pBGRA,
+                                      uint32_t nWidth, uint32_t nHeight)
+{
+    if (__atomic_load_n(&g_nFrameWanted, __ATOMIC_ACQUIRE) && !__atomic_load_n(&g_nFrameSeen, __ATOMIC_ACQUIRE) &&
+        nWidth == g_nFrameWidth && nHeight == g_nFrameHeight)
+    {
+        memcpy(g_pFrame, pBGRA, (size_t)nWidth * nHeight * 4U);
+        __atomic_store_n(&g_nFrameSeen, 1U, __ATOMIC_RELEASE);
+    }
+
+    __real_DirectGate_YUV_BGRAToI420(pY, pU, pV, pBGRA, nWidth, nHeight);
+}
+
+static int frame_seen(void) { return __atomic_load_n(&g_nFrameSeen, __ATOMIC_ACQUIRE) != 0; }
+static int raw_seen(void) { return g_bRawSeen; }
 
 /* ---- driving the session ---- */
 
@@ -360,6 +430,206 @@ static int test_h264(Display *pObserver)
 
     DirectGate_Desktop_Clear(pDesktop);
     CHECK(!pDesktop->bRunning, "clearing the desktop stops it");
+    return 0;
+}
+
+/* Every byte of the screen different from its neighbours, whatever its depth. */
+static int draw_pattern(Display *pObserver, uint32_t nSeed)
+{
+    int nScreen = DefaultScreen(pObserver);
+    XImage *pPut = XCreateImage(pObserver, DefaultVisual(pObserver, nScreen), (unsigned int)DefaultDepth(pObserver, nScreen),
+        ZPixmap, 0, NULL, SCREEN_W, SCREEN_H, 32, 0);
+    CHECK(pPut != NULL, "make the screen pattern an image");
+
+    size_t nBytes = (size_t)pPut->bytes_per_line * SCREEN_H;
+    pPut->data = (char*)malloc(nBytes);
+    CHECK(pPut->data != NULL, "allocate the screen pattern");
+
+    uint32_t nState = nSeed;
+    for (size_t i = 0; i < nBytes; i++)
+    {
+        nState ^= nState << 13;
+        nState ^= nState >> 17;
+        nState ^= nState << 5;
+        pPut->data[i] = (char)nState;
+    }
+
+    XPutImage(pObserver, DefaultRootWindow(pObserver), DefaultGC(pObserver, nScreen), pPut, 0, 0, 0, 0, SCREEN_W, SCREEN_H);
+    XSync(pObserver, False);
+    XDestroyImage(pPut);
+    return 0;
+}
+
+/* The raw frame as the raw path has always made it: nearest source pixel through XGetPixel, each channel scaled from
+   its mask to eight bits, red first. */
+static uint8_t raw_component(unsigned long nPixel, unsigned long nMask)
+{
+    uint32_t nShift = 0;
+    if (!nMask) return 0;
+    while (((nMask >> nShift) & 1UL) == 0) nShift++;
+    return (uint8_t)((((nPixel & nMask) >> nShift) * 255UL) / (nMask >> nShift));
+}
+
+/* The next raw frame against the screen it was taken from. */
+static int check_raw_frame(Display *pObserver)
+{
+    directgate_desktop_t *pDesktop = &g_session.desktop;
+    g_bRawSeen = 0;
+    g_bRawWanted = 1;
+    int bSeen = pump_until(raw_seen, 5000);
+    g_bRawWanted = 0;
+    CHECK(bSeen, "a whole raw frame arrives");
+    CHECK(g_nRawWidth == pDesktop->nFrameWidth && g_nRawHeight == pDesktop->nFrameHeight, "the raw frame has the frame size");
+
+    uint32_t nWidth = pDesktop->nCaptureWidth;
+    uint32_t nHeight = pDesktop->nCaptureHeight;
+    XImage *pImage = XGetImage(pObserver, DefaultRootWindow(pObserver), pDesktop->nCaptureX, pDesktop->nCaptureY,
+        nWidth, nHeight, AllPlanes, ZPixmap);
+    CHECK(pImage != NULL, "read the screen back");
+
+    int bSame = 1;
+    for (uint32_t y = 0; y < g_nRawHeight && bSame; y++)
+    {
+        uint32_t nSrcY = (uint32_t)(((uint64_t)y * nHeight) / g_nRawHeight);
+        for (uint32_t x = 0; x < g_nRawWidth && bSame; x++)
+        {
+            uint32_t nSrcX = (uint32_t)(((uint64_t)x * nWidth) / g_nRawWidth);
+            unsigned long nPixel = XGetPixel(pImage, (int)nSrcX, (int)nSrcY);
+            const uint8_t *pGot = g_pRaw + ((size_t)y * g_nRawWidth + x) * 4U;
+
+            if (pGot[0] != raw_component(nPixel, pImage->red_mask) || pGot[1] != raw_component(nPixel, pImage->green_mask) ||
+                pGot[2] != raw_component(nPixel, pImage->blue_mask) || pGot[3] != 255U) bSame = 0;
+        }
+    }
+
+    XDestroyImage(pImage);
+    free(g_pRaw);
+    g_pRaw = NULL;
+
+    CHECK(bSame, "the raw frame is the screen, nearest pixel by pixel, channel by channel");
+    return 0;
+}
+
+/* The frame the H.264 encoder is handed is the screen: unscaled, a copy of what is on it, and scaled, what the
+   scaler makes of exactly that - checked on content that is different in every byte, so a pixel read from the
+   wrong place, a row read with the wrong stride or a channel out of place shows. */
+static int check_frame(Display *pObserver, uint32_t nTargetWidth, uint32_t nTargetHeight,
+                       uint32_t nWantWidth, uint32_t nWantHeight)
+{
+    directgate_desktop_t *pDesktop = &g_session.desktop;
+    size_t nFrameBytes = (size_t)nWantWidth * nWantHeight * 4U;
+
+    g_pFrame = (uint8_t*)malloc(nFrameBytes);
+    CHECK(g_pFrame != NULL, "allocate the frame copy");
+    g_nFrameWidth = nWantWidth;
+    g_nFrameHeight = nWantHeight;
+    __atomic_store_n(&g_nFrameSeen, 0U, __ATOMIC_RELEASE);
+
+    char sJson[256];
+    snprintf(sJson, sizeof(sJson), "{\"action\":\"set-resolution\",\"mode\":\"scale\",\"width\":%u,\"height\":%u}",
+        nTargetWidth, nTargetHeight);
+    CHECK(control(sJson) == XAPI_CONTINUE, "ask for the encode size");
+
+    __atomic_store_n(&g_nFrameWanted, 1U, __ATOMIC_RELEASE);
+    CHECK(control("{\"action\":\"request-keyframe\"}") == XAPI_CONTINUE, "ask for a keyframe at that size");
+    int bSeen = pump_until(frame_seen, 10000);
+    __atomic_store_n(&g_nFrameWanted, 0U, __ATOMIC_RELEASE);
+    CHECK(bSeen, "the encoder is handed a frame at the asked size");
+
+    uint32_t nWidth = pDesktop->nCaptureWidth;
+    uint32_t nHeight = pDesktop->nCaptureHeight;
+    XImage *pImage = XGetImage(pObserver, DefaultRootWindow(pObserver), pDesktop->nCaptureX, pDesktop->nCaptureY,
+        nWidth, nHeight, AllPlanes, ZPixmap);
+    CHECK(pImage != NULL, "read the screen back");
+
+    uint8_t *pScreen = (uint8_t*)malloc((size_t)nWidth * nHeight * 4U);
+    uint8_t *pWant = (uint8_t*)malloc(nFrameBytes);
+    int bSame = (pScreen != NULL && pWant != NULL);
+
+    if (bSame)
+    {
+        /* Each channel scaled from its mask to eight bits, blue first: on the common 24-bit screen that is the bytes
+           as they are, on a deeper one what the pipeline's own conversion makes of them. */
+        for (uint32_t y = 0; y < nHeight; y++)
+        {
+            for (uint32_t x = 0; x < nWidth; x++)
+            {
+                unsigned long nPixel = XGetPixel(pImage, (int)x, (int)y);
+                uint8_t *pOut = pScreen + ((size_t)y * nWidth + x) * 4U;
+
+                pOut[0] = raw_component(nPixel, pImage->blue_mask);
+                pOut[1] = raw_component(nPixel, pImage->green_mask);
+                pOut[2] = raw_component(nPixel, pImage->red_mask);
+                pOut[3] = 255U;
+            }
+        }
+
+        DirectGate_YUV_ScaleBGRA(pWant, nWantWidth, nWantHeight, pScreen, nWidth, nHeight, (size_t)nWidth * 4U);
+
+        /* The fourth byte is the X server's padding on the unscaled path and opaque on the scaled one; the converter
+           never reads it either way. */
+        for (size_t i = 0; i < nFrameBytes && bSame; i++)
+            if ((i & 3U) != 3U && g_pFrame[i] != pWant[i]) bSame = 0;
+    }
+
+    XDestroyImage(pImage);
+    free(pScreen);
+    free(pWant);
+    free(g_pFrame);
+    g_pFrame = NULL;
+
+    CHECK(bSame, "the frame handed to the encoder is the screen, scaled to the encode size");
+    return 0;
+}
+
+static int test_frame_content(Display *pObserver)
+{
+    g_pPhase = "frame content";
+    if (draw_pattern(pObserver, 0x2545F491U)) return 1;
+    if (start_and_pick(23)) return 1;
+    directgate_desktop_t *pDesktop = &g_session.desktop;
+
+    if (pDesktop->ePipeline != DIRECTGATE_DESKTOP_PIPELINE_H264_DC)
+    {
+        fprintf(stderr, "desktop_x11_smoke: no H.264 encoder here (%s), frame content not checked\n",
+            pDesktop->sFallbackReason);
+        DirectGate_Desktop_Clear(pDesktop);
+        return 0;
+    }
+
+    CHECK(pDesktop->nCaptureWidth == SCREEN_W && pDesktop->nCaptureHeight == SCREEN_H, "the whole screen is captured");
+
+    /* The screen's own size; a fit-to-window size the bilinear path takes; exactly half. */
+    if (check_frame(pObserver, SCREEN_W, SCREEN_H, SCREEN_W, SCREEN_H)) return 1;
+    if (check_frame(pObserver, 1000, 600, 1000, 562)) return 1;
+    if (check_frame(pObserver, SCREEN_W / 2, SCREEN_H / 2, SCREEN_W / 2, SCREEN_H / 2)) return 1;
+
+    DirectGate_Desktop_Clear(pDesktop);
+    return 0;
+}
+
+/* The raw path's frames are the screen too: at its own size, and at a size that is not a whole fraction of it. */
+static int test_raw_content(Display *pObserver)
+{
+    g_pPhase = "raw content";
+    if (draw_pattern(pObserver, 0x7F4A7C15U)) return 1;
+
+    setenv("DIRECTGATE_DESKTOP_FORCE_RAW", "1", 1);
+    int nStarted = start_and_pick(26);
+    unsetenv("DIRECTGATE_DESKTOP_FORCE_RAW");
+    if (nStarted) return 1;
+
+    directgate_desktop_t *pDesktop = &g_session.desktop;
+    CHECK(pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_RAW, "the raw stream starts");
+    CHECK(pDesktop->nFrameWidth == SCREEN_W && pDesktop->nFrameHeight == SCREEN_H, "the raw frame is the screen's size");
+    if (check_raw_frame(pObserver)) return 1;
+
+    CHECK(control("{\"action\":\"set-resolution\",\"mode\":\"scale\",\"width\":1000,\"height\":600}") == XAPI_CONTINUE,
+        "scale the raw stream");
+    CHECK(pDesktop->nFrameWidth == 1000 && pDesktop->nFrameHeight == 562, "the raw frame takes the fitted size");
+    if (check_raw_frame(pObserver)) return 1;
+
+    DirectGate_Desktop_Clear(pDesktop);
     return 0;
 }
 
@@ -731,6 +1001,29 @@ static int test_input(Display *pObserver)
 
 /* A 30-bit screen without MIT-SHM: every frame by XGetImage, and pixels that
    are not the BGRX layout the fast path copies, so each is converted. */
+/* 32 bits a pixel like the common screen, but ten bits a channel: the raw path scales each channel down to eight
+   rather than reading it as a byte. */
+static int test_deep_raw(void)
+{
+    g_pPhase = "30-bit raw";
+    setenv("DIRECTGATE_DESKTOP_FORCE_RAW", "1", 1);
+    int nStarted = start_and_pick(27);
+    unsetenv("DIRECTGATE_DESKTOP_FORCE_RAW");
+    if (nStarted) return 1;
+
+    directgate_desktop_t *pDesktop = &g_session.desktop;
+    CHECK(pDesktop->ePipeline == DIRECTGATE_DESKTOP_PIPELINE_RAW, "the 30-bit screen streams raw when asked to");
+
+    Display *pObserver = XOpenDisplay(NULL);
+    CHECK(pObserver != NULL, "open the 30-bit screen to observe it");
+    int nFailed = draw_pattern(pObserver, 0x68E31DA4U) || check_raw_frame(pObserver);
+    XCloseDisplay(pObserver);
+    if (nFailed) return 1;
+
+    DirectGate_Desktop_Clear(pDesktop);
+    return 0;
+}
+
 static int test_deep_no_shm(void)
 {
     g_pPhase = "30-bit without MIT-SHM";
@@ -746,6 +1039,14 @@ static int test_deep_no_shm(void)
 
     g_nWantEncoded = 2;
     CHECK(pump_until(enough_encoded, 10000), "a 30-bit screen without shared memory still encodes");
+
+    /* Ten bits a channel are converted, not copied: scaled, then at the screen's own size again. */
+    Display *pObserver = XOpenDisplay(NULL);
+    CHECK(pObserver != NULL, "open the 30-bit screen to observe it");
+    int nFailed = draw_pattern(pObserver, 0x3C6EF372U) || check_frame(pObserver, 1000, 600, 1000, 562) ||
+        check_frame(pObserver, SCREEN_W, SCREEN_H, SCREEN_W, SCREEN_H);
+    XCloseDisplay(pObserver);
+    if (nFailed) return 1;
 
     /* The bitrate step and the error text, as the ABR controller and the fallback read them. */
     DirectGate_Desktop_LinuxEncoder_SetBitrate(&g_session, 1500);
@@ -774,7 +1075,7 @@ static int test_deep_no_shm(void)
     snprintf(pDesktop->sDisplay, sizeof(pDesktop->sDisplay), "%s", sSaved);
 
     DirectGate_Desktop_Clear(pDesktop);
-    return 0;
+    return test_deep_raw();
 }
 
 /* A 16-bit screen: nothing the H.264 capture can take, so the stream steps
@@ -790,6 +1091,13 @@ static int test_shallow(void)
 
     g_nWantRaw = 1;
     CHECK(pump_until(enough_raw, 5000), "the 16-bit screen is captured raw");
+
+    /* 5-6-5 channels are scaled up to eight bits, not read as bytes. */
+    Display *pObserver = XOpenDisplay(NULL);
+    CHECK(pObserver != NULL, "open the 16-bit screen to observe it");
+    int nFailed = draw_pattern(pObserver, 0x1B873593U) || check_raw_frame(pObserver);
+    XCloseDisplay(pObserver);
+    if (nFailed) return 1;
 
     DirectGate_Desktop_Clear(pDesktop);
     return 0;
@@ -905,10 +1213,143 @@ static int test_connection_lost(xvfb_t *pX)
     return 0;
 }
 
+/* ---- raw frames from images no server here hands out ---- */
+
+/* An image built in memory: the byte orders, depths, channel layouts and formats a real X server can send, which
+   this machine's Xvfb never does - and each one differs from the common layout in one respect only, so every part
+   of the raw capture's test for that layout is needed. nPad widens every row past its pixels. */
+static XImage* make_image(int nFormat, int nByteOrder, unsigned int nDepth, int nBitsPerPixel, unsigned long nRed,
+                          unsigned long nGreen, unsigned long nBlue, unsigned int nWidth, unsigned int nHeight, int nPad)
+{
+    XImage *pImage = (XImage*)calloc(1, sizeof(XImage));
+    if (pImage == NULL) return NULL;
+
+    pImage->width = (int)nWidth;
+    pImage->height = (int)nHeight;
+    pImage->format = nFormat;
+    pImage->byte_order = nByteOrder;
+    pImage->bitmap_unit = 32;
+    pImage->bitmap_bit_order = nByteOrder;
+    pImage->bitmap_pad = 32;
+    pImage->depth = (int)nDepth;
+    pImage->bits_per_pixel = nBitsPerPixel;
+    pImage->red_mask = nRed;
+    pImage->green_mask = nGreen;
+    pImage->blue_mask = nBlue;
+
+    if (nFormat == ZPixmap) pImage->bytes_per_line = (int)((((size_t)nWidth * (size_t)nBitsPerPixel + 31U) / 32U) * 4U) + nPad;
+    if (!XInitImage(pImage))
+    {
+        free(pImage);
+        return NULL;
+    }
+
+    size_t nBytes = (size_t)pImage->bytes_per_line * nHeight * (nFormat == ZPixmap ? 1U : nDepth);
+    pImage->data = (char*)malloc(nBytes);
+    if (pImage->data == NULL)
+    {
+        free(pImage);
+        return NULL;
+    }
+
+    uint32_t nState = 0x9E3779B9U ^ (nDepth * 2654435761U) ^ (uint32_t)nRed ^ (uint32_t)nBlue;
+    for (size_t i = 0; i < nBytes; i++)
+    {
+        nState ^= nState << 13;
+        nState ^= nState >> 17;
+        nState ^= nState << 5;
+        pImage->data[i] = (char)nState;
+    }
+
+    return pImage;
+}
+
+/* The raw capture's conversion of pImage into a frame of the given size, against XGetPixel and the masks. */
+static int check_raw_layout(XImage *pImage, uint32_t nFrameWidth, uint32_t nFrameHeight, const char *pWhat)
+{
+    uint32_t nWidth = (uint32_t)pImage->width;
+    uint32_t nHeight = (uint32_t)pImage->height;
+    uint8_t *pFrame = (uint8_t*)malloc((size_t)nFrameWidth * nFrameHeight * 4U);
+    CHECK(pFrame != NULL, "allocate the raw frame");
+
+    DirectGate_Desktop_TestConvertRaw(pFrame, nFrameWidth, nFrameHeight, pImage, nWidth, nHeight);
+
+    int bSame = 1;
+    for (uint32_t y = 0; y < nFrameHeight && bSame; y++)
+    {
+        uint32_t nSrcY = (uint32_t)(((uint64_t)y * nHeight) / nFrameHeight);
+        for (uint32_t x = 0; x < nFrameWidth && bSame; x++)
+        {
+            uint32_t nSrcX = (uint32_t)(((uint64_t)x * nWidth) / nFrameWidth);
+            unsigned long nPixel = XGetPixel(pImage, (int)nSrcX, (int)nSrcY);
+            const uint8_t *pGot = pFrame + ((size_t)y * nFrameWidth + x) * 4U;
+
+            if (pGot[0] != raw_component(nPixel, pImage->red_mask) || pGot[1] != raw_component(nPixel, pImage->green_mask) ||
+                pGot[2] != raw_component(nPixel, pImage->blue_mask) || pGot[3] != 255U) bSame = 0;
+        }
+    }
+
+    free(pFrame);
+    if (!bSame) fprintf(stderr, "desktop_x11_smoke: raw %s %ux%u -> %ux%u\n", pWhat, nWidth, nHeight, nFrameWidth, nFrameHeight);
+    CHECK(bSame, "a raw frame is its image, nearest pixel by pixel, channel by channel");
+    return 0;
+}
+
+static int test_raw_layouts(void)
+{
+    g_pPhase = "raw layouts";
+
+    static const struct {
+        const char *pWhat;
+        int nFormat;
+        int nByteOrder;
+        unsigned int nDepth;
+        int nBitsPerPixel;
+        unsigned long nRed;
+        unsigned long nGreen;
+        unsigned long nBlue;
+        int nPad;
+    } layouts[] = {
+        { "24-bit, padded rows", ZPixmap, LSBFirst, 24, 32, 0xFF0000UL, 0x00FF00UL, 0x0000FFUL, 12 },
+        { "24-bit, most significant byte first", ZPixmap, MSBFirst, 24, 32, 0xFF0000UL, 0x00FF00UL, 0x0000FFUL, 4 },
+        { "24-bit packed in three bytes", ZPixmap, LSBFirst, 24, 24, 0xFF0000UL, 0x00FF00UL, 0x0000FFUL, 0 },
+        { "24-bit planes", XYPixmap, LSBFirst, 24, 1, 0xFF0000UL, 0x00FF00UL, 0x0000FFUL, 0 },
+        { "24-bit planes claiming 32 bits a pixel", XYPixmap, LSBFirst, 24, 32, 0xFF0000UL, 0x00FF00UL, 0x0000FFUL, 0 },
+        { "24-bit, blue in the high byte", ZPixmap, LSBFirst, 24, 32, 0x0000FFUL, 0x00FF00UL, 0xFF0000UL, 0 },
+        { "32-bit, red in the top byte", ZPixmap, LSBFirst, 32, 32, 0xFF000000UL, 0x00FF00UL, 0x0000FFUL, 0 },
+        { "32-bit, green in the top byte", ZPixmap, LSBFirst, 32, 32, 0xFF0000UL, 0xFF000000UL, 0x0000FFUL, 0 },
+        { "32-bit, blue in the top byte", ZPixmap, LSBFirst, 32, 32, 0xFF0000UL, 0x00FF00UL, 0xFF000000UL, 0 },
+        { "16-bit 5-6-5", ZPixmap, LSBFirst, 16, 16, 0xF800UL, 0x07E0UL, 0x001FUL, 0 },
+        { "24-bit without channel masks", ZPixmap, LSBFirst, 24, 32, 0UL, 0UL, 0UL, 0 }
+    };
+
+    /* The frame at the image's size, smaller by a ratio that is not a whole number, larger, and one column. */
+    static const uint32_t sizes[][2] = { { 37, 13 }, { 20, 7 }, { 61, 29 }, { 1, 13 } };
+
+    for (size_t i = 0; i < sizeof(layouts) / sizeof(layouts[0]); i++)
+    {
+        XImage *pImage = make_image(layouts[i].nFormat, layouts[i].nByteOrder, layouts[i].nDepth, layouts[i].nBitsPerPixel,
+            layouts[i].nRed, layouts[i].nGreen, layouts[i].nBlue, 37, 13, layouts[i].nPad);
+        CHECK(pImage != NULL, "build an image in memory");
+
+        int nFailed = 0;
+        for (size_t j = 0; j < sizeof(sizes) / sizeof(sizes[0]) && !nFailed; j++)
+            nFailed = check_raw_layout(pImage, sizes[j][0], sizes[j][1], layouts[i].pWhat);
+
+        XDestroyImage(pImage);
+        if (nFailed) return 1;
+    }
+
+    return 0;
+}
+
 int main(void)
 {
     signal(SIGALRM, on_watchdog);
     alarm(170);
+
+    /* Needs no server, so it runs where Xvfb is missing too. */
+    if (test_raw_layouts()) return 1;
 
     char sXvfb[4096];
     if (!find_xvfb(sXvfb, sizeof(sXvfb)))
@@ -937,7 +1378,8 @@ int main(void)
 
     if (pObserver == NULL) fprintf(stderr, "desktop_x11_smoke: cannot open %s to observe it\n", xvfb.sDisplay);
     else if (!test_no_display(xvfb.sDisplay) && !test_h264(pObserver) && !test_capture_lost(pObserver) &&
-             !test_edges(pObserver) && !test_raw() && !test_input(pObserver))
+             !test_edges(pObserver) && !test_raw() && !test_input(pObserver) && !test_frame_content(pObserver) &&
+             !test_raw_content(pObserver))
         nResult = 0;
 
     if (pObserver != NULL) XCloseDisplay(pObserver);
