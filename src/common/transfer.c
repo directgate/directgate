@@ -238,6 +238,52 @@ static int DirectGate_Transfer_SendMsg(xjson_obj_t *pHeader, const uint8_t *pPay
     return sendFn(pHeader, pPayload, nLen, pCtx);
 }
 
+static void DirectGate_Transfer_HashFree(directgate_transfer_t *pFT)
+{
+    EVP_MD_CTX_free(pFT->pSha256Md);
+    pFT->pSha256Md = NULL;
+}
+
+static void DirectGate_Transfer_HashInit(directgate_transfer_t *pFT)
+{
+    DirectGate_Transfer_HashFree(pFT);
+    XSHA256_Init(&pFT->sha256Ctx);
+
+    EVP_MD_CTX *pCtx = EVP_MD_CTX_new();
+    if (pCtx != NULL && EVP_DigestInit_ex(pCtx, EVP_sha256(), NULL) == 1)
+    {
+        pFT->pSha256Md = pCtx;
+        return;
+    }
+
+    EVP_MD_CTX_free(pCtx);
+}
+
+static xbool_t DirectGate_Transfer_HashUpdate(directgate_transfer_t *pFT, const uint8_t *pData, size_t nLength)
+{
+    if (pFT->pSha256Md != NULL) return EVP_DigestUpdate(pFT->pSha256Md, pData, nLength) == 1 ? XTRUE : XFALSE;
+
+    XSHA256_Update(&pFT->sha256Ctx, pData, nLength);
+    return XTRUE;
+}
+
+/* Writes the digest into pFT->sha256 and lets go of OpenSSL's context, whose job ends here either way */
+static xbool_t DirectGate_Transfer_HashFinal(directgate_transfer_t *pFT)
+{
+    if (pFT->pSha256Md == NULL)
+    {
+        XSHA256_Final(&pFT->sha256Ctx, pFT->sha256);
+        return XTRUE;
+    }
+
+    unsigned int nLength = 0;
+    xbool_t bOk = (EVP_DigestFinal_ex(pFT->pSha256Md, pFT->sha256, &nLength) == 1 &&
+        nLength == XSHA256_DIGEST_SIZE) ? XTRUE : XFALSE;
+
+    DirectGate_Transfer_HashFree(pFT);
+    return bOk;
+}
+
 void DirectGate_Transfer_Init(directgate_transfer_t *pFT)
 {
     XCHECK_VOID_NL((pFT != NULL));
@@ -267,6 +313,7 @@ void DirectGate_Transfer_Destroy(directgate_transfer_t *pFT)
         }
     }
 
+    DirectGate_Transfer_HashFree(pFT);
     memset(pFT, 0, sizeof(*pFT));
     pFT->eState = XTRANSFER_STATE_IDLE;
     pFT->nChunkSize = XFILE_CHUNK_SIZE;
@@ -336,7 +383,7 @@ XSTATUS DirectGate_Transfer_Send(directgate_transfer_t *pFT, const char *pPath,
     pFT->nBytesXferred = 0;
     pFT->eState = XTRANSFER_STATE_SENDING;
 
-    XSHA256_Init(&pFT->sha256Ctx);
+    DirectGate_Transfer_HashInit(pFT);
     DirectGate_Transfer_GenerateId(pFT->sId, sizeof(pFT->sId));
     xstrncpy(pFT->sName, sizeof(pFT->sName), pName);
     xstrncpy(pFT->sPath, sizeof(pFT->sPath), pPath);
@@ -395,7 +442,15 @@ XSTATUS DirectGate_Transfer_SendNext(directgate_transfer_t *pFT, directgate_file
 
         /* All chunks sent - send end message */
         char sSha256Hex[XSHA256_HEX_LENGTH];
-        XSHA256_Final(&pFT->sha256Ctx, pFT->sha256);
+        if (!DirectGate_Transfer_HashFinal(pFT))
+        {
+            xloge("Failed to finish outbound transfer SHA-256: id(%s), path(%s)",
+                DirectGate_Transfer_GetId(pFT), DirectGate_Transfer_GetPath(pFT));
+
+            pFT->eState = XTRANSFER_STATE_ERROR;
+            return XSTDERR;
+        }
+
         DirectGate_Transfer_SHA256ToHex(pFT->sha256, sSha256Hex, sizeof(sSha256Hex));
 
         xjson_obj_t *pHeader = DirectGate_Proto_BuildFileEnd(pFT->sId, sSha256Hex);
@@ -462,8 +517,14 @@ XSTATUS DirectGate_Transfer_SendNext(directgate_transfer_t *pFT, directgate_file
         return XSTDERR;
     }
 
-    /* Update SHA-256 */
-    XSHA256_Update(&pFT->sha256Ctx, sBuf, nRead);
+    if (!DirectGate_Transfer_HashUpdate(pFT, sBuf, nRead))
+    {
+        xloge("Failed to hash transfer chunk: id(%s), path(%s), chunk(%u/%u)",
+            DirectGate_Transfer_GetId(pFT), DirectGate_Transfer_GetPath(pFT), pFT->nCurrentChunk, pFT->nTotalChunks);
+
+        pFT->eState = XTRANSFER_STATE_ERROR;
+        return XSTDERR;
+    }
 
     /* Send chunk */
     xjson_obj_t *pHeader = DirectGate_Proto_BuildFileChunk(pFT->sId, pFT->nCurrentChunk);
@@ -550,7 +611,6 @@ XSTATUS DirectGate_Transfer_HandleStartPath(directgate_transfer_t *pFT, const di
     pFT->nCurrentChunk = XSTDNON;
     pFT->nBytesXferred = XSTDNON;
     pFT->nSize = pTransfer->nFileSize;
-    XSHA256_Init(&pFT->sha256Ctx);
 
     pFT->pFile = DirectGate_Transfer_OpenDestination(pFT->sPath);
     if (pFT->pFile == NULL)
@@ -562,12 +622,14 @@ XSTATUS DirectGate_Transfer_HandleStartPath(directgate_transfer_t *pFT, const di
         return XSTDERR;
     }
 
+    DirectGate_Transfer_HashInit(pFT);
+    pFT->bRemoveOnDestroy = XTRUE;
+    pFT->eState = XTRANSFER_STATE_RECEIVING;
+
     xlogi("Starting inbound file transfer: id(%s), name(%s), path(%s), chunks(%u), bytes(%" PRIu64 ")",
         DirectGate_Transfer_GetId(pFT), DirectGate_Transfer_GetName(pFT), DirectGate_Transfer_GetPath(pFT),
         pFT->nTotalChunks, pFT->nSize);
 
-    pFT->eState = XTRANSFER_STATE_RECEIVING;
-    pFT->bRemoveOnDestroy = XTRUE;
     return XSTDOK;
 }
 
@@ -696,7 +758,16 @@ XSTATUS DirectGate_Transfer_HandleChunk(directgate_transfer_t *pFT, const direct
         pFT->nSize = nActualSize;
     }
 
-    XSHA256_Update(&pFT->sha256Ctx, pFilePkg->data.pPayload, pFilePkg->data.nPayloadLength);
+    if (!DirectGate_Transfer_HashUpdate(pFT, pFilePkg->data.pPayload, pFilePkg->data.nPayloadLength))
+    {
+        xloge("Failed to hash inbound transfer chunk: id(%s), path(%s), chunk(%u/%u)",
+            DirectGate_Transfer_GetId(pFT), DirectGate_Transfer_GetPath(pFT), pFT->nCurrentChunk, pFT->nTotalChunks);
+
+        pFT->eState = XTRANSFER_STATE_ERROR;
+        errno = EIO;
+        return XSTDERR;
+    }
+
     pFT->nBytesXferred += pFilePkg->data.nPayloadLength;
     pFT->nCurrentChunk++;
 
@@ -769,7 +840,16 @@ XSTATUS DirectGate_Transfer_HandleEnd(directgate_transfer_t *pFT, const directga
 
     /* Verify SHA-256 */
     char sRecvHex[XSHA256_HEX_LENGTH];
-    XSHA256_Final(&pFT->sha256Ctx, pFT->sha256);
+    if (!DirectGate_Transfer_HashFinal(pFT))
+    {
+        xloge("Failed to finish inbound transfer SHA-256: id(%s), path(%s)",
+            DirectGate_Transfer_GetId(pFT), DirectGate_Transfer_GetPath(pFT));
+
+        pFT->eState = XTRANSFER_STATE_ERROR;
+        errno = EIO;
+        return XSTDERR;
+    }
+
     DirectGate_Transfer_SHA256ToHex(pFT->sha256, sRecvHex, sizeof(sRecvHex));
 
     if (!DirectGate_Transfer_IsSHA256Hex(pFilePkg->transfer.pSha256))
@@ -833,8 +913,10 @@ XSTATUS DirectGate_Transfer_HandleCancel(directgate_transfer_t *pFT)
     /* The error state no longer tells us the direction. Retain ownership
        until commit so failed writes and failed finalization also clean up. */
     if (bReceiving && xstrused(pFT->sPath)) remove(pFT->sPath);
-    pFT->bRemoveOnDestroy = XFALSE;
 
+    DirectGate_Transfer_HashFree(pFT);
+    pFT->bRemoveOnDestroy = XFALSE;
     pFT->eState = XTRANSFER_STATE_CANCELLED;
+
     return XSTDOK;
 }

@@ -67,7 +67,8 @@ typedef struct xfile_transfer_ {
     uint64_t nBytesXferred;             /* bytes transferred so far */
     size_t nChunkSize;                  /* bytes per chunk */
 
-    xsha256_t sha256Ctx;                 /* running SHA-256 context */
+    EVP_MD_CTX *pSha256Md;               /* running SHA-256 context, OpenSSL's; owned, freed by Destroy */
+    xsha256_t sha256Ctx;                 /* running SHA-256 context while pSha256Md is NULL */
     uint8_t sha256[XSHA256_DIGEST_SIZE]; /* final SHA-256 digest */
 } directgate_transfer_t;
 

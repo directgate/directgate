@@ -118,6 +118,16 @@ if(UNIX AND NOT APPLE)
         -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free -Wl,--wrap=strdup)
 endif()
 
+# The SHA-256 a file transfer carries and checks, over every size a block hash cares about. Where the linker can
+# wrap OpenSSL's digest calls it also fails each one, and counts the contexts transfers take and give back.
+directgate_smoke(transfer_digest_smoke)
+if(UNIX AND NOT APPLE)
+    target_compile_definitions(transfer_digest_smoke PRIVATE DIRECTGATE_TEST_EVP_WRAP)
+    target_link_options(transfer_digest_smoke PRIVATE
+        -Wl,--wrap=EVP_MD_CTX_new -Wl,--wrap=EVP_MD_CTX_free -Wl,--wrap=EVP_DigestInit_ex
+        -Wl,--wrap=EVP_DigestUpdate -Wl,--wrap=EVP_DigestFinal_ex)
+endif()
+
 # Out-of-memory sweep over OpenSSL's own allocations, which the linker wrap above cannot reach.
 directgate_smoke(openssl_alloc_smoke)
 set_tests_properties(openssl_alloc_smoke PROPERTIES TIMEOUT 300)

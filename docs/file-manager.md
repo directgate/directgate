@@ -48,9 +48,9 @@ Bidirectional file transfer uses a dedicated `file` message type with the follow
 | `file/cancel` | Either → Either    | Abort an in-progress transfer               |
 
 - **Chunk size:** fixed at **64 KB**, safe for both WebRTC data channels and WebSocket frames. Files of any size are supported; the chunk count is calculated and sent in `file/start`.
-- **Integrity:** a running **SHA-256** hash is accumulated over all chunks. The sender includes the final digest in `file/end`; the receiver verifies it before accepting the file. On mismatch, the partial file is discarded.
+- **Integrity:** a running **SHA-256** hash is accumulated over all chunks. The sender includes the final digest in `file/end`; the receiver verifies it before accepting the file. On mismatch, the partial file is discarded. The agent and `dgcli` hash with OpenSSL, which uses the CPU's SHA instructions or vector units where it has them, and fall back to the portable libxutils SHA-256 for a transfer whose OpenSSL context cannot be set up (out of memory, or no provider offering SHA-256). Both give the same digest. A hash that OpenSSL fails part way through fails the transfer; it never sends or accepts the digest of part of a file.
 - **Transfer ID:** each transfer has a unique string ID (timestamp + random component).
-- **Async sending:** chunk sending is driven by the event-loop interrupt handler (one chunk per tick), keeping the event loop responsive and avoiding frame-size or buffer overflow on either transport.
+- **Async sending:** chunk sending is driven by the event-loop tick (up to four chunks per session per tick, and only while the transport has less than 1 MB queued), keeping the event loop responsive and avoiding frame-size or buffer overflow on either transport.
 
 ## See also
 
