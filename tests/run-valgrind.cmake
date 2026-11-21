@@ -27,6 +27,15 @@ ctest_memcheck(EXCLUDE_LABEL "gpu" RETURN_VALUE test_result DEFECT_COUNT defects
 # Check both: a test may return success while Valgrind reports errors from a
 # forked child, or return a skip code despite a memory error in its log.
 if(NOT test_result EQUAL 0 OR NOT defects EQUAL 0)
+    # What valgrind found is only in its per-test logs, and CI keeps nothing but
+    # the console: print every log that reports an error or an unsuppressed leak.
+    file(GLOB _dg_logs "${CTEST_BINARY_DIRECTORY}/Testing/Temporary/MemoryChecker.*.log")
+    foreach(_dg_log IN LISTS _dg_logs)
+        file(READ "${_dg_log}" _dg_text)
+        if(_dg_text MATCHES "lost in loss record|ERROR SUMMARY: [1-9]")
+            message("---- ${_dg_log}\n${_dg_text}")
+        endif()
+    endforeach()
     message(FATAL_ERROR
         "Valgrind failed: test result ${test_result}, memory defects ${defects}. See ${CTEST_BINARY_DIRECTORY}/Testing/Temporary/MemoryChecker.*.log")
 endif()

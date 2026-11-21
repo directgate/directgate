@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "src/common/webrtc.c"
+#include "webrtc_teardown.h"
 #define CHECK(c, msg) do { if (!(c)) { fprintf(stderr, "webrtc_static_smoke: %s\n", msg); return 1; } } while (0)
 
 static int negotiation(void)
@@ -76,7 +77,7 @@ static int handles(void)
     CHECK(DirectGate_WebRTC_BufferIce(&rtc, "candidate:overflow", "0", 1) == XSTDERR,
         "pending candidate count bounded");
     DirectGate_WebRTC_Clear(&rtc);
-    DirectGate_WebRTC_Cleanup();
+    webrtc_cleanup_settled();
     return 0;
 }
 

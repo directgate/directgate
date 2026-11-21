@@ -33,6 +33,7 @@
 #include <rtc/rtc.h>
 
 #include "src/common/webrtc.h"
+#include "webrtc_teardown.h"
 
 #define CHECK(cond, msg) \
     do { \
@@ -594,7 +595,7 @@ int main(void)
     CHECK(DirectGate_WebRTC_SendOpus(&g_agent, opus, sizeof(opus), 1300000) != XSTDOK, "audio cannot be sent on a closed track");
 
     DirectGate_WebRTC_Destroy(&g_agent);
-    DirectGate_WebRTC_Cleanup();
+    webrtc_cleanup_settled();
     pthread_mutex_destroy(&g_browser[0].lock);
     pthread_mutex_destroy(&g_browser[1].lock);
 

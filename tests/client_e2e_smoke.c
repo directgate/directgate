@@ -58,6 +58,7 @@
 #include "src/common/websock.h"
 
 #include "tls_fixture.h"
+#include "webrtc_teardown.h"
 
 #define CHECK(cond, msg) \
     do { \
@@ -2057,7 +2058,7 @@ int main(void)
     XThread_Join(&thread);
     host_rtc_stop();
     XAPI_Destroy(&g_cli.api);
-    DirectGate_WebRTC_Cleanup();
+    webrtc_cleanup_settled();
 
     DirectGate_SRP_Destroy(&g_cli.srp);
     DirectGate_KeyAuth_Cleanse(&g_cli.keyauth);

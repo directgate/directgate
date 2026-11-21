@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "src/common/webrtc.h"
+#include "webrtc_teardown.h"
 
 typedef struct peer_ {
     directgate_webrtc_t rtc;
@@ -69,7 +70,7 @@ int main(void)
     ok = ok && a.received == 1 && b.received == 1 && !a.errors && !b.errors;
     DirectGate_WebRTC_Clear(&a.rtc);
     DirectGate_WebRTC_Clear(&b.rtc);
-    DirectGate_WebRTC_Cleanup();
+    webrtc_cleanup_settled();
     if (!ok) { fprintf(stderr, "webrtc_peer_smoke: negotiation or bidirectional delivery failed\n"); return 1; }
     puts("webrtc_peer_smoke: OK");
     return 0;

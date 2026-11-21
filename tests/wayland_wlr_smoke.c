@@ -72,6 +72,8 @@ _Static_assert(sizeof(((directgate_wlr_arg_t*)0)->nFixed) == sizeof(wl_fixed_t),
 #define COLOUR_TWO   0x00C08040U
 #define COLOUR_THREE 0x0011AA22U
 
+#define COMPOSITOR_READY_MS 30000U  /* from its socket to its first answer */
+
 #define GEORGIAN_AN  0x010010D0U    /* ა */
 #define GEORGIAN_BAN 0x010010D1U    /* ბ */
 
@@ -112,6 +114,28 @@ static const char* find_compositor(xbool_t *pExplicit)
     return NULL;
 }
 
+/* The socket is there before the compositor answers on it: sway makes it, then
+ * reads its configuration and starts its outputs, and measuring its font on a
+ * cold fontconfig cache took 2.1 s on its own. The agent gives each request
+ * DIRECTGATE_WLR_CALL_MS, so the test waits for one answer of its own first,
+ * by time. 0 once it came, -1 when the compositor never answered or went away. */
+static int wait_compositor(void)
+{
+    char sPath[256];
+    snprintf(sPath, sizeof(sPath), "%s/%s", g_sRoot, g_sSocket);
+
+    directgate_wlr_conn_t conn;
+    memset(&conn, 0, sizeof(conn));
+    conn.pDisplay = g_wlr.connect(sPath);
+    if (conn.pDisplay == NULL) return -1;
+
+    int nStatus = DirectGate_WLR_Roundtrip(&conn, COMPOSITOR_READY_MS);
+    g_wlr.disconnect(conn.pDisplay);
+    return nStatus == XSTDOK ? 0 : -1;
+}
+
+/* 0 once the compositor answers, -1 when it did not start, -2 when its socket
+ * came up but it never answered on it. */
 static int start_compositor(const char *pPath)
 {
     char sConfig[256];
@@ -166,7 +190,7 @@ static int start_compositor(const char *pPath)
             if (access(sSocket, F_OK) != 0) continue;
 
             snprintf(g_sSocket, sizeof(g_sSocket), "wayland-%d", n);
-            return 0;
+            return wait_compositor() == 0 ? 0 : -2;
         }
 
         int nStatus = 0;
@@ -864,11 +888,13 @@ int main(void)
     CHECK(mkdtemp(g_sRoot) != NULL, "make a runtime directory");
     XSync_Init(&g_frames.lock);
 
-    if (start_compositor(pCompositor) != 0)
+    int nStarted = start_compositor(pCompositor);
+    if (nStarted != 0)
     {
         show_log();
         stop_compositor();
         remove_tree();
+        CHECK(nStarted != -2, "the compositor answers on its socket within 30 s");
         if (bExplicit) CHECK(0, "the compositor named by DIRECTGATE_WLR_COMPOSITOR starts");
 
         printf("wayland_wlr_smoke: SKIP (%s did not start)\n", pCompositor);

@@ -15,6 +15,7 @@
 
 #define main dgcli_main
 #include "src/client/client.c"
+#include "webrtc_teardown.h"
 #undef main
 
 #define CHECK(cond, msg) \
@@ -372,7 +373,7 @@ int main(void)
     if (check_stdin_states()) return 1;
     if (check_routing_key()) return 1;
 
-    DirectGate_WebRTC_Cleanup();
+    webrtc_cleanup_settled();
     XLog_Destroy();
     printf("client_io_smoke: ok\n");
     return 0;

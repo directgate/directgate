@@ -39,6 +39,7 @@
 #include "src/common/websock.h"
 
 #include "tls_fixture.h"
+#include "webrtc_teardown.h"
 
 #define CHECK(cond, msg) \
     do { \
@@ -887,7 +888,7 @@ int main(void)
     XSYNC_ATOMIC_SET(&g_e2e.bStop, 1);
     XThread_Join(&thread);
     browser_stop();
-    DirectGate_WebRTC_Cleanup();
+    webrtc_cleanup_settled();
     XAPI_Destroy(&g_e2e.api);
 
     DirectGate_SRP_ClientCleanse(&g_e2e.client);

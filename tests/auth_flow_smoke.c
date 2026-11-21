@@ -22,6 +22,7 @@
 #include <openssl/crypto.h>
 
 #include "src/agent/directgate.h"
+#include "webrtc_teardown.h"
 
 #define CHECK(cond, msg) \
     do { \
@@ -1904,7 +1905,7 @@ int main(void)
     if (test_dispatch_corners()) return 1;
 
     /* The dispatch test started a peer connection; its transport threads go with it. */
-    DirectGate_WebRTC_Cleanup();
+    webrtc_cleanup_settled();
     puts("auth_flow_smoke: OK");
     return 0;
 }

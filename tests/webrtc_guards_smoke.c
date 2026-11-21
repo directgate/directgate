@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include "src/common/webrtc.c"
+#include "webrtc_teardown.h"
 
 #define CHECK(c, msg) \
     do { if (!(c)) { fprintf(stderr, "webrtc_guards_smoke: %s (line %d)\n", msg, __LINE__); return 1; } } while (0)
@@ -317,7 +318,7 @@ int main(void)
         check_negotiation(&rtc) || check_callbacks(&rtc) || check_stale(&rtc) || check_media(&rtc);
 
     DirectGate_WebRTC_Clear(&rtc);
-    DirectGate_WebRTC_Cleanup();
+    webrtc_cleanup_settled();
     if (nFailed) return 1;
 
     puts("webrtc_guards_smoke: OK");
