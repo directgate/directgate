@@ -118,6 +118,16 @@ if(UNIX AND NOT APPLE)
         -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free -Wl,--wrap=strdup)
 endif()
 
+# The SHA-256 a file transfer carries and checks, over every size a block hash cares about. Where the linker can
+# wrap OpenSSL's digest calls it also fails each one, and counts the contexts transfers take and give back.
+directgate_smoke(transfer_digest_smoke)
+if(UNIX AND NOT APPLE)
+    target_compile_definitions(transfer_digest_smoke PRIVATE DIRECTGATE_TEST_EVP_WRAP)
+    target_link_options(transfer_digest_smoke PRIVATE
+        -Wl,--wrap=EVP_MD_CTX_new -Wl,--wrap=EVP_MD_CTX_free -Wl,--wrap=EVP_DigestInit_ex
+        -Wl,--wrap=EVP_DigestUpdate -Wl,--wrap=EVP_DigestFinal_ex)
+endif()
+
 # Out-of-memory sweep over OpenSSL's own allocations, which the linker wrap above cannot reach.
 directgate_smoke(openssl_alloc_smoke)
 set_tests_properties(openssl_alloc_smoke PROPERTIES TIMEOUT 300)
@@ -638,6 +648,17 @@ directgate_smoke_desktop(session_lifetime_smoke)
 target_compile_definitions(session_lifetime_smoke PRIVATE DIRECTGATE_TESTING)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(session_lifetime_smoke PRIVATE -Wno-unused-function)
+endif()
+
+# Every test runs with a home directory of its own. Code under test that falls back to a default path - the agent's
+# config is ~/.config/directgate/agent.json - otherwise writes into the real home of whoever runs the suite, and
+# enroll_api_smoke did: it saved its fixture over the developer's own agent config on every run. Appended last, so a
+# test that sets its own ENVIRONMENT above keeps it.
+set(DIRECTGATE_TEST_HOME "${CMAKE_CURRENT_BINARY_DIR}/test-home")
+file(MAKE_DIRECTORY "${DIRECTGATE_TEST_HOME}")
+get_property(_dg_tests DIRECTORY PROPERTY TESTS)
+if(_dg_tests)
+    set_property(TEST ${_dg_tests} APPEND PROPERTY ENVIRONMENT "HOME=${DIRECTGATE_TEST_HOME}")
 endif()
 
 # Optional coverage-guided parser fuzzing. Recompile only the parser units

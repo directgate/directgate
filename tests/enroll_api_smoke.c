@@ -250,13 +250,18 @@ int main(void)
         CHECK(!file_has(sPersonalCfgPath, "managedOrganizationId") && !file_has(sPersonalCfgPath, "organizationId"),
             "a personal pairing should record no organization and allow nothing");
 
+        /* InitConfig points the config at the default path in the home directory, and LoadConfig reads from the path it
+           is given without moving it: the refresh below saves, and used to save over the developer's own agent.json */
         DirectGate_InitConfig(&personal);
+        xstrncpy(personal.sCfgPath, sizeof(personal.sCfgPath), sPersonalCfgPath);
         CHECK(DirectGate_LoadConfig(&personal, sPersonalCfgPath), "load the paired personal device");
         fake_https_reply(&api, 200, "application/json", g_pOrgRefreshJson);
         CHECK(DirectGate_Enroll_Refresh(&personal, sReason, sizeof(sReason)) == DIRECTGATE_ENROLL_REFRESH_OK,
             "a refresh naming an organization should succeed");
         CHECK(!strcmp(personal.enroll.sOrganizationId, ORG_ID) && personal.keyauth.sManagedOrgId[0] == '\0',
             "the organization the refresh names should be recorded without being allowed");
+        CHECK(file_has(sPersonalCfgPath, "\"organizationId\": \"" ORG_ID "\""),
+            "and saved into the config it was loaded from");
 
         unlink(sOrgCfgPath);
         unlink(sPersonalCfgPath);

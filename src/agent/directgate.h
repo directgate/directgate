@@ -37,6 +37,16 @@ extern "C" {
 
 typedef char xstr_tiny_t[XSTR_TINY];
 
+/* What the refresh on the worker is for, which decides where its answer goes */
+typedef enum {
+    DIRECTGATE_REFRESH_SESSION = 0,     /* the in-session refresh: tells the relay the new token */
+    DIRECTGATE_REFRESH_CONNECT,         /* the reconnect's own: the connect waits for it */
+    DIRECTGATE_REFRESH_REPROBE          /* asking the API for a relay after reconnects kept failing */
+} directgate_refresh_kind_t;
+
+/* The relay host looked up on a worker thread, see DirectGate_CheckReconnect() */
+typedef struct directgate_resolve_job_ directgate_resolve_job_t;
+
 typedef struct directgate_temporary_desktop_share_ {
     directgate_auth_t auth;
     xstr_mid_t sShareId;
@@ -78,11 +88,22 @@ typedef struct directgate_conn_ {
      * when the request ran on the event loop it stalled every live session too. */
     uint64_t nNextTokenRefreshMs;
     uint32_t nTokenRefreshFailures;
-    /* The in-session token refresh in flight on its worker, taken by a later
-     * loop pass. While it is out no other refresh may start, the reconnect
-     * included: two requests with one refresh token read as reuse to the API
-     * the moment it rotates that token, and it revokes the device. */
+    /* The token refresh in flight on its worker, taken by a later loop pass.
+     * While it is out no other refresh may start, the reconnect included: two
+     * requests with one refresh token read as reuse to the API the moment it
+     * rotates that token, and it revokes the device. */
     directgate_enroll_job_t *pRefreshJob;
+    directgate_refresh_kind_t eRefreshKind;
+    /* The reconnect's refresh is settled, so the connect goes on without asking again. Which pre-connect check it
+     * was is kept for the log of its answer, and the relay a re-probe asked about to tell a new one from the same. */
+    xbool_t bConnectRefreshed;
+    const char *pConnectRefreshStage;
+    char sReprobePrevUrl[XPATH_MAX];
+    /* The relay host's address for the next connect, looked up on a worker: getaddrinfo() has no timeout of its own
+     * and the loop carries the sessions the relay left running on their data channels. Valid for sRelayHost only. */
+    directgate_resolve_job_t *pResolveJob;
+    char sRelayHost[XLINK_ADDR_MAX];
+    char sRelayIPAddr[XSOCK_ADDR_MAX];
     /* Next retry of a config save that failed after a token refresh. */
     uint64_t nNextSaveRetryMs;
     xstr_tiny_t sDisconnectReason;
@@ -115,6 +136,10 @@ xbool_t DirectGate_TestFinishTokenRefresh(directgate_conn_t *pConn, uint32_t nWa
 void DirectGate_TestSettleTokenRefresh(directgate_conn_t *pConn, uint32_t nWaitMs);
 void DirectGate_TestRetryPendingSave(directgate_conn_t *pConn);
 xbool_t DirectGate_TestPrepareEndpoint(directgate_conn_t *pConn);
+void DirectGate_TestCheckReconnect(xapi_t *pApi, xapi_endpoint_t *pEndpt, directgate_conn_t *pConn);
+xbool_t DirectGate_TestCollectReconnect(directgate_conn_t *pConn, uint32_t nWaitMs);
+void DirectGate_TestDropRelayResolve(directgate_conn_t *pConn);
+void DirectGate_TestInitialConnect(xapi_t *pApi, xapi_endpoint_t *pEndpt, directgate_conn_t *pConn);
 #endif
 
 #ifdef __cplusplus

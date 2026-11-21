@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <openssl/crypto.h>
 #include <openssl/err.h>
@@ -19,6 +20,7 @@
 #include "src/common/e2e.h"
 #include "src/common/keyauth.h"
 #include "src/common/srp.h"
+#include "src/common/transfer.h"
 
 #define CHECK(cond, msg) \
     do { \
@@ -241,6 +243,79 @@ static int scn_e2e(void)
     return nResult;
 }
 
+/* A file of three chunks and a tail, sent and received. Either end that cannot have OpenSSL's SHA-256 hashes with
+   libxutils' instead, so the file has to arrive whole every time; what the receiver keeps is judged on its bytes. */
+#define TRANSFER_SIZE   (3U * XFILE_CHUNK_SIZE + 17U)
+
+static uint8_t g_transferData[TRANSFER_SIZE];
+static uint8_t g_transferBack[TRANSFER_SIZE + 1];
+static char g_sTransferSrc[256];
+static char g_sTransferDst[256];
+
+static int transfer_ack(xjson_obj_t *pHeader, const uint8_t *pPayload, size_t nLen, void *pCtx)
+{
+    (void)pHeader;
+    (void)pPayload;
+    (void)nLen;
+    (void)pCtx;
+    return XSTDOK;
+}
+
+static int transfer_deliver(xjson_obj_t *pHeader, const uint8_t *pPayload, size_t nLen, void *pCtx)
+{
+    directgate_transfer_t *pRx = (directgate_transfer_t*)pCtx;
+    xbyte_buffer_t wire;
+    XByteBuffer_Init(&wire, 0, XFALSE);
+
+    directgate_pkg_t pkg;
+    if (!DirectGate_Proto_Build(&wire, pHeader, pPayload, nLen, XFALSE) ||
+        !DirectGate_Package_Parse(&pkg, wire.pData, wire.nUsed))
+    {
+        XByteBuffer_Clear(&wire);
+        return XSTDERR;
+    }
+
+    const directgate_pkg_file_t *pFile = (const directgate_pkg_file_t*)pkg.pPackage;
+    int nStatus = XSTDERR;
+
+    if (!strcmp(pFile->pAction, "start")) nStatus = DirectGate_Transfer_HandleStartPath(pRx, &pkg, g_sTransferDst);
+    else if (!strcmp(pFile->pAction, "chunk")) nStatus = DirectGate_Transfer_HandleChunk(pRx, &pkg);
+    else if (!strcmp(pFile->pAction, "end")) nStatus = DirectGate_Transfer_HandleEnd(pRx, &pkg, transfer_ack, NULL);
+
+    DirectGate_Package_Clear(&pkg);
+    XByteBuffer_Clear(&wire);
+    return nStatus;
+}
+
+static int scn_transfer(void)
+{
+    directgate_transfer_t tx, rx;
+    DirectGate_Transfer_Init(&tx);
+    DirectGate_Transfer_Init(&rx);
+    unlink(g_sTransferDst);
+
+    if (DirectGate_Transfer_Send(&tx, g_sTransferSrc, transfer_deliver, &rx) == XSTDOK)
+    {
+        while (DirectGate_Transfer_IsActive(&tx))
+            if (DirectGate_Transfer_SendNext(&tx, transfer_deliver, &rx) < 0) break;
+    }
+
+    int nResult = SCN_WRONG;
+    if (tx.eState == XTRANSFER_STATE_DONE && rx.eState == XTRANSFER_STATE_DONE)
+    {
+        FILE *pFile = fopen(g_sTransferDst, "rb");
+        size_t nBack = pFile != NULL ? fread(g_transferBack, 1, sizeof(g_transferBack), pFile) : 0;
+        if (pFile != NULL) fclose(pFile);
+
+        if (nBack == TRANSFER_SIZE && !memcmp(g_transferBack, g_transferData, nBack)) nResult = SCN_DONE;
+    }
+
+    DirectGate_Transfer_Destroy(&tx);
+    DirectGate_Transfer_Destroy(&rx);
+    unlink(g_sTransferDst);
+    return nResult;
+}
+
 /* Up to 3.0.17, 3.2.5, 3.3.4, 3.4.2 and 3.5.3, and in all of 3.1, an allocation failing part way through an AES-SIV
    key setup makes OpenSSL free what the setup allocated so far once more when the cipher context is freed
    (ossl_siv128_init, crypto/modes/siv128.c). With those, the E2E round trip keeps its cipher calls out of the sweep. */
@@ -332,8 +407,20 @@ int main(void)
     CHECK(DirectGate_KeyAuth_Base64Encode(g_agentPub, sizeof(g_agentPub), g_sAgentPubB64, sizeof(g_sAgentPubB64)),
         "encode the agent identity");
 
+    char sTransferDir[] = "/tmp/directgate_openssl_alloc.XXXXXX";
+    CHECK(mkdtemp(sTransferDir) != NULL, "create the transfer directory");
+    snprintf(g_sTransferSrc, sizeof(g_sTransferSrc), "%s/source.bin", sTransferDir);
+    snprintf(g_sTransferDst, sizeof(g_sTransferDst), "%s/dest.bin", sTransferDir);
+    for (size_t i = 0; i < sizeof(g_transferData); i++) g_transferData[i] = (uint8_t)((i * 131U) ^ (i >> 9));
+
+    FILE *pSource = fopen(g_sTransferSrc, "wb");
+    CHECK(pSource != NULL, "create the transfer source");
+    size_t nWritten = fwrite(g_transferData, 1, sizeof(g_transferData), pSource);
+    CHECK(fclose(pSource) == 0 && nWritten == sizeof(g_transferData), "write the transfer source");
+
     /* Warm OpenSSL's lazily built global state, the error queue included, before anything is counted */
-    CHECK(scn_srp_exchange() == SCN_DONE && scn_keyauth() == SCN_DONE && scn_e2e() == SCN_DONE, "warm every path");
+    CHECK(scn_srp_exchange() == SCN_DONE && scn_keyauth() == SCN_DONE && scn_e2e() == SCN_DONE &&
+        scn_transfer() == SCN_DONE, "warm every path");
     ERR_raise(ERR_LIB_CRYPTO, ERR_R_MALLOC_FAILURE);
     ERR_clear_error();
 
@@ -341,6 +428,10 @@ int main(void)
     CHECK(sweep("the SRP exchange", scn_srp_exchange, sweep_stride(8)) == 0, "the SRP exchange survives every failure");
     CHECK(sweep("the key handshake", scn_keyauth, 1) == 0, "the key handshake survives every failure");
     CHECK(sweep("the E2E round trip", scn_e2e, 1) == 0, "the E2E round trip survives every failure");
+    CHECK(sweep("the file transfer", scn_transfer, 1) == 0, "the file transfer arrives whole through every failure");
+
+    unlink(g_sTransferSrc);
+    CHECK(rmdir(sTransferDir) == 0, "the transfer directory is left empty");
 
     DirectGate_KeyAuth_KeyCleanse(&g_clientKey);
     BN_free(g_pRefK);
