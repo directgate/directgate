@@ -73,7 +73,7 @@ typedef struct {
     uint16_t nRelayPort;
     char sLocalRelayUrl[128];
     xatomic_t bLocalRelay;
-    xatomic_t nRelayAccepts;
+    xatomic_t nRelayConns;  /* connections that reached the relay: accepted, or turned down in their TLS accept */
     xatomic_t nRelayUpgrades;
     char sRelayHost[128];   /* the Host header of the last upgrade, written before nRelayUpgrades counts it */
 } api_t;
@@ -149,9 +149,14 @@ static int api_callback(xapi_ctx_t *pCtx, xapi_session_t *pSession)
     {
         if (pCtx->eCbType == XAPI_CB_ACCEPTED)
         {
-            XSYNC_ATOMIC_ADD(&g_api.nRelayAccepts, 1);
+            XSYNC_ATOMIC_ADD(&g_api.nRelayConns, 1);
             return XAPI_SetEvents(pSession, XPOLLIN);
         }
+
+        /* Reported in place of the accept: SSL_accept() reads on after sending the certificate, and a client that
+           turned it down by then has sent an alert instead of finishing */
+        if (pCtx->eCbType == XAPI_CB_ERROR && pCtx->eStatType == XAPI_SOCK && pCtx->nStatus == XSOCK_ERR_SSLACC)
+            XSYNC_ATOMIC_ADD(&g_api.nRelayConns, 1);
 
         return pCtx->eCbType == XAPI_CB_HANDSHAKE_REQUEST ? relay_upgrade(pSession) : XAPI_CONTINUE;
     }
@@ -579,7 +584,7 @@ static int test_reconnect_refresh(const char *pRoot, uint16_t nPort)
     rec.cfg.enroll.nAccessTokenExp = (uint64_t)time(NULL) + 30U;
 
     uint32_t nRequests = (uint32_t)XSYNC_ATOMIC_GET(&g_api.nRequests);
-    uint32_t nAccepts = (uint32_t)XSYNC_ATOMIC_GET(&g_api.nRelayAccepts);
+    uint32_t nConns = (uint32_t)XSYNC_ATOMIC_GET(&g_api.nRelayConns);
     XSYNC_ATOMIC_SET(&g_api.bLocalRelay, 1);
     api_hold_for(ANSWER_OK, 5000);
 
@@ -591,7 +596,7 @@ static int test_reconnect_refresh(const char *pRoot, uint16_t nPort)
 
     for (int i = 0; i < 3; i++) CHECK(reconnect_pass(&rec) < QUICK_MS, "a pass while it is out returns at once");
     CHECK((uint32_t)XSYNC_ATOMIC_GET(&g_api.nRequests) == nRequests + 1U, "no second request goes out meanwhile");
-    CHECK(rec.conn.pWsSession == NULL && (uint32_t)XSYNC_ATOMIC_GET(&g_api.nRelayAccepts) == nAccepts,
+    CHECK(rec.conn.pWsSession == NULL && (uint32_t)XSYNC_ATOMIC_GET(&g_api.nRelayConns) == nConns,
         "the relay is not dialed before the answer is in");
 
     api_release();
@@ -697,7 +702,7 @@ static int test_reconnect_lookup(const char *pRoot, uint16_t nPort)
 
     snprintf(sUrl, sizeof(sUrl), "wss://dg-relay..invalid:%u/websock", (unsigned)g_api.nRelayPort);
     reconnect_open(&rec, pRoot, nPort, sUrl);
-    uint32_t nAccepts = (uint32_t)XSYNC_ATOMIC_GET(&g_api.nRelayAccepts);
+    uint32_t nConns = (uint32_t)XSYNC_ATOMIC_GET(&g_api.nRelayConns);
 
     reconnect_pass(&rec);
     CHECK(rec.conn.pResolveJob != NULL, "a host that will not resolve is looked up on the worker too");
@@ -706,21 +711,31 @@ static int test_reconnect_lookup(const char *pRoot, uint16_t nPort)
     CHECK(!rec.conn.bConnectRefreshed, "and the next attempt starts over with its own refresh check");
     CHECK(rec.conn.nReconnectAttempt == 1 && rec.conn.nNextReconnectMs > XTime_GetMonoMs(),
         "the attempt fails and another is due");
-    CHECK((uint32_t)XSYNC_ATOMIC_GET(&g_api.nRelayAccepts) == nAccepts, "and the relay never heard of it");
+    CHECK((uint32_t)XSYNC_ATOMIC_GET(&g_api.nRelayConns) == nConns, "and the relay never heard of it");
 
-    /* An address in hand for the host is dialed as it is: this name would not resolve, so only it reaches the relay */
+    /* An address in hand for the host is dialed as it is: this name would not resolve, so only it reaches the relay.
+       Where TLS turns the link down is a race with the relay's thread: on the loop, or already inside the connect when
+       the certificate came back before SSL_connect() was done reading. The relay counts the connection after it has
+       sent that certificate, so the link may be gone before the count. Both are waited for by time, not by the link. */
+    uint32_t nUpgrades = (uint32_t)XSYNC_ATOMIC_GET(&g_api.nRelayUpgrades);
     rec.conn.nNextReconnectMs = 1;
     xstrncpy(rec.conn.sRelayHost, sizeof(rec.conn.sRelayHost), "dg-relay..invalid");
     xstrncpy(rec.conn.sRelayIPAddr, sizeof(rec.conn.sRelayIPAddr), "127.0.0.1");
     reconnect_pass(&rec);
-    CHECK(rec.conn.pResolveJob == NULL && rec.conn.pWsSession != NULL, "the address found is the one dialed");
+    CHECK(rec.conn.pResolveJob == NULL && rec.conn.sRelayIPAddr[0] == '\0', "the address in hand is not looked up again");
 
     uint64_t nDeadlineMs = XTime_GetMonoMs() + WAIT_MS;
-    while ((uint32_t)XSYNC_ATOMIC_GET(&g_api.nRelayAccepts) == nAccepts && rec.conn.pWsSession != NULL &&
-        XTime_GetMonoMs() < nDeadlineMs) XAPI_Service(&rec.api, 20);
-    CHECK((uint32_t)XSYNC_ATOMIC_GET(&g_api.nRelayAccepts) > nAccepts, "and it reaches the relay");
-    while (rec.conn.pWsSession != NULL && XTime_GetMonoMs() < nDeadlineMs) XAPI_Service(&rec.api, 20);
+    while (((uint32_t)XSYNC_ATOMIC_GET(&g_api.nRelayConns) == nConns || rec.conn.pWsSession != NULL) &&
+        XTime_GetMonoMs() < nDeadlineMs)
+    {
+        if (rec.conn.pWsSession != NULL) XAPI_Service(&rec.api, 20);
+        else xusleep(5000);
+    }
+
+    CHECK((uint32_t)XSYNC_ATOMIC_GET(&g_api.nRelayConns) > nConns, "the address found is the one dialed");
     CHECK(rec.conn.pWsSession == NULL && !rec.conn.bRoleSent, "where TLS still holds it to the name it lacks");
+    CHECK(rec.conn.nReconnectAttempt == 2 && rec.conn.nNextReconnectMs > 0, "the attempt fails and another is due");
+    CHECK((uint32_t)XSYNC_ATOMIC_GET(&g_api.nRelayUpgrades) == nUpgrades, "with no upgrade ever sent");
     reconnect_close(&rec);
     return 0;
 }
@@ -931,10 +946,21 @@ static int test_refusals(const char *pRoot, uint16_t nPort)
     char sReason[XSTR_TINY];
     directgate_enroll_status_t eStatus = DIRECTGATE_ENROLL_REFRESH_OK;
 
-    xstrncpy(fix.cfg.enroll.sApiUrl, sizeof(fix.cfg.enroll.sApiUrl), "http://127.0.0.1:1");
-    CHECK(DirectGate_Enroll_StartRefresh(&fix.cfg, &eStatus, sReason, sizeof(sReason)) == NULL &&
-        eStatus == DirectGate_Enroll_Refresh(&fix.cfg, sReason, sizeof(sReason)),
-        "an API endpoint the build does not allow is refused up front, as the in-line refresh refuses it");
+    /* Refused by every build; plain http only by a production one (DIRECTGATE_DEBUG off, as CI builds) */
+    const char *pRefused[] = {
+        "ftp://127.0.0.1:1",
+#ifndef DIRECTGATE_DEBUG
+        "http://127.0.0.1:1",
+#endif
+    };
+
+    for (size_t i = 0; i < sizeof(pRefused) / sizeof(pRefused[0]); i++)
+    {
+        xstrncpy(fix.cfg.enroll.sApiUrl, sizeof(fix.cfg.enroll.sApiUrl), pRefused[i]);
+        CHECK(DirectGate_Enroll_StartRefresh(&fix.cfg, &eStatus, sReason, sizeof(sReason)) == NULL &&
+            eStatus == DirectGate_Enroll_Refresh(&fix.cfg, sReason, sizeof(sReason)),
+            "an API endpoint the build does not allow is refused up front, as the in-line refresh refuses it");
+    }
 
     fix.cfg.enroll.sRefreshToken[0] = '\0';
     CHECK(DirectGate_Enroll_StartRefresh(&fix.cfg, &eStatus, sReason, sizeof(sReason)) == NULL &&
