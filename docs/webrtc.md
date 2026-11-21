@@ -49,6 +49,8 @@ The connection degrades gracefully through three tiers, and the client always sh
 
 The terminal session stays fully functional on every tier, and traffic remains end-to-end encrypted regardless of which one is in use - so you always know whether the connection is direct, TURN-relayed, or on the WebSocket relay.
 
+The background peer the agent holds next to the active one (`migration: "p2p"` offers, `migration-ready`, `migration-commit`) serves two cases. One is the browser's TURN -> P2P upgrade. The other is a peer whose path went quiet: the browser starts a second peer the moment it sees the active one `disconnected`, so a direct path takes over with its media already flowing instead of after a plain replacement, which drops the old peer and freezes the picture until the new one draws. The agent side is the same in both cases and has not changed: it promotes only a candidate whose selected pair is direct, and a plain offer still replaces everything.
+
 On the WebSocket relay tier the desktop stream is paced by the relay socket itself: while more than 1 MB is still waiting to go out on it, the agent skips capture and drops encoded frames instead of queueing them, and asks the encoder for a keyframe so the picture recovers the moment the backlog clears. Without that, a slow relay link let the queue - and the viewer's latency - grow without bound, and delayed the terminal and input traffic sharing the socket. A send that fails while the data channel still reports itself open no longer marks WebRTC as down; only a channel that is actually closed moves the session to the relay.
 
 ## Desktop video track

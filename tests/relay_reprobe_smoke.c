@@ -170,6 +170,9 @@ static int run(const char *pRoot, uint16_t nPort)
     xstrncpy(g_api.sRelayUrl, sizeof(g_api.sRelayUrl), SECOND_RELAY);
     conn.nReconnectAttempt = 5;
     relay_closed(&conn, &relay);
+    CHECK(conn.pRefreshJob != NULL && conn.eRefreshKind == DIRECTGATE_REFRESH_REPROBE,
+        "the API is asked on the refresh worker, not on the loop the relay left sessions running on");
+    CHECK(DirectGate_TestCollectReconnect(&conn, 20000) && conn.pRefreshJob == NULL, "a later pass takes its answer");
     CHECK(XSYNC_ATOMIC_GET(&g_api.nRefreshes) == 1, "after enough failed reconnects the API is asked again");
     CHECK(strcmp(cfg.sRelayUrl, SECOND_RELAY) == 0, "the relay the API hands out is the one used next");
     CHECK(conn.nReconnectAttempt == 1, "a new relay starts the backoff over, so it is tried at once");
@@ -177,6 +180,7 @@ static int run(const char *pRoot, uint16_t nPort)
     /* Not again inside the probe gap, however many failures pile up. */
     conn.nReconnectAttempt = 9;
     relay_closed(&conn, &relay);
+    CHECK(conn.pRefreshJob == NULL, "nothing goes out inside the probe gap");
     CHECK(XSYNC_ATOMIC_GET(&g_api.nRefreshes) == 1, "the API is not asked again inside the probe gap");
     CHECK(conn.nReconnectAttempt == 10, "inside the gap the reconnects simply go on");
 
@@ -184,6 +188,7 @@ static int run(const char *pRoot, uint16_t nPort)
     XSYNC_ATOMIC_SET(&g_api.nCode, 503);
     conn.nNextRefreshProbeMs = 0;
     relay_closed(&conn, &relay);
+    CHECK(DirectGate_TestCollectReconnect(&conn, 20000), "the failed ask is taken");
     CHECK(XSYNC_ATOMIC_GET(&g_api.nRefreshes) == 2, "after the gap the API is asked again");
     CHECK(strcmp(cfg.sRelayUrl, SECOND_RELAY) == 0 && conn.nReconnectAttempt == 11,
         "a failed ask keeps the relay and the backoff");
@@ -192,6 +197,7 @@ static int run(const char *pRoot, uint16_t nPort)
     XSYNC_ATOMIC_SET(&g_api.nCode, 200);
     conn.nNextRefreshProbeMs = 0;
     relay_closed(&conn, &relay);
+    CHECK(DirectGate_TestCollectReconnect(&conn, 20000), "the answer naming the same relay is taken");
     CHECK(XSYNC_ATOMIC_GET(&g_api.nRefreshes) == 3, "the API is asked once more after the gap");
     CHECK(conn.nReconnectAttempt == 12, "the same relay handed back does not restart the backoff");
 

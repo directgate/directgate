@@ -220,10 +220,29 @@ static int test_relay_probe(void)
     CHECK(conn.nRelayProbeDeadlineMs == 0, "a fresh link owes no answer");
     relay.sock.nFD = pair[0];
     relay.nEvents = XPOLLIO;
+
+    /* A link still connecting gets no frame: one queued ahead of the upgrade request of an async connect would go out
+       first and break it. Its upgrade is owed all the same, so a link that never gets one is given up as before. */
+    uint64_t nNowMs = XTime_GetMonoMs();
+    conn.nLastRelayRecvMs = nNowMs - 21000ULL;
+    DirectGate_TestCheckRelayKeepalive(&conn);
+    CHECK(relay.txBuffer.nUsed == 0, "a link still connecting is not pinged");
+    CHECK(conn.nRelayProbeDeadlineMs >= nNowMs + 7000ULL && conn.nRelayProbeDeadlineMs <= nNowMs + 9000ULL,
+        "its upgrade is owed within the answer time a ping would have");
+
+    conn.nRelayProbeDeadlineMs = XTime_GetMonoMs() - 1ULL;
+    g_sLogged[0] = '\0';
+    DirectGate_TestCheckRelayKeepalive(&conn);
+    CHECK(strstr(g_sLogged, "Relay probe went unanswered") != NULL, "a link whose upgrade never comes is given up");
+
+    /* From here an established link: upgraded, its role sent */
+    conn.nLastRelayProbeMs = 0;
+    conn.nRelayProbeDeadlineMs = 0;
+    relay.bHandshakeDone = XTRUE;
     conn.bRoleSent = XTRUE;
 
     /* Silent for the probe interval with nothing queued: the probe is owed an answer within seconds */
-    uint64_t nNowMs = XTime_GetMonoMs();
+    nNowMs = XTime_GetMonoMs();
     conn.nLastRelayRecvMs = nNowMs - 21000ULL;
     DirectGate_TestCheckRelayKeepalive(&conn);
     CHECK(count_pings(&relay.txBuffer) == 1, "an idle link is probed");
@@ -636,6 +655,538 @@ static int test_detach(void)
     return 0;
 }
 
+typedef struct {
+    int bFound;
+    char sStatus[16];
+    char sReason[64];
+    int bResume;
+    int bResumed;
+    char sProof[2048];
+} auth_result_t;
+
+/* The last auth result the agent wrote to a relay link for an id: read back out of its (masked) binary frames */
+static int read_auth_result(const xbyte_buffer_t *pBuffer, uint32_t nSessionId, auth_result_t *pResult)
+{
+    memset(pResult, 0, sizeof(*pResult));
+
+    for (size_t nPos = 0; nPos + 2 <= pBuffer->nUsed;)
+    {
+        const uint8_t *pFrame = pBuffer->pData + nPos;
+        size_t nLength = pFrame[1] & 0x7F, nHeader = 2;
+
+        if (nLength == 126)
+        {
+            if (nPos + 4 > pBuffer->nUsed) break;
+            nLength = ((size_t)pFrame[2] << 8) | pFrame[3];
+            nHeader = 4;
+        }
+        else if (nLength == 127)
+        {
+            if (nPos + 10 > pBuffer->nUsed) break;
+            nLength = 0;
+            for (int i = 0; i < 8; i++) nLength = (nLength << 8) | pFrame[2 + i];
+            nHeader = 10;
+        }
+
+        size_t nMaskAt = nHeader;
+        if (pFrame[1] & 0x80) nHeader += 4;
+        if (nPos + nHeader + nLength > pBuffer->nUsed) break;
+
+        if ((pFrame[0] & 0x0F) == 0x02 && nLength > 0)
+        {
+            uint8_t *pPayload = (uint8_t*)malloc(nLength);
+            if (pPayload == NULL) return 0;
+
+            for (size_t i = 0; i < nLength; i++)
+                pPayload[i] = pFrame[nHeader + i] ^ ((pFrame[1] & 0x80) ? pFrame[nMaskAt + (i % 4)] : 0);
+
+            directgate_pkg_t pkg;
+            if (DirectGate_Package_Parse(&pkg, pPayload, nLength))
+            {
+                const directgate_pkg_auth_t *pAuth = (const directgate_pkg_auth_t*)pkg.pPackage;
+                xjson_obj_t *pRoot = pkg.jsonHeader.pRootObj;
+
+                if (pkg.header.eType == DIRECTGATE_PKG_AUTH && pkg.header.nSessionId == nSessionId && pAuth != NULL)
+                {
+                    pResult->bFound = 1;
+                    xstrncpy(pResult->sStatus, sizeof(pResult->sStatus), pAuth->pStatus);
+                    xstrncpy(pResult->sReason, sizeof(pResult->sReason), XJSON_GetString(XJSON_GetObject(pRoot, "reason")));
+                    xstrncpy(pResult->sProof, sizeof(pResult->sProof), XJSON_GetString(XJSON_GetObject(pRoot, "proof")));
+                    pResult->bResume = XJSON_GetBool(XJSON_GetObject(pRoot, "resume"));
+                    pResult->bResumed = XJSON_GetBool(XJSON_GetObject(pRoot, "resumed"));
+                }
+
+                DirectGate_Package_Clear(&pkg);
+            }
+
+            free(pPayload);
+        }
+
+        nPos += nHeader + nLength;
+    }
+
+    return pResult->bFound;
+}
+
+/* What a client that lost its relay socket seals with the session's keys to take it back: an auth "resume" under the
+   old id, bound to the new one and the device. Returned as the base64 the request carries, so a test can resend it. */
+static int seal_resume_proof(directgate_e2e_t *pPeer, uint32_t nPrevId, uint32_t nBoundId, const char *pDeviceId,
+                             char *pProof, size_t nProofSize)
+{
+    xjson_obj_t *pInner = DirectGate_Proto_NewHeader("auth", nPrevId);
+    if (pInner == NULL) return 0;
+
+    XJSON_AddString(pInner, "action", "resume");
+    XJSON_AddU32(pInner, "newSessionId", nBoundId);
+    XJSON_AddString(pInner, "deviceId", pDeviceId);
+    DirectGate_Proto_AddCC(pInner, pPeer, 0);
+
+    xbyte_buffer_t packet;
+    XByteBuffer_Init(&packet, XSTDNON, XFALSE);
+    int bOk = DirectGate_Proto_Build(&packet, pInner, NULL, 0, XFALSE) &&
+        DirectGate_Proto_EncryptPackage(&packet, pPeer, nPrevId) &&
+        DirectGate_KeyAuth_Base64Encode(packet.pData, packet.nUsed, pProof, nProofSize);
+
+    XJSON_FreeObject(pInner);
+    XByteBuffer_Clear(&packet);
+    return bOk;
+}
+
+/* A proof that is wrong in one way: its envelope's id, what it seals, or not sealed at all */
+static int seal_odd_proof(directgate_e2e_t *pPeer, const char *pType, const char *pAction, uint32_t nInnerId,
+                          uint32_t nEnvelopeId, int bSeal, char *pProof, size_t nProofSize)
+{
+    xjson_obj_t *pInner = DirectGate_Proto_NewHeader(pType, nInnerId);
+    if (pInner == NULL) return 0;
+
+    XJSON_AddString(pInner, "action", pAction);
+    XJSON_AddU32(pInner, "newSessionId", 97);
+    XJSON_AddString(pInner, "deviceId", DETACH_DEVICE_ID);
+    if (bSeal) DirectGate_Proto_AddCC(pInner, pPeer, 0);
+
+    xbyte_buffer_t packet;
+    XByteBuffer_Init(&packet, XSTDNON, XFALSE);
+    int bOk = DirectGate_Proto_Build(&packet, pInner, NULL, 0, XFALSE) &&
+        (!bSeal || DirectGate_Proto_EncryptPackage(&packet, pPeer, nEnvelopeId)) &&
+        DirectGate_KeyAuth_Base64Encode(packet.pData, packet.nUsed, pProof, nProofSize);
+
+    XJSON_FreeObject(pInner);
+    XByteBuffer_Clear(&packet);
+    return bOk;
+}
+
+/* The request itself, plaintext on the new socket's id, as the relay has to see an auth message before any other */
+static int send_resume(directgate_conn_t *pConn, xapi_session_t *pRelay, uint32_t nNewId, uint32_t nPrevId, const char *pProof)
+{
+    xjson_obj_t *pHeader = DirectGate_Proto_NewHeader("auth", nNewId);
+    if (pHeader == NULL) return XSTDERR;
+
+    g_sLogged[0] = '\0';
+    XJSON_AddString(pHeader, "action", "resume");
+    if (nPrevId) XJSON_AddU32(pHeader, "resumeSid", nPrevId);
+    if (pProof != NULL) XJSON_AddString(pHeader, "proof", pProof);
+    return send_header(pConn, pRelay, pHeader);
+}
+
+/* The agent's answer, opened with the client's half of the keys: it has to be the agent's own, for the new id */
+static int open_resume_answer(directgate_e2e_t *pPeer, const char *pProof, uint32_t nNewId, uint32_t nPrevId,
+                              const char *pDeviceId)
+{
+    uint8_t sDecoded[DIRECTGATE_SESSION_RESUME_PROOF_MAX];
+    size_t nDecoded = 0;
+    if (!DirectGate_KeyAuth_Base64Decode(pProof, sDecoded, sizeof(sDecoded), &nDecoded)) return 0;
+
+    directgate_pkg_t sealed;
+    if (!DirectGate_Package_Parse(&sealed, sDecoded, nDecoded)) return 0;
+
+    xbyte_buffer_t inner;
+    XByteBuffer_Init(&inner, XSTDNON, XFALSE);
+    int bOk = sealed.header.eType == DIRECTGATE_PKG_ENCRYPTED && sealed.header.nSessionId == nNewId &&
+        DirectGate_Proto_DecryptPackage(&inner, &sealed, pPeer);
+
+    if (bOk)
+    {
+        directgate_pkg_t answer;
+        bOk = DirectGate_Package_Parse(&answer, inner.pData, inner.nUsed);
+
+        if (bOk)
+        {
+            const directgate_pkg_auth_t *pAuth = (const directgate_pkg_auth_t*)answer.pPackage;
+            xjson_obj_t *pRoot = answer.jsonHeader.pRootObj;
+
+            bOk = answer.header.eType == DIRECTGATE_PKG_AUTH && pAuth != NULL && xstrcmp(pAuth->pAction, "resumed") &&
+                answer.header.nSessionId == nNewId && XJSON_GetU32(XJSON_GetObject(pRoot, "prevSessionId")) == nPrevId &&
+                xstrcmp(XJSON_GetString(XJSON_GetObject(pRoot, "deviceId")), pDeviceId);
+
+            DirectGate_Package_Clear(&answer);
+        }
+    }
+
+    XByteBuffer_Clear(&inner);
+    DirectGate_Package_Clear(&sealed);
+    return bOk;
+}
+
+/* data_channel, sealed under an id of the caller's choosing: the one a resumed session had before */
+static void data_channel_as(directgate_session_t *pSession, directgate_e2e_t *pPeer, xjson_obj_t *pHeader, uint32_t nSealedId)
+{
+    xbyte_buffer_t packet;
+    XByteBuffer_Init(&packet, XSTDNON, XFALSE);
+
+    DirectGate_Proto_AddCC(pHeader, pPeer, 0);
+    if (DirectGate_Proto_Build(&packet, pHeader, NULL, 0, XFALSE) && DirectGate_Proto_EncryptPackage(&packet, pPeer, nSealedId))
+        DirectGate_TestHandleDataChannelMessage(pSession, packet.pData, packet.nUsed);
+
+    XJSON_FreeObject(pHeader);
+    XByteBuffer_Clear(&packet);
+}
+
+/* A refused resume answers "failed" on the new id and leaves every session exactly as it was */
+static int expect_refused(directgate_conn_t *pConn, xapi_session_t *pRelay, uint32_t nNewId,
+                          directgate_session_t *pSession, uint32_t nPrevId, const char *pWhy, const char *pReason)
+{
+    auth_result_t result;
+    char sLogged[96];
+    snprintf(sLogged, sizeof(sLogged), "reason(%s)", pReason);
+
+    if (strstr(g_sLogged, sLogged) == NULL)
+    {
+        fprintf(stderr, "connection_lifecycle_smoke: %s: not refused for %s\n", pWhy, pReason);
+        return 1;
+    }
+    xbool_t bDetached = pSession != NULL ? pSession->bDetached : XFALSE;
+
+    if (!read_auth_result(&pRelay->txBuffer, nNewId, &result) || strcmp(result.sStatus, "failed") ||
+        strcmp(result.sReason, "resume refused") || result.bResumed || result.sProof[0])
+    {
+        fprintf(stderr, "connection_lifecycle_smoke: %s: no plain refusal on the new id\n", pWhy);
+        return 1;
+    }
+
+    if ((nNewId != nPrevId && DirectGate_SessionMgr_Find(&pConn->mgr, nNewId) != NULL) ||
+        (pSession != NULL && (DirectGate_SessionMgr_Find(&pConn->mgr, nPrevId) != pSession || pSession->bDetached != bDetached)))
+    {
+        fprintf(stderr, "connection_lifecycle_smoke: %s: a refused resume changed a session\n", pWhy);
+        return 1;
+    }
+
+    XByteBuffer_Clear(&pRelay->txBuffer);
+    return 0;
+}
+
+/* A desktop whose client lost its relay socket used to end there, or live on its data channel only until the client
+   authenticated a brand-new session and the picture started over. The client now proves on its new socket that it
+   holds the session's keys, and the session carries on under the new id: same keys, counters and data channel. A
+   proof for another id, another device, another key, a second time, or for a session that cannot outlive its route
+   is refused, and changes nothing. */
+static int test_resume(void)
+{
+    xlog_init("connection_lifecycle_smoke", XLOG_ALL, XFALSE);
+    xlog_screen(XFALSE);
+    xlog_callback(collect_log, NULL);
+
+    directgate_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    xstrncpy(cfg.sDeviceId, sizeof(cfg.sDeviceId), DETACH_DEVICE_ID);
+    xstrncpy(cfg.auth.sSaltHex, sizeof(cfg.auth.sSaltHex), "0000000000000000000000000000000000000000000000000000000000000000");
+    xstrncpy(cfg.auth.sVerifierHex, sizeof(cfg.auth.sVerifierHex), "configured");
+
+    directgate_conn_t conn;
+    memset(&conn, 0, sizeof(conn));
+    conn.pCfg = &cfg;
+    DirectGate_SessionMgr_Init(&conn.mgr, &cfg);
+
+    xapi_session_t relay;
+    CHECK(dispatch(&conn, &relay, XAPI_CB_CONNECTED) == XAPI_CONTINUE, "the resume test relay connects");
+    relay.nEvents = XPOLLIO;
+    conn.bRoleSent = XTRUE;
+
+    /* A client is told it may resume; a temporary share's guest, and a refusal, are not */
+    auth_result_t result;
+    directgate_session_t *pFresh = DirectGate_SessionMgr_Create(&conn.mgr, 79);
+    CHECK(pFresh != NULL, "a session to answer is up");
+    pFresh->pWsSession = &relay;
+    DirectGate_Session_SendAuthResp(pFresh, "ok", "00", NULL);
+    CHECK(read_auth_result(&relay.txBuffer, 79, &result) && result.bResume, "an accepted client may resume");
+    XByteBuffer_Clear(&relay.txBuffer);
+    DirectGate_Session_SendAuthResp(pFresh, "failed", NULL, "no");
+    CHECK(read_auth_result(&relay.txBuffer, 79, &result) && !result.bResume, "a refused one is not told so");
+    XByteBuffer_Clear(&relay.txBuffer);
+    pFresh->bDesktopShare = XTRUE;
+    DirectGate_Session_SendAuthResp(pFresh, "ok", "00", NULL);
+    CHECK(read_auth_result(&relay.txBuffer, 79, &result) && !result.bResume, "nor is a temporary share's guest");
+    XByteBuffer_Clear(&relay.txBuffer);
+    DirectGate_SessionMgr_Remove(&conn.mgr, pFresh);
+
+    /* The browser's socket went away and the desktop lives on its data channel; the client comes back on a new one */
+    directgate_e2e_t peer;
+    directgate_session_t *pDesk = detach_session(&conn, &relay, 81, &peer);
+    CHECK(pDesk != NULL, "the resume test desktop is up");
+    relay_status(&conn, &relay, 81, "lost");
+    CHECK(pDesk->bDetached, "and detached");
+
+    char sProof[2048];
+    CHECK(seal_resume_proof(&peer, 81, 91, DETACH_DEVICE_ID, sProof, sizeof(sProof)), "a resume proof is sealed");
+    XByteBuffer_Clear(&relay.txBuffer);
+    CHECK(send_resume(&conn, &relay, 91, 81, sProof) == XAPI_CONTINUE, "a resume never takes the relay link down");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 91) == pDesk, "the session goes by the new socket's id");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 81) == NULL, "and no longer by its old one");
+    CHECK(!pDesk->bDetached && pDesk->nDetachedMs == 0 && pDesk->pWsSession == &relay, "it is back on the relay link");
+    CHECK(pDesk->nPrevSessionId == 81, "it remembers the id it had");
+    CHECK(DirectGate_E2E_IsInitialized(&pDesk->e2e) && pDesk->bAuthenticated, "with the keys it authenticated with");
+    CHECK(read_auth_result(&relay.txBuffer, 91, &result), "the resume is answered on the new id");
+    CHECK(!strcmp(result.sStatus, "ok") && result.bResumed && result.bResume, "with a plaintext ok the relay can read");
+    CHECK(open_resume_answer(&peer, result.sProof, 91, 81, DETACH_DEVICE_ID), "and the agent's own sealed answer");
+    CHECK(!open_resume_answer(&peer, result.sProof, 91, 81, DETACH_DEVICE_ID), "which opens once, like any message");
+    XByteBuffer_Clear(&relay.txBuffer);
+
+    /* What the client put on the data channel under the old id before the new one reached it still lands */
+    g_sLogged[0] = '\0';
+    pDesk->nLastKAPongMs = 0;
+    data_channel_as(pDesk, &peer, DirectGate_Proto_BuildKeepalive("pong", 81), 81);
+    CHECK(pDesk->nLastKAPongMs > 0, "a message sealed under the old id is taken in the moments after a resume");
+    CHECK(strstr(g_sLogged, "without session E2E context") == NULL, "and handled as the session's own");
+    pDesk->nLastKAPongMs = 0;
+    data_channel_as(pDesk, &peer, DirectGate_Proto_BuildKeepalive("pong", 91), 91);
+    CHECK(pDesk->nLastKAPongMs > 0, "as is one under the new id");
+
+    /* Never over the relay, which hands out new ids to new sockets, and not for long */
+    pDesk->nLastKAPongMs = 0;
+    xbyte_buffer_t sealed;
+    XByteBuffer_Init(&sealed, XSTDNON, XFALSE);
+    xjson_obj_t *pPong = DirectGate_Proto_BuildKeepalive("pong", 81);
+    DirectGate_Proto_AddCC(pPong, &peer, 0);
+    CHECK(DirectGate_Proto_Build(&sealed, pPong, NULL, 0, XFALSE) &&
+        DirectGate_Proto_EncryptPackage(&sealed, &peer, 81), "an old-id message for the relay is sealed");
+    XJSON_FreeObject(pPong);
+    DirectGate_TestHandleTransportMessage(&relay, sealed.pData, sealed.nUsed);
+    XByteBuffer_Clear(&sealed);
+    CHECK(pDesk->nLastKAPongMs == 0, "the old id means nothing on the relay link");
+    pDesk->nPrevSessionUntilMs = XTime_GetMonoMs();
+    g_sLogged[0] = '\0';
+    data_channel_as(pDesk, &peer, DirectGate_Proto_BuildKeepalive("pong", 81), 81);
+    CHECK(pDesk->nLastKAPongMs == 0, "nor on the data channel once the switch is long over");
+    CHECK(strstr(g_sLogged, "without session E2E context") != NULL, "it reads as any unknown id");
+
+    /* The relay speaking of the old id now - its socket timing out at last - is not about this session */
+    relay_status(&conn, &relay, 81, NULL);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 91) == pDesk, "a late notice for the old id leaves the session alone");
+
+    /* It can be resumed again: the next socket lost, the next one taken */
+    relay_status(&conn, &relay, 91, "lost");
+    CHECK(pDesk->bDetached, "the resumed session detaches like any other");
+    CHECK(seal_resume_proof(&peer, 91, 101, DETACH_DEVICE_ID, sProof, sizeof(sProof)), "a second proof is sealed");
+    send_resume(&conn, &relay, 101, 91, sProof);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 101) == pDesk && !pDesk->bDetached, "and it is resumed again");
+    CHECK(pDesk->nPrevSessionId == 91, "the newest old id is the one remembered");
+    XByteBuffer_Clear(&relay.txBuffer);
+
+    /* An attached desktop whose relay socket the relay has not noticed is gone yet resumes the same way */
+    directgate_e2e_t attachedPeer;
+    directgate_session_t *pAttached = detach_session(&conn, &relay, 82, &attachedPeer);
+    CHECK(pAttached != NULL && !pAttached->bDetached, "an attached desktop is up");
+    CHECK(seal_resume_proof(&attachedPeer, 82, 92, DETACH_DEVICE_ID, sProof, sizeof(sProof)), "its proof is sealed");
+    send_resume(&conn, &relay, 92, 82, sProof);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 92) == pAttached && pAttached->pWsSession == &relay,
+        "a session on a socket the relay still thinks alive moves to the new one");
+    XByteBuffer_Clear(&relay.txBuffer);
+
+    /* Refusals: each leaves the session as it was and answers "failed", so the client authenticates afresh */
+    directgate_e2e_t detPeer;
+    directgate_session_t *pDet = detach_session(&conn, &relay, 83, &detPeer);
+    CHECK(pDet != NULL, "a desktop to refuse resumes for is up");
+    relay_status(&conn, &relay, 83, "lost");
+    XByteBuffer_Clear(&relay.txBuffer);
+
+    CHECK(seal_resume_proof(&detPeer, 83, 93, DETACH_DEVICE_ID, sProof, sizeof(sProof)), "a proof for 93 is sealed");
+    send_resume(&conn, &relay, 94, 83, sProof);
+    if (expect_refused(&conn, &relay, 94, pDet, 83, "a proof bound to another id", "invalid proof") != 0) return 1;
+    send_resume(&conn, &relay, 93, 83, sProof);
+    if (expect_refused(&conn, &relay, 93, pDet, 83, "a proof already opened, even if refused", "invalid proof") != 0) return 1;
+
+    CHECK(seal_resume_proof(&detPeer, 83, 95, "another-device", sProof, sizeof(sProof)), "a foreign proof is sealed");
+    send_resume(&conn, &relay, 95, 83, sProof);
+    if (expect_refused(&conn, &relay, 95, pDet, 83, "a proof for another device", "invalid proof") != 0) return 1;
+
+    directgate_e2e_t strangerPeer;
+    DirectGate_E2E_Init(&strangerPeer);
+    uint8_t sKey[32], agentNonce[DIRECTGATE_SRP_NONCE_SIZE], clientNonce[DIRECTGATE_SRP_NONCE_SIZE];
+    memset(sKey, 0x7a, sizeof(sKey));
+    memset(agentNonce, 0x11, sizeof(agentNonce));
+    memset(clientNonce, 0x22, sizeof(clientNonce));
+    CHECK(DirectGate_E2E_DeriveFromSRP(&strangerPeer, sKey, sizeof(sKey), agentNonce, clientNonce,
+        sizeof(agentNonce), DETACH_DEVICE_ID, XFALSE), "a stranger's keys are derived");
+    CHECK(seal_resume_proof(&strangerPeer, 83, 96, DETACH_DEVICE_ID, sProof, sizeof(sProof)), "a stranger's proof");
+    send_resume(&conn, &relay, 96, 83, sProof);
+    if (expect_refused(&conn, &relay, 96, pDet, 83, "a proof under other keys", "invalid proof") != 0) return 1;
+    DirectGate_E2E_Clear(&strangerPeer);
+
+    CHECK(seal_resume_proof(&detPeer, 83, 97, DETACH_DEVICE_ID, sProof, sizeof(sProof)), "a proof for 97 is sealed");
+    send_resume(&conn, &relay, 97, 83, NULL);
+    if (expect_refused(&conn, &relay, 97, pDet, 83, "a request without a proof", "malformed request") != 0) return 1;
+    send_resume(&conn, &relay, 97, 0, sProof);
+    if (expect_refused(&conn, &relay, 97, pDet, 83, "a request without the old id", "malformed request") != 0) return 1;
+    send_resume(&conn, &relay, 97, 84, sProof);
+    if (expect_refused(&conn, &relay, 97, NULL, 84, "a request for no such session", "no such session") != 0) return 1;
+    send_resume(&conn, &relay, 101, 83, sProof);
+    CHECK(relay.txBuffer.nUsed == 0, "a resume on another live session's id is plaintext where it must not be: dropped");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 101) == pDesk && DirectGate_SessionMgr_Find(&conn.mgr, 83) == pDet &&
+        pDet->bDetached && !pDesk->bDetached, "without touching either session");
+
+    /* A proof has to be the session's own sealed resume, for the session it names */
+    char sOdd[2048];
+    CHECK(seal_odd_proof(&detPeer, "auth", "resume", 83, 83, 0, sOdd, sizeof(sOdd)), "an unsealed proof is built");
+    send_resume(&conn, &relay, 97, 83, sOdd);
+    if (expect_refused(&conn, &relay, 97, pDet, 83, "a proof that is not sealed", "malformed proof") != 0) return 1;
+    CHECK(seal_odd_proof(&detPeer, "auth", "resume", 83, 84, 1, sOdd, sizeof(sOdd)), "a misaddressed proof is sealed");
+    send_resume(&conn, &relay, 97, 83, sOdd);
+    if (expect_refused(&conn, &relay, 97, pDet, 83, "a proof sealed for another id", "malformed proof") != 0) return 1;
+    CHECK(seal_odd_proof(&detPeer, "auth", "resume", 84, 83, 1, sOdd, sizeof(sOdd)), "a proof naming another session");
+    send_resume(&conn, &relay, 97, 83, sOdd);
+    if (expect_refused(&conn, &relay, 97, pDet, 83, "a proof that names another session", "invalid proof") != 0) return 1;
+    CHECK(seal_odd_proof(&detPeer, "auth", "hello", 83, 83, 1, sOdd, sizeof(sOdd)), "a proof of another action");
+    send_resume(&conn, &relay, 97, 83, sOdd);
+    if (expect_refused(&conn, &relay, 97, pDet, 83, "a sealed message that is not a resume", "invalid proof") != 0) return 1;
+    CHECK(seal_odd_proof(&detPeer, "keepalive", "resume", 83, 83, 1, sOdd, sizeof(sOdd)), "a proof of another type");
+    send_resume(&conn, &relay, 97, 83, sOdd);
+    if (expect_refused(&conn, &relay, 97, pDet, 83, "a sealed message that is not auth", "invalid proof") != 0) return 1;
+
+    /* A client that began authenticating on the new id already has a session there */
+    directgate_session_t *pPending = DirectGate_SessionMgr_Create(&conn.mgr, 98);
+    CHECK(pPending != NULL, "a session still authenticating is up");
+    CHECK(seal_resume_proof(&detPeer, 83, 98, DETACH_DEVICE_ID, sOdd, sizeof(sOdd)), "a proof for its id is sealed");
+    send_resume(&conn, &relay, 98, 83, sOdd);
+    CHECK(read_auth_result(&relay.txBuffer, 98, &result) && !strcmp(result.sStatus, "failed"), "a new id in use");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 98) == pPending && DirectGate_SessionMgr_Find(&conn.mgr, 83) == pDet &&
+        pDet->bDetached, "is refused, leaving both sessions as they were");
+    DirectGate_SessionMgr_Remove(&conn.mgr, pPending);
+    XByteBuffer_Clear(&relay.txBuffer);
+
+    char sHuge[4096];
+    memset(sHuge, 'A', sizeof(sHuge) - 1);
+    sHuge[sizeof(sHuge) - 1] = '\0';
+    send_resume(&conn, &relay, 97, 83, sHuge);
+    if (expect_refused(&conn, &relay, 97, pDet, 83, "a proof larger than any could be", "malformed proof") != 0) return 1;
+    send_resume(&conn, &relay, 97, 83, "!!!not-base64!!!");
+    if (expect_refused(&conn, &relay, 97, pDet, 83, "a proof that is not base64", "malformed proof") != 0) return 1;
+
+    /* Only a session that could outlive its route, inside its minute: then the same proof still works */
+    pDet->nDetachedMs = XTime_GetMonoMs() - DIRECTGATE_SESSION_DETACHED_MAX_MS;
+    send_resume(&conn, &relay, 97, 83, sProof);
+    if (expect_refused(&conn, &relay, 97, pDet, 83, "a session detached a minute ago", "session expired") != 0) return 1;
+    pDet->nDetachedMs = XTime_GetMonoMs();
+    pDet->webrtc.bConnected = XFALSE;
+    send_resume(&conn, &relay, 97, 83, sProof);
+    if (expect_refused(&conn, &relay, 97, pDet, 83, "a session whose data channel is gone", "session cannot be resumed") != 0)
+        return 1;
+    pDet->webrtc.bConnected = XTRUE;
+    pDet->bDesktopShare = XTRUE;
+    send_resume(&conn, &relay, 97, 83, sProof);
+    if (expect_refused(&conn, &relay, 97, pDet, 83, "a temporary share's guest", "session cannot be resumed") != 0) return 1;
+    pDet->bDesktopShare = XFALSE;
+    pDet->eActiveMode = DIRECTGATE_SESSION_MODE_TERMINAL;
+    send_resume(&conn, &relay, 97, 83, sProof);
+    if (expect_refused(&conn, &relay, 97, pDet, 83, "a session that is not a desktop", "session cannot be resumed") != 0)
+        return 1;
+    pDet->eActiveMode = DIRECTGATE_SESSION_MODE_DESKTOP;
+
+    /* Nor off the relay link: a resume put on a data channel, plaintext or not, is not heard */
+    xbyte_buffer_t plain;
+    XByteBuffer_Init(&plain, XSTDNON, XFALSE);
+    xjson_obj_t *pOff = DirectGate_Proto_NewHeader("auth", 97);
+    XJSON_AddString(pOff, "action", "resume");
+    XJSON_AddU32(pOff, "resumeSid", 83);
+    XJSON_AddString(pOff, "proof", sProof);
+    CHECK(DirectGate_Proto_Build(&plain, pOff, NULL, 0, XFALSE), "an off-link resume is built");
+    XJSON_FreeObject(pOff);
+    DirectGate_TestHandleDataChannelMessage(pDet, plain.pData, plain.nUsed);
+    XByteBuffer_Clear(&plain);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 97) == NULL && pDet->bDetached && relay.txBuffer.nUsed == 0,
+        "a resume off a data channel moves nothing and is not answered");
+
+    /* Under the session's own id, the data channel is still no place for plaintext: a protocol violation, as ever */
+    xjson_obj_t *pOwnOff = DirectGate_Proto_NewHeader("auth", 83);
+    XJSON_AddString(pOwnOff, "action", "resume");
+    XJSON_AddU32(pOwnOff, "resumeSid", 83);
+    XJSON_AddString(pOwnOff, "proof", sProof);
+    CHECK(DirectGate_Proto_Build(&plain, pOwnOff, NULL, 0, XFALSE), "an own-id resume for the data channel is built");
+    XJSON_FreeObject(pOwnOff);
+    g_sLogged[0] = '\0';
+    DirectGate_TestHandleDataChannelMessage(pDet, plain.pData, plain.nUsed);
+    XByteBuffer_Clear(&plain);
+    CHECK(strstr(g_sLogged, "Protocol violation") != NULL && pDet->bDetached && relay.txBuffer.nUsed == 0,
+        "an own-id resume off a data channel is plaintext where it may not be");
+
+    /* After all of those, the proof that was never opened still resumes the session */
+    send_resume(&conn, &relay, 97, 83, sProof);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 97) == pDet && !pDet->bDetached, "the untouched proof still works");
+    CHECK(read_auth_result(&relay.txBuffer, 97, &result) && open_resume_answer(&detPeer, result.sProof, 97, 83,
+        DETACH_DEVICE_ID), "and is answered by the agent");
+
+    /* A relay that restarted hands its ids out from 1 again: the new socket may get the very id the lost one had. The
+       session's own resume under that id is the one relay message that does not end it; its proof decides. */
+    directgate_e2e_t samePeer;
+    directgate_session_t *pSame = detach_session(&conn, &relay, 88, &samePeer);
+    CHECK(pSame != NULL, "a desktop whose id comes back is up");
+    relay_status(&conn, &relay, 88, "lost");
+    CHECK(pSame->bDetached, "and detached");
+    CHECK(seal_resume_proof(&samePeer, 88, 88, DETACH_DEVICE_ID, sProof, sizeof(sProof)), "a same-id proof is sealed");
+    XByteBuffer_Clear(&relay.txBuffer);
+    send_resume(&conn, &relay, 88, 88, sProof);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 88) == pSame && !pSame->bDetached && pSame->pWsSession == &relay,
+        "a resume under the same id takes the session back");
+    CHECK(pSame->nPrevSessionId == 0, "with no old id to keep taking");
+    CHECK(read_auth_result(&relay.txBuffer, 88, &result) && result.bResumed &&
+        open_resume_answer(&samePeer, result.sProof, 88, 88, DETACH_DEVICE_ID), "and the agent answers it as its own");
+    XByteBuffer_Clear(&relay.txBuffer);
+
+    /* Under the same id, a proof the session's keys do not open is refused, and the session stays as it was: the
+       first message of a new session on that id ends it, as before */
+    relay_status(&conn, &relay, 88, "lost");
+    CHECK(pSame->bDetached, "the same-id session detaches again");
+    directgate_e2e_t samePeerStranger;
+    DirectGate_E2E_Init(&samePeerStranger);
+    memset(sKey, 0x6b, sizeof(sKey));
+    CHECK(DirectGate_E2E_DeriveFromSRP(&samePeerStranger, sKey, sizeof(sKey), agentNonce, clientNonce,
+        sizeof(agentNonce), DETACH_DEVICE_ID, XFALSE), "a stranger's keys for the same id");
+    CHECK(seal_resume_proof(&samePeerStranger, 88, 88, DETACH_DEVICE_ID, sProof, sizeof(sProof)), "a stranger's proof");
+    send_resume(&conn, &relay, 88, 88, sProof);
+    if (expect_refused(&conn, &relay, 88, pSame, 88, "a same-id proof under other keys", "invalid proof") != 0) return 1;
+    DirectGate_E2E_Clear(&samePeerStranger);
+    xjson_obj_t *pHello = DirectGate_Proto_NewHeader("auth", 88);
+    XJSON_AddString(pHello, "action", "hello");
+    XJSON_AddU32(pHello, "resumeSid", 88);
+    send_header(&conn, &relay, pHello);
+    directgate_session_t *pAfter = DirectGate_SessionMgr_Find(&conn.mgr, 88);
+    CHECK(pAfter == NULL || (!pAfter->bAuthenticated && !pAfter->bDetached), "a new session's hello on that id ends it");
+    DirectGate_E2E_Clear(&samePeer);
+    XByteBuffer_Clear(&relay.txBuffer);
+
+    /* A resume for another session, on an id a stale detached session still holds: the stale one goes, as any relay
+       message for its id ends it, and the session asked for takes the id */
+    directgate_e2e_t stalePeer, targetPeer;
+    directgate_session_t *pStale = detach_session(&conn, &relay, 111, &stalePeer);
+    directgate_session_t *pTarget = detach_session(&conn, &relay, 112, &targetPeer);
+    CHECK(pStale != NULL && pTarget != NULL, "a stale and a wanted detached session are up");
+    relay_status(&conn, &relay, 111, "lost");
+    relay_status(&conn, &relay, 112, "lost");
+    CHECK(seal_resume_proof(&targetPeer, 112, 111, DETACH_DEVICE_ID, sProof, sizeof(sProof)), "a proof onto 111");
+    send_resume(&conn, &relay, 111, 112, sProof);
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 111) == pTarget && !pTarget->bDetached && pTarget->nPrevSessionId == 112,
+        "the wanted session takes over the id the stale one held");
+    CHECK(DirectGate_SessionMgr_Find(&conn.mgr, 112) == NULL, "and no longer goes by its old one");
+    DirectGate_E2E_Clear(&stalePeer);
+    DirectGate_E2E_Clear(&targetPeer);
+
+    XByteBuffer_Clear(&relay.txBuffer);
+    DirectGate_E2E_Clear(&peer);
+    DirectGate_E2E_Clear(&attachedPeer);
+    DirectGate_E2E_Clear(&detPeer);
+    DirectGate_SessionMgr_Destroy(&conn.mgr);
+    xlog_destroy();
+    return 0;
+}
+
 int main(void)
 {
     directgate_desktop_t desktop;
@@ -969,6 +1520,7 @@ int main(void)
     if (test_loop_stall() != 0) return 1;
     if (test_relay_probe() != 0) return 1;
     if (test_detach() != 0) return 1;
+    if (test_resume() != 0) return 1;
 
     puts("connection_lifecycle_smoke: OK");
     return 0;

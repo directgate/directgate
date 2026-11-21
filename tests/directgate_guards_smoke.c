@@ -252,6 +252,15 @@ static int check_connection(void)
     conn.bReconnectSuppressed = XTRUE;
     DirectGate_ScheduleReconnect(&conn, "x");
     CHECK(conn.nNextReconnectMs == 0, "no reconnect is scheduled while finishing or suppressed");
+
+    /* A worker with an answer coming has the loop look for it often: the reconnect waits on it */
+    CHECK(DirectGate_GetServiceWaitMs(&conn) == DIRECTGATE_EVENT_LOOP_WAIT_MS, "an idle loop waits its usual time");
+    conn.pRefreshJob = (directgate_enroll_job_t*)&conn;
+    CHECK(DirectGate_GetServiceWaitMs(&conn) == DIRECTGATE_WORKER_WAIT_MS, "a refresh out shortens the wait");
+    conn.pRefreshJob = NULL;
+    conn.pResolveJob = (directgate_resolve_job_t*)&conn;
+    CHECK(DirectGate_GetServiceWaitMs(&conn) == DIRECTGATE_WORKER_WAIT_MS, "so does a relay lookup");
+    conn.pResolveJob = NULL;
     return 0;
 }
 

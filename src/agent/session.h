@@ -53,6 +53,18 @@ extern "C" {
 #define DIRECTGATE_AUTH_LOCKOUT_BASE_MS 2000ULL
 #define DIRECTGATE_AUTH_LOCKOUT_MAX_MS 300000ULL
 
+/* How long a session may live on its data channel alone once its relay route is gone. The relay ends a client it
+   signs out by closing its socket, which a detached session may no longer hear of, so this bounds how long that can
+   go unheard: the same minute a dead relay link already went unnoticed before. */
+#define DIRECTGATE_SESSION_DETACHED_MAX_MS 60000ULL
+
+/* A resumed session still takes, for this long, what its client put on the data channel under its old id before
+   the new one reached it: input in flight across the switch is not lost. */
+#define DIRECTGATE_SESSION_RESUME_ALIAS_MS 10000ULL
+
+/* The most a resume proof may decode to: a sealed auth header carries a few ids and counters, nothing more. */
+#define DIRECTGATE_SESSION_RESUME_PROOF_MAX 1024U
+
 typedef enum directgate_session_mode_ {
     DIRECTGATE_SESSION_MODE_NONE = 0,
     DIRECTGATE_SESSION_MODE_TERMINAL,
@@ -93,6 +105,10 @@ typedef struct directgate_session_ {
        reconnects. It never sends to the relay, and no relay message reaches it: see DirectGate_DetachSession. */
     xbool_t bDetached;
     uint64_t nDetachedMs;
+    /* The id the session had before its client resumed it under a new relay socket, and until when data-channel
+       messages still sealed under that id are taken as this session's: see DirectGate_Session_HandleResume. */
+    uint32_t nPrevSessionId;
+    uint64_t nPrevSessionUntilMs;
     uint8_t nAuthMessages;
     xbool_t bAuthenticated;
     xbool_t bDesktopShare;
@@ -122,6 +138,7 @@ xbool_t DirectGate_SessionMgr_IsEmpty(const directgate_session_mgr_t *pMgr);
 directgate_session_t* DirectGate_SessionMgr_GetOrCreate(directgate_session_mgr_t *pMgr, xapi_session_t *pApiSession, uint32_t nSessionId);
 directgate_session_t* DirectGate_SessionMgr_Create(directgate_session_mgr_t *pMgr, uint32_t nSessionId);
 directgate_session_t* DirectGate_SessionMgr_Find(directgate_session_mgr_t *pMgr, uint32_t nSessionId);
+directgate_session_t* DirectGate_SessionMgr_FindResumed(directgate_session_mgr_t *pMgr, uint32_t nPrevId, uint64_t nNowMs);
 
 int DirectGate_SessionMgr_Close(directgate_session_mgr_t *pMgr, uint32_t nSessionId, const char *pReason);
 void DirectGate_SessionMgr_Remove(directgate_session_mgr_t *pMgr, directgate_session_t *pSession);
@@ -177,6 +194,21 @@ int DirectGate_Session_DeriveE2EFromSRP(directgate_session_t *pSession, const ch
 
 int DirectGate_Session_Close(directgate_session_t *pSession, const char *pReason);
 void DirectGate_Session_Remove(directgate_session_t *pSession);
+
+/*!
+ * @brief Whether the session may outlive its relay route on its data channel, and so be resumed under a new one.
+ */
+xbool_t DirectGate_Session_CanDetach(const directgate_session_t *pSession);
+
+/*!
+ * @brief Answer an auth "resume" that arrived on the relay link @p pRelay.
+ *
+ * The client proves, on the socket that replaced the one it lost, that it holds a live desktop session's keys. On a
+ * valid proof the session carries on under the new socket's id - same keys, counters, data channel and desktop - and
+ * the answer is a plaintext "ok" carrying a proof of the agent's own. Anything else is answered "failed" and leaves
+ * every session as it was, so the client authenticates afresh.
+ */
+int DirectGate_Session_HandleResume(directgate_session_mgr_t *pMgr, xapi_session_t *pRelay, const directgate_pkg_t *pPkg);
 
 #ifdef __cplusplus
 }

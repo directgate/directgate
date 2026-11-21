@@ -650,6 +650,17 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(session_lifetime_smoke PRIVATE -Wno-unused-function)
 endif()
 
+# Every test runs with a home directory of its own. Code under test that falls back to a default path - the agent's
+# config is ~/.config/directgate/agent.json - otherwise writes into the real home of whoever runs the suite, and
+# enroll_api_smoke did: it saved its fixture over the developer's own agent config on every run. Appended last, so a
+# test that sets its own ENVIRONMENT above keeps it.
+set(DIRECTGATE_TEST_HOME "${CMAKE_CURRENT_BINARY_DIR}/test-home")
+file(MAKE_DIRECTORY "${DIRECTGATE_TEST_HOME}")
+get_property(_dg_tests DIRECTORY PROPERTY TESTS)
+if(_dg_tests)
+    set_property(TEST ${_dg_tests} APPEND PROPERTY ENVIRONMENT "HOME=${DIRECTGATE_TEST_HOME}")
+endif()
+
 # Optional coverage-guided parser fuzzing. Recompile only the parser units
 # with libFuzzer coverage; xcommon supplies their ordinary dependencies.
 option(DIRECTGATE_BUILD_FUZZERS "Build Clang libFuzzer wire parser target" OFF)
