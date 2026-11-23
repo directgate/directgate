@@ -36,6 +36,7 @@
    no longer read: the program then blocks on a full pipe, the flow control a local pipeline has. */
 #define DIRECTGATE_COMMAND_READ_SIZE        (16U * 1024U)
 #define DIRECTGATE_COMMAND_READ_BUDGET      16
+#define DIRECTGATE_COMMAND_DRAIN_ROUNDS     64
 #define DIRECTGATE_COMMAND_TX_HIGH_WATER    (4U * 1024U * 1024U)
 #define DIRECTGATE_COMMAND_TX_LOW_WATER     (1U * 1024U * 1024U)
 
@@ -721,17 +722,14 @@ int DirectGate_CMD_OnRead(directgate_session_t *pSession, XSOCKET nFd)
     return XAPI_CONTINUE;
 }
 
-void DirectGate_CMD_OnHangup(directgate_session_t *pSession, XSOCKET nFd)
+/* Reads out what a stream holds now and sends it, never waiting for more: the descriptor does not block,
+   and the bound only stops a stream that something the program started keeps writing to */
+static void DirectGate_CMD_Drain(directgate_session_t *pSession, XSOCKET nFd, xbool_t bStdErr)
 {
-    XCHECK_VOID_NL((pSession != NULL));
-    directgate_command_t *pCmd = &pSession->command;
-    if (nFd != pCmd->nOutFd && nFd != pCmd->nErrFd) return;
-
-    xbool_t bStdErr = nFd == pCmd->nErrFd ? XTRUE : XFALSE;
     uint8_t sBuffer[DIRECTGATE_COMMAND_READ_SIZE];
 
-    /* A pipe holds at most 1 MB unless its owner enlarged it; the bound only stops a stream that never ends */
-    for (int nRound = 0; nRound < 64; nRound++)
+    /* A pipe holds at most 1 MB unless its owner enlarged it */
+    for (int nRound = 0; nRound < DIRECTGATE_COMMAND_DRAIN_ROUNDS; nRound++)
     {
 #ifdef _WIN32
         int nRead = recv(nFd, (char*)sBuffer, (int)sizeof(sBuffer), 0);
@@ -743,6 +741,14 @@ void DirectGate_CMD_OnHangup(directgate_session_t *pSession, XSOCKET nFd)
         if (nRead <= 0) return;
         if (DirectGate_CMD_Deliver(pSession, bStdErr, sBuffer, (size_t)nRead) < 0) return;
     }
+}
+
+void DirectGate_CMD_OnHangup(directgate_session_t *pSession, XSOCKET nFd)
+{
+    XCHECK_VOID_NL((pSession != NULL));
+    directgate_command_t *pCmd = &pSession->command;
+    if (nFd != pCmd->nOutFd && nFd != pCmd->nErrFd) return;
+    DirectGate_CMD_Drain(pSession, nFd, nFd == pCmd->nErrFd ? XTRUE : XFALSE);
 }
 
 int DirectGate_CMD_OnWrite(directgate_session_t *pSession, XSOCKET nFd)
@@ -766,7 +772,12 @@ static int DirectGate_CMD_Finish(directgate_session_t *pSession, uint64_t nNowMs
     directgate_command_t *pCmd = &pSession->command;
     xexec_t *pExec = &pCmd->exec;
 
-    /* Output still held open by something the program started is not read any further */
+    /* What the program wrote before it exited goes out ahead of its exit, however late the loop came to read it - a
+       busy pass, a pipe the program enlarged past one pass's read. Output something it started still holds open is
+       not read any further than what is there now. */
+    if (pCmd->nOutFd != XSOCK_INVALID) DirectGate_CMD_Drain(pSession, pCmd->nOutFd, XFALSE);
+    if (pCmd->nErrFd != XSOCK_INVALID) DirectGate_CMD_Drain(pSession, pCmd->nErrFd, XTRUE);
+
     DirectGate_CMD_DropEndpoint(&pCmd->pOutSession);
     DirectGate_CMD_DropEndpoint(&pCmd->pErrSession);
     DirectGate_CMD_DropEndpoint(&pCmd->pInSession);

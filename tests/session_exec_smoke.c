@@ -65,6 +65,9 @@ typedef struct {
     xbool_t bUnavailable;           /* webrtc/unavailable: the agent cannot set WebRTC up */
     int nRelayExec;                 /* exec messages that came on the relay */
     int nChannelExec;               /* ... and over the data channel */
+    int nUnreadable;                /* frames on the relay link this client could not open: lost to it */
+    size_t nOutAtExit;              /* stdout and stderr that had come when the exit did */
+    size_t nErrAtExit;
 } replies_t;
 
 /* The client's half of a data channel, when a case has one: what the agent signals goes to it */
@@ -153,6 +156,8 @@ static void note_package(replies_t *pReplies, directgate_pkg_t *pPkg)
     else if (xstrcmp(pExec->pAction, "exit"))
     {
         pReplies->bExit = XTRUE;
+        pReplies->nOutAtExit = pReplies->out.nUsed;
+        pReplies->nErrAtExit = pReplies->err.nUsed;
         pReplies->nExitCode = pExec->nExitCode;
         pReplies->bTimedOut = pExec->bTimedOut;
         pReplies->bTruncated = pExec->bTruncated;
@@ -171,7 +176,9 @@ static void collect(fixture_t *pFix, replies_t *pReplies)
         xws_frame_t frame;
         if (XWebFrame_ParseData(&frame, pTx->pData + nOffset, pTx->nUsed - nOffset) != XWS_FRAME_COMPLETE)
         {
+            /* The rest of the queue goes with this frame */
             XWebFrame_Clear(&frame);
+            pReplies->nUnreadable++;
             break;
         }
 
@@ -195,6 +202,7 @@ static void collect(fixture_t *pFix, replies_t *pReplies)
                     note_package(pReplies, &innerPkg);
                     DirectGate_Package_Clear(&innerPkg);
                 }
+                else pReplies->nUnreadable++;
             }
             else
             {
@@ -204,6 +212,7 @@ static void collect(fixture_t *pFix, replies_t *pReplies)
 
             DirectGate_Package_Clear(&pkg);
         }
+        else pReplies->nUnreadable++;
 
         XByteBuffer_Clear(&outer);
         XByteBuffer_Clear(&inner);
@@ -621,7 +630,7 @@ int main(void)
         collect(&fix, &replies);
         CHECK(!strcmp(replies.sStarted, "ok") && replies.nPid > 0, "the start is confirmed with the program's pid");
 
-        CHECK(run_until_exit(&fix, &api, &replies, 5000), "the exit is reported");
+        CHECK(run_until_exit(&fix, &api, &replies, 20000), "the exit is reported");
         CHECK(!replies.bPlainExec, "nothing about the command crosses the relay in the clear");
         CHECK(output_is(&replies.out, "out"), "stdout arrives on its own stream");
 
@@ -659,7 +668,7 @@ int main(void)
         CHECK(deliver(&fix, DirectGate_Proto_BuildExec("eof", NULL, NULL, 22), XTRUE, NULL, 0) == XAPI_CONTINUE,
             "end of input is accepted");
 
-        CHECK(run_until_exit(&fix, &api, &replies, 5000), "the command reading stdin finishes");
+        CHECK(run_until_exit(&fix, &api, &replies, 20000), "the command reading stdin finishes");
         CHECK(output_is(&replies.out, "hello, program\ndone\n"), "the program got the input and then end of file");
         CHECK(replies.nExitCode == 0, "the program exits normally");
 
@@ -674,7 +683,7 @@ int main(void)
             "a command without stdin is accepted");
         CHECK(deliver(&fix, DirectGate_Proto_BuildExec("input", NULL, NULL, 23), XTRUE, (const uint8_t*)"x", 1) == XAPI_CONTINUE,
             "input to a command without stdin is not fatal");
-        CHECK(run_until_exit(&fix, &api, &replies, 5000), "the command without stdin finishes");
+        CHECK(run_until_exit(&fix, &api, &replies, 20000), "the command without stdin finishes");
         CHECK(output_is(&replies.out, "rc=0\n"), "a command without stdin reads end of file, never the agent's stdin");
 
         DirectGate_SessionMgr_Remove(&fix.conn.mgr, pSession);
@@ -691,7 +700,7 @@ int main(void)
         CHECK(pSession != NULL, "an exec session for a missing directory");
         CHECK(deliver(&fix, exec_start(24, "echo ran", sMissing, 0, XFALSE), XTRUE, NULL, 0) == XAPI_CONTINUE,
             "a command in a missing directory is accepted");
-        CHECK(run_until_exit(&fix, &api, &replies, 5000), "the command in a missing directory ends");
+        CHECK(run_until_exit(&fix, &api, &replies, 20000), "the command in a missing directory ends");
         CHECK(replies.nExitCode == 127 && output_has(&replies.err, "cannot change to the working directory"),
             "a directory that cannot be entered fails the command");
         CHECK(replies.out.nUsed == 0, "the command never runs somewhere else instead");
@@ -704,7 +713,7 @@ int main(void)
         CHECK(pSession != NULL, "an exec session whose home is missing");
         CHECK(deliver(&fix, exec_start(25, "pwd -P; echo \"$TERM\"", NULL, 0, XFALSE), XTRUE, NULL, 0) == XAPI_CONTINUE,
             "a command with a missing home is accepted");
-        CHECK(run_until_exit(&fix, &api, &replies, 5000), "the command with a missing home ends");
+        CHECK(run_until_exit(&fix, &api, &replies, 20000), "the command with a missing home ends");
         CHECK(output_has(&replies.out, "/\n") && replies.nExitCode == 0, "a missing default directory falls back to /");
         CHECK(output_is(&replies.out, "/\ndumb\n"), "a command without a terminal is told so by TERM");
         DirectGate_SessionMgr_Remove(&fix.conn.mgr, pSession);
@@ -724,8 +733,9 @@ int main(void)
         uint64_t nStart = XTime_GetMonoMs();
         CHECK(deliver(&fix, exec_start(31, sScript, NULL, 300, XFALSE), XTRUE, NULL, 0) == XAPI_CONTINUE,
             "a command with a timeout is accepted");
-        CHECK(run_until_exit(&fix, &api, &replies, 5000), "a command that outlives its timeout is ended");
-        CHECK(XTime_GetMonoMs() - nStart < 3000, "the timeout is honoured");
+        /* Without its 300 ms timeout the program would run 30 s: the bounds tell the two apart, not the machine's speed */
+        CHECK(run_until_exit(&fix, &api, &replies, 20000), "a command that outlives its timeout is ended");
+        CHECK(XTime_GetMonoMs() - nStart < 15000, "the timeout is honoured");
         CHECK(replies.bTimedOut && !strcmp(replies.sSignal, "KILL") && replies.nExitCode == 128 + SIGKILL,
             "the exit says the command was killed for its timeout");
 
@@ -738,7 +748,7 @@ int main(void)
         CHECK(nRead == 1 && nChild > 0, "the background pid can be read");
 
         int bGone = 0;
-        for (int i = 0; i < 200 && !bGone; i++)
+        for (int i = 0; i < 1500 && !bGone; i++)
         {
             bGone = kill(nChild, 0) != 0 && errno == ESRCH;
             if (!bGone) usleep(10000);
@@ -751,8 +761,18 @@ int main(void)
 
         pSession = exec_session(&fix, 32, sRoot);
         CHECK(pSession != NULL, "an exec session for a signal");
-        CHECK(deliver(&fix, exec_start(32, "exec sleep 30", NULL, 0, XFALSE), XTRUE, NULL, 0) == XAPI_CONTINUE,
+        CHECK(deliver(&fix, exec_start(32, "printf ready; exec sleep 30", NULL, 0, XFALSE), XTRUE, NULL, 0) == XAPI_CONTINUE,
             "a long command is accepted");
+
+        /* Signalled once it runs: a signal that lands while valgrind itself execs the child can stay blocked in the
+           new program for good, which no native run does - and a command not yet started is the hangup's case */
+        uint64_t nReady = XTime_GetMonoMs() + 20000;
+        while (!output_is(&replies.out, "ready") && XTime_GetMonoMs() < nReady)
+        {
+            XAPI_Service(&api, 10);
+            collect(&fix, &replies);
+        }
+        CHECK(output_is(&replies.out, "ready") && !replies.bExit, "the long command runs");
 
         xjson_obj_t *pBad = DirectGate_Proto_BuildExec("signal", NULL, NULL, 32);
         XJSON_AddString(pBad, "signal", "STOP");
@@ -763,7 +783,7 @@ int main(void)
         xjson_obj_t *pSignal = DirectGate_Proto_BuildExec("signal", NULL, NULL, 32);
         XJSON_AddString(pSignal, "signal", "TERM");
         CHECK(deliver(&fix, pSignal, XTRUE, NULL, 0) == XAPI_CONTINUE, "a signal is accepted");
-        CHECK(run_until_exit(&fix, &api, &replies, 5000), "the signalled command ends");
+        CHECK(run_until_exit(&fix, &api, &replies, 20000), "the signalled command ends");
         CHECK(!strcmp(replies.sSignal, "TERM") && !replies.bTimedOut, "the exit names the signal that ended it");
         DirectGate_SessionMgr_Remove(&fix.conn.mgr, pSession);
         collect(&fix, &replies);
@@ -776,11 +796,43 @@ int main(void)
         CHECK(pSession != NULL, "an exec session for a background child");
 
         uint64_t nStart = XTime_GetMonoMs();
-        CHECK(deliver(&fix, exec_start(33, "sleep 3 & echo started", NULL, 0, XFALSE), XTRUE, NULL, 0) == XAPI_CONTINUE,
+        /* The child holds stdout for 20 s; the exit comes within the grace of the command's own */
+        CHECK(deliver(&fix, exec_start(33, "sleep 20 & echo started", NULL, 0, XFALSE), XTRUE, NULL, 0) == XAPI_CONTINUE,
             "a command leaving a background child is accepted");
-        CHECK(run_until_exit(&fix, &api, &replies, 5000), "its exit is reported");
-        CHECK(XTime_GetMonoMs() - nStart < 2000, "the exit is not held up by the child keeping stdout open");
+        CHECK(run_until_exit(&fix, &api, &replies, 15000), "its exit is reported");
+        CHECK(XTime_GetMonoMs() - nStart < 10000, "the exit is not held up by the child keeping stdout open");
         CHECK(output_is(&replies.out, "started\n") && replies.nExitCode == 0, "the command's own output came first");
+        DirectGate_SessionMgr_Remove(&fix.conn.mgr, pSession);
+        collect(&fix, &replies);
+        replies_clear(&replies);
+    }
+
+    /* ---- what the program wrote before it exited goes out ahead of its exit, however late the loop comes to it -- */
+    {
+        directgate_session_t *pSession = exec_session(&fix, 35, sRoot);
+        CHECK(pSession != NULL, "an exec session for output the loop has not read");
+
+        /* The background child keeps both streams open: no end of file and no hangup, only the grace ends the command */
+        CHECK(deliver(&fix, exec_start(35, "printf late; printf later >&2; sleep 3 &", NULL, 0, XFALSE), XTRUE, NULL, 0)
+            == XAPI_CONTINUE, "a command that exits with its output unread is accepted");
+        collect(&fix, &replies);
+
+        /* No pass of the event loop, so nothing reads the streams: only the exit is collected */
+        uint64_t nDeadline = XTime_GetMonoMs() + 10000;
+        while (!pSession->command.exec.bExited && XTime_GetMonoMs() < nDeadline)
+        {
+            DirectGate_CMD_Check(pSession, XTime_GetMonoMs());
+            usleep(10000);
+        }
+        CHECK(pSession->command.exec.bExited && replies.out.nUsed == 0 && replies.err.nUsed == 0,
+            "the program has exited with nothing of it read yet");
+
+        /* The grace runs out before the loop reads again: a busy pass, a slow host */
+        DirectGate_CMD_Check(pSession, pSession->command.nExitMs + DIRECTGATE_COMMAND_GRACE_MS);
+        collect(&fix, &replies);
+        CHECK(replies.bExit && replies.nExitCode == 0, "the exit is reported once the grace is over");
+        CHECK(output_is(&replies.out, "late") && output_is(&replies.err, "later") && replies.nOutAtExit == 4 &&
+              replies.nErrAtExit == 5, "what the program wrote arrives in full, ahead of its exit");
         DirectGate_SessionMgr_Remove(&fix.conn.mgr, pSession);
         collect(&fix, &replies);
         replies_clear(&replies);
@@ -810,7 +862,7 @@ int main(void)
         CHECK(nSent > 7, "input up to the limit is queued, not refused early");
 
         int bGone = 0;
-        for (int i = 0; i < 300 && !bGone; i++)
+        for (int i = 0; i < 1500 && !bGone; i++)
         {
             DirectGate_Term_ReapPending();
             bGone = kill(nPid, 0) != 0 && errno == ESRCH;
@@ -835,7 +887,7 @@ int main(void)
         collect(&fix, &replies);
 
         int bGone = 0;
-        for (int i = 0; i < 300 && !bGone; i++)
+        for (int i = 0; i < 1500 && !bGone; i++)
         {
             DirectGate_Term_ReapPending();
             bGone = kill(nPid, 0) != 0 && errno == ESRCH;
@@ -874,6 +926,14 @@ int main(void)
         /* Drained as a client would: everything arrives, then the exit */
         /* A second natively; half a minute under valgrind. The bound is for a hang, not for the speed. */
         CHECK(run_until_exit(&fix, &api, &replies, 120000), "the flooding command finishes once drained");
+        if (replies.out.nUsed != nTotal)
+        {
+            /* Enough to tell, from a CI log alone, whether the agent never sent it or this client could not read it */
+            fprintf(stderr, "session_exec_smoke: flood: received(%zu), sent(%llu), total(%zu), unreadable(%d), code(%d), "
+                "signal(%s), truncated(%d)\n", replies.out.nUsed, (unsigned long long)pSession->command.nOutSent, nTotal,
+                replies.nUnreadable, replies.nExitCode, replies.sSignal, (int)replies.bTruncated);
+        }
+        CHECK(replies.nUnreadable == 0, "every frame the agent queued is one its client can open");
         CHECK(replies.out.nUsed == nTotal, "every byte of output arrives");
         CHECK(replies.nExitCode == 0, "the flooding command exits normally");
         DirectGate_SessionMgr_Remove(&fix.conn.mgr, pSession);
@@ -886,12 +946,13 @@ int main(void)
         directgate_session_t *pSession = exec_session(&fix, 57, sRoot);
         CHECK(pSession != NULL, "an exec session for paced output");
 
-        /* 256 KB/s with no burst: kept to 240 KB/s, a 16 KB read every 67 ms. The program keeps its output open a while
-           after writing it: what is left in the pipe of one that exits is read at once rather than lost (at most a pipe's
-           worth, a debt what comes next waits for), and that is not what this measures. */
-        DirectGate_SessionMgr_SetRelayLimit(&fix.conn.mgr, 262144, 0);
+        /* 64 KB/s with no burst: kept to 60 KB/s, a 16 KB read every 267 ms - room for a slow runner under valgrind,
+           whose every pass of this loop costs tens of milliseconds, to still see each wait. The program keeps its output
+           open a while after writing it: what is left in the pipe of one that exits is read at once rather than lost (at
+           most a pipe's worth, a debt what comes next waits for), and that is not what this measures. */
+        DirectGate_SessionMgr_SetRelayLimit(&fix.conn.mgr, 65536, 0);
         uint64_t nStartMs = XTime_GetMonoMs(), nOutputMs = 0;
-        xjson_obj_t *pPaced = exec_start(57, "head -c 131072 /dev/zero; sleep 1", NULL, 0, XFALSE);
+        xjson_obj_t *pPaced = exec_start(57, "head -c 131072 /dev/zero; sleep 3", NULL, 0, XFALSE);
         CHECK(deliver(&fix, pPaced, XTRUE, NULL, 0) == XAPI_CONTINUE, "a command writing 128 KB on the relay is accepted");
 
         xbool_t bPaced = XFALSE, bSlept = XFALSE;
@@ -918,7 +979,7 @@ int main(void)
 
         CHECK(replies.bExit && replies.out.nUsed == 131072 && replies.nExitCode == 0, "every byte arrives, then the exit");
         CHECK(bPaced && bSlept, "held by the limit, the output waited, and the loop slept until it could go");
-        CHECK(nOutputMs - nStartMs >= 400, "no faster than the limit allows: 128 KB at 240 KB/s");
+        CHECK(nOutputMs - nStartMs >= 1500, "no faster than the limit allows: 128 KB at 60 KB/s");
 
         DirectGate_SessionMgr_SetRelayLimit(&fix.conn.mgr, 0, 0);
         DirectGate_SessionMgr_Remove(&fix.conn.mgr, pSession);
@@ -944,6 +1005,10 @@ int main(void)
             collect(&fix, &replies);
         }
         CHECK(pSession->command.bReadPaused && pSession->command.bPaced, "the first read is held by the limit");
+
+        /* The debt stands as it is from here on: what follows checks how the hold is classified, and a slow runner under
+           valgrind could otherwise pay a second's debt off before the last check looks */
+        pSession->nRelayTokensMs = XTime_GetMonoMs() + 3600000;
 
         const size_t nFill = 2U * 1024U * 1024U;
         size_t nUsed = fix.api.txBuffer.nUsed;
@@ -1011,7 +1076,7 @@ int main(void)
 
             /* The link drains: the stand-in goes first, then whatever the agent queued behind it is read back */
             XByteBuffer_Advance(&fix.api.txBuffer, nBacklog);
-            CHECK(run_until_exit(&fix, &api, &replies, 10000), "the exit follows once the link drains");
+            CHECK(run_until_exit(&fix, &api, &replies, 20000), "the exit follows once the link drains");
             CHECK(replies.out.nUsed == nTotal, "output still in the pipe at exit arrives in full");
             CHECK(replies.nExitCode == 0, "the program's exit is reported after its output");
 
@@ -1097,11 +1162,12 @@ int main(void)
         CHECK(pSession != NULL, "an exec session for a program without output");
         directgate_command_t *pCmd = &pSession->command;
 
-        CHECK(deliver(&fix, exec_start(61, "exec >/dev/null 2>&1; sleep 0.3; exit 7", NULL, 0, XFALSE), XTRUE, NULL, 0)
+        /* Seconds of running after the output closes, so that it still runs when that is looked at on a slow runner */
+        CHECK(deliver(&fix, exec_start(61, "exec >/dev/null 2>&1; sleep 3; exit 7", NULL, 0, XFALSE), XTRUE, NULL, 0)
             == XAPI_CONTINUE, "a command that closes its output is accepted");
         CHECK(pCmd->nExitFd != XSOCK_INVALID && pCmd->pExitSession != NULL, "the program's exit is an endpoint on the loop");
 
-        uint64_t nDeadline = XTime_GetMonoMs() + 5000;
+        uint64_t nDeadline = XTime_GetMonoMs() + 30000;
         while ((pCmd->nOutFd != XSOCK_INVALID || pCmd->nErrFd != XSOCK_INVALID) && XTime_GetMonoMs() < nDeadline)
             XAPI_Service(&api, 10);
 
@@ -1112,16 +1178,16 @@ int main(void)
         CHECK(DirectGate_TestGetServiceWaitMs(&fix.conn) >= DIRECTGATE_COMMAND_POLL_MAX_MS,
             "the agent's event loop sleeps its full wait");
 
-        /* Each wait would last seconds: only the exit itself can end them early */
+        /* Each wait would last 20 s: only the exit itself can end one early */
         uint64_t nStart = XTime_GetMonoMs();
-        while (!replies.bExit && XTime_GetMonoMs() - nStart < 15000)
+        while (!replies.bExit && XTime_GetMonoMs() - nStart < 60000)
         {
-            XAPI_Service(&api, 5000);
+            XAPI_Service(&api, 20000);
             collect(&fix, &replies);
         }
 
         CHECK(replies.bExit && replies.nExitCode == 7, "the exit is reported with the program's code");
-        CHECK(XTime_GetMonoMs() - nStart < 2500, "the exit wakes the loop from a long wait");
+        CHECK(XTime_GetMonoMs() - nStart < 10000, "the exit wakes the loop from a long wait");
         CHECK(pCmd->nExitFd == XSOCK_INVALID && pCmd->pExitSession == NULL, "the exit endpoint is gone once it has fired");
         DirectGate_SessionMgr_Remove(&fix.conn.mgr, pSession);
         collect(&fix, &replies);
@@ -1134,7 +1200,7 @@ int main(void)
         CHECK(pSession != NULL, "an exec session without an exit endpoint");
         directgate_command_t *pCmd = &pSession->command;
 
-        CHECK(deliver(&fix, exec_start(62, "exec >/dev/null 2>&1; sleep 0.3; exit 9", NULL, 0, XFALSE), XTRUE, NULL, 0)
+        CHECK(deliver(&fix, exec_start(62, "exec >/dev/null 2>&1; sleep 3; exit 9", NULL, 0, XFALSE), XTRUE, NULL, 0)
             == XAPI_CONTINUE, "a command for the polling path is accepted");
 
         /* As on a system that cannot announce an exit: the endpoint goes, and the command must not notice */
@@ -1142,7 +1208,7 @@ int main(void)
         if (pCmd->pExitSession != NULL) XAPI_Disconnect(pCmd->pExitSession);
         pCmd->pExitSession = NULL;
 
-        uint64_t nDeadline = XTime_GetMonoMs() + 5000;
+        uint64_t nDeadline = XTime_GetMonoMs() + 30000;
         while ((pCmd->nOutFd != XSOCK_INVALID || pCmd->nErrFd != XSOCK_INVALID || pCmd->nExitFd != XSOCK_INVALID) &&
                XTime_GetMonoMs() < nDeadline)
             XAPI_Service(&api, 10);
@@ -1154,7 +1220,7 @@ int main(void)
         /* Driven as the agent's own loop drives it: each pass waits as long as the loop would */
         uint32_t nShortest = DIRECTGATE_COMMAND_WAIT_NONE, nLongest = 0;
         uint64_t nStart = XTime_GetMonoMs();
-        while (!replies.bExit && XTime_GetMonoMs() - nStart < 15000)
+        while (!replies.bExit && XTime_GetMonoMs() - nStart < 60000)
         {
             uint32_t nWaitMs = DirectGate_TestGetServiceWaitMs(&fix.conn);
             if (nWaitMs < nShortest) nShortest = nWaitMs;
@@ -1179,7 +1245,7 @@ int main(void)
         CHECK(pSession != NULL, "an exec session with an output limit");
         CHECK(deliver(&fix, exec_start_max(71, "head -c 200000 /dev/zero; printf err >&2; exit 4", 1000), XTRUE, NULL, 0)
             == XAPI_CONTINUE, "a command with an output limit is accepted");
-        CHECK(run_until_exit(&fix, &api, &replies, 10000), "the limited command finishes");
+        CHECK(run_until_exit(&fix, &api, &replies, 20000), "the limited command finishes");
         CHECK(replies.out.nUsed == 1000, "no more of a stream is sent than the client asked for");
         CHECK(output_is(&replies.err, "err"), "each stream has a limit of its own");
         CHECK(replies.nExitCode == 4 && replies.bTruncated, "the exit is the program's own, and says output was dropped");
@@ -1192,7 +1258,7 @@ int main(void)
         CHECK(pSession != NULL, "an exec session for output at the limit");
         CHECK(deliver(&fix, exec_start_max(72, "printf abc; printf defg >&2", 3), XTRUE, NULL, 0) == XAPI_CONTINUE,
             "a command writing up to the limit is accepted");
-        CHECK(run_until_exit(&fix, &api, &replies, 10000), "the command at the limit finishes");
+        CHECK(run_until_exit(&fix, &api, &replies, 20000), "the command at the limit finishes");
         CHECK(output_is(&replies.out, "abc") && output_is(&replies.err, "def"), "output is cut at the byte");
         CHECK(replies.bTruncated, "a stream cut on one side is reported");
         DirectGate_SessionMgr_Remove(&fix.conn.mgr, pSession);
@@ -1203,7 +1269,7 @@ int main(void)
         CHECK(pSession != NULL, "an exec session for output that fits");
         CHECK(deliver(&fix, exec_start_max(73, "printf abc; printf def >&2", 3), XTRUE, NULL, 0) == XAPI_CONTINUE,
             "a command whose output fits is accepted");
-        CHECK(run_until_exit(&fix, &api, &replies, 10000), "the command whose output fits finishes");
+        CHECK(run_until_exit(&fix, &api, &replies, 20000), "the command whose output fits finishes");
         CHECK(output_is(&replies.out, "abc") && output_is(&replies.err, "def") && !replies.bTruncated,
             "output that fits the limit is all sent, and nothing is reported dropped");
         DirectGate_SessionMgr_Remove(&fix.conn.mgr, pSession);
@@ -1261,7 +1327,7 @@ int main(void)
         CHECK(pSession->command.exec.bExited, "the program has exited meanwhile");
 
         XByteBuffer_Advance(&fix.api.txBuffer, nBacklog);
-        CHECK(run_until_exit(&fix, &api, &replies, 10000), "the exit follows once the link drains");
+        CHECK(run_until_exit(&fix, &api, &replies, 20000), "the exit follows once the link drains");
         CHECK(replies.out.nUsed == 1000 && replies.bTruncated, "output read out at the hangup keeps to the limit");
         DirectGate_SessionMgr_Remove(&fix.conn.mgr, pSession);
         collect(&fix, &replies);
@@ -1299,7 +1365,7 @@ int main(void)
 
         CHECK(deliver(&fix, exec_start_max(76, "printf x", 4294967295U), XTRUE, NULL, 0) == XAPI_CONTINUE,
             "the largest limit is accepted");
-        CHECK(run_until_exit(&fix, &api, &replies, 10000) && output_is(&replies.out, "x") && !replies.bTruncated,
+        CHECK(run_until_exit(&fix, &api, &replies, 20000) && output_is(&replies.out, "x") && !replies.bTruncated,
             "the largest limit runs the command");
         DirectGate_SessionMgr_Remove(&fix.conn.mgr, pSession);
         collect(&fix, &replies);
@@ -1351,7 +1417,7 @@ int main(void)
         CHECK(!replies.bExit, "no exit is reported over another route");
 
         int bGone = 0;
-        for (int i = 0; i < 300 && !bGone; i++)
+        for (int i = 0; i < 1500 && !bGone; i++)
         {
             DirectGate_Term_ReapPending();
             bGone = kill(nPid, 0) != 0 && errno == ESRCH;
@@ -1391,7 +1457,7 @@ int main(void)
             "a remote session runs one command at a time");
         replies_clear(&replies);
 
-        CHECK(run_until_exit(&fix, &api, &replies, 10000) && output_is(&replies.out, "first") && replies.nExitCode == 0,
+        CHECK(run_until_exit(&fix, &api, &replies, 20000) && output_is(&replies.out, "first") && replies.nExitCode == 0,
             "the first command finishes");
         CHECK(pSession->command.eState == DIRECTGATE_COMMAND_IDLE && pSession->command.nOutFd == XSOCK_INVALID &&
             pSession->command.nExitFd == XSOCK_INVALID && pSession->command.exec.nPid == XSTDERR,
@@ -1400,7 +1466,7 @@ int main(void)
 
         CHECK(deliver(&fix, exec_start(85, "printf second; exit 4", NULL, 0, XFALSE), XTRUE, NULL, 0) == XAPI_CONTINUE,
             "a second command is accepted");
-        CHECK(run_until_exit(&fix, &api, &replies, 10000) && output_is(&replies.out, "second") && replies.nExitCode == 4,
+        CHECK(run_until_exit(&fix, &api, &replies, 20000) && output_is(&replies.out, "second") && replies.nExitCode == 4,
             "the second command runs on the same session");
         replies_clear(&replies);
 
@@ -1423,7 +1489,7 @@ int main(void)
         snprintf(sMissingDir, sizeof(sMissingDir), "%s/no-such-dir", sRoot);
         CHECK(deliver(&fix, exec_start(85, "true", sMissingDir, 0, XFALSE), XTRUE, NULL, 0) == XAPI_CONTINUE,
             "a command in a missing directory is accepted");
-        CHECK(run_until_exit(&fix, &api, &replies, 10000) && replies.nExitCode == 127, "and fails as such");
+        CHECK(run_until_exit(&fix, &api, &replies, 20000) && replies.nExitCode == 127, "and fails as such");
         CHECK(pSession->command.eState == DIRECTGATE_COMMAND_IDLE, "the session is ready again after a failed command");
 
         char sSecondRan[PATH_MAX];
@@ -1484,27 +1550,31 @@ int main(void)
         /* The command goes over the channel, as dgcli sends it once the channel is open */
         xbyte_buffer_t packet;
         XByteBuffer_Init(&packet, XSTDNON, XFALSE);
-        /* The program writes, then keeps running: its output has to arrive while it runs, not with its exit */
-        xjson_obj_t *pStart = exec_start(84, "printf over-the-channel; printf warn >&2; sleep 3; exit 6", NULL, 0, XFALSE);
+        /* The program writes, then keeps running: its output has to arrive while it runs, not with its exit. Seconds of
+           running, so that a data channel slowed down by valgrind on a slow runner still delivers well inside them. */
+        xjson_obj_t *pStart = exec_start(84, "printf over-the-channel; printf warn >&2; sleep 5; exit 6", NULL, 0, XFALSE);
         CHECK(pStart != NULL && seal(&fix, &packet, pStart, NULL, 0), "seal a command for the channel");
         XJSON_FreeObject(pStart);
         CHECK(DirectGate_WebRTC_Send(&peer, packet.pData, packet.nUsed) == XSTDOK, "the command goes over the channel");
         XByteBuffer_Clear(&packet);
 
         nDeadline = XTime_GetMonoMs() + 30000;
-        uint64_t nOutputMs = 0, nExitMs = 0;
+        xbool_t bOutput = XFALSE, bStillRunning = XFALSE;
         while (!replies.bExit && XTime_GetMonoMs() < nDeadline)
         {
             DirectGate_WebRTC_ProcessQueue(&peer);
             XAPI_Service(&api, 10);
             collect(&fix, &replies);
-            if (!nOutputMs && output_is(&replies.out, "over-the-channel") && output_is(&replies.err, "warn"))
-                nOutputMs = XTime_GetMonoMs();
+            if (!bOutput && output_is(&replies.out, "over-the-channel") && output_is(&replies.err, "warn"))
+            {
+                /* Whether the program still runs, not how long it took: held, the output would only come with the exit */
+                bOutput = XTRUE;
+                bStillRunning = !replies.bExit && !pSession->command.exec.bExited && kill(pSession->command.exec.nPid, 0) == 0;
+            }
         }
-        nExitMs = XTime_GetMonoMs();
 
         CHECK(replies.bExit && replies.nExitCode == 6, "the exit arrives with the program's code");
-        CHECK(nOutputMs && nExitMs - nOutputMs >= 1000,
+        CHECK(bOutput && bStillRunning,
             "the output arrives as it is written: a relay limit and a debt with it hold nothing back on the channel");
         CHECK(output_is(&replies.out, "over-the-channel") && output_is(&replies.err, "warn"), "the output arrives whole");
         CHECK(replies.nChannelExec >= 3 && replies.nRelayExec == 0,

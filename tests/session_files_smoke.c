@@ -200,6 +200,13 @@ static xjson_obj_t* limit_header(uint32_t nSessionId, uint32_t nRate, uint32_t n
     return pHeader;
 }
 
+/* The session's relay bucket as it stands, with no time passing for it until the next send: what a check then sees is
+   the bucket's arithmetic, never how fast this machine runs (a slow runner under valgrind takes milliseconds) */
+static void hold_bucket(directgate_session_t *pSession)
+{
+    pSession->nRelayTokensMs = XTime_GetMonoMs() + 3600000;
+}
+
 /* A plain message, on the relay link or from some other transport */
 static int deliver_plain(fixture_t *pFix, xjson_obj_t *pHeader, xbool_t bRelay)
 {
@@ -916,21 +923,22 @@ int main(void)
         CHECK(pS->nRelayTokens < 0, "everything the session sent the relay counts: the answer to the open put it in debt");
 
         size_t nQueued = fix.api.txBuffer.nUsed;
-        pS->nRelayTokensMs = XTime_GetMonoMs();
+        hold_bucket(pS);
         DirectGate_TestPumpTransfers(&fix.conn);
         CHECK(fix.api.txBuffer.nUsed == nQueued, "in debt, the download waits");
 
         int nChunks = 0, nLongWaits = 0;
         for (int i = 0; i < 20 && pS->transfer.eState == XTRANSFER_STATE_SENDING; i++)
         {
-            /* A second on: the bucket holds no more than its burst, so it is room for one chunk, not for more */
-            pS->nRelayTokensMs -= 1000;
+            /* Topped up a second ago: the bucket holds no more than its burst, so it is room for one chunk, not for more */
+            pS->nRelayTokensMs = XTime_GetMonoMs() - 1000;
             nQueued = fix.api.txBuffer.nUsed;
             DirectGate_TestPumpTransfers(&fix.conn);
             CHECK(fix.api.txBuffer.nUsed > nQueued, "with room, the download moves");
             nChunks++;
 
             if (pS->transfer.eState != XTRANSFER_STATE_SENDING) break;
+            hold_bucket(pS);
             uint64_t nNowMs = XTime_GetMonoMs();
             uint32_t nRelayMs = DirectGate_Session_GetRelayWaitMs(pS, nNowMs);
             uint32_t nServiceMs = DirectGate_TestGetServiceWaitMs(&fix.conn);

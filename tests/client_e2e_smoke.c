@@ -3329,14 +3329,16 @@ int main(void)
     snprintf(sCfg, sizeof(sCfg), "%s/dgcli.json", sRoot);
     snprintf(sAcctCfg, sizeof(sAcctCfg), "%s/dgcli-account.json", sRoot);
 
+    /* A log directory of its own: the default one is a system directory a CI runner cannot create, and a client that
+       fails to says so on stderr - which the exec checks compare byte for byte */
     char sText[1024];
     snprintf(sText, sizeof(sText), "{\"apiUrl\":\"https://127.0.0.1:%u\",\"apiToken\":\"%s\",\"webUrl\":\"https://example.test\","
-        "\"log\":{\"toScreen\":true,\"toFile\":false}}\n", (unsigned)g_cli.nApiPort, CLI_API_TOKEN);
+        "\"log\":{\"toScreen\":true,\"toFile\":false,\"path\":\"%s/logs\"}}\n", (unsigned)g_cli.nApiPort, CLI_API_TOKEN, sRoot);
     write_file(sCfg, sText);
 
     /* No API token: this one has to sign in to an account. */
     snprintf(sText, sizeof(sText), "{\"apiUrl\":\"https://127.0.0.1:%u\",\"webUrl\":\"https://example.test\","
-        "\"log\":{\"toScreen\":true,\"toFile\":false}}\n", (unsigned)g_cli.nApiPort);
+        "\"log\":{\"toScreen\":true,\"toFile\":false,\"path\":\"%s/logs\"}}\n", (unsigned)g_cli.nApiPort, sRoot);
     write_file(sAcctCfg, sText);
 
     tty_t tty;
