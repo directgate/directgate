@@ -212,6 +212,150 @@ static int check_loop(void)
     return 0;
 }
 
+/* What the session wrote on stdout while pFn ran: its answers */
+static size_t capture_stdout(void (*pFn)(directgate_ctx_t*), directgate_ctx_t *pCli, char *pOut, size_t nSize)
+{
+    int nPipe[2];
+    if (pipe(nPipe) != 0) return 0;
+
+    fflush(stdout);
+    int nSaved = dup(STDOUT_FILENO);
+    dup2(nPipe[1], STDOUT_FILENO);
+    close(nPipe[1]);
+    pFn(pCli);
+    dup2(nSaved, STDOUT_FILENO);
+    close(nSaved);
+
+    ssize_t nRead = read(nPipe[0], pOut, nSize - 1);
+    close(nPipe[0]);
+    pOut[nRead > 0 ? nRead : 0] = '\0';
+    return nRead > 0 ? (size_t)nRead : 0;
+}
+
+static void serve_next(directgate_ctx_t *pCli) { DirectGate_Client_ServeNext(pCli); }
+
+/* dgcli session between its requests: what ends it, and what does not */
+static int check_session(void)
+{
+    directgate_ctx_t sess;
+    memset(&sess, 0, sizeof(sess));
+    directgate_remote_req_t req;
+    memset(&req, 0, sizeof(req));
+    req.eOp = DIRECTGATE_REMOTE_SESSION;
+    directgate_remote_t op;
+    DirectGate_Remote_Init(&op, &req, NULL, NULL);
+    sess.pRemote = &op;
+    sess.bServe = XTRUE;
+    g_bFinish = XFALSE;
+
+    CHECK(DirectGate_Client_ServiceSession(&sess) == XAPI_CONTINUE && !g_bFinish, "a session not open yet waits for its route");
+
+    uint64_t nNowMs = XTime_GetMonoMs();
+    sess.bServeReady = XTRUE;
+    sess.nServeStartMs = nNowMs;
+    sess.nServeIdleMs = nNowMs;
+    sess.nServeIdleLimitMs = DIRECTGATE_REMOTE_IDLE_MS;
+    CHECK(DirectGate_Client_ServiceSession(&sess) == XAPI_CONTINUE && !g_bFinish, "a fresh session waits for requests");
+
+    sess.bServeBusy = XTRUE;
+    sess.nServeIdleMs = nNowMs - 2 * DIRECTGATE_REMOTE_IDLE_MS;
+    sess.nServeStartMs = nNowMs - 2 * DIRECTGATE_REMOTE_LIFETIME_MS;
+    CHECK(DirectGate_Client_ServiceSession(&sess) == XAPI_CONTINUE && !g_bFinish,
+        "a session running an operation is never ended under it");
+
+    sess.bServeBusy = XFALSE;
+    sess.nServeStartMs = nNowMs;
+    CHECK(DirectGate_Client_ServiceSession(&sess) == XAPI_DISCONNECT && g_bFinish && sess.bServeDone,
+        "a session idle for too long ends by its own rule");
+
+    g_bFinish = XFALSE;
+    sess.bServeDone = XFALSE;
+    sess.nServeIdleMs = nNowMs;
+    sess.nServeStartMs = nNowMs - DIRECTGATE_REMOTE_LIFETIME_MS;
+    CHECK(DirectGate_Client_ServiceSession(&sess) == XAPI_DISCONNECT && g_bFinish && sess.bServeDone,
+        "a session that has lived its lifetime ends, between operations");
+
+    g_bFinish = XFALSE;
+    sess.bServeDone = XFALSE;
+    sess.nServeStartMs = nNowMs;
+    /* Against the clock the session reads itself: half a second short of a one-second limit is no end yet, even
+       under valgrind, and a whole second is - where the default would wait ten minutes */
+    sess.nServeIdleLimitMs = 1000;
+    sess.nServeIdleMs = XTime_GetMonoMs() - 500;
+    CHECK(DirectGate_Client_ServiceSession(&sess) == XAPI_CONTINUE && !g_bFinish, "-t sets the idle time");
+    sess.nServeIdleMs = XTime_GetMonoMs() - 1000;
+    CHECK(DirectGate_Client_ServiceSession(&sess) == XAPI_DISCONNECT && g_bFinish, "and ends it once the time is up");
+
+    /* Blank lines ask for nothing; the last line need not end in a newline once stdin has ended */
+    g_bFinish = XFALSE;
+    sess.bServeDone = XFALSE;
+    sess.nServeIdleMs = nNowMs;
+    sess.nServeIdleLimitMs = DIRECTGATE_REMOTE_IDLE_MS;
+    xstrncpy(sess.sServeDevice, sizeof(sess.sServeDevice), "box");
+    XByteBuffer_Add(&sess.serveIn, (const uint8_t*)"\n\r\n{\"argv\":[\"exec\",\"elsewhere\",\"ls\"]}", 37);
+
+    char sOut[1024];
+    size_t nOut = capture_stdout(serve_next, &sess, sOut, sizeof(sOut));
+    CHECK(nOut == 0 && sess.serveIn.nUsed == 36, "a blank line is passed over without an answer");
+    capture_stdout(serve_next, &sess, sOut, sizeof(sOut));
+    CHECK(sess.serveIn.nUsed == 34, "and so is one that is only a carriage return");
+    nOut = capture_stdout(serve_next, &sess, sOut, sizeof(sOut));
+    CHECK(nOut == 0 && sess.serveIn.nUsed == 34, "a line still being written is not taken");
+
+    sess.bServeEof = XTRUE;
+    nOut = capture_stdout(serve_next, &sess, sOut, sizeof(sOut));
+    CHECK(nOut > 0 && strstr(sOut, "{\"exitCode\":255,") == sOut && strstr(sOut, "a session reaches its own device only") != NULL,
+        "with stdin over, the last line is taken without its newline, and answered");
+    CHECK(!sess.serveIn.nUsed && !sess.bServeBusy, "nothing is left waiting");
+    CHECK(DirectGate_Client_ServiceSession(&sess) == XAPI_DISCONNECT && g_bFinish && sess.bServeDone,
+        "with its requests over and answered, the session ends");
+
+    sess.bServeReady = XFALSE;
+    g_bFinish = XFALSE;
+    capture_stdout(serve_next, &sess, sOut, sizeof(sOut));
+    CHECK(!sess.bServeBusy, "nothing is taken before the session is open");
+
+    /* The agent closing the session while nothing runs: a failure, not an end of its own */
+    sess.bServeReady = XTRUE;
+    xbyte_buffer_t packet;
+    XByteBuffer_Init(&packet, XSTDNON, XFALSE);
+    xjson_obj_t *pStatus = DirectGate_Proto_BuildStatus("closed", 1);
+    directgate_pkg_t pkg;
+    CHECK(pStatus != NULL && DirectGate_Proto_Build(&packet, pStatus, NULL, 0, XFALSE) &&
+          DirectGate_Package_Parse(&pkg, packet.pData, packet.nUsed), "a closed status");
+    XJSON_FreeObject(pStatus);
+    sess.nServeExit = 0;
+    CHECK(DirectGate_Client_ServeMessage(&sess, &pkg) == XAPI_DISCONNECT && g_bFinish &&
+          sess.nServeExit == DIRECTGATE_REMOTE_EXIT_FAILED, "a session the agent closes ends as broken");
+    DirectGate_Package_Clear(&pkg);
+    XByteBuffer_Reset(&packet);
+
+    g_bFinish = XFALSE;
+    xjson_obj_t *pError = DirectGate_Proto_BuildError("between operations", 1);
+    CHECK(pError != NULL && DirectGate_Proto_Build(&packet, pError, NULL, 0, XFALSE) &&
+          DirectGate_Package_Parse(&pkg, packet.pData, packet.nUsed), "an error");
+    XJSON_FreeObject(pError);
+    CHECK(DirectGate_Client_ServeMessage(&sess, &pkg) == XAPI_CONTINUE && !g_bFinish,
+        "an error between operations is noted, and the session goes on");
+    DirectGate_Package_Clear(&pkg);
+    XByteBuffer_Clear(&packet);
+
+    /* An upload over the data channel paces the loop; nothing else does */
+    CHECK(DirectGate_Client_GetWaitMs(&sess) == DIRECTGATE_CLIENT_LOOP_WAIT_MS, "an idle session sleeps the whole wait");
+    sess.bChannelUsed = XTRUE;
+    op.transfer.eState = XTRANSFER_STATE_SENDING;
+    CHECK(DirectGate_Client_GetWaitMs(&sess) == DIRECTGATE_CLIENT_TRANSFER_WAIT_MS, "an upload on the channel paces the loop");
+    sess.bChannelUsed = XFALSE;
+    CHECK(DirectGate_Client_GetWaitMs(&sess) == DIRECTGATE_CLIENT_LOOP_WAIT_MS, "one on the relay waits for its socket");
+    op.transfer.eState = XTRANSFER_STATE_IDLE;
+    CHECK(DirectGate_Client_GetWaitMs(NULL) == DIRECTGATE_CLIENT_LOOP_WAIT_MS, "no client sleeps the whole wait");
+
+    g_bFinish = XFALSE;
+    DirectGate_Client_Release(&sess);
+    DirectGate_Remote_Clear(&op);
+    return 0;
+}
+
 int main(void)
 {
     memset(&g_cfg, 0, sizeof(g_cfg));
@@ -219,7 +363,7 @@ int main(void)
     g_cli.pCfg = &g_cfg;
     DirectGate_WebRTC_Init(&g_cli.webrtc);
 
-    int nFailed = check_sending() || check_handlers() || check_loop();
+    int nFailed = check_sending() || check_handlers() || check_loop() || check_session();
 
     DirectGate_WebRTC_Clear(&g_cli.webrtc);
     if (nFailed) return 1;

@@ -56,6 +56,8 @@
 #define E2E_MARKER       "E2E_MARK_42"
 #define E2E_FLOOD_CHUNK  32768
 #define E2E_FLOOD_CHUNKS 8
+#define E2E_RELAY_RATE   4194304U
+#define E2E_RELAY_BURST  8388608U
 
 typedef enum {
     RELAY_WAIT_ROLE = 0,
@@ -370,6 +372,17 @@ static int relay_on_role(xapi_session_t *pSession, directgate_pkg_t *pPkg)
     if (pRole != NULL && strcmp(pRole, "agent") == 0 && pDevice != NULL && strcmp(pDevice, E2E_DEVICE_ID) == 0 &&
         pToken != NULL && strncmp(pToken, "access-", 7) == 0)
         XSYNC_ATOMIC_SET(&g_e2e.bRoleTokenOk, 1);
+
+    /* The relay's limit, told on every link - twice here, which changes nothing the second time: high enough to hold
+       nothing of this test back */
+    for (int i = 0; i < 2; i++)
+    {
+        xjson_obj_t *pLimit = DirectGate_Proto_BuildStatus("limit", 0);
+        if (pLimit == NULL) return XAPI_DISCONNECT;
+        XJSON_AddU32(pLimit, "rateBytes", E2E_RELAY_RATE);
+        XJSON_AddU32(pLimit, "burstBytes", E2E_RELAY_BURST);
+        if (relay_send_plain(pSession, pLimit) < 0) return XAPI_DISCONNECT;
+    }
 
     XSYNC_ATOMIC_ADD(&g_e2e.nRoles, 1);
     int nRoles = (int)XSYNC_ATOMIC_GET(&g_e2e.nRoles);
@@ -806,6 +819,23 @@ static int run(const char *pRoot, const tls_fixture_t *pTls, pid_t *pPid)
     CHECK(wait_for(&g_e2e.nRelayConnections, 2, 30000, *pPid), "the agent reconnects after the relay drops it");
     CHECK(wait_for(&g_e2e.nRoles, 2, 20000, *pPid), "the reconnected agent announces itself again");
     CHECK(wait_for(&g_e2e.bRevokeSent, 1, 5000, *pPid), "the relay claims the device was revoked");
+
+    /* Each link takes the limit its relay tells of: forgotten when the first link went, taken again from the second */
+    int nLimits = 0;
+    for (int i = 0; i < 100 && nLimits < 2; i++)
+    {
+        xbyte_buffer_t log;
+        nLimits = 0;
+        if (XPath_LoadBuffer(sLog, &log) > 0)
+        {
+            const char *pNeedle = "Relay limit per session: rate(4194304), burst(8388608)";
+            for (const char *pAt = strstr((const char*)log.pData, pNeedle); pAt != NULL; pAt = strstr(pAt + 1, pNeedle))
+                nLimits++;
+            XByteBuffer_Clear(&log);
+        }
+        if (nLimits < 2) xusleep(50000);
+    }
+    CHECK(nLimits == 2, "the agent takes the relay's limit on each link it opens");
 
     /* The claim alone changes nothing on disk: only the API may end an enrollment. */
     int nApiBefore = (int)XSYNC_ATOMIC_GET(&g_e2e.nApiRequests);

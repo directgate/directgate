@@ -1274,8 +1274,60 @@ int DirectGate_Files_TransferSendCb(xjson_obj_t *pHeader, const uint8_t *pPayloa
         return XSTDERR;
     }
 
-    int nStatus = DirectGate_Session_Send(pSession, pHeader, pPayload, nLen);
+    /* Every message of a download is bulk data: started, sent and ended on one route (see DirectGate_Files_Pump) */
+    directgate_bulk_route_t eRoute = DirectGate_Session_GetBulkRoute(pSession, XTime_GetMonoMs());
+    if (eRoute == DIRECTGATE_BULK_WAIT)
+    {
+        xloge("File transfer message with no route to take: sid(%u)", pSession->nSessionId);
+        return XSTDERR;
+    }
+
+    int nStatus = DirectGate_Session_SendBulk(pSession, eRoute, pHeader, pPayload, nLen);
     return (nStatus >= 0) ? XSTDOK : XSTDERR;
+}
+
+/* Starts a download and answers its "open". The route is known: the caller checked. */
+static int DirectGate_Files_StartOpen(directgate_session_t *pSession, const char *pPath)
+{
+    /* The transfer opens its source with O_NOFOLLOW so a link planted
+       between the check above and the read cannot redirect it, which also
+       means it will not open a link the user asked for on purpose. The
+       link is resolved here instead, so the transfer still sees a real
+       file and keeps that guarantee. */
+    char *pResolved = DirectGate_Files_ResolveLink(pPath);
+    const char *pSource = pResolved != NULL ? pResolved : pPath;
+
+    int nStarted = DirectGate_Transfer_Send(&pSession->transfer, pSource, DirectGate_Files_TransferSendCb, pSession);
+    free(pResolved);
+
+    if (nStarted < 0)
+    {
+        DirectGate_Transfer_Destroy(&pSession->transfer);
+        return DirectGate_Session_SendManagerResp(pSession, "open", "failed", "failed to start file transfer", pPath);
+    }
+
+    return DirectGate_Session_SendManagerResp(pSession, "open", "ok", NULL, pPath);
+}
+
+void DirectGate_Files_StartPendingOpen(directgate_session_t *pSession, uint64_t nNowMs)
+{
+    XCHECK_VOID_NL((pSession != NULL && pSession->bPendingOpen && !pSession->bClosing));
+    if (DirectGate_Session_GetBulkRoute(pSession, nNowMs) == DIRECTGATE_BULK_WAIT) return;
+
+    char sPath[XFILE_PATH_SIZE];
+    xstrncpy(sPath, sizeof(sPath), pSession->sPendingOpenPath);
+    pSession->sPendingOpenPath[0] = '\0';
+    pSession->bPendingOpen = XFALSE;
+
+    /* Checked again: the file had the whole wait to change */
+    struct stat st;
+    if (stat(sPath, &st) != 0 || !S_ISREG(st.st_mode))
+    {
+        DirectGate_Session_SendManagerResp(pSession, "open", "failed", "file not found or not a regular file", sPath);
+        return;
+    }
+
+    DirectGate_Files_StartOpen(pSession, sPath);
 }
 
 void DirectGate_Files_ProcessTransfer(directgate_session_t *pSession)
@@ -1640,36 +1692,36 @@ int DirectGate_Files_HandleManager(xapi_session_t *pApiSession, directgate_pkg_t
                 "failed", "file not found or not a regular file", pMgrPkg->pPath);
         }
 
-        if (DirectGate_Transfer_IsActive(&pSession->transfer))
+        if (DirectGate_Transfer_IsActive(&pSession->transfer) || pSession->bPendingOpen)
         {
             return DirectGate_Session_SendManagerResp(pSession, "open",
                 "failed", "transfer already in progress", pMgrPkg->pPath);
         }
 
-        /* The transfer opens its source with O_NOFOLLOW so a link planted
-           between the check above and the read cannot redirect it, which also
-           means it will not open a link the user asked for on purpose. The
-           link is resolved here instead, so the transfer still sees a real
-           file and keeps that guarantee. */
-        char *pResolved = DirectGate_Files_ResolveLink(pMgrPkg->pPath);
-        const char *pSource = pResolved != NULL ? pResolved : pMgrPkg->pPath;
-
-        int nStarted = DirectGate_Transfer_Send(&pSession->transfer, pSource, DirectGate_Files_TransferSendCb, pSession);
-        free(pResolved);
-
-        if (nStarted < 0)
+        /* The download is bulk data: while the data channel is coming it waits for it, answered once it starts */
+        if (DirectGate_Session_GetBulkRoute(pSession, XTime_GetMonoMs()) == DIRECTGATE_BULK_WAIT)
         {
-            DirectGate_Transfer_Destroy(&pSession->transfer);
-            return DirectGate_Session_SendManagerResp(pSession, "open",
-                "failed", "failed to start file transfer", pMgrPkg->pPath);
+            if (strlen(pMgrPkg->pPath) >= sizeof(pSession->sPendingOpenPath))
+            {
+                return DirectGate_Session_SendManagerResp(pSession, "open",
+                    "failed", "path is too long", pMgrPkg->pPath);
+            }
+
+            xstrncpy(pSession->sPendingOpenPath, sizeof(pSession->sPendingOpenPath), pMgrPkg->pPath);
+            pSession->bPendingOpen = XTRUE;
+
+            xlogi("Download waits for the data channel: sid(%u), wsfd(%d)", pSession->nSessionId,
+                pSession->pWsSession != NULL ? (int)pSession->pWsSession->sock.nFD : (int)XSOCK_INVALID);
+
+            return XAPI_CONTINUE;
         }
 
-        return DirectGate_Session_SendManagerResp(pSession, "open", "ok", NULL, pMgrPkg->pPath);
+        return DirectGate_Files_StartOpen(pSession, pMgrPkg->pPath);
     }
 
     if (xstrcmp(pMgrPkg->pAction, "save"))
     {
-        if (DirectGate_Transfer_IsActive(&pSession->transfer))
+        if (DirectGate_Transfer_IsActive(&pSession->transfer) || pSession->bPendingOpen)
         {
             return DirectGate_Session_SendManagerResp(pSession, "save",
                 "failed", "transfer already in progress", pMgrPkg->pPath);

@@ -25,6 +25,21 @@ int DirectGate_Session_Send(directgate_session_t *pSession, xjson_obj_t *pHeader
     return XSTDOK;
 }
 
+/* files.c sends downloads as bulk data; this unit has no data channel, so the relay is the route */
+directgate_bulk_route_t DirectGate_Session_GetBulkRoute(directgate_session_t *pSession, uint64_t nNowMs)
+{
+    (void)pSession;
+    (void)nNowMs;
+    return DIRECTGATE_BULK_RELAY;
+}
+
+int DirectGate_Session_SendBulk(directgate_session_t *pSession, directgate_bulk_route_t eRoute,
+                                xjson_obj_t *pHeader, const uint8_t *pPayload, size_t nPayloadLength)
+{
+    (void)eRoute;
+    return DirectGate_Session_Send(pSession, pHeader, pPayload, nPayloadLength);
+}
+
 int DirectGate_Session_SendManagerResp(directgate_session_t *pSession,
                                    const char *pAction, const char *pStatus,
                                    const char *pReason, const char *pPath)

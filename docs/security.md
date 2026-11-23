@@ -67,6 +67,20 @@ Remote desktop cannot function without these; they are the feature, not a side e
 - All desktop control and input traffic is AES-256-SIV encrypted; video is encrypted as described above.
 - They act as `shell.user`, the same account the terminal already runs as. A client that can start a desktop session can already run arbitrary commands as that user through the PTY, so desktop access grants no privilege that shell access does not.
 
+## What a command session can do
+
+A session in `exec` mode runs one command and reports its exit - the `ssh host 'command'` of DirectGate, used by `dgcli exec` and AI agents. It grants nothing a terminal does not: the same completed SRP-6a or Ed25519 handshake, the same `shell.user`, the same pre-logon and temporary-share refusals, and all of its traffic - the command line included - encrypted end to end. What it does add is shaped by the fact that nobody is watching a terminal:
+
+- **Nothing inherited.** The command gets stdin, stdout and stderr and no other descriptor of the agent's - the relay socket, the TLS state, log files - whether or not they were marked close-on-exec; and every signal at its default, so nothing the agent ignores is ignored by the command.
+- **No surprises in where it runs.** A directory the client names has to be absolute - a relative one would resolve against wherever the shell happens to start - and is entered as `shell.user`, after the identity change; one that cannot be entered fails the command instead of letting it run somewhere else (a `rm -rf` meant for one directory must not land in another).
+- **Nothing outlives its session.** The command leads its own process group; a timeout, a forwarded signal and a session that goes away all reach everything it started there (a program that deliberately leaves the group, as a daemon does, leaves as it would under ssh). Nor does it outlive the agent: on Linux its shell is killed when the agent dies and never starts if the agent is already gone; on Windows the whole job is killed.
+- **Bounded.** Output stops being read while the transport is backed up, queued input is capped, and the command line has a size limit. A client that asks for only so much of each stream (`outputMax`) gets only that: the rest is dropped on the device and never crosses the link, and a limit that is not a whole number of bytes is refused rather than read as none.
+- **Logged without its secrets.** The agent records that a command ran, its pid, exit code, duration and how many bytes each stream sent - never the command line or its output.
+- **A kept session is bounded too.** A `remote` session (`dgcli session`, MCP `keep_open`) runs one command at a time on one authentication. The client ends it after 10 minutes idle and 30 minutes in all, so access is checked again on a fresh connection at least that often; the agent ends it like any session when the relay or the client goes, and a new authentication is needed for the next.
+- **Data off the relay.** Command output and file data move over the session's WebRTC data channel, still sealed end to end. The relay sees them only when WebRTC cannot be established, and then at no more than the limit it announces; the agent accepts that limit only from the relay link itself, never from a message a client could send.
+
+Because an AI agent acting on a prompt it was given is still the user acting, its access should be what the user would grant a script: a client key of its own (`dgcli -g -k <path>`, authorized on just the devices it should reach) rather than the user's own, so it can be withdrawn by itself.
+
 ### Privileged UI on Windows
 
 There is one place where the "no more privilege than shell access" property above does **not** hold, and it deserves to be stated plainly rather than buried.

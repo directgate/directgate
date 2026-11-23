@@ -320,6 +320,7 @@ add_executable(directgate
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
     ${AGENT_DIR}/term.c
+    ${AGENT_DIR}/command.c
     ${AGENT_DIR}/directgate.c)
 target_include_directories(directgate PRIVATE ${AGENT_DIR} ${AGENT_DIR}/desktop)
 target_link_libraries(directgate PRIVATE xcommon)
@@ -644,6 +645,8 @@ add_executable(dgcli
     ${CLIENT_DIR}/devices.c
     ${CLIENT_DIR}/login.c
     ${CLIENT_DIR}/relay.c
+    ${CLIENT_DIR}/mcp.c
+    ${CLIENT_DIR}/remote.c
     ${CLIENT_DIR}/webapi.c)
 target_include_directories(dgcli PRIVATE ${CLIENT_DIR})
 target_link_libraries(dgcli PRIVATE xcommon)

@@ -50,6 +50,7 @@ struct winsize {
 #include "sys/srch.h"
 #include "sys/xtime.h"
 #include "sys/thread.h"
+#include "sys/exec.h"
 
 #include "net/addr.h"
 #include "net/mdtp.h"

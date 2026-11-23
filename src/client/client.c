@@ -27,14 +27,25 @@
 #include "common.h"
 #include "config.h"
 #include "devices.h"
+#include "websock.h"
+#include "webrtc.h"
+#include "remote.h"
 #include "login.h"
 #include "relay.h"
-#include "webrtc.h"
-#include "websock.h"
 #include "e2e.h"
 #include "srp.h"
+#include "mcp.h"
+
+/* The event loop's longest sleep, and its pace while an upload drains into the data channel */
+#define DIRECTGATE_CLIENT_LOOP_WAIT_MS      100
+#define DIRECTGATE_CLIENT_TRANSFER_WAIT_MS  5
 
 static xbool_t g_bFinish = XFALSE;
+
+/* A remote command gets the first Ctrl-C or SIGTERM as a signal of its own, and its exit is still waited for;
+   the next one ends dgcli. Armed while a remote command runs, the signal waits here for the event loop. */
+static volatile sig_atomic_t g_bRemoteSignals = 0;
+static volatile sig_atomic_t g_nRemoteSignal = 0;
 
 #ifndef _WIN32
 static volatile sig_atomic_t g_bWinch = 0;
@@ -107,6 +118,38 @@ typedef struct directgate_client_ctx_ {
     /* Ended in a way a script has to be able to see even after a login: the
        host could not give what was asked for, or broke the protocol. */
     xbool_t bSessionFailed;
+
+    /* A remote operation (exec, dir, get, put, ...) instead of a terminal; owned by main, so a key-auth retry
+       that resets this context keeps what the operation prepared. NULL for a terminal session. */
+    directgate_remote_t *pRemote;
+
+    /* Its data takes the WebRTC data channel, and the relay only once WebRTC proved impossible */
+    uint64_t nChannelWaitMs;        /* When it began waiting for the channel */
+    xbool_t bChannelWait;           /* Authenticated, not started yet: the channel is coming */
+    xbool_t bChannelUsed;           /* Started on the channel: losing it ends the operation */
+    xbool_t bRelayOnly;             /* WebRTC is impossible: everything goes on the relay */
+
+    /* dgcli session: requests on stdin, one operation at a time on this one connection (pRemote is the operation
+       of the moment), each answered on stdout */
+    xbool_t bServe;
+    xbool_t bServeReady;            /* Its mode is open and its route decided: requests are taken */
+    xbool_t bServeBusy;             /* An operation runs */
+    xbool_t bServeEof;              /* stdin ended: no request will come */
+    xbool_t bServeDone;             /* It ended by its own rule (requests over, idle, lifetime), not by a failure */
+    int nServeExit;                 /* How dgcli exits: 0 when the session simply ended, 255 when it broke */
+    uint64_t nServeStartMs;
+    uint64_t nServeIdleMs;          /* When the last operation ended, or the session became ready */
+    uint64_t nServeIdleLimitMs;     /* How long it may stay idle: DIRECTGATE_REMOTE_IDLE_MS, or less with -t */
+    char sServeDevice[XSTR_MID];    /* The device as named: every request names the same one */
+    xbyte_buffer_t serveIn;         /* Request bytes read, not handled yet */
+    xbyte_buffer_t serveOut;
+    xbyte_buffer_t serveErr;
+    xbyte_buffer_t serveStdin;
+    directgate_remote_req_t serveReq;
+    XSOCKET nStdinFd;               /* The event loop's copy of stdin, while registered */
+#ifdef _WIN32
+    HANDLE hStdinPump;
+#endif
 } directgate_ctx_t;
 
 static int DirectGate_Client_SendAuthHello(directgate_ctx_t *pCli);
@@ -126,7 +169,14 @@ static void DirectGate_Client_SignalCallback(int sig)
 
     if (sig == SIGPIPE) return;
 #endif
-    (void)sig;
+
+    if (g_bRemoteSignals && (sig == SIGINT || sig == SIGTERM))
+    {
+        g_bRemoteSignals = 0;
+        g_nRemoteSignal = sig;
+        return;
+    }
+
     g_bFinish = XTRUE;
 }
 
@@ -146,6 +196,12 @@ static void DirectGate_Client_Release(directgate_ctx_t *pCli)
     DirectGate_SRP_ClientCleanse(&pCli->srp);
     DirectGate_KeyAuth_Cleanse(&pCli->keyauth);
     DirectGate_KeyAuth_KeyCleanse(&pCli->key);
+
+    XByteBuffer_Clear(&pCli->serveIn);
+    XByteBuffer_Clear(&pCli->serveOut);
+    XByteBuffer_Clear(&pCli->serveErr);
+    XByteBuffer_Clear(&pCli->serveStdin);
+    DirectGate_Remote_ReqClear(&pCli->serveReq);
 }
 
 static void DirectGate_Client_CleanseSecretCtx(directgate_ctx_t *pCli)
@@ -185,6 +241,7 @@ static int DirectGate_Client_LogError(xapi_ctx_t *pCtx, xapi_session_t *pSession
 void DirectGate_Client_Init(directgate_ctx_t *pClient)
 {
     memset(pClient, 0, sizeof(directgate_ctx_t));
+    pClient->nStdinFd = XSOCK_INVALID;
     pClient->io.bRaw = XFALSE;
     pClient->nSessionId = 0;
 
@@ -451,7 +508,7 @@ static int DirectGate_Client_SendMsg(directgate_ctx_t *pCli, xjson_obj_t *pHeade
     }
 
     int nStatus;
-    if (DirectGate_WebRTC_IsConnected(&pCli->webrtc))
+    if (!pCli->bRelayOnly && DirectGate_WebRTC_IsConnected(&pCli->webrtc))
     {
         nStatus = DirectGate_WebRTC_Send(&pCli->webrtc, msg.pData, msg.nUsed);
         nStatus = (nStatus == XSTDOK) ? XAPI_CONTINUE : XAPI_DISCONNECT;
@@ -550,7 +607,7 @@ static int DirectGate_Client_HandleAdminMsg(directgate_ctx_t *pCli, directgate_p
 
 /* Terminal session is up: bring the P2P data channel online.
  * Shared by both authentication methods so they cannot drift apart. */
-static void DirectGate_Client_StartWebRTC(directgate_ctx_t *pCli)
+static XSTATUS DirectGate_Client_StartWebRTC(directgate_ctx_t *pCli)
 {
     pCli->webrtc.signalCb = DirectGate_Client_WebRTC_SignalCb;
     pCli->webrtc.pSignalCtx = pCli;
@@ -561,9 +618,128 @@ static void DirectGate_Client_StartWebRTC(directgate_ctx_t *pCli)
         DirectGate_WebRTC_SetIceServers(&pCli->webrtc, pCli->pCfg->sIceServers, pCli->pCfg->nIceSrvCount);
 
     if (DirectGate_WebRTC_CreateOffer(&pCli->webrtc) < 0)
-        xlogw("RTC: Offer failed, continuing with WebSocket relay");
-    else
-        xlogn("RTC: P2P offer sent, waiting for answer");
+    {
+        /* A remote operation's stderr is its command's: there it is a notice, for the log only */
+        if (pCli->pRemote == NULL) xlogw("RTC: Offer failed, continuing with WebSocket relay");
+        else xlogn("RTC: Offer failed, continuing with WebSocket relay");
+        return XSTDERR;
+    }
+
+    xlogn("RTC: P2P offer sent, waiting for answer");
+    return XSTDOK;
+}
+
+static XSTATUS DirectGate_Client_OpenStdin(directgate_ctx_t *pCli, xapi_t *pApi);
+
+/* The session is open and its route decided: from here on its requests are read */
+static int DirectGate_Client_ServeReady(directgate_ctx_t *pCli)
+{
+    pCli->bServeReady = XTRUE;
+    pCli->nServeStartMs = XTime_GetMonoMs();
+    pCli->nServeIdleMs = pCli->nServeStartMs;
+
+    /* The first line it writes: from here on a request is taken. A session that ends before this ran nothing. */
+    if (DirectGate_Remote_WriteReady(STDOUT_FILENO) != XSTDOK ||
+        DirectGate_Client_OpenStdin(pCli, pCli->pWsSession->pApi) != XSTDOK)
+    {
+        xloge("Cannot read the session's requests");
+        pCli->nServeExit = DIRECTGATE_REMOTE_EXIT_FAILED;
+        g_bFinish = XTRUE;
+        return XAPI_DISCONNECT;
+    }
+
+    return XAPI_CONTINUE;
+}
+
+/* The remote operation goes out, on the route already decided: the data channel, or the relay. */
+static int DirectGate_Client_BeginRemote(directgate_ctx_t *pCli)
+{
+    pCli->bChannelWait = XFALSE;
+    pCli->bChannelUsed = (!pCli->bRelayOnly && DirectGate_WebRTC_IsConnected(&pCli->webrtc)) ? XTRUE : XFALSE;
+    if (pCli->bServe) return DirectGate_Client_ServeReady(pCli);
+
+    if (DirectGate_Remote_Start(pCli->pRemote) != XSTDOK)
+    {
+        g_bFinish = XTRUE;
+        return XAPI_DISCONNECT;
+    }
+
+    /* Input is read only once the command exists to take it: nothing typed or piped is dropped meanwhile */
+    if (pCli->pRemote->pReq->eOp == DIRECTGATE_REMOTE_EXEC)
+    {
+        g_bRemoteSignals = 1;
+
+        if (pCli->pRemote->pReq->bStdin && DirectGate_Client_OpenStdin(pCli, pCli->pWsSession->pApi) != XSTDOK)
+            DirectGate_Remote_SendEof(pCli->pRemote);
+    }
+
+    return XAPI_CONTINUE;
+}
+
+/* WebRTC proved impossible: the agent is told so - its own wait ends there - and the operation takes the relay. The
+   peer connection goes, so that a channel opening late cannot split the operation across two transports. */
+static int DirectGate_Client_UseRelay(directgate_ctx_t *pCli, const char *pReason)
+{
+    /* Not a warning on stderr: an operation's stderr is the remote command's, and the relay is a working route */
+    xlogn("RTC: No data channel (%s), the operation takes the relay", pReason);
+    pCli->bRelayOnly = XTRUE;
+    DirectGate_WebRTC_Destroy(&pCli->webrtc);
+
+    xjson_obj_t *pHeader = DirectGate_Proto_BuildWebRTC("unavailable", pCli->nSessionId);
+    int nStatus = pHeader != NULL ? DirectGate_Client_SendMsg(pCli, pHeader, NULL, 0) : XAPI_DISCONNECT;
+    XJSON_FreeObject(pHeader);
+
+    if (nStatus < 0)
+    {
+        g_bFinish = XTRUE;
+        return XAPI_DISCONNECT;
+    }
+
+    return DirectGate_Client_BeginRemote(pCli);
+}
+
+/* What an authenticated session is for: a shell, or the one remote operation the command line asked for. */
+static int DirectGate_Client_StartSession(directgate_ctx_t *pCli, const directgate_pkg_auth_t *pAuth)
+{
+    /* A pre-logon agent serves desktop sessions only, and dgcli has
+       no desktop client - say so plainly instead of letting the shell
+       request come back as a generic mode error. */
+    if (pAuth->bPreLogon)
+    {
+        xloge("Nobody is logged on to this device yet, so only a remote desktop "
+              "session is available; sign in there first");
+
+        pCli->bSessionFailed = XTRUE;
+        g_bFinish = XTRUE;
+        return XAPI_DISCONNECT;
+    }
+
+    if (pCli->pRemote != NULL)
+    {
+        /* The mode first: the agent sets WebRTC up for a session only once its mode is active. A command for an agent
+           that runs none fails here, with no channel set up for it. */
+        if (DirectGate_Remote_OpenMode(pCli->pRemote, pCli->nSessionId, pAuth->bExec, pAuth->bRemote) != XSTDOK)
+        {
+            g_bFinish = XTRUE;
+            return XAPI_DISCONNECT;
+        }
+
+        /* The operation's data takes the data channel: it starts once the channel is open, and on the relay only
+           when WebRTC proved impossible (DirectGate_Client_ServiceRemote) */
+        if (DirectGate_Client_StartWebRTC(pCli) != XSTDOK) return DirectGate_Client_UseRelay(pCli, "the offer failed");
+
+        pCli->bChannelWait = XTRUE;
+        pCli->nChannelWaitMs = XTime_GetMonoMs();
+        return XAPI_CONTINUE;
+    }
+
+    if (DirectGate_Client_SendCmdStart(pCli, "terminal") < 0)
+        return XAPI_DISCONNECT;
+
+    DirectGate_Client_SendResize(pCli);
+    DirectGate_Client_StartWebRTC(pCli);
+
+    return XAPI_CONTINUE;
 }
 
 /* Completes a successful key handshake: derive the shared secret from the two
@@ -632,26 +808,7 @@ static int DirectGate_Client_HandleKeyAuthMsg(directgate_ctx_t *pCli, directgate
             if (pCli->bAddKeyMode)
                 return DirectGate_Client_SendAddKey(pCli);
 
-            /* A pre-logon agent serves desktop sessions only, and dgcli has
-               no desktop client - say so plainly instead of letting the shell
-               request come back as a generic mode error. */
-            if (pAuth->bPreLogon)
-            {
-                xloge("Nobody is logged on to this device yet, so only a remote desktop "
-                      "session is available; sign in there first");
-
-                pCli->bSessionFailed = XTRUE;
-                g_bFinish = XTRUE;
-                return XAPI_DISCONNECT;
-            }
-
-            if (DirectGate_Client_SendCmdStart(pCli, "terminal") < 0)
-                return XAPI_DISCONNECT;
-
-            DirectGate_Client_SendResize(pCli);
-            DirectGate_Client_StartWebRTC(pCli);
-
-            return XAPI_CONTINUE;
+            return DirectGate_Client_StartSession(pCli, pAuth);
         }
 
         /*
@@ -750,26 +907,7 @@ static int DirectGate_Client_HandleAuthMsg(directgate_ctx_t *pCli, directgate_pk
         if (pCli->bAddKeyMode)
             return DirectGate_Client_SendAddKey(pCli);
 
-        /* A pre-logon agent serves desktop sessions only, and dgcli has
-           no desktop client - say so plainly instead of letting the shell
-           request come back as a generic mode error. */
-        if (pAuth->bPreLogon)
-        {
-            xloge("Nobody is logged on to this device yet, so only a remote desktop "
-                  "session is available; sign in there first");
-
-            pCli->bSessionFailed = XTRUE;
-            g_bFinish = XTRUE;
-            return XAPI_DISCONNECT;
-        }
-
-        if (DirectGate_Client_SendCmdStart(pCli, "terminal") < 0)
-            return XAPI_DISCONNECT;
-
-        DirectGate_Client_SendResize(pCli);
-        DirectGate_Client_StartWebRTC(pCli);
-
-        return XAPI_CONTINUE;
+        return DirectGate_Client_StartSession(pCli, pAuth);
     }
 
     /* Unauthenticated until here, so the reason may be the relay's words, not the host's */
@@ -840,6 +978,11 @@ static int DirectGate_Client_HandleWebRTCMsg(directgate_ctx_t *pCli, directgate_
             DirectGate_WebRTC_HandleAnswer(&pCli->webrtc, pSdp);
         }
         else xloge("RTC: Answer does not contain SDP");
+    }
+    else if (xstrcmp(pRtc->pAction, "unavailable"))
+    {
+        /* The agent cannot set WebRTC up for this session: an operation waiting for a channel takes the relay */
+        if (pCli->bChannelWait) return DirectGate_Client_UseRelay(pCli, "the agent cannot set it up");
     }
     else if (xstrcmp(pRtc->pAction, "ice"))
     {
@@ -957,11 +1100,178 @@ static int DirectGate_Client_HandleErrorMsg(directgate_ctx_t *pCli, directgate_p
     return XAPI_CONTINUE;
 }
 
+/* A remote operation takes its own answers, and the session ends with it. A shell's output (data)
+   has no place in a remote operation's stdout, and a host that sends some anyway is not heard.
+   The operation of the moment is done: its answer goes out, and the session is ready for the next request */
+static XSTATUS DirectGate_Client_ServeComplete(directgate_ctx_t *pCli)
+{
+    directgate_remote_t *pRemote = pCli->pRemote;
+    XSTATUS nStatus = DirectGate_Remote_WriteResponse(STDOUT_FILENO, DirectGate_Remote_ExitCode(pRemote),
+        &pCli->serveOut, &pCli->serveErr, pRemote->bTruncated);
+
+    DirectGate_Remote_Clear(pRemote);
+    DirectGate_Remote_ReqClear(&pCli->serveReq);
+    XByteBuffer_Reset(&pCli->serveOut);
+    XByteBuffer_Reset(&pCli->serveErr);
+    XByteBuffer_Reset(&pCli->serveStdin);
+
+    pCli->bServeBusy = XFALSE;
+    pCli->nServeIdleMs = XTime_GetMonoMs();
+
+    /* Nobody reads the answers any more: the session has no one left to serve */
+    if (nStatus != XSTDOK)
+    {
+        pCli->nServeExit = DIRECTGATE_REMOTE_EXIT_FAILED;
+        g_bFinish = XTRUE;
+    }
+
+    return nStatus;
+}
+
+/* A command's stdin came with its request: it goes in pieces no larger than one message carries, then end of file */
+static XSTATUS DirectGate_Client_ServeInput(directgate_ctx_t *pCli)
+{
+    const xbyte_buffer_t *pInput = &pCli->serveStdin;
+
+    for (size_t nOffset = 0; nOffset < pInput->nUsed; nOffset += XFILE_CHUNK_SIZE)
+    {
+        size_t nChunk = pInput->nUsed - nOffset < XFILE_CHUNK_SIZE ? pInput->nUsed - nOffset : XFILE_CHUNK_SIZE;
+        if (DirectGate_Remote_SendInput(pCli->pRemote, pInput->pData + nOffset, nChunk) != XSTDOK) return XSTDERR;
+    }
+
+    return DirectGate_Remote_SendEof(pCli->pRemote);
+}
+
+/* The next request, when one is complete and nothing runs: parsed, and started or answered with what is wrong */
+static void DirectGate_Client_ServeNext(directgate_ctx_t *pCli)
+{
+    if (pCli->bServeBusy || !pCli->bServeReady || g_bFinish) return;
+
+    xbyte_buffer_t *pIn = &pCli->serveIn;
+    const uint8_t *pNewline = pIn->nUsed ? (const uint8_t*)memchr(pIn->pData, '\n', pIn->nUsed) : NULL;
+    if (pNewline == NULL && !(pCli->bServeEof && pIn->nUsed)) return;
+
+    size_t nLine = pNewline != NULL ? (size_t)(pNewline - pIn->pData) : pIn->nUsed;
+    size_t nConsumed = pNewline != NULL ? nLine + 1 : nLine;
+
+    /* A blank line asks for nothing */
+    if (!nLine || (nLine == 1 && pIn->pData[0] == '\r'))
+    {
+        XByteBuffer_Advance(pIn, nConsumed);
+        return;
+    }
+
+    char sError[XSTR_MID];
+    size_t nMax = DIRECTGATE_REMOTE_CAPTURE_MAX;
+    XByteBuffer_Reset(&pCli->serveStdin);
+
+    XSTATUS nParsed = DirectGate_Remote_ParseRequest(&pCli->serveReq, (const char*)pIn->pData,
+        nLine, pCli->sServeDevice, &pCli->serveStdin, &nMax, sError, sizeof(sError));
+    XByteBuffer_Advance(pIn, nConsumed);
+
+    if (nParsed != XSTDOK)
+    {
+        xbyte_buffer_t reason;
+        XByteBuffer_Init(&reason, XSTDNON, XFALSE);
+        XByteBuffer_Add(&reason, (const uint8_t*)sError, strlen(sError));
+
+        if (DirectGate_Remote_WriteResponse(STDOUT_FILENO, DIRECTGATE_REMOTE_EXIT_FAILED, NULL, &reason, XFALSE) != XSTDOK)
+        {
+            pCli->nServeExit = DIRECTGATE_REMOTE_EXIT_FAILED;
+            g_bFinish = XTRUE;
+        }
+
+        XByteBuffer_Clear(&reason);
+        return;
+    }
+
+    directgate_remote_t *pRemote = pCli->pRemote;
+    DirectGate_Remote_Init(pRemote, &pCli->serveReq, DirectGate_Client_Transfer_SendCb, pCli);
+
+    pRemote->pOutCapture = &pCli->serveOut;
+    pRemote->pErrCapture = &pCli->serveErr;
+    pRemote->nCaptureMax = nMax;
+    pRemote->pStdinData = pCli->serveStdin.pData;
+    pRemote->nStdinData = pCli->serveStdin.nUsed;
+    pRemote->nSessionId = pCli->nSessionId;
+    pCli->bServeBusy = XTRUE;
+
+    if (DirectGate_Remote_Prepare(pRemote) != XSTDOK || DirectGate_Remote_Start(pRemote) != XSTDOK ||
+        (pCli->serveReq.eOp == DIRECTGATE_REMOTE_EXEC && pCli->serveReq.bStdin && DirectGate_Client_ServeInput(pCli) != XSTDOK))
+    {
+        if (!DirectGate_Remote_IsDone(pRemote)) DirectGate_Remote_Abort(pRemote, "the request could not be sent");
+        DirectGate_Client_ServeComplete(pCli);
+    }
+}
+
+/* What the agent sends a session: the operation of the moment's, or the session's end */
+static int DirectGate_Client_ServeMessage(directgate_ctx_t *pCli, directgate_pkg_t *pMsg)
+{
+    const directgate_pkg_status_t *pStatus = pMsg->header.eType == DIRECTGATE_PKG_STATUS ?
+        (const directgate_pkg_status_t*)pMsg->pPackage : NULL;
+    xbool_t bClosed = (pStatus != NULL && xstrcmp(pStatus->pStatus, "closed")) ? XTRUE : XFALSE;
+
+    if (pCli->bServeBusy)
+    {
+        DirectGate_Remote_HandleMessage(pCli->pRemote, pMsg);
+        if (DirectGate_Remote_IsDone(pCli->pRemote)) DirectGate_Client_ServeComplete(pCli);
+    }
+    else if (pMsg->header.eType == DIRECTGATE_PKG_ERROR)
+    {
+        const directgate_pkg_error_t *pError = (const directgate_pkg_error_t*)pMsg->pPackage;
+        xlogw("The agent reported an error between operations: %s", xstrused(pError->pReason) ? pError->pReason : "N/A");
+    }
+
+    if (!bClosed) return g_bFinish ? XAPI_DISCONNECT : XAPI_CONTINUE;
+
+    xlogn("The agent closed the session");
+    pCli->nServeExit = DIRECTGATE_REMOTE_EXIT_FAILED;
+    g_bFinish = XTRUE;
+    return XAPI_DISCONNECT;
+}
+
+static int DirectGate_Client_DispatchRemote(directgate_ctx_t *pCli, directgate_pkg_t *pMsg, xbool_t *pHandled)
+{
+    *pHandled = XTRUE;
+
+    switch (pMsg->header.eType)
+    {
+        case DIRECTGATE_PKG_EXEC:
+        case DIRECTGATE_PKG_MANAGER:
+        case DIRECTGATE_PKG_FILE:
+        case DIRECTGATE_PKG_ERROR:
+        case DIRECTGATE_PKG_STATUS:
+        {
+            if (pCli->bServeReady) return DirectGate_Client_ServeMessage(pCli, pMsg);
+
+            int nStatus = DirectGate_Remote_HandleMessage(pCli->pRemote, pMsg);
+            if (!DirectGate_Remote_IsDone(pCli->pRemote)) return nStatus;
+
+            g_bFinish = XTRUE;
+            return XAPI_DISCONNECT;
+        }
+        case DIRECTGATE_PKG_DATA:
+            return XAPI_CONTINUE;
+        default:
+            break;
+    }
+
+    *pHandled = XFALSE;
+    return XAPI_CONTINUE;
+}
+
 static int DirectGate_Client_DispatchMessage(directgate_ctx_t *pCli, directgate_pkg_t *pMsg, const char *pTransport)
 {
     XCHECK((pCli != NULL), XAPI_DISCONNECT);
     XCHECK((pMsg != NULL), XAPI_DISCONNECT);
     XCHECK((pMsg->pPackage != NULL), XAPI_DISCONNECT);
+
+    if (pCli->pRemote != NULL)
+    {
+        xbool_t bHandled = XFALSE;
+        int nStatus = DirectGate_Client_DispatchRemote(pCli, pMsg, &bHandled);
+        if (bHandled) return nStatus;
+    }
 
     switch (pMsg->header.eType)
     {
@@ -1430,7 +1740,7 @@ static int DirectGate_Client_HandleStdin(xapi_session_t *pSession)
     ssize_t nRead = read(STDIN_FILENO, sBuffer, sizeof(sBuffer));
 #endif
 
-    if (nRead == 0)
+    if (nRead == 0 && pCli->pRemote == NULL)
     {
         g_bFinish = XTRUE;
         return XAPI_CONTINUE;
@@ -1445,6 +1755,40 @@ static int DirectGate_Client_HandleStdin(xapi_session_t *pSession)
         if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return XAPI_CONTINUE;
 #endif
         return XAPI_DISCONNECT;
+    }
+
+    /* A session's requests: kept until a line is complete, a bounded amount at a time */
+    if (pCli->bServe)
+    {
+        if (nRead == 0)
+        {
+            pCli->bServeEof = XTRUE;
+            return XAPI_DISCONNECT;
+        }
+
+        if (pCli->serveIn.nUsed + (size_t)nRead > DIRECTGATE_REMOTE_REQUEST_MAX ||
+            XByteBuffer_Add(&pCli->serveIn, sBuffer, (size_t)nRead) <= 0)
+        {
+            xloge("A session request is larger than %u bytes", DIRECTGATE_REMOTE_REQUEST_MAX);
+            pCli->nServeExit = DIRECTGATE_REMOTE_EXIT_FAILED;
+            g_bFinish = XTRUE;
+            return XAPI_DISCONNECT;
+        }
+
+        return XAPI_CONTINUE;
+    }
+
+    /* A remote command's input: registered only once it runs. End of file closes this copy of stdin, and the
+       command reads its own end of file; the session goes on until the command exits. */
+    if (pCli->pRemote != NULL)
+    {
+        if (nRead == 0)
+        {
+            DirectGate_Remote_SendEof(pCli->pRemote);
+            return XAPI_DISCONNECT;
+        }
+
+        return DirectGate_Remote_SendInput(pCli->pRemote, sBuffer, (size_t)nRead) == XSTDOK ? XAPI_CONTINUE : XAPI_DISCONNECT;
     }
 
     if (!pCli->pWsSession->bHandshakeDone) return XAPI_CONTINUE;
@@ -1532,7 +1876,8 @@ static int DirectGate_Client_InitSession(xapi_ctx_t *pCtx, xapi_session_t *pSess
             return XAPI_DISCONNECT;
         }
 
-        DirectGate_Client_EnableRawIO(&pCli->io);
+        /* A remote operation reads no keystrokes: the terminal stays as it is */
+        if (pCli->pRemote == NULL) DirectGate_Client_EnableRawIO(&pCli->io);
     }
 
     return XAPI_SetEvents(pSession, XPOLLIO);
@@ -1553,6 +1898,17 @@ static int DirectGate_Client_DestroySession(xapi_ctx_t *pCtx, xapi_session_t *pS
             {
                 pCli->webrtc.nPipeFds[0] = -1;
                 pCli->pPipeSession = NULL;
+            }
+
+            /* An emptied pipe whose writer has gone reports a hangup, not a zero read, and the event loop closes
+               it itself: this is where a remote command learns its input is over */
+            if (pSession->sock.nFD == pCli->nStdinFd)
+            {
+                pCli->nStdinFd = XSOCK_INVALID;
+
+                /* A session's stdin carries its requests, not a command's input: its end is the end of them */
+                if (pCli->bServe) pCli->bServeEof = XTRUE;
+                else if (pCli->pRemote != NULL && !g_bFinish) DirectGate_Remote_SendEof(pCli->pRemote);
             }
         }
 
@@ -1579,6 +1935,10 @@ static int DirectGate_Client_DestroySession(xapi_ctx_t *pCtx, xapi_session_t *pS
         DirectGate_Transfer_Destroy(&pCli->transfer);
         pCli->pWsSession = NULL;
 
+        if (pCli->pRemote != NULL && (!pCli->bServe || pCli->bServeBusy)) DirectGate_Remote_HandleClosed(pCli->pRemote);
+        if (pCli->bServe && pCli->bServeBusy) DirectGate_Client_ServeComplete(pCli);
+        if (pCli->bServe && pCli->bServeReady && !pCli->bServeDone) pCli->nServeExit = DIRECTGATE_REMOTE_EXIT_FAILED;
+
         if (pCli->bLogMuted)
         {
             xlog_screen(XTRUE);
@@ -1590,10 +1950,96 @@ static int DirectGate_Client_DestroySession(xapi_ctx_t *pCtx, xapi_session_t *pS
     return XAPI_DISCONNECT;
 }
 
+/* A session between its requests: the next one, or the end - stdin closed, idle too long, or alive long enough that
+   the account's access is better checked again by a connection of its own */
+static int DirectGate_Client_ServiceSession(directgate_ctx_t *pCli)
+{
+    if (!pCli->bServeReady) return XAPI_CONTINUE;
+    DirectGate_Client_ServeNext(pCli);
+    if (g_bFinish) return XAPI_DISCONNECT;
+    if (pCli->bServeBusy) return XAPI_CONTINUE;
+
+    uint64_t nNowMs = XTime_GetMonoMs();
+    const char *pEnd = NULL;
+
+    if (pCli->bServeEof && !pCli->serveIn.nUsed) pEnd = "its requests ended";
+    else if (nNowMs - pCli->nServeIdleMs >= pCli->nServeIdleLimitMs) pEnd = "it was idle";
+    else if (nNowMs - pCli->nServeStartMs >= DIRECTGATE_REMOTE_LIFETIME_MS) pEnd = "it reached its lifetime";
+    if (pEnd == NULL) return XAPI_CONTINUE;
+
+    xlogn("Session ends: %s", pEnd);
+    pCli->bServeDone = XTRUE;
+    g_bFinish = XTRUE;
+    return XAPI_DISCONNECT;
+}
+
+/* How long the loop may sleep. A data channel draining says nothing, so an upload on it is paced by the loop - as the
+   agent paces its own downloads; every other wake-up is an event, or the 100 ms the loop has always kept. */
+static int DirectGate_Client_GetWaitMs(const directgate_ctx_t *pCli)
+{
+    xbool_t bChannelUpload = (pCli != NULL && pCli->pRemote != NULL && pCli->bChannelUsed &&
+        pCli->pRemote->transfer.eState == XTRANSFER_STATE_SENDING) ? XTRUE : XFALSE;
+
+    return bChannelUpload ? DIRECTGATE_CLIENT_TRANSFER_WAIT_MS : DIRECTGATE_CLIENT_LOOP_WAIT_MS;
+}
+
+/* Every pass of a remote operation: the wait for its data channel, a signal to forward to the command, upload
+   chunks for a link with room. */
+static int DirectGate_Client_ServiceRemote(directgate_ctx_t *pCli)
+{
+    directgate_remote_t *pRemote = pCli->pRemote;
+
+    if (pCli->bChannelWait)
+    {
+        if (DirectGate_WebRTC_IsConnected(&pCli->webrtc)) return DirectGate_Client_BeginRemote(pCli);
+        if (XTime_GetMonoMs() - pCli->nChannelWaitMs < DIRECTGATE_REMOTE_CHANNEL_WAIT_MS) return XAPI_CONTINUE;
+        return DirectGate_Client_UseRelay(pCli, "it did not open in time");
+    }
+
+    /* Started on the channel, and the channel is gone: what was in it cannot be known to have arrived. A session
+       answers the operation it was running, and ends: the next connection starts afresh. */
+    if (pCli->bChannelUsed && !DirectGate_WebRTC_IsConnected(&pCli->webrtc) &&
+        (pCli->bServe ? pCli->bServeReady : !DirectGate_Remote_IsDone(pRemote)))
+    {
+        if (!pCli->bServe || pCli->bServeBusy) DirectGate_Remote_Abort(pRemote, "the peer-to-peer connection was lost");
+        if (pCli->bServe && pCli->bServeBusy) DirectGate_Client_ServeComplete(pCli);
+        if (pCli->bServe) pCli->nServeExit = DIRECTGATE_REMOTE_EXIT_FAILED;
+        g_bFinish = XTRUE;
+        return XAPI_DISCONNECT;
+    }
+
+    if (g_nRemoteSignal)
+    {
+        int nSignal = g_nRemoteSignal;
+        g_nRemoteSignal = 0;
+
+        if (DirectGate_Remote_Interrupt(pRemote, nSignal == SIGTERM ? XTRUE : XFALSE) < 0)
+        {
+            g_bFinish = XTRUE;
+            return XAPI_DISCONNECT;
+        }
+    }
+
+    /* The window is the queue of the transport the upload takes */
+    if (pCli->bAuthDone && pCli->pWsSession != NULL && !pCli->bChannelWait)
+    {
+        int nBuffered = pCli->bChannelUsed ? DirectGate_WebRTC_GetBufferedAmount(&pCli->webrtc) : 0;
+        size_t nQueued = pCli->bChannelUsed ? (nBuffered > 0 ? (size_t)nBuffered : 0) : pCli->pWsSession->txBuffer.nUsed;
+        DirectGate_Remote_Pump(pRemote, nQueued);
+    }
+
+    if (pCli->bServe) return DirectGate_Client_ServiceSession(pCli);
+    if (!DirectGate_Remote_IsDone(pRemote)) return XAPI_CONTINUE;
+
+    g_bFinish = XTRUE;
+    return XAPI_DISCONNECT;
+}
+
 static int DirectGate_Client_Interrupt(xapi_ctx_t *pCtx)
 {
     if (g_bFinish) return XAPI_DISCONNECT;
     directgate_ctx_t *pCli = (directgate_ctx_t*)pCtx->pApi->pUserCtx;
+    if (pCli != NULL && pCli->pRemote != NULL) return DirectGate_Client_ServiceRemote(pCli);
 
 #ifndef _WIN32
     if (g_bWinch && pCli != NULL)
@@ -1613,6 +2059,7 @@ static int DirectGate_Client_Tick(xapi_ctx_t *pCtx)
 {
     if (g_bFinish) return XAPI_DISCONNECT;
     directgate_ctx_t *pCli = (directgate_ctx_t*)pCtx->pApi->pUserCtx;
+    if (pCli != NULL && pCli->pRemote != NULL) return DirectGate_Client_ServiceRemote(pCli);
 
     if (pCli != NULL && pCli->transfer.eState == XTRANSFER_STATE_SENDING)
     {
@@ -1682,9 +2129,15 @@ static int DirectGate_Client_ServiceCallback(xapi_ctx_t *pCtx, xapi_session_t *p
         case XAPI_CB_TICK:
             return DirectGate_Client_Tick(pCtx);
         case XAPI_CB_COMPLETE:
+        {
             XCHECK((pSession != NULL), XAPI_DISCONNECT);
             xlogd("TX complete: fd(%d)", (int)pSession->sock.nFD);
+
+            /* The link drained: the next upload chunks can go without waiting for a tick */
+            directgate_ctx_t *pCli = (directgate_ctx_t*)pCtx->pApi->pUserCtx;
+            if (pCli != NULL && pCli->pRemote != NULL && !g_bFinish) return DirectGate_Client_ServiceRemote(pCli);
             break;
+        }
         default:
             break;
     }
@@ -1915,6 +2368,12 @@ static const directgate_device_t* DirectGate_Client_ResolveDevice(directgate_cfg
     if (xstrused(pCfg->sDeviceQuery))
     {
         nIndex = DirectGate_Devices_Find(pList, pCfg->sDeviceQuery);
+        if (nIndex == DIRECTGATE_DEVICE_NO_PICK && pCfg->eCommand == DIRECTGATE_CMD_REMOTE)
+        {
+            xloge("No device matches '%s'; 'dgcli devices' lists them", pCfg->sDeviceQuery);
+            return NULL;
+        }
+
         if (nIndex == DIRECTGATE_DEVICE_NO_PICK)
         {
             xloge("No device matches '%s'. Known devices:", pCfg->sDeviceQuery);
@@ -1946,7 +2405,9 @@ static const directgate_device_t* DirectGate_Client_ResolveDevice(directgate_cfg
     xstrncpy(pCfg->sDeviceId, sizeof(pCfg->sDeviceId), pDevice->sId);
     xstrncpy(pCfg->sDeviceName, sizeof(pCfg->sDeviceName), pDevice->sName);
 
-    printf("\n  %s %s...\n\n", pCfg->bAddKey ? "Authorizing the key on" : "Connecting to", pDevice->sName);
+    if (pCfg->eCommand != DIRECTGATE_CMD_REMOTE)
+        printf("\n  %s %s...\n\n", pCfg->bAddKey ? "Authorizing the key on" : "Connecting to", pDevice->sName);
+
     return pDevice;
 }
 
@@ -2024,6 +2485,7 @@ static XSTATUS DirectGate_Client_Prepare(directgate_ctx_t *pCli, directgate_cfg_
 
     if (pCfg->eCommand == DIRECTGATE_CMD_DEVICES)
     {
+        if (pCfg->bJson) return DirectGate_Devices_PrintJson(&devices) ? XSTDNON : XSTDERR;
         if (!devices.nCount) printf("  No devices on this account yet.\n");
         else DirectGate_Devices_Print(&devices);
 
@@ -2049,6 +2511,17 @@ static XSTATUS DirectGate_Client_Prepare(directgate_ctx_t *pCli, directgate_cfg_
         return XSTDERR;
     }
 
+    /* A remote operation prompts only at a terminal: on Windows the prompt would otherwise read the password off
+       whatever is piped into the command, and a script has nobody to answer it */
+    if (!pCli->bUseKeyAuth && pCfg->eCommand == DIRECTGATE_CMD_REMOTE && !xstrused(pCfg->sSecret) &&
+        !DirectGate_Client_IsInteractive())
+    {
+        xloge("No client key is authorized for '%s' and there is no terminal to ask for its password. "
+              "Generate a key with 'dgcli -g' and authorize it with 'dgcli -A -d %s'", pDevice->sName, pDevice->sName);
+
+        return XSTDERR;
+    }
+
     if (!pCli->bUseKeyAuth && !DirectGate_PromptDeviceSecret(pCfg, pCfg->sDeviceName))
     {
         xloge("A device password is required to authenticate");
@@ -2056,6 +2529,60 @@ static XSTATUS DirectGate_Client_Prepare(directgate_ctx_t *pCli, directgate_cfg_
     }
 
     return XSTDOK;
+}
+
+static XSTATUS DirectGate_Client_OpenStdin(directgate_ctx_t *pCli, xapi_t *pApi)
+{
+    xapi_endpoint_t stdinEndpt;
+    XAPI_InitEndpoint(&stdinEndpt);
+
+    stdinEndpt.eType = XAPI_EVENT;
+    stdinEndpt.eRole = XAPI_CUSTOM;
+    stdinEndpt.nEvents = XPOLLIN;
+    stdinEndpt.bUnix = XTRUE;
+    stdinEndpt.pSessionData = pCli;
+
+    /*
+        XAPI owns and closes every endpoint socket it is handed, and an
+        attempt that ends tears the whole API down. Handing it the real
+        stdin would therefore close fd 0 - which used to be harmless at
+        exit, but now leaves the key-auth fallback with no terminal to read
+        the password from. Both platforms give it a disposable handle.
+    */
+#ifdef _WIN32
+    if (XSock_CreatePair(g_nStdinBridge) != XSTDOK)
+    {
+        xloge("Failed to create stdin bridge socket pair: error(%d)", WSAGetLastError());
+        return XSTDERR;
+    }
+
+    u_long nNonBlock = 1;
+    ioctlsocket(g_nStdinBridge[0], FIONBIO, &nNonBlock);
+
+    pCli->hStdinPump = CreateThread(NULL, 0, DirectGate_Client_StdinPump, NULL, 0, NULL);
+    if (pCli->hStdinPump == NULL)
+    {
+        xloge("Failed to start stdin pump thread: error(%lu)", GetLastError());
+        return XSTDERR;
+    }
+
+    stdinEndpt.nFD = g_nStdinBridge[0];
+#else
+    int nStdinFd = dup(STDIN_FILENO);
+    if (nStdinFd < 0)
+    {
+        xloge("Failed to duplicate stdin: errno(%d)", errno);
+        return XSTDERR;
+    }
+
+    stdinEndpt.nFD = nStdinFd;
+#endif
+
+    pCli->nStdinFd = stdinEndpt.nFD;
+    if (XAPI_AddEndpoint(pApi, &stdinEndpt) >= 0) return XSTDOK;
+
+    pCli->nStdinFd = XSOCK_INVALID;
+    return XSTDERR;
 }
 
 /*
@@ -2117,55 +2644,8 @@ static XSTATUS DirectGate_Client_Run(directgate_ctx_t *pClient, directgate_cfg_t
         return XSTDERR;
     }
 
-    xapi_endpoint_t stdinEndpt;
-    XAPI_InitEndpoint(&stdinEndpt);
-
-    stdinEndpt.eType = XAPI_EVENT;
-    stdinEndpt.eRole = XAPI_CUSTOM;
-    stdinEndpt.nEvents = XPOLLIN;
-    stdinEndpt.bUnix = XTRUE;
-    stdinEndpt.pSessionData = pClient;
-
-    /*
-        XAPI owns and closes every endpoint socket it is handed, and an
-        attempt that ends tears the whole API down. Handing it the real
-        stdin would therefore close fd 0 - which used to be harmless at
-        exit, but now leaves the key-auth fallback with no terminal to read
-        the password from. Both platforms give it a disposable handle.
-    */
-#ifdef _WIN32
-    if (XSock_CreatePair(g_nStdinBridge) != XSTDOK)
-    {
-        xloge("Failed to create stdin bridge socket pair: error(%d)", WSAGetLastError());
-        XAPI_Destroy(&api);
-        return XSTDERR;
-    }
-
-    u_long nNonBlock = 1;
-    ioctlsocket(g_nStdinBridge[0], FIONBIO, &nNonBlock);
-
-    HANDLE hStdinPump = CreateThread(NULL, 0, DirectGate_Client_StdinPump, NULL, 0, NULL);
-    if (hStdinPump == NULL)
-    {
-        xloge("Failed to start stdin pump thread: error(%lu)", GetLastError());
-        XAPI_Destroy(&api);
-        return XSTDERR;
-    }
-
-    stdinEndpt.nFD = g_nStdinBridge[0];
-#else
-    int nStdinFd = dup(STDIN_FILENO);
-    if (nStdinFd < 0)
-    {
-        xloge("Failed to duplicate stdin: errno(%d)", errno);
-        XAPI_Destroy(&api);
-        return XSTDERR;
-    }
-
-    stdinEndpt.nFD = nStdinFd;
-#endif
-
-    if (XAPI_AddEndpoint(&api, &stdinEndpt) < 0)
+    /* A terminal reads keystrokes from the start; a remote command's input is opened once it runs */
+    if (pClient->pRemote == NULL && DirectGate_Client_OpenStdin(pClient, &api) != XSTDOK)
     {
         XAPI_Destroy(&api);
         return XSTDERR;
@@ -2189,7 +2669,7 @@ static XSTATUS DirectGate_Client_Run(directgate_ctx_t *pClient, directgate_cfg_t
     }
 
     xevent_status_t status;
-    do status = XAPI_Service(&api, 100);
+    do status = XAPI_Service(&api, DirectGate_Client_GetWaitMs(pClient));
     while (status == XEVENTS_SUCCESS && !g_bFinish);
 
     DirectGate_Client_RestoreIO(&pClient->io);
@@ -2202,8 +2682,10 @@ static XSTATUS DirectGate_Client_Run(directgate_ctx_t *pClient, directgate_cfg_t
     */
     if (!pClient->bAuthDone && !pClient->bKeyAuthFailed)
     {
-        printf("\n  The session ended before authentication completed.\n");
-        printf("  Re-run with -v 5 to see the exchange.\n\n");
+        /* A remote operation's stdout is its data: this goes where its errors go */
+        FILE *pNotice = pClient->pRemote != NULL ? stderr : stdout;
+        fprintf(pNotice, "\n  The session ended before authentication completed.\n");
+        fprintf(pNotice, "  Re-run with -v 5 to see the exchange.\n\n");
 
         char sStatus[XSTR_MIN];
         DirectGate_DescribeEvents(&api.events, status, sStatus, sizeof(sStatus));
@@ -2221,9 +2703,13 @@ static XSTATUS DirectGate_Client_Run(directgate_ctx_t *pClient, directgate_cfg_t
         unblocked before the next prompt or it would swallow the password
         the user types for the fallback.
     */
-    CancelIoEx(GetStdHandle(STD_INPUT_HANDLE), NULL);
-    WaitForSingleObject(hStdinPump, 1000);
-    CloseHandle(hStdinPump);
+    if (pClient->hStdinPump != NULL)
+    {
+        CancelIoEx(GetStdHandle(STD_INPUT_HANDLE), NULL);
+        WaitForSingleObject(pClient->hStdinPump, 1000);
+        CloseHandle(pClient->hStdinPump);
+        pClient->hStdinPump = NULL;
+    }
 #endif
 
     XAPI_Destroy(&api);
@@ -2260,15 +2746,35 @@ int main(int argc, char* argv[])
     memset(&client, 0, sizeof(client));
     DirectGate_Client_Init(&client);
 
+    /* The MCP server owns stdin and stdout; every tool call runs this binary again, for one operation */
+    if (argc > 1 && !strcmp(argv[1], "mcp"))
+    {
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+
+        int nCode = DirectGate_Mcp_Run(argc, argv);
+        DirectGate_Client_Release(&client);
+        XLog_Destroy();
+        return nCode;
+    }
+
+    /* stdout carries what a command produces - a remote command's output, a file, a device list as JSON - so
+       dgcli's own words, warnings included, go to stderr. On a terminal both land on the screen as before. */
+    /* Until the arguments are parsed the verb is all there is to go on; "ls" may yet turn out to be the device list */
+    xbool_t bRemote = (argc > 1 && (DirectGate_Remote_ParseOp(argv[1], NULL) || !strcmp(argv[1], "ls"))) ? XTRUE : XFALSE;
+    xlog_stderr(XTRUE);
+
     directgate_cfg_t args;
     int nStatus = DirectGate_ParseArgs(&args, argc, argv);
     if (nStatus < 0)
     {
         /* A failure has already said what went wrong; only bad arguments get the usage. */
-        if (nStatus != XSTDEXC) DirectGate_DisplayUsage(argv[0]);
+        if (nStatus != XSTDEXC && !bRemote) DirectGate_DisplayUsage(argv[0]);
+        if (nStatus != XSTDEXC && bRemote) fprintf(stderr, "dgcli: invalid arguments; 'dgcli -h' shows the usage\n");
+        DirectGate_Remote_ReqClear(&args.remote);
         DirectGate_Client_Release(&client);
         XLog_Destroy();
-        return XSTDERR;
+        return bRemote ? DIRECTGATE_REMOTE_EXIT_FAILED : XSTDERR;
     }
     else if (!nStatus)
     {
@@ -2278,11 +2784,37 @@ int main(int argc, char* argv[])
         return XSTDNON;
     }
 
+    bRemote = args.eCommand == DIRECTGATE_CMD_REMOTE ? XTRUE : XFALSE;
     xlogn("Starting directgate client v%s", DirectGate_GetVersionLong());
     xlogn("libxutils v%s", XUtils_Version());
 
     client.pCfg = &args;
     client.bAuthDone = XFALSE;
+
+    /* Prepared before anything connects: a missing upload source or an unreadable stdin fails here */
+    directgate_remote_t remote;
+    if (args.eCommand == DIRECTGATE_CMD_REMOTE)
+    {
+        args.remote.bStdin = (args.remote.eOp == DIRECTGATE_REMOTE_EXEC && !DirectGate_Client_IsInteractive()) ? XTRUE : XFALSE;
+        DirectGate_Remote_Init(&remote, &args.remote, DirectGate_Client_Transfer_SendCb, &client);
+
+        if (DirectGate_Remote_Prepare(&remote) != XSTDOK)
+        {
+            DirectGate_Remote_Clear(&remote);
+            DirectGate_Remote_ReqClear(&args.remote);
+            DirectGate_Client_Release(&client);
+            XLog_Destroy();
+            return DirectGate_Remote_ExitCode(&remote);
+        }
+
+        client.pRemote = &remote;
+        if (args.remote.eOp == DIRECTGATE_REMOTE_SESSION)
+        {
+            client.bServe = XTRUE;
+            client.nServeIdleLimitMs = args.remote.nTimeoutMs ? args.remote.nTimeoutMs : DIRECTGATE_REMOTE_IDLE_MS;
+            xstrncpy(client.sServeDevice, sizeof(client.sServeDevice), args.sDeviceQuery);
+        }
+    }
 
     /*
         Sign in, list the account's devices and pick one. Standalone
@@ -2297,8 +2829,15 @@ int main(int argc, char* argv[])
         DirectGate_Account_Cleanse(&account);
         DirectGate_Client_CleanseSecret(&args);
         DirectGate_Client_Release(&client);
-        XLog_Destroy();
 
+        if (client.pRemote != NULL)
+        {
+            DirectGate_Remote_Clear(client.pRemote);
+            DirectGate_Remote_ReqClear(&args.remote);
+        }
+
+        XLog_Destroy();
+        if (bRemote) return DIRECTGATE_REMOTE_EXIT_FAILED;
         return nStatus == XSTDNON ? XSTDNON : XSTDERR;
     }
 
@@ -2334,6 +2873,15 @@ int main(int argc, char* argv[])
         client.bUseKeyAuth = XFALSE;
         DirectGate_KeyAuth_KeyCleanse(&client.key);
 
+        if (client.pRemote != NULL && !xstrused(args.sSecret) && !DirectGate_Client_IsInteractive())
+        {
+            xloge("The client key is not authorized on '%s' and there is no terminal to ask for its password. "
+                  "Authorize it with 'dgcli -A -d %s'", args.sDeviceName, args.sDeviceName);
+
+            nResult = XSTDERR;
+            break;
+        }
+
         if (!DirectGate_PromptDeviceSecret(&args, args.sDeviceName))
         {
             xloge("A device password is required to authenticate");
@@ -2344,8 +2892,24 @@ int main(int argc, char* argv[])
         /* Fresh transport state for the second attempt; the previous one
          * tore its own down when the socket closed. */
         g_bFinish = XFALSE;
+        directgate_remote_t *pRemote = client.pRemote;
+        xbool_t bServe = client.bServe;
+        DirectGate_Client_Release(&client);
         DirectGate_Client_Init(&client);
         client.pCfg = &args;
+        client.pRemote = pRemote;
+        client.bServe = bServe;
+        client.nServeIdleLimitMs = args.remote.nTimeoutMs ? args.remote.nTimeoutMs : DIRECTGATE_REMOTE_IDLE_MS;
+        xstrncpy(client.sServeDevice, sizeof(client.sServeDevice), args.sDeviceQuery);
+    }
+
+    /* A remote operation exits with its own result: the command's exit code, or how the operation went */
+    if (client.pRemote != NULL)
+    {
+        /* A session that got as far as serving exits by how it ended; one that did not, by why */
+        nResult = client.bServeReady ? client.nServeExit : DirectGate_Remote_ExitCode(client.pRemote);
+        DirectGate_Remote_Clear(client.pRemote);
+        DirectGate_Remote_ReqClear(&args.remote);
     }
 
     DirectGate_Client_RestoreIO(&client.io);

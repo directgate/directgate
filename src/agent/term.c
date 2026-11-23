@@ -96,24 +96,7 @@ extern char **environ;
 #define DIRECTGATE_TERM_HUP_GRACE_MS  500U
 #define DIRECTGATE_TERM_REAP_SLOTS    64U
 
-/* Everything the child needs, worked out in the parent. The agent is threaded
- * (libdatachannel, search, capture, audio), and after fork() the child holds
- * a copy of every lock exactly as it was: a name-service lookup, a malloc or
- * a log line there can wait forever on a lock whose owner does not exist in
- * the child. So the child only makes system calls on what is prepared here. */
-typedef struct directgate_term_spawn_ {
-    uid_t nUid;
-    gid_t nGid;
-    gid_t *pGroups;
-    int nGroups;
-    xbool_t bSwitchUser;
-    char sWorkDir[XPATH_MAX];
-    char sShell[XPATH_MAX];
-    char sArg0[XPATH_MAX];
-    char **ppEnv;
-} directgate_term_spawn_t;
-
-static void DirectGate_Term_FreeSpawn(directgate_term_spawn_t *pSpawn)
+void DirectGate_Term_FreeSpawn(directgate_term_spawn_t *pSpawn)
 {
     XCHECK_VOID_NL((pSpawn != NULL));
 
@@ -252,7 +235,7 @@ static char** DirectGate_Term_BuildEnv(const char *pUser, const char *pHome, con
     return ppEnv;
 }
 
-static XSTATUS DirectGate_Term_ResolveShell(const directgate_term_t *pTerm, directgate_term_spawn_t *pSpawn)
+XSTATUS DirectGate_Term_ResolveShell(const directgate_term_t *pTerm, directgate_term_spawn_t *pSpawn)
 {
     XCHECK((pTerm != NULL && pSpawn != NULL), XSTDINV);
     memset(pSpawn, 0, sizeof(*pSpawn));
@@ -589,7 +572,7 @@ static void DirectGate_Term_JoinPumps(directgate_term_t *pTerm)
     pTerm->nBridgeSock = XSOCK_INVALID;
 }
 
-static XSTATUS DirectGate_Term_ValidateShellUser(const directgate_term_t *pTerm)
+XSTATUS DirectGate_Term_ValidateShellUser(const directgate_term_t *pTerm)
 {
     XCHECK_NL((pTerm != NULL), XSTDOK);
     XCHECK_NL(xstrused(pTerm->sShellUser), XSTDOK);
@@ -900,6 +883,20 @@ size_t DirectGate_Term_ReapPending(void)
     return nPending;
 }
 
+void DirectGate_Term_HangupProcess(pid_t nPid)
+{
+    XCHECK_VOID((nPid > 0));
+
+    /* If already dead, reap and exit */
+    if (DirectGate_WaitNoHang(nPid, NULL) != 0) return;
+
+    /* Hangup whole group; the rest happens on the event loop. */
+    (void)kill(-nPid, SIGHUP);
+    if (DirectGate_WaitNoHang(nPid, NULL) != 0) return;
+
+    DirectGate_Term_DeferReap(nPid);
+}
+
 static void DirectGate_Term_KillChild(directgate_term_t *pTerm)
 {
     XCHECK_VOID((pTerm != NULL));
@@ -907,15 +904,7 @@ static void DirectGate_Term_KillChild(directgate_term_t *pTerm)
 
     const pid_t pid = pTerm->nPid;
     pTerm->nPid = -1;
-
-    /* If already dead, reap and exit */
-    if (DirectGate_WaitNoHang(pid, NULL) != 0) return;
-
-    /* Hangup whole group; the rest happens on the event loop. */
-    (void)kill(-pid, SIGHUP);
-    if (DirectGate_WaitNoHang(pid, NULL) != 0) return;
-
-    DirectGate_Term_DeferReap(pid);
+    DirectGate_Term_HangupProcess(pid);
 }
 #endif /* _WIN32 */
 

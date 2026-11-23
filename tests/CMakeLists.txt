@@ -209,6 +209,11 @@ if(UNIX AND NOT APPLE)
     directgate_smoke(client_e2e_smoke)
     target_compile_definitions(client_e2e_smoke PRIVATE DIRECTGATE_CLIENT_BIN="$<TARGET_FILE:dgcli>")
     add_dependencies(client_e2e_smoke dgcli)
+
+    # Preloaded into dgcli for the downloads that land on a file system without hard links
+    add_library(shim_no_hardlinks MODULE shim_no_hardlinks.c)
+    target_compile_definitions(client_e2e_smoke PRIVATE DIRECTGATE_NO_HARDLINKS_SHIM="$<TARGET_FILE:shim_no_hardlinks>")
+    add_dependencies(client_e2e_smoke shim_no_hardlinks)
     set_tests_properties(client_e2e_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 LABELS "e2e")
 
     directgate_smoke(openh264_smoke ${AGENT_DIR}/desktop/openh264.c)
@@ -452,23 +457,25 @@ endif()
 directgate_smoke(enroll_prompt_smoke ${AGENT_DIR}/enroll.c)
 directgate_smoke(files_smoke         ${AGENT_DIR}/files.c)
 directgate_smoke(session_smoke       ${AGENT_DIR}/session.c)
+target_compile_definitions(session_smoke PRIVATE DIRECTGATE_TESTING)
 
 # Client utility tests that compile the client-only implementation files.
 directgate_smoke(client_devices_smoke ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/webapi.c)
 directgate_smoke(client_pick_smoke    ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/webapi.c)
-directgate_smoke(client_config_smoke  ${CLIENT_DIR}/config.c ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/webapi.c)
+directgate_smoke(client_config_smoke  ${CLIENT_DIR}/config.c ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/remote.c ${CLIENT_DIR}/webapi.c)
 directgate_smoke(client_login_smoke   ${CLIENT_DIR}/login.c ${CLIENT_DIR}/webapi.c)
 directgate_smoke(client_login_guards_smoke ${CLIENT_DIR}/webapi.c)
 directgate_smoke(client_relay_smoke   ${CLIENT_DIR}/relay.c ${CLIENT_DIR}/webapi.c)
 directgate_smoke(client_webapi_smoke  ${CLIENT_DIR}/webapi.c)
+directgate_smoke(client_mcp_smoke     ${CLIENT_DIR}/mcp.c)
 
 # Compiles client.c itself (its main renamed away) to drive the static terminal I/O and inbound message gate,
 # and everything dgcli refuses.
 if(NOT WIN32)
     directgate_smoke(client_io_smoke ${CLIENT_DIR}/config.c ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/login.c
-        ${CLIENT_DIR}/relay.c ${CLIENT_DIR}/webapi.c)
+        ${CLIENT_DIR}/relay.c ${CLIENT_DIR}/remote.c ${CLIENT_DIR}/mcp.c ${CLIENT_DIR}/webapi.c)
     directgate_smoke(client_guards_smoke ${CLIENT_DIR}/config.c ${CLIENT_DIR}/devices.c ${CLIENT_DIR}/login.c
-        ${CLIENT_DIR}/relay.c ${CLIENT_DIR}/webapi.c)
+        ${CLIENT_DIR}/relay.c ${CLIENT_DIR}/remote.c ${CLIENT_DIR}/mcp.c ${CLIENT_DIR}/webapi.c)
 endif()
 
 # The client sources include their neighbour headers by bare name
@@ -479,7 +486,8 @@ foreach(test
         client_login_smoke
         client_login_guards_smoke
         client_relay_smoke
-        client_webapi_smoke)
+        client_webapi_smoke
+        client_mcp_smoke)
     target_include_directories(${test} PRIVATE ${CLIENT_DIR})
 endforeach()
 
@@ -497,6 +505,7 @@ directgate_smoke(session_files_smoke
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
     ${AGENT_DIR}/term.c
+    ${AGENT_DIR}/command.c
     ${AGENT_DIR}/directgate.c)
 directgate_smoke_desktop(session_files_smoke)
 target_compile_definitions(session_files_smoke PRIVATE DIRECTGATE_TESTING)
@@ -517,7 +526,8 @@ directgate_smoke(directgate_guards_smoke
     ${AGENT_DIR}/files.c
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
-    ${AGENT_DIR}/term.c)
+    ${AGENT_DIR}/term.c
+    ${AGENT_DIR}/command.c)
 directgate_smoke_desktop(directgate_guards_smoke)
 target_compile_definitions(directgate_guards_smoke PRIVATE DIRECTGATE_TESTING)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
@@ -536,6 +546,7 @@ directgate_smoke(auth_flow_smoke
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
     ${AGENT_DIR}/term.c
+    ${AGENT_DIR}/command.c
     ${AGENT_DIR}/directgate.c)
 directgate_smoke_desktop(auth_flow_smoke)
 target_compile_definitions(auth_flow_smoke PRIVATE DIRECTGATE_TESTING)
@@ -558,6 +569,7 @@ if(UNIX AND NOT APPLE)
         ${AGENT_DIR}/search.c
         ${AGENT_DIR}/session.c
         ${AGENT_DIR}/term.c
+        ${AGENT_DIR}/command.c
         ${AGENT_DIR}/directgate.c)
     directgate_smoke_desktop(alloc_fail_agent_smoke)
     target_compile_definitions(alloc_fail_agent_smoke PRIVATE DIRECTGATE_TESTING)
@@ -580,6 +592,7 @@ directgate_smoke(connection_lifecycle_smoke
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
     ${AGENT_DIR}/term.c
+    ${AGENT_DIR}/command.c
     ${AGENT_DIR}/directgate.c)
 directgate_smoke_desktop(connection_lifecycle_smoke)
 target_compile_definitions(connection_lifecycle_smoke PRIVATE DIRECTGATE_TESTING)
@@ -601,6 +614,7 @@ directgate_smoke(relay_reprobe_smoke
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
     ${AGENT_DIR}/term.c
+    ${AGENT_DIR}/command.c
     ${AGENT_DIR}/directgate.c)
 directgate_smoke_desktop(relay_reprobe_smoke)
 target_compile_definitions(relay_reprobe_smoke PRIVATE DIRECTGATE_TESTING)
@@ -622,6 +636,7 @@ directgate_smoke(token_refresh_smoke
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
     ${AGENT_DIR}/term.c
+    ${AGENT_DIR}/command.c
     ${AGENT_DIR}/directgate.c)
 directgate_smoke_desktop(token_refresh_smoke)
 target_compile_definitions(token_refresh_smoke PRIVATE DIRECTGATE_TESTING)
@@ -643,11 +658,38 @@ directgate_smoke(session_lifetime_smoke
     ${AGENT_DIR}/search.c
     ${AGENT_DIR}/session.c
     ${AGENT_DIR}/term.c
+    ${AGENT_DIR}/command.c
     ${AGENT_DIR}/directgate.c)
 directgate_smoke_desktop(session_lifetime_smoke)
 target_compile_definitions(session_lifetime_smoke PRIVATE DIRECTGATE_TESTING)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(session_lifetime_smoke PRIVATE -Wno-unused-function)
+endif()
+
+# Non-interactive commands ("exec" sessions): real programs behind event-loop
+# endpoints, driven through the dispatch layer.
+if(UNIX)
+    directgate_smoke(session_exec_smoke
+        ${AGENT_DIR}/config.c
+        ${AGENT_DIR}/desktop/desktop.c
+        ${AGENT_DIR}/desktop/display.c
+        ${AGENT_DIR}/desktop/input.c
+        ${AGENT_DIR}/desktop/stream.c
+        ${AGENT_DIR}/enroll.c
+        ${AGENT_DIR}/keymgr.c
+        ${AGENT_DIR}/files.c
+        ${AGENT_DIR}/search.c
+        ${AGENT_DIR}/session.c
+        ${AGENT_DIR}/term.c
+        ${AGENT_DIR}/command.c
+        ${AGENT_DIR}/directgate.c)
+    directgate_smoke_desktop(session_exec_smoke)
+    target_compile_definitions(session_exec_smoke PRIVATE DIRECTGATE_TESTING)
+    # Megabytes of output sealed and opened again: half a minute of it under valgrind
+    set_tests_properties(session_exec_smoke PROPERTIES TIMEOUT 300)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(session_exec_smoke PRIVATE -Wno-unused-function)
+    endif()
 endif()
 
 # Every test runs with a home directory of its own. Code under test that falls back to a default path - the agent's

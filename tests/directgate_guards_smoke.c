@@ -140,7 +140,7 @@ static int check_sessions(void)
     DirectGate_WebRTC_DataCb((const uint8_t*)"x", 0, &idle);
 
     CHECK(DirectGate_Session_GetWsFd(NULL) == (int)XSOCK_INVALID, "no session has no socket");
-    CHECK(!DirectGate_Session_IsTransferWritable(NULL), "nor a transfer");
+    CHECK(!DirectGate_Session_IsTransferWritable(NULL, 0), "nor a transfer");
     CHECK(!DirectGate_Conn_HasOutboundTransfers(NULL) && !DirectGate_Conn_HasPausedTerminals(NULL), "nor a connection");
     DirectGate_PumpOutboundTransfers(NULL);
 

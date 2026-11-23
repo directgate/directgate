@@ -33,6 +33,7 @@
 #include "e2e.h"
 #include "srp.h"
 #include "keyauth.h"
+#include "command.h"
 
 typedef struct directgate_cfg_ directgate_cfg_t;
 
@@ -65,11 +66,38 @@ extern "C" {
 /* The most a resume proof may decode to: a sealed auth header carries a few ids and counters, nothing more. */
 #define DIRECTGATE_SESSION_RESUME_PROOF_MAX 1024U
 
+/* How long bulk data - file transfer chunks, command output - waits for a WebRTC data channel before the relay is
+   taken as the only way left. A client that knows sooner, its own ICE having failed, says so (webrtc/unavailable)
+   and the wait ends there. The relay carries bulk data only when WebRTC cannot be established at all. */
+#define DIRECTGATE_BULK_CHANNEL_WAIT_MS 15000ULL
+
+/*
+    The relay limits what each client session moves through it (its "limit" status: a rate after a burst) and stops
+    reading the agent's whole link when one session goes past it. What can wait - bulk data on the relay - keeps below
+    it instead: each session counts what it sends the relay in a bucket of its own, at a sixteenth less than the
+    relay's rate and half its burst, so the relay's bucket always holds more than the agent's. In thousandths of a
+    byte, like the relay's: a millisecond of any rate is a whole number of them. The floor keeps a debt in range.
+*/
+#define DIRECTGATE_RELAY_PACE_UNIT      1000
+#define DIRECTGATE_RELAY_PACE_SHARE     16
+#define DIRECTGATE_RELAY_PACE_FLOOR     (-(INT64_MAX / 2))
+
+/* Where a session's bulk data may go (DirectGate_Session_GetBulkRoute) */
+typedef enum directgate_bulk_route_ {
+    DIRECTGATE_BULK_WAIT = 0,       /* Nowhere yet: the data channel is coming, or coming back */
+    DIRECTGATE_BULK_CHANNEL,        /* The WebRTC data channel, direct or through TURN */
+    DIRECTGATE_BULK_RELAY           /* The relay: WebRTC could not be established for this session */
+} directgate_bulk_route_t;
+
 typedef enum directgate_session_mode_ {
     DIRECTGATE_SESSION_MODE_NONE = 0,
     DIRECTGATE_SESSION_MODE_TERMINAL,
     DIRECTGATE_SESSION_MODE_FILE_MANAGER,
     DIRECTGATE_SESSION_MODE_DESKTOP,
+    DIRECTGATE_SESSION_MODE_EXEC,
+    /* Commands and file operations on one session, one command at a time, for as long as the client keeps it: the
+       persistent connection an AI agent's tools hold to a device, so signalling and authentication happen once */
+    DIRECTGATE_SESSION_MODE_REMOTE,
 } directgate_session_mode_t;
 
 typedef struct directgate_session_ {
@@ -88,6 +116,7 @@ typedef struct directgate_session_ {
     directgate_desktop_t desktop;
     directgate_webrtc_t webrtc;
     directgate_term_t term;
+    directgate_command_t command;
     directgate_e2e_t e2e;
     directgate_srp_t srp;
     directgate_keyauth_t keyauth;
@@ -101,6 +130,13 @@ typedef struct directgate_session_ {
     uint64_t nLastKAPingMs;
     uint64_t nLastKAPongMs;
     xbool_t bWebRTCWasUp;           /* Data channel up at the last pass, so a drop is seen once */
+    uint64_t nBulkWaitMs;           /* When bulk data began waiting for a data channel; 0 while it is not waiting */
+    xbool_t bBulkRelay;             /* WebRTC is not possible for this session: bulk data may take the relay */
+    directgate_bulk_route_t eBulkPin; /* What the bulk data in progress started on; WAIT while there is none */
+    xbool_t bPendingOpen;           /* A download asked for while no route was known, started once one is */
+    char sPendingOpenPath[XFILE_PATH_SIZE];
+    int64_t nRelayTokens;           /* What it may still send the relay: see DIRECTGATE_RELAY_PACE_UNIT */
+    uint64_t nRelayTokensMs;        /* When that was counted; 0 before anything was, the bucket full */
     /* The relay route is gone and the session lives on its data channel alone, for a bounded time while its client
        reconnects. It never sends to the relay, and no relay message reaches it: see DirectGate_DetachSession. */
     xbool_t bDetached;
@@ -129,6 +165,8 @@ typedef struct directgate_session_mgr_ {
     uint32_t nAuthAttempts;
     uint32_t nAuthFailures;
     uint64_t nAuthLockoutUntilMs;
+    uint32_t nRelayRateBytes;       /* The relay's limit, from its "limit" status; 0: the relay has none */
+    uint32_t nRelayBurstBytes;
 } directgate_session_mgr_t;
 
 void DirectGate_SessionMgr_Init(directgate_session_mgr_t *pMgr, const directgate_cfg_t *pCfg);
@@ -169,6 +207,69 @@ int DirectGate_Session_SendManagerResp(directgate_session_t *pSession,
 int DirectGate_Session_SendManagerData(directgate_session_t *pSession, const char *pAction,
                                        const char *pStatus, const char *pPath,
                                        const uint8_t *pPayload, size_t nPayloadLen);
+
+/*!
+ * @brief Where the session's bulk data may go now.
+ *
+ * The data channel when it is open. The relay only once WebRTC has proved impossible: the client said so, or no data
+ * channel came up within DIRECTGATE_BULK_CHANNEL_WAIT_MS of bulk data starting to wait for one. Otherwise WAIT, and
+ * the caller holds its data back - nothing bulky reaches the relay while a channel is coming or coming back.
+ * Bulk data that started on the relay stays there until it is done (see DirectGate_Session_SendBulk), so that no
+ * message of it can be overtaken by a later one sent over the channel.
+ */
+directgate_bulk_route_t DirectGate_Session_GetBulkRoute(directgate_session_t *pSession, uint64_t nNowMs);
+
+/*!
+ * @brief How long the event loop may sleep before the wait for a data channel runs out, so that the relay is taken
+ *        on time, or before bulk data on the relay may send again (DirectGate_Session_GetRelayWaitMs).
+ *        DIRECTGATE_COMMAND_WAIT_NONE when nothing waits: the channel opening is an event of its own.
+ */
+uint32_t DirectGate_Session_GetBulkWaitMs(const directgate_session_t *pSession, uint64_t nNowMs);
+
+/*!
+ * @brief Sends bulk data on @p eRoute (CHANNEL or RELAY, never WAIT) and pins the session's bulk data to that route
+ *        until DirectGate_Session_ReleaseBulk. A channel send that fails falls back to the relay, as every send does.
+ */
+int DirectGate_Session_SendBulk(directgate_session_t *pSession, directgate_bulk_route_t eRoute,
+                                xjson_obj_t *pHeader, const uint8_t *pPayload, size_t nPayloadLength);
+
+/*!
+ * @brief The bulk data in progress is done: what comes next chooses its route afresh.
+ */
+void DirectGate_Session_ReleaseBulk(directgate_session_t *pSession);
+
+/*!
+ * @brief Whether bulk data is in progress or waiting to start: a download, one held until its route is known, or a
+ *        command whose output may still come.
+ */
+xbool_t DirectGate_Session_HasBulk(const directgate_session_t *pSession);
+
+/*!
+ * @brief The client found WebRTC impossible (webrtc/unavailable): bulk data may take the relay at once.
+ */
+void DirectGate_Session_SetBulkRelay(directgate_session_t *pSession);
+
+/*!
+ * @brief Whether the session's bulk data goes to the relay now: where DirectGate_Session_GetBulkRoute says RELAY.
+ */
+xbool_t DirectGate_Session_IsBulkOnRelay(const directgate_session_t *pSession);
+
+/*!
+ * @brief The relay's limit, from its "limit" status on the relay link; 0 when the relay has none, as a new link has
+ *        until told otherwise.
+ */
+void DirectGate_SessionMgr_SetRelayLimit(directgate_session_mgr_t *pMgr, uint32_t nRateBytes, uint32_t nBurstBytes);
+
+/*!
+ * @brief How long bulk data on the relay waits before it may send more without going past the relay's limit; 0 when
+ *        it may send now, or the relay has no limit. Never DIRECTGATE_COMMAND_WAIT_NONE.
+ */
+uint32_t DirectGate_Session_GetRelayWaitMs(const directgate_session_t *pSession, uint64_t nNowMs);
+
+#ifdef DIRECTGATE_TESTING
+/* The session's relay bucket at nNowMs, in thousandths of a byte, counting nothing */
+int64_t DirectGate_Session_TestRelayLevel(const directgate_session_t *pSession, uint64_t nNowMs);
+#endif
 
 int DirectGate_Session_SendKeepalive(directgate_session_t *pSession, const char *pAction);
 int DirectGate_Session_SendErrorMsg(directgate_session_t *pSession, const char *pReason);

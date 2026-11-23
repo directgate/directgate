@@ -57,6 +57,9 @@
 #include "src/common/webrtc.h"
 #include "src/common/websock.h"
 
+#include "src/common/transfer.h"
+#include "src/client/remote.h"
+
 #include "tls_fixture.h"
 #include "webrtc_teardown.h"
 
@@ -86,6 +89,7 @@ typedef enum {
     HOST_WAIT_TYPED,
     HOST_WAIT_PONG,
     HOST_WAIT_RESIZE,
+    HOST_REMOTE,                    /* exec or file-manager mode: answers remote operations */
     HOST_DONE
 } host_stage_t;
 
@@ -156,10 +160,40 @@ typedef struct {
     xatomic_t bRtcTyped;
     char sAddedKey[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
 
+    /* Remote operations: what the host offers, what it was asked and what it was sent. */
+    xatomic_t bOfferExec;
+    xatomic_t bExecStarted;
+    xatomic_t bExecSignalled;
+    xatomic_t bUploadDone;
+    xatomic_t nRemoteModes;
+    char sExecCommand[256];
+    char sExecSignal[16];
+    char sExecCwd[256];
+    uint32_t nExecTimeoutMs;
+    uint32_t nExecOutputMax;
+    xbool_t bExecOutputMax;
+    xbool_t bExecStdin;
+    char sManagerLast[600];
+    char sRacePath[512];
+    char sUploadId[64];
+    xbyte_buffer_t execInput;
+    xbyte_buffer_t upload;
+
     /* The host's half of a direct connection, driven from the server thread. */
     directgate_webrtc_t rtc;
     xbool_t bRtcActive;
     xbool_t bRtcGreeted;
+
+    /* Remote operations: how the host meets the client's offer, and which way the operation's traffic came */
+    int bRemoteRtc;                 /* The scenario drives remote operations: their offers are the host's to meet */
+    int bNoRemote;                  /* The host's auth result offers commands but no remote sessions */
+    int eRtcMode;                   /* HOST_RTC_* */
+    int nRemoteRtcMsgs;             /* exec, manager and file messages that arrived over the data channel */
+    int nRemoteRelayMsgs;           /* ... and over the relay */
+    int bClientUnavailable;         /* The client said WebRTC is impossible */
+    xbool_t bInRtcData;             /* Server thread: the message being handled came over the data channel */
+    xbool_t bDropChannel;           /* Server thread: tear the channel down on the next tick, outside its own dispatch */
+    uint64_t nSlowStartDueMs;       /* Server thread: when the deferred start of "slow-start" is confirmed */
 
     host_stage_t eStage;
     xbool_t bKeyMethod;
@@ -171,6 +205,10 @@ typedef struct {
 } cli_t;
 
 static cli_t g_cli;
+
+#define HOST_RTC_ANSWER 0           /* Answered: the operation runs over the data channel */
+#define HOST_RTC_REFUSE 1           /* Answered webrtc/unavailable, as an agent that cannot set WebRTC up */
+#define HOST_RTC_IGNORE 2           /* Never answered: the client's own wait has to run out */
 
 static uint16_t reserve_port(void)
 {
@@ -237,6 +275,14 @@ static void reset_outputs(void)
     XSYNC_ATOMIC_SET(&g_cli.bFileAcked, 0);
     XSYNC_ATOMIC_SET(&g_cli.bRtcConnected, 0);
     XSYNC_ATOMIC_SET(&g_cli.bRtcTyped, 0);
+    XSYNC_ATOMIC_SET(&g_cli.bExecStarted, 0);
+    XSYNC_ATOMIC_SET(&g_cli.eRtcMode, HOST_RTC_ANSWER);
+    XSYNC_ATOMIC_SET(&g_cli.nRemoteRtcMsgs, 0);
+    XSYNC_ATOMIC_SET(&g_cli.nRemoteRelayMsgs, 0);
+    XSYNC_ATOMIC_SET(&g_cli.bClientUnavailable, 0);
+    XSYNC_ATOMIC_SET(&g_cli.bExecSignalled, 0);
+    XSYNC_ATOMIC_SET(&g_cli.bUploadDone, 0);
+    XSYNC_ATOMIC_SET(&g_cli.nRemoteModes, 0);
 }
 
 static host_fault_t fault(void)
@@ -367,10 +413,18 @@ static int host_send(xapi_session_t *pSession, xjson_obj_t *pHeader, const uint8
     xbool_t bSealed = DirectGate_E2E_IsInitialized(&g_cli.e2e);
     if (bSealed) DirectGate_Proto_AddCC(pHeader, &g_cli.e2e, 0);
 
+    /* A remote operation is answered the way the agent answers it: over the data channel once it is open */
+    xbool_t bChannel = (g_cli.eStage == HOST_REMOTE && g_cli.bRtcActive && DirectGate_WebRTC_IsConnected(&g_cli.rtc)) ?
+        XTRUE : XFALSE;
+
     int nStatus = XAPI_DISCONNECT;
     if (DirectGate_Proto_Build(&packet, pHeader, pPayload, nPayload, XFALSE) &&
         (!bSealed || DirectGate_Proto_EncryptPackage(&packet, &g_cli.e2e, CLI_SESSION_ID)))
-        nStatus = DirectGate_WebSock_SendBuff(pSession, &packet);
+    {
+        if (bChannel) nStatus = DirectGate_WebRTC_Send(&g_cli.rtc, packet.pData, packet.nUsed) == XSTDOK ?
+            XAPI_CONTINUE : XAPI_DISCONNECT;
+        else nStatus = DirectGate_WebSock_SendBuff(pSession, &packet);
+    }
 
     XJSON_FreeObject(pHeader);
     XByteBuffer_Clear(&packet);
@@ -434,6 +488,15 @@ static xjson_obj_t* webrtc_header(const char *pAction, const char *pField, const
     return pHeader;
 }
 
+/* A successful auth result, offering commands when the scenario says the host runs them. */
+static xjson_obj_t* host_auth_ok(xjson_obj_t *pResult)
+{
+    if (pResult != NULL && XSYNC_ATOMIC_GET(&g_cli.bOfferExec)) XJSON_AddBool(pResult, "exec", XTRUE);
+    if (pResult != NULL && XSYNC_ATOMIC_GET(&g_cli.bOfferExec) && !XSYNC_ATOMIC_GET(&g_cli.bNoRemote))
+        XJSON_AddBool(pResult, "remote", XTRUE);
+    return pResult;
+}
+
 static int host_srp(xapi_session_t *pSession, const directgate_pkg_auth_t *pAuth)
 {
     if (g_cli.eStage == HOST_WAIT_HELLO && strcmp(pAuth->pAction, "hello") == 0)
@@ -488,8 +551,8 @@ static int host_srp(xapi_session_t *pSession, const directgate_pkg_auth_t *pAuth
         if (fault() == FAULT_WRONG_M2) sM2[0] = (sM2[0] == 'a') ? 'b' : 'a';
 
         /* The result goes out in the clear, before the keys exist. */
-        int nStatus = host_send(pSession, DirectGate_Proto_BuildAuthResult("ok", sM2, NULL, CLI_SESSION_ID,
-            fault() == FAULT_PRE_LOGON), NULL, 0);
+        int nStatus = host_send(pSession, host_auth_ok(DirectGate_Proto_BuildAuthResult("ok", sM2, NULL, CLI_SESSION_ID,
+            fault() == FAULT_PRE_LOGON)), NULL, 0);
         if (nStatus < 0) return nStatus;
 
         DirectGate_E2E_Init(&g_cli.e2e);
@@ -546,7 +609,8 @@ static int host_key(xapi_session_t *pSession, const directgate_pkg_auth_t *pAuth
             !DirectGate_KeyAuth_DeriveShared(&g_cli.keyauth))
             return XAPI_DISCONNECT;
 
-        int nStatus = host_send(pSession, DirectGate_Proto_BuildAuthResult("ok", NULL, NULL, CLI_SESSION_ID, XFALSE), NULL, 0);
+        xjson_obj_t *pResult = host_auth_ok(DirectGate_Proto_BuildAuthResult("ok", NULL, NULL, CLI_SESSION_ID, XFALSE));
+        int nStatus = host_send(pSession, pResult, NULL, 0);
         if (nStatus < 0) return nStatus;
 
         DirectGate_E2E_Init(&g_cli.e2e);
@@ -576,6 +640,227 @@ static int host_push_file(xapi_session_t *pSession, const char *pId, const char 
     if (nStatus >= 0) nStatus = host_send(pSession, DirectGate_Proto_BuildFileChunk(pId, 0), (const uint8_t*)pText, nText);
     if (nStatus >= 0) nStatus = host_send(pSession, DirectGate_Proto_BuildFileEnd(pId, sHex), NULL, 0);
     return nStatus;
+}
+
+static void write_file(const char *pPath, const char *pText);
+
+/* ---- remote operations, as an agent answers them ---------------------------------- */
+
+#define CLI_REMOTE_FILE_TEXT "hello from the host\n"
+
+static int host_exec_output(xapi_session_t *pSession, const char *pStream, const uint8_t *pData, size_t nLength)
+{
+    xjson_obj_t *pHeader = DirectGate_Proto_BuildExec("output", NULL, NULL, CLI_SESSION_ID);
+    if (pHeader != NULL) XJSON_AddString(pHeader, "stream", pStream);
+    return host_send(pSession, pHeader, pData, nLength);
+}
+
+static int host_exec_exit(xapi_session_t *pSession, int nCode, const char *pSignal, xbool_t bTimedOut)
+{
+    xjson_obj_t *pHeader = DirectGate_Proto_BuildExec("exit", "ok", NULL, CLI_SESSION_ID);
+    if (pHeader == NULL) return XAPI_DISCONNECT;
+
+    XJSON_AddInt(pHeader, "exitCode", nCode);
+    if (pSignal != NULL) XJSON_AddString(pHeader, "signal", pSignal);
+    if (bTimedOut) XJSON_AddBool(pHeader, "timedOut", XTRUE);
+    return host_send(pSession, pHeader, NULL, 0);
+}
+
+/* The commands this host knows, each standing for one behaviour a real program has. */
+static int host_on_exec(xapi_session_t *pSession, const directgate_pkg_exec_t *pExec)
+{
+    const char *pAction = pExec->pAction != NULL ? pExec->pAction : "";
+    const char *pCommand = g_cli.sExecCommand;
+
+    if (strcmp(pAction, "start") == 0)
+    {
+        xstrncpy(g_cli.sExecCommand, sizeof(g_cli.sExecCommand), pExec->pCommand != NULL ? pExec->pCommand : "");
+        xstrncpy(g_cli.sExecCwd, sizeof(g_cli.sExecCwd), pExec->pCwd != NULL ? pExec->pCwd : "");
+        g_cli.nExecTimeoutMs = pExec->nTimeoutMs;
+        g_cli.bExecOutputMax = pExec->bHasOutputMax && !pExec->bBadOutputMax;
+        g_cli.nExecOutputMax = pExec->nOutputMax;
+        g_cli.bExecStdin = pExec->bStdin;
+        XByteBuffer_Clear(&g_cli.execInput);
+        XByteBuffer_Init(&g_cli.execInput, XSTDNON, XFALSE);
+
+        /* "slow-start" stands for a start whose confirmation is still on its way when the user presses Ctrl-C */
+        int nStatus = XAPI_CONTINUE;
+        if (strcmp(pCommand, "slow-start") == 0) g_cli.nSlowStartDueMs = XTime_GetMonoMs() + 300;
+        else
+        {
+            xjson_obj_t *pStarted = DirectGate_Proto_BuildExec("started", "ok", NULL, CLI_SESSION_ID);
+            if (pStarted != NULL) XJSON_AddInt(pStarted, "pid", 4242);
+            nStatus = host_send(pSession, pStarted, NULL, 0);
+        }
+
+        XSYNC_ATOMIC_SET(&g_cli.bExecStarted, 1);
+        if (nStatus < 0) return nStatus;
+
+        if (strcmp(pCommand, "streams") == 0)
+        {
+            /* Terminal output has no place in a command's stdout: a host that sends some is not heard */
+            nStatus = host_send(pSession, DirectGate_Proto_BuildData(CLI_SESSION_ID), (const uint8_t*)"INJECTED", 8);
+            if (nStatus >= 0) nStatus = host_exec_output(pSession, "stdout", (const uint8_t*)"out-1\n", 6);
+            if (nStatus >= 0) nStatus = host_exec_output(pSession, "stderr", (const uint8_t*)"err-1\n", 6);
+            if (nStatus >= 0) nStatus = host_exec_output(pSession, "stdout", (const uint8_t*)"out-2\x1b[31m\n", 11);
+            if (nStatus >= 0) nStatus = host_exec_exit(pSession, 0, NULL, XFALSE);
+        }
+        else if (strcmp(pCommand, "chatty") == 0 || strcmp(pCommand, "chatty-big") == 0)
+        {
+            /* A device that does not keep to outputMax: everything is sent, whatever the client asked for */
+            static uint8_t sChunk[16384];
+            memset(sChunk, 'a', sizeof(sChunk));
+            int nChunks = strcmp(pCommand, "chatty-big") == 0 ? 13 : 3;
+
+            for (int i = 0; i < nChunks && nStatus >= 0; i++)
+                nStatus = host_exec_output(pSession, "stdout", sChunk, sizeof(sChunk));
+
+            if (nStatus >= 0) nStatus = host_exec_output(pSession, "stderr", (const uint8_t*)"0123456789", 10);
+            if (nStatus >= 0) nStatus = host_exec_exit(pSession, 0, NULL, XFALSE);
+        }
+        else if (strcmp(pCommand, "drop-channel") == 0)
+        {
+            /* The data channel goes while the command runs, as a peer-to-peer route that dies midway */
+            if (nStatus >= 0) nStatus = host_exec_output(pSession, "stdout", (const uint8_t*)"before\n", 7);
+            g_cli.bDropChannel = XTRUE;
+        }
+        else if (strcmp(pCommand, "fail 3") == 0) nStatus = host_exec_exit(pSession, 3, NULL, XFALSE);
+        else if (strcmp(pCommand, "too slow") == 0) nStatus = host_exec_exit(pSession, 137, "KILL", XTRUE);
+        else if (strcmp(pCommand, "refuse") == 0)
+            nStatus = host_send(pSession, DirectGate_Proto_BuildExec("started", "failed",
+                "cannot start the command: \x1b]0;x\x07nope", CLI_SESSION_ID), NULL, 0);
+        else if (strcmp(pCommand, "vanish") == 0)
+            nStatus = host_send(pSession, DirectGate_Proto_BuildStatus("closed", CLI_SESSION_ID), NULL, 0);
+        else if (strcmp(pCommand, "echo-input") != 0 && strcmp(pCommand, "wait-for-signal") != 0 &&
+                 strcmp(pCommand, "stubborn") != 0 && strcmp(pCommand, "drop-channel") != 0 &&
+                 strcmp(pCommand, "slow-start") != 0)
+            nStatus = host_exec_exit(pSession, 0, NULL, XFALSE);
+
+        return nStatus;
+    }
+
+    if (strcmp(pAction, "input") == 0)
+    {
+        if (pExec->data.nPayloadLength) XByteBuffer_Add(&g_cli.execInput, pExec->data.pPayload, pExec->data.nPayloadLength);
+        return XAPI_CONTINUE;
+    }
+
+    if (strcmp(pAction, "eof") == 0 && strcmp(pCommand, "echo-input") == 0)
+    {
+        int nStatus = host_exec_output(pSession, "stdout", g_cli.execInput.pData, g_cli.execInput.nUsed);
+        if (nStatus >= 0) nStatus = host_exec_output(pSession, "stderr", (const uint8_t*)"warn\n", 5);
+        if (nStatus >= 0) nStatus = host_exec_exit(pSession, 7, NULL, XFALSE);
+        return nStatus;
+    }
+
+    if (strcmp(pAction, "signal") == 0)
+    {
+        xstrncpy(g_cli.sExecSignal, sizeof(g_cli.sExecSignal), pExec->pSignal != NULL ? pExec->pSignal : "");
+        XSYNC_ATOMIC_SET(&g_cli.bExecSignalled, 1);
+
+        /* "stubborn" stands for a program that ignores the signal: the client has to give up on its own */
+        if (strcmp(pCommand, "wait-for-signal") == 0 || strcmp(pCommand, "slow-start") == 0)
+            return host_exec_exit(pSession, 130, "INT", XFALSE);
+    }
+
+    return XAPI_CONTINUE;
+}
+
+static int host_manager_answer(xapi_session_t *pSession, const char *pAction, const char *pStatus, const char *pReason,
+                               const char *pPath)
+{
+    return host_send(pSession, DirectGate_Proto_BuildManager(pAction, pStatus, pPath, pReason, CLI_SESSION_ID), NULL, 0);
+}
+
+static int host_on_manager(xapi_session_t *pSession, const directgate_pkg_manager_t *pMgr)
+{
+    const char *pAction = pMgr->pAction != NULL ? pMgr->pAction : "";
+    const char *pPath = pMgr->pPath != NULL ? pMgr->pPath : "";
+
+    const char *pTarget = xstrused(pMgr->pTargetPath) ? pMgr->pTargetPath : NULL;
+    snprintf(g_cli.sManagerLast, sizeof(g_cli.sManagerLast), "%s %s%s%s%s", pAction, pPath,
+        pTarget != NULL ? " " : "", pTarget != NULL ? pTarget : "", pMgr->bForce ? " force" : "");
+
+    if (strcmp(pAction, "list") == 0)
+    {
+        if (strcmp(pPath, "/srv") != 0) return host_manager_answer(pSession, "list", "failed", "failed to read directory", pPath);
+
+        const char *pListing = "{\"path\":\"/srv\",\"entries\":["
+            "{\"name\":\"hello.txt\",\"type\":\"file\",\"permissions\":\"-rw-r--r--\",\"owner\":\"user\",\"group\":\"user\","
+            "\"sizeBytes\":20,\"modified\":\"2026-11-22T10:00:00\"},"
+            "{\"name\":\"logs\",\"type\":\"directory\",\"permissions\":\"drwxr-xr-x\",\"owner\":\"root\",\"group\":\"root\","
+            "\"sizeBytes\":4096,\"modified\":\"2026-11-21T09:30:00\"}]}";
+
+        xjson_obj_t *pHeader = DirectGate_Proto_BuildManager("list", "ok", "/srv", NULL, CLI_SESSION_ID);
+        if (pHeader != NULL) XJSON_AddString(pHeader, "payloadType", "json");
+        return host_send(pSession, pHeader, (const uint8_t*)pListing, strlen(pListing));
+    }
+
+    if (strcmp(pAction, "open") == 0)
+    {
+        if (strcmp(pPath, "/srv/hello.txt") != 0)
+            return host_manager_answer(pSession, "open", "failed", "file not found or not a regular file", pPath);
+
+        /* A local file appearing while the download runs: the client must not replace it */
+        if (g_cli.sRacePath[0]) write_file(g_cli.sRacePath, "appeared meanwhile\n");
+
+        int nStatus = host_push_file(pSession, "get-1", "hello.txt", CLI_REMOTE_FILE_TEXT);
+        if (nStatus >= 0) nStatus = host_manager_answer(pSession, "open", "ok", NULL, pPath);
+        return nStatus;
+    }
+
+    if (strcmp(pAction, "save") == 0)
+    {
+        if (strcmp(pPath, "/srv/exists.txt") == 0 && !pMgr->bForce)
+            return host_manager_answer(pSession, "save", "exists", "file already exists", pPath);
+
+        XByteBuffer_Clear(&g_cli.upload);
+        XByteBuffer_Init(&g_cli.upload, XSTDNON, XFALSE);
+        return host_manager_answer(pSession, "save", "ok", NULL, pPath);
+    }
+
+    if (strcmp(pAction, "rename") == 0 && xstrused(pMgr->pTargetPath) && strcmp(pMgr->pTargetPath, "/srv/taken") == 0)
+        return host_manager_answer(pSession, "rename", "failed", "target already exists", pPath);
+
+    if (strcmp(pAction, "delete") == 0 || strcmp(pAction, "mkdir") == 0 || strcmp(pAction, "rename") == 0)
+        return host_manager_answer(pSession, pAction, "ok", NULL, xstrused(pMgr->pTargetPath) ? pMgr->pTargetPath : pPath);
+
+    return host_manager_answer(pSession, pAction, "failed", "unsupported", pPath);
+}
+
+/* An upload, kept whole and checked against the hash the client sends at the end. */
+static int host_on_upload(xapi_session_t *pSession, const directgate_pkg_file_t *pFile)
+{
+    const char *pAction = pFile->pAction != NULL ? pFile->pAction : "";
+    const char *pId = pFile->transfer.pTransferId != NULL ? pFile->transfer.pTransferId : "";
+
+    if (strcmp(pAction, "start") == 0)
+    {
+        xstrncpy(g_cli.sUploadId, sizeof(g_cli.sUploadId), pId);
+        return XAPI_CONTINUE;
+    }
+
+    if (strcmp(pAction, "chunk") == 0 && strcmp(pId, g_cli.sUploadId) == 0)
+    {
+        if (pFile->data.nPayloadLength) XByteBuffer_Add(&g_cli.upload, pFile->data.pPayload, pFile->data.nPayloadLength);
+        return XAPI_CONTINUE;
+    }
+
+    if (strcmp(pAction, "end") == 0 && strcmp(pId, g_cli.sUploadId) == 0)
+    {
+        uint8_t digest[XSHA256_DIGEST_SIZE];
+        char sHex[XSHA256_DIGEST_SIZE * 2 + 1];
+        XSHA256_Compute(digest, sizeof(digest), g_cli.upload.pData, g_cli.upload.nUsed);
+        for (size_t i = 0; i < sizeof(digest); i++) snprintf(sHex + (i * 2), 3, "%02x", digest[i]);
+
+        if (pFile->transfer.pSha256 == NULL || strcmp(pFile->transfer.pSha256, sHex) != 0)
+            return host_send(pSession, DirectGate_Proto_BuildFileCancel(pId, "hash mismatch"), NULL, 0);
+
+        XSYNC_ATOMIC_SET(&g_cli.bUploadDone, 1);
+        return host_send(pSession, DirectGate_Proto_BuildFileAck(pId, 0), NULL, 0);
+    }
+
+    return XAPI_CONTINUE;
 }
 
 /* What a misbehaving host sends once the terminal is asked for. XAPI_CONTINUE
@@ -704,7 +989,9 @@ static void host_rtc_data(const uint8_t *pData, size_t nLen, void *pCtx)
     if (pkg.header.pType != NULL && strcmp(pkg.header.pType, "encrypted") == 0)
     {
         xbool_t bTyped = XSYNC_ATOMIC_GET(&g_cli.bTypedSeen) != 0;
+        g_cli.bInRtcData = XTRUE;
         host_on_sealed(g_cli.pRelay, &pkg);
+        g_cli.bInRtcData = XFALSE;
         if (!bTyped && XSYNC_ATOMIC_GET(&g_cli.bTypedSeen)) XSYNC_ATOMIC_SET(&g_cli.bRtcTyped, 1);
     }
 
@@ -740,13 +1027,31 @@ static int host_rtc_signal_in(xjson_obj_t *pRoot)
 }
 
 /* Once the channel is up the host greets over it, so what reaches the terminal came the direct way. */
+static void host_rtc_stop(void);
+
 static void host_rtc_tick(void)
 {
+    if (g_cli.nSlowStartDueMs && XTime_GetMonoMs() >= g_cli.nSlowStartDueMs && g_cli.pRelay != NULL)
+    {
+        g_cli.nSlowStartDueMs = 0;
+        xjson_obj_t *pStarted = DirectGate_Proto_BuildExec("started", "ok", NULL, CLI_SESSION_ID);
+        if (pStarted != NULL) XJSON_AddInt(pStarted, "pid", 4243);
+        host_send(g_cli.pRelay, pStarted, NULL, 0);
+    }
+
     if (!g_cli.bRtcActive) return;
+    if (g_cli.bDropChannel)
+    {
+        g_cli.bDropChannel = XFALSE;
+        host_rtc_stop();
+        return;
+    }
+
     DirectGate_WebRTC_ProcessQueue(&g_cli.rtc);
 
     if (g_cli.bRtcGreeted || !DirectGate_WebRTC_IsConnected(&g_cli.rtc)) return;
     g_cli.bRtcGreeted = XTRUE;
+    if (XSYNC_ATOMIC_GET(&g_cli.bRemoteRtc)) return;
     XSYNC_ATOMIC_SET(&g_cli.bRtcConnected, 1);
 
     const char *pGreeting = CLI_GREETING "\r\n";
@@ -788,6 +1093,13 @@ static int host_on_sealed(xapi_session_t *pSession, directgate_pkg_t *pPkg)
     const char *pType = msg.header.pType != NULL ? msg.header.pType : "";
     xjson_obj_t *pRoot = msg.jsonHeader.pRootObj;
 
+    /* Which way an operation's own traffic came: the data channel, or the relay */
+    if (g_cli.eStage == HOST_REMOTE && (!strcmp(pType, "exec") || !strcmp(pType, "manager") || !strcmp(pType, "file")))
+    {
+        if (g_cli.bInRtcData) XSYNC_ATOMIC_ADD(&g_cli.nRemoteRtcMsgs, 1);
+        else XSYNC_ATOMIC_ADD(&g_cli.nRemoteRelayMsgs, 1);
+    }
+
     if (strcmp(pType, "admin") == 0)
     {
         const char *pAction = XJSON_GetString(XJSON_GetObject(pRoot, "action"));
@@ -823,10 +1135,41 @@ static int host_on_sealed(xapi_session_t *pSession, directgate_pkg_t *pPkg)
             else XJSON_FreeObject(pAnswer);
         }
     }
+    else if (strcmp(pType, "webrtc") == 0 && XSYNC_ATOMIC_GET(&g_cli.bRemoteRtc))
+    {
+        const char *pAction = XJSON_GetString(XJSON_GetObject(pRoot, "action"));
+        int eMode = XSYNC_ATOMIC_GET(&g_cli.eRtcMode);
+
+        /* As the agent: WebRTC is set up for a session whose mode is active, and an offer before that waits unseen */
+        if (pAction != NULL && strcmp(pAction, "unavailable") == 0) XSYNC_ATOMIC_SET(&g_cli.bClientUnavailable, 1);
+        else if (g_cli.eStage != HOST_REMOTE) nStatus = XAPI_CONTINUE;
+        else if (eMode == HOST_RTC_ANSWER) nStatus = host_rtc_signal_in(pRoot);
+        else if (eMode == HOST_RTC_REFUSE && pAction != NULL && strcmp(pAction, "offer") == 0)
+            nStatus = host_send(pSession, DirectGate_Proto_BuildWebRTC("unavailable", CLI_SESSION_ID), NULL, 0);
+    }
+    else if (strcmp(pType, "exec") == 0 && g_cli.eStage == HOST_REMOTE)
+    {
+        nStatus = host_on_exec(pSession, (const directgate_pkg_exec_t*)msg.pPackage);
+    }
+    else if (strcmp(pType, "manager") == 0 && g_cli.eStage == HOST_REMOTE)
+    {
+        nStatus = host_on_manager(pSession, (const directgate_pkg_manager_t*)msg.pPackage);
+    }
+    else if (strcmp(pType, "file") == 0 && g_cli.eStage == HOST_REMOTE)
+    {
+        nStatus = host_on_upload(pSession, (const directgate_pkg_file_t*)msg.pPackage);
+    }
     else if (strcmp(pType, "cmd") == 0)
     {
         const char *pAction = XJSON_GetString(XJSON_GetObject(pRoot, "action"));
         const char *pMode = XJSON_GetString(XJSON_GetObject(pRoot, "mode"));
+
+        if (g_cli.eStage == HOST_WAIT_START && pAction != NULL && strcmp(pAction, "start") == 0 &&
+            pMode != NULL && (strcmp(pMode, "exec") == 0 || strcmp(pMode, "file-manager") == 0 || strcmp(pMode, "remote") == 0))
+        {
+            XSYNC_ATOMIC_ADD(&g_cli.nRemoteModes, 1);
+            g_cli.eStage = HOST_REMOTE;
+        }
 
         if (g_cli.eStage == HOST_WAIT_START && pAction != NULL && strcmp(pAction, "start") == 0 &&
             pMode != NULL && strcmp(pMode, "terminal") == 0)
@@ -1317,6 +1660,975 @@ static int scenario_keys(tty_t *pTty, const char *pCfg, const char *pRoot)
 }
 
 /* Extracts port=<n> and state=<s> from the sign-in URL the client printed. */
+/* ---- remote operations: dgcli the way a script or an AI agent runs it ------------------ */
+
+/* No terminal, stdout and stderr kept apart, the exit code as the verdict. */
+/* dgcli with its arguments, the input it reads, and anything the environment should add (NULL: nothing) */
+static int cli_run_env(const tty_t *pTty, const char *const *pArgs, const char *pInput, size_t nInput,
+                       const char *const *pExtraEnv, xexec_result_t *pResult)
+{
+    char *pArgv[32];
+    size_t n = 0;
+    pArgv[n++] = (char*)DIRECTGATE_CLIENT_BIN;
+    for (size_t i = 0; pArgs[i] != NULL && n + 1 < sizeof(pArgv) / sizeof(pArgv[0]); i++) pArgv[n++] = (char*)pArgs[i];
+    pArgv[n] = NULL;
+
+    char sHome[600], sCert[600];
+    snprintf(sHome, sizeof(sHome), "HOME=%s", pTty->pRoot);
+    snprintf(sCert, sizeof(sCert), "SSL_CERT_FILE=%s", pTty->pCert);
+    char *aEnv[8] = { sHome, sCert, (char*)"PATH=/usr/bin:/bin", NULL };
+    for (size_t i = 0, n = 3; pExtraEnv != NULL && pExtraEnv[i] != NULL && n + 1 < 8; i++) aEnv[n++] = (char*)pExtraEnv[i];
+
+    xexec_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.pPath = DIRECTGATE_CLIENT_BIN;
+    opts.ppArgv = pArgv;
+    opts.ppEnv = aEnv;
+    opts.pWorkDir = pTty->pRoot;
+
+    XExec_ResultInit(pResult);
+    if (XExec_Run(&opts, (const uint8_t*)pInput, pInput != NULL ? nInput : 0, 4U * 1024U * 1024U, 30000, pResult) != XSTDOK)
+        return -1;
+
+    /* Readable as strings, without counting the terminator */
+    XByteBuffer_AddByte(&pResult->output, 0);
+    XByteBuffer_AddByte(&pResult->errors, 0);
+    pResult->output.nUsed--;
+    pResult->errors.nUsed--;
+    return pResult->bTimedOut ? -2 : pResult->nExitCode;
+}
+
+static int cli_run(const tty_t *pTty, const char *const *pArgs, const char *pInput, size_t nInput, xexec_result_t *pResult)
+{
+    return cli_run_env(pTty, pArgs, pInput, nInput, NULL, pResult);
+}
+
+static const char* out_of(const xbyte_buffer_t *pBuffer)
+{
+    return pBuffer->pData != NULL ? (const char*)pBuffer->pData : "";
+}
+
+/* dgcli started in the background, for the cases that signal it while it runs. */
+static int cli_spawn(const tty_t *pTty, const char *const *pArgs, xexec_t *pExec)
+{
+    char *pArgv[32];
+    size_t n = 0;
+    pArgv[n++] = (char*)DIRECTGATE_CLIENT_BIN;
+    for (size_t i = 0; pArgs[i] != NULL && n + 1 < sizeof(pArgv) / sizeof(pArgv[0]); i++) pArgv[n++] = (char*)pArgs[i];
+    pArgv[n] = NULL;
+
+    char sHome[600], sCert[600];
+    snprintf(sHome, sizeof(sHome), "HOME=%s", pTty->pRoot);
+    snprintf(sCert, sizeof(sCert), "SSL_CERT_FILE=%s", pTty->pCert);
+    char *aEnv[] = { sHome, sCert, (char*)"PATH=/usr/bin:/bin", NULL };
+
+    xexec_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.pPath = DIRECTGATE_CLIENT_BIN;
+    opts.ppArgv = pArgv;
+    opts.ppEnv = aEnv;
+    opts.pWorkDir = pTty->pRoot;
+    opts.nFlags = XEXEC_STDOUT | XEXEC_STDERR | XEXEC_GROUP;
+
+    return XExec_Spawn(pExec, &opts) == XSTDOK;
+}
+
+static int wait_atomic(xatomic_t *pFlag, uint32_t nTimeoutMs)
+{
+    for (uint32_t nWaited = 0; nWaited < nTimeoutMs && !XSYNC_ATOMIC_GET(pFlag); nWaited += 10) usleep(10000);
+    return XSYNC_ATOMIC_GET(pFlag) != 0;
+}
+
+static int read_text(const char *pPath, char *pOut, size_t nSize)
+{
+    FILE *pFile = fopen(pPath, "rb");
+    if (pFile == NULL) return 0;
+    size_t nRead = fread(pOut, 1, nSize - 1, pFile);
+    pOut[nRead] = '\0';
+    fclose(pFile);
+    return 1;
+}
+
+static int no_partial_downloads(const char *pRoot)
+{
+    char sCmd[700];
+    snprintf(sCmd, sizeof(sCmd), "ls -a '%s' | grep -q dgpart", pRoot);
+    return system(sCmd) != 0;
+}
+
+/* One request to the MCP server and its one-line answer, read within nTimeoutMs. */
+static int mcp_call(xexec_t *pMcp, const char *pRequest, char *pReply, size_t nSize, uint32_t nTimeoutMs)
+{
+    size_t nLength = strlen(pRequest);
+    if (write(pMcp->nStdIn, pRequest, nLength) != (ssize_t)nLength || write(pMcp->nStdIn, "\n", 1) != 1) return 0;
+
+    size_t nUsed = 0;
+    pReply[0] = '\0';
+
+    for (uint32_t nWaited = 0; nWaited < nTimeoutMs && strchr(pReply, '\n') == NULL; nWaited += 20)
+    {
+        struct pollfd pfd = { pMcp->nStdOut, POLLIN, 0 };
+        if (poll(&pfd, 1, 20) <= 0) continue;
+
+        ssize_t nRead = read(pMcp->nStdOut, pReply + nUsed, nSize - 1 - nUsed);
+        if (nRead <= 0) break;
+        nUsed += (size_t)nRead;
+        pReply[nUsed] = '\0';
+    }
+
+    return strchr(pReply, '\n') != NULL;
+}
+
+/* ---- dgcli session: many operations on one connection ------------------------------------------------- */
+
+typedef struct {
+    xexec_t exec;
+    xbyte_buffer_t in;              /* What the session wrote, not taken yet */
+    xbyte_buffer_t log;             /* Its stderr, drained so it never blocks on it */
+} session_child_t;
+
+static int session_start(session_child_t *pChild, tty_t *pTty, const char *pCfg, const char *pIdle)
+{
+    char *pArgv[] = { (char*)DIRECTGATE_CLIENT_BIN, (char*)"session", (char*)"-c", (char*)pCfg, (char*)"-t", (char*)pIdle,
+                      (char*)CLI_DEVICE_ID, NULL };
+    char sHome[600], sCert[600];
+    snprintf(sHome, sizeof(sHome), "HOME=%s", pTty->pRoot);
+    snprintf(sCert, sizeof(sCert), "SSL_CERT_FILE=%s", pTty->pCert);
+    char *aEnv[] = { sHome, sCert, (char*)"PATH=/usr/bin:/bin", NULL };
+
+    xexec_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.pPath = DIRECTGATE_CLIENT_BIN;
+    opts.ppArgv = pArgv;
+    opts.ppEnv = aEnv;
+    opts.pWorkDir = pTty->pRoot;
+    opts.nFlags = XEXEC_STDIN | XEXEC_STDOUT | XEXEC_STDERR | XEXEC_GROUP;
+
+    XByteBuffer_Init(&pChild->in, XSTDNON, XFALSE);
+    XByteBuffer_Init(&pChild->log, XSTDNON, XFALSE);
+    return XExec_Spawn(&pChild->exec, &opts) == XSTDOK;
+}
+
+static int session_fill(session_child_t *pChild, size_t nWant, uint32_t nTimeoutMs);
+
+/* Its first line, once it is open */
+static int session_ready(session_child_t *pChild)
+{
+    static const char sReady[] = "{\"ready\":true}\n";
+    if (!session_fill(pChild, sizeof(sReady) - 1, 30000) || memcmp(pChild->in.pData, sReady, sizeof(sReady) - 1)) return 0;
+    XByteBuffer_Advance(&pChild->in, sizeof(sReady) - 1);
+    return 1;
+}
+
+/* Reads what the session writes into in, its stderr into log, until in holds nWant bytes or the time runs out */
+static int session_fill(session_child_t *pChild, size_t nWant, uint32_t nTimeoutMs)
+{
+    uint64_t nDeadline = XTime_GetMonoMs() + nTimeoutMs;
+
+    while (pChild->in.nUsed < nWant && XTime_GetMonoMs() < nDeadline)
+    {
+        struct pollfd pfd[2] = { { pChild->exec.nStdOut, POLLIN, 0 }, { pChild->exec.nStdErr, POLLIN, 0 } };
+        if (poll(pfd, pChild->exec.nStdErr >= 0 ? 2 : 1, 50) <= 0) continue;
+
+        uint8_t sBuffer[16384];
+        if (pChild->exec.nStdErr >= 0 && (pfd[1].revents & (POLLIN | POLLHUP)))
+        {
+            ssize_t nRead = read(pChild->exec.nStdErr, sBuffer, sizeof(sBuffer));
+            if (nRead > 0) XByteBuffer_Add(&pChild->log, sBuffer, (size_t)nRead);
+            else
+            {
+                close(pChild->exec.nStdErr);
+                pChild->exec.nStdErr = XSOCK_INVALID;
+            }
+        }
+
+        if (pfd[0].revents & (POLLIN | POLLHUP))
+        {
+            ssize_t nRead = read(pChild->exec.nStdOut, sBuffer, sizeof(sBuffer));
+            if (nRead <= 0) return 0;
+            XByteBuffer_Add(&pChild->in, sBuffer, (size_t)nRead);
+        }
+    }
+
+    return pChild->in.nUsed >= nWant;
+}
+
+/* One request, one answer: the answer's code, its stdout and stderr, and whether output was cut */
+static int session_call(session_child_t *pChild, const char *pRequest, int *pCode, xbyte_buffer_t *pOut, xbyte_buffer_t *pErr,
+                        int *pTruncated)
+{
+    size_t nLength = strlen(pRequest);
+    if (write(pChild->exec.nStdIn, pRequest, nLength) != (ssize_t)nLength || write(pChild->exec.nStdIn, "\n", 1) != 1)
+        return 0;
+
+    /* The header line */
+    uint64_t nDeadline = XTime_GetMonoMs() + 30000;
+    const uint8_t *pNewline = NULL;
+    while ((pNewline = pChild->in.nUsed ? memchr(pChild->in.pData, '\n', pChild->in.nUsed) : NULL) == NULL &&
+           XTime_GetMonoMs() < nDeadline)
+        if (!session_fill(pChild, pChild->in.nUsed + 1, 200) && pChild->exec.nStdOut < 0) return 0;
+    if (pNewline == NULL) return 0;
+
+    size_t nHeader = (size_t)(pNewline - pChild->in.pData) + 1;
+    xjson_t json;
+    if (!XJSON_Parse(&json, NULL, (const char*)pChild->in.pData, nHeader - 1)) return 0;
+    *pCode = XJSON_GetInt(XJSON_GetObject(json.pRootObj, "exitCode"));
+    size_t nOut = (size_t)XJSON_GetU64(XJSON_GetObject(json.pRootObj, "stdout"));
+    size_t nErr = (size_t)XJSON_GetU64(XJSON_GetObject(json.pRootObj, "stderr"));
+    *pTruncated = XJSON_GetBool(XJSON_GetObject(json.pRootObj, "truncated")) ? 1 : 0;
+    XJSON_Destroy(&json);
+
+    if (!session_fill(pChild, nHeader + nOut + nErr, 30000)) return 0;
+    XByteBuffer_Reset(pOut);
+    XByteBuffer_Reset(pErr);
+    if (nOut) XByteBuffer_Add(pOut, pChild->in.pData + nHeader, nOut);
+    if (nErr) XByteBuffer_Add(pErr, pChild->in.pData + nHeader + nOut, nErr);
+    XByteBuffer_Advance(&pChild->in, nHeader + nOut + nErr);
+    return 1;
+}
+
+static void session_stop(session_child_t *pChild)
+{
+    if (pChild->exec.nPid > 0 && !pChild->exec.bExited)
+    {
+        XExec_Kill(&pChild->exec, SIGKILL);
+        XExec_Wait(&pChild->exec, XEXEC_WAIT_FOREVER);
+    }
+
+    XExec_Close(&pChild->exec);
+    XByteBuffer_Clear(&pChild->in);
+    XByteBuffer_Clear(&pChild->log);
+}
+
+static int scenario_session(tty_t *pTty, const char *pCfg)
+{
+    xbyte_buffer_t out, err;
+    XByteBuffer_Init(&out, XSTDNON, XFALSE);
+    XByteBuffer_Init(&err, XSTDNON, XFALSE);
+    int nCode = -1, nTruncated = 0, nOk = 1;
+
+    const char *sStreams = "out-1\nout-2\x1b[31m\n";
+    session_child_t child;
+    reset_outputs();
+    CHECK(session_start(&child, pTty, pCfg, "600"), "start a session");
+    CHECK(session_ready(&child), "the session says it is open before anything else");
+
+    do
+    {
+        nOk = session_call(&child, "{\"argv\":[\"exec\",\"" CLI_DEVICE_ID "\",\"streams\"]}", &nCode, &out, &err, &nTruncated) &&
+            nCode == 0 && out.nUsed == strlen(sStreams) && memcmp(out.pData, sStreams, out.nUsed) == 0 &&
+            err.nUsed == 6 && memcmp(err.pData, "err-1\n", 6) == 0 && !nTruncated;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a session runs a command and answers with its streams\n"); break; }
+
+        nOk = session_call(&child, "{\"argv\":[\"exec\",\"-t\",\"9\",\"-C\",\"/srv\",\"" CLI_DEVICE_ID "\",\"fail\",\"3\"]}",
+            &nCode, &out, &err, &nTruncated) && nCode == 3 && strcmp(g_cli.sExecCwd, "/srv") == 0 &&
+            g_cli.nExecTimeoutMs == 9000;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a session's second command runs with its own options\n"); break; }
+
+        nOk = session_call(&child, "{\"argv\":[\"exec\",\"" CLI_DEVICE_ID "\",\"chatty\"],\"max\":1000}", &nCode, &out, &err,
+            &nTruncated) && nCode == 0 && out.nUsed == 1000 && nTruncated;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a session keeps no more of a stream than the request allows\n"); break; }
+
+        nOk = session_call(&child, "{\"argv\":[\"exec\",\"" CLI_DEVICE_ID "\",\"echo-input\"],\"stdin\":\"fed\\n\"}", &nCode,
+            &out, &err, &nTruncated) && nCode == 7 && out.nUsed == 4 && memcmp(out.pData, "fed\n", 4) == 0;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a session's command reads the stdin of its request\n"); break; }
+
+        nOk = session_call(&child, "{\"argv\":[\"cp\",\"" CLI_DEVICE_ID ":/srv/hello.txt\",\"-\"]}", &nCode, &out, &err,
+            &nTruncated) && nCode == 0 && out.nUsed == strlen(CLI_REMOTE_FILE_TEXT) &&
+            memcmp(out.pData, CLI_REMOTE_FILE_TEXT, out.nUsed) == 0;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a session downloads a file into its answer\n"); break; }
+
+        nOk = session_call(&child,
+            "{\"argv\":[\"cp\",\"-\",\"" CLI_DEVICE_ID ":/srv/session.txt\"],\"stdin\":\"from a session\\n\"}",
+            &nCode, &out, &err, &nTruncated) && nCode == 0 && g_cli.upload.nUsed == 15 &&
+            memcmp(g_cli.upload.pData, "from a session\n", 15) == 0;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a session uploads the stdin of its request\n"); break; }
+
+        nOk = session_call(&child, "{\"argv\":[\"exec\",\"another-box\",\"ls\"]}", &nCode, &out, &err, &nTruncated) &&
+            nCode == 255 && strstr(out_of(&err), "a session reaches its own device only") != NULL;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a session refuses an operation on another device\n"); break; }
+
+        nOk = session_call(&child, "not json", &nCode, &out, &err, &nTruncated) && nCode == 255 &&
+            strstr(out_of(&err), "one line of JSON") != NULL;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a session answers a malformed request and goes on\n"); break; }
+
+        nOk = session_call(&child, "{\"argv\":[\"exec\",\"" CLI_DEVICE_ID "\",\"fail\",\"3\"]}", &nCode, &out, &err,
+            &nTruncated) && nCode == 3;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a session goes on after a refused request\n"); break; }
+
+        nOk = XSYNC_ATOMIC_GET(&g_cli.nConnects) == 1 && XSYNC_ATOMIC_GET(&g_cli.nRemoteRtcMsgs) > 0 &&
+            XSYNC_ATOMIC_GET(&g_cli.nRemoteRelayMsgs) == 0;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: one connection carries every operation, over the data channel\n"); break; }
+
+        /* Its requests end: the session ends, cleanly */
+        XExec_CloseStdIn(&child.exec);
+        nOk = XExec_Wait(&child.exec, 10000) == XSTDOK && child.exec.nExitCode == 0;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a session ends cleanly when its requests end\n"); break; }
+    }
+    while (0);
+
+    if (!nOk) fprintf(stderr, "---- session stderr ----\n%.*s\n------------------------\n", (int)child.log.nUsed,
+        child.log.pData != NULL ? (const char*)child.log.pData : "");
+    session_stop(&child);
+    CHECK(nOk, "a session serves its requests on one connection");
+
+    /* Idle for longer than it may be: it ends on its own */
+    reset_outputs();
+    CHECK(session_start(&child, pTty, pCfg, "1"), "start a session that may idle for a second");
+    CHECK(session_ready(&child), "the idle session opens");
+    uint64_t nStart = XTime_GetMonoMs();
+    CHECK(XExec_Wait(&child.exec, 20000) == XSTDOK && child.exec.nExitCode == 0, "an idle session ends by itself");
+    CHECK(XTime_GetMonoMs() - nStart < 15000, "and soon after its idle time");
+    session_stop(&child);
+
+    /* An agent that offers no remote sessions: dgcli says so and fails, as for a command it cannot run */
+    reset_outputs();
+    XSYNC_ATOMIC_SET(&g_cli.bNoRemote, 1);
+    CHECK(session_start(&child, pTty, pCfg, "600"), "start a session with an agent that keeps none");
+    int bExited = XExec_Wait(&child.exec, 20000) == XSTDOK && child.exec.nExitCode == 255;
+    session_fill(&child, 1, 500);
+    int bNotReady = child.in.nUsed == 0;
+    XSYNC_ATOMIC_SET(&g_cli.bNoRemote, 0);
+    int bSaid = child.log.nUsed && strstr(out_of(&child.log), "cannot keep sessions") != NULL;
+    session_stop(&child);
+    CHECK(bExited && bSaid, "a session with an agent that keeps none fails and says why");
+    CHECK(bNotReady, "and never says it is open, so nothing could have run on it");
+
+    XByteBuffer_Clear(&out);
+    XByteBuffer_Clear(&err);
+    return 0;
+}
+
+/* The same operations through "dgcli mcp", the way an AI client drives them. */
+static int scenario_mcp(tty_t *pTty, const char *pCfg)
+{
+    char *pArgv[] = { (char*)DIRECTGATE_CLIENT_BIN, (char*)"mcp", (char*)"-c", (char*)pCfg, NULL };
+    char sHome[600], sCert[600];
+    snprintf(sHome, sizeof(sHome), "HOME=%s", pTty->pRoot);
+    snprintf(sCert, sizeof(sCert), "SSL_CERT_FILE=%s", pTty->pCert);
+    char *aEnv[] = { sHome, sCert, (char*)"PATH=/usr/bin:/bin", NULL };
+
+    xexec_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.pPath = DIRECTGATE_CLIENT_BIN;
+    opts.ppArgv = pArgv;
+    opts.ppEnv = aEnv;
+    opts.pWorkDir = pTty->pRoot;
+    opts.nFlags = XEXEC_STDIN | XEXEC_STDOUT | XEXEC_GROUP;
+
+    xexec_t mcp;
+    CHECK(XExec_Spawn(&mcp, &opts) == XSTDOK, "start the MCP server");
+
+    static char sReply[1024 * 1024];        /* An exec cut at the limit comes back twice: as text and as structure */
+    int nOk = 1;
+
+    do
+    {
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+            "\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\"}}}",
+            sReply, sizeof(sReply), 10000) && strstr(sReply, "\"protocolVersion\":\"2025-06-18\"") != NULL &&
+            strstr(sReply, "\"tools\":{") != NULL;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: the MCP server answers initialize with its tools capability\n"); break; }
+
+        /* A notification is never answered: the next line read is the next request's */
+        const char *pNote = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+        if (write(mcp.nStdIn, pNote, strlen(pNote)) != (ssize_t)strlen(pNote)) { nOk = 0; break; }
+
+        reset_outputs();
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"command\":\"streams\"}}}", sReply, sizeof(sReply), 30000) &&
+            strstr(sReply, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":") == sReply &&
+            strstr(sReply, "\"exitCode\":0,\"stdout\":\"out-1\\nout-2\\u001b[31m\\n\"") != NULL &&
+            strstr(sReply, "\"isError\":false") != NULL && strstr(sReply, "\"truncated\":false") != NULL;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: exec through MCP returns the exit code and the escaped output\n"); break; }
+
+        nOk = g_cli.bExecOutputMax && g_cli.nExecOutputMax == 128U * 1024U + 1U;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: exec through MCP asks the device for no more than it keeps\n"); break; }
+
+        /* A device that sends past the limit anyway: what is kept is cut there, and the cut is reported */
+        reset_outputs();
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"command\":\"chatty-big\"}}}", sReply, sizeof(sReply), 30000) &&
+            strstr(sReply, "\"truncated\":true") != NULL && strstr(sReply, "[output cut at 128 KB per stream]") != NULL &&
+            strstr(sReply, "0123456789") != NULL;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: output past the limit through MCP is reported cut\n"); break; }
+
+        reset_outputs();
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":\"three\",\"method\":\"tools/call\",\"params\":{\"name\":\"exec\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"command\":\"fail 3\",\"cwd\":\"/srv\",\"timeout_seconds\":9}}}",
+            sReply, sizeof(sReply), 30000) && strstr(sReply, "\"id\":\"three\"") != NULL &&
+            strstr(sReply, "\"exitCode\":3") != NULL && strstr(sReply, "\"isError\":true") != NULL &&
+            strcmp(g_cli.sExecCwd, "/srv") == 0 && g_cli.nExecTimeoutMs == 9000;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a failing command through MCP is an error with its code\n"); break; }
+
+        reset_outputs();
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"read_file\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"path\":\"/srv/hello.txt\"}}}", sReply, sizeof(sReply), 30000) &&
+            strstr(sReply, "\"text\":\"hello from the host\\n\"") != NULL;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: read_file through MCP returns the file's text\n"); break; }
+
+        reset_outputs();
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"write_file\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"path\":\"/srv/mcp.txt\",\"content\":\"written over MCP\\n\"}}}",
+            sReply, sizeof(sReply), 30000) && strstr(sReply, "\"isError\":false") != NULL &&
+            g_cli.upload.nUsed == 17 && memcmp(g_cli.upload.pData, "written over MCP\n", 17) == 0 &&
+            strcmp(g_cli.sManagerLast, "save /srv/mcp.txt") == 0;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: write_file through MCP uploads the content\n"); break; }
+
+        reset_outputs();
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"list_devices\","
+            "\"arguments\":{}}}", sReply, sizeof(sReply), 30000) &&
+            strstr(sReply, "\"structuredContent\":{\"devices\":[") != NULL && strstr(sReply, CLI_DEVICE_ID) != NULL;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: list_devices through MCP returns structured devices\n"); break; }
+
+        /* keep_open: one connection for many calls */
+        reset_outputs();
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"command\":\"streams\",\"keep_open\":true}}}",
+            sReply, sizeof(sReply), 30000) && strstr(sReply, "\"exitCode\":0,\"stdout\":\"out-1\\nout-2") != NULL;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: exec with keep_open runs on a session\n"); break; }
+
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"command\":\"fail 3\",\"keep_open\":true}}}",
+            sReply, sizeof(sReply), 30000) && strstr(sReply, "\"exitCode\":3") != NULL &&
+            strstr(sReply, "\"isError\":true") != NULL;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a second call with keep_open runs on the same session\n"); break; }
+
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"command\":\"chatty-big\",\"keep_open\":true}}}",
+            sReply, sizeof(sReply), 30000) && strstr(sReply, "\"truncated\":true") != NULL &&
+            strstr(sReply, "[output cut at 128 KB per stream]") != NULL;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: output past the limit on a session is reported cut\n"); break; }
+
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"tools/call\",\"params\":{\"name\":\"read_file\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"path\":\"/srv/hello.txt\"}}}", sReply, sizeof(sReply), 30000) &&
+            strstr(sReply, "\"text\":\"hello from the host\\n\"") != NULL &&
+            XSYNC_ATOMIC_GET(&g_cli.nConnects) == 1;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: calls on a kept connection share one connect\n"); break; }
+
+        /* That call had no keep_open: the session went with it, and the next call connects anew */
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":24,\"method\":\"tools/call\",\"params\":{\"name\":\"disconnect\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\"}}}", sReply, sizeof(sReply), 30000) &&
+            strstr(sReply, "no open connection") != NULL;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a call without keep_open closes the connection it used\n"); break; }
+
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":25,\"method\":\"tools/call\",\"params\":{\"name\":\"list_directory\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"path\":\"/srv\",\"keep_open\":true}}}",
+            sReply, sizeof(sReply), 30000) && strstr(sReply, "\"isError\":false") != NULL &&
+            XSYNC_ATOMIC_GET(&g_cli.nConnects) == 2;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: the next keep_open call opens a new connection\n"); break; }
+
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":26,\"method\":\"tools/call\",\"params\":{\"name\":\"disconnect\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\"}}}", sReply, sizeof(sReply), 30000) &&
+            strstr(sReply, "\"text\":\"disconnected\"") != NULL;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: disconnect closes a kept connection\n"); break; }
+
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":27,\"method\":\"tools/call\",\"params\":{\"name\":\"disconnect\","
+            "\"arguments\":{}}}", sReply, sizeof(sReply), 30000) && strstr(sReply, "device is required") != NULL;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: disconnect needs its device\n"); break; }
+
+        /* An agent that keeps no sessions: the call runs on a connection of its own instead */
+        reset_outputs();
+        XSYNC_ATOMIC_SET(&g_cli.bNoRemote, 1);
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":28,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"command\":\"fail 3\",\"keep_open\":true}}}",
+            sReply, sizeof(sReply), 60000) && strstr(sReply, "\"exitCode\":3") != NULL;
+        XSYNC_ATOMIC_SET(&g_cli.bNoRemote, 0);
+        if (!nOk)
+        {
+            fprintf(stderr, "client_e2e_smoke: keep_open with an agent that keeps no sessions still runs the call\n");
+            break;
+        }
+
+        reset_outputs();
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\","
+            "\"arguments\":{\"device\":\"no-such-box\",\"command\":\"true\"}}}", sReply, sizeof(sReply), 30000) &&
+            strstr(sReply, "\"isError\":true") != NULL && strstr(sReply, "No device matches") != NULL;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a failure through MCP is an error result with dgcli's reason\n"); break; }
+    }
+    while (0);
+
+    /* Closing its input ends the server */
+    XExec_CloseStdIn(&mcp);
+    int bExited = XExec_Wait(&mcp, 10000) == XSTDOK && mcp.nExitCode == 0;
+    if (!bExited) XExec_Kill(&mcp, SIGKILL), XExec_Wait(&mcp, XEXEC_WAIT_FOREVER);
+    XExec_Close(&mcp);
+
+    if (!nOk) fprintf(stderr, "---- last MCP reply ----\n%s\n------------------------\n", sReply);
+    CHECK(nOk, "the MCP tools work end to end");
+    CHECK(bExited, "the MCP server exits cleanly when its input closes");
+    return 0;
+}
+
+static int scenario_remote(tty_t *pTty, const char *pCfg, const char *pRoot)
+{
+    /* The key generated earlier, authorized on the device: no password is ever asked for */
+    char sKey[256];
+    snprintf(sKey, sizeof(sKey), "%s/.config/directgate/auth/key.json", pRoot);
+
+    directgate_client_key_t key;
+    CHECK(DirectGate_KeyAuth_KeyLoad(&key, sKey) &&
+        DirectGate_KeyAuth_Base64Encode(key.clientPub, sizeof(key.clientPub), g_cli.sAuthorizedKey,
+            sizeof(g_cli.sAuthorizedKey)), "the client key loads for the remote operations");
+    DirectGate_KeyAuth_KeyCleanse(&key);
+
+    xexec_result_t res;
+    int nCode = 0;
+
+    /* ---- exec ---- */
+
+    /* An agent that does not offer commands is never sent one */
+    reset_outputs();
+    XSYNC_ATOMIC_SET(&g_cli.bOfferExec, 0);
+    const char *noExec[] = { "exec", "-c", pCfg, CLI_DEVICE_ID, "uname", "-a", NULL };
+    nCode = cli_run(pTty, noExec, NULL, 0, &res);
+    CHECK(nCode == 255, "a command for an agent without exec fails as dgcli's own failure");
+    CHECK(strstr(out_of(&res.errors), "cannot run commands") != NULL, "the client says the agent has to be updated");
+    CHECK(XSYNC_ATOMIC_GET(&g_cli.bKeyAuthOk) && XSYNC_ATOMIC_GET(&g_cli.nRemoteModes) == 0,
+        "a key logs in, and no command is sent to an agent that did not offer them");
+    XExec_ResultClear(&res);
+
+    XSYNC_ATOMIC_SET(&g_cli.bOfferExec, 1);
+
+    /* Output keeps its streams, and stdout holds nothing but the command's own */
+    reset_outputs();
+    const char *streams[] = { "exec", "-c", pCfg, CLI_DEVICE_ID, "streams", NULL };
+    nCode = cli_run(pTty, streams, NULL, 0, &res);
+    CHECK(nCode == 0, "a command that succeeds makes dgcli exit 0");
+    CHECK(strcmp(out_of(&res.output), "out-1\nout-2\x1b[31m\n") == 0,
+        "stdout is exactly the command's stdout, byte for byte, with nothing of dgcli's own");
+    CHECK(strstr(out_of(&res.errors), "err-1\n") != NULL, "the command's stderr goes to stderr");
+    CHECK(strstr(out_of(&res.errors), "Password") == NULL, "no password is asked for");
+    CHECK(XSYNC_ATOMIC_GET(&g_cli.nRemoteRtcMsgs) > 0 && XSYNC_ATOMIC_GET(&g_cli.nRemoteRelayMsgs) == 0,
+        "a command's own traffic goes over the data channel, and none of it over the relay");
+    CHECK(strstr(out_of(&res.errors), "RTC") == NULL, "nothing of dgcli's own reaches the command's stderr");
+    XExec_ResultClear(&res);
+
+    /* An agent that cannot set WebRTC up says so: the relay is taken at once, with nothing waited out */
+    reset_outputs();
+    XSYNC_ATOMIC_SET(&g_cli.eRtcMode, HOST_RTC_REFUSE);
+    uint64_t nRefusedStart = XTime_GetMonoMs();
+    nCode = cli_run(pTty, streams, NULL, 0, &res);
+    uint64_t nRefusedMs = XTime_GetMonoMs() - nRefusedStart;
+    CHECK(nCode == 0 && strcmp(out_of(&res.output), "out-1\nout-2\x1b[31m\n") == 0,
+        "a command whose agent refuses WebRTC still runs, on the relay");
+    CHECK(XSYNC_ATOMIC_GET(&g_cli.nRemoteRelayMsgs) > 0 && XSYNC_ATOMIC_GET(&g_cli.nRemoteRtcMsgs) == 0 &&
+        XSYNC_ATOMIC_GET(&g_cli.bClientUnavailable), "the client tells the agent, and the relay carries the command");
+    CHECK(nRefusedMs < DIRECTGATE_REMOTE_CHANNEL_WAIT_MS, "a refused offer is not waited out");
+    XExec_ResultClear(&res);
+
+    /* An offer nobody answers: only once the client's own wait runs out is the relay taken */
+    reset_outputs();
+    XSYNC_ATOMIC_SET(&g_cli.eRtcMode, HOST_RTC_IGNORE);
+    const char *unanswered[] = { "exec", "-c", pCfg, CLI_DEVICE_ID, "fail", "3", NULL };
+    uint64_t nIgnoredStart = XTime_GetMonoMs();
+    nCode = cli_run(pTty, unanswered, NULL, 0, &res);
+    uint64_t nIgnoredMs = XTime_GetMonoMs() - nIgnoredStart;
+    CHECK(nCode == 3 && XSYNC_ATOMIC_GET(&g_cli.bClientUnavailable) && XSYNC_ATOMIC_GET(&g_cli.nRemoteRtcMsgs) == 0,
+        "an unanswered offer ends with the client's word that WebRTC is impossible, and the relay");
+    CHECK(nIgnoredMs >= DIRECTGATE_REMOTE_CHANNEL_WAIT_MS - 500, "the relay is not taken before the wait runs out");
+    XExec_ResultClear(&res);
+
+    /* The data channel goes while the command runs: what was in it cannot be known to have arrived */
+    reset_outputs();
+    const char *dropped[] = { "exec", "-c", pCfg, CLI_DEVICE_ID, "drop-channel", NULL };
+    nCode = cli_run(pTty, dropped, NULL, 0, &res);
+    CHECK(nCode == 255 && strstr(out_of(&res.errors), "the peer-to-peer connection was lost") != NULL,
+        "a command whose data channel is lost fails, and says why");
+    CHECK(XSYNC_ATOMIC_GET(&g_cli.nRemoteRelayMsgs) == 0, "nothing of it moves to the relay");
+    XExec_ResultClear(&res);
+
+    /* -o: no more of each stream than asked for, even from an agent that sends it all; nothing asked, nothing cut */
+    reset_outputs();
+    const char *limited[] = { "exec", "-c", pCfg, "-o", "5", CLI_DEVICE_ID, "chatty", NULL };
+    nCode = cli_run(pTty, limited, NULL, 0, &res);
+    CHECK(nCode == 0, "a command with an output limit exits with its own code");
+    CHECK(g_cli.bExecOutputMax && g_cli.nExecOutputMax == 5, "the output limit reaches the host");
+    CHECK(strcmp(out_of(&res.output), "aaaaa") == 0 && strcmp(out_of(&res.errors), "01234") == 0,
+        "each stream is cut at the limit on this side too");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *unlimited[] = { "exec", "-c", pCfg, CLI_DEVICE_ID, "chatty", NULL };
+    nCode = cli_run(pTty, unlimited, NULL, 0, &res);
+    CHECK(nCode == 0 && !g_cli.bExecOutputMax, "without -o the host is asked for no limit");
+    CHECK(res.output.nUsed == 3U * 16384U && strcmp(out_of(&res.errors), "0123456789") == 0, "without -o nothing is cut");
+    XExec_ResultClear(&res);
+
+    /* Options before the device; the exit code is the command's; words that look like options are the command's */
+    reset_outputs();
+    const char *failing[] = { "exec", "-c", pCfg, "-t", "5", "-C", "/srv", CLI_DEVICE_ID, "fail", "3", NULL };
+    nCode = cli_run(pTty, failing, NULL, 0, &res);
+    CHECK(nCode == 3, "dgcli exits with the command's own exit code");
+    CHECK(strcmp(g_cli.sExecCwd, "/srv") == 0 && g_cli.nExecTimeoutMs == 5000, "the directory and the timeout reach the host");
+    XExec_ResultClear(&res);
+
+    /* With the config at its default path, a command's own -c is still the command's */
+    char sDefaultCfg[512], sCfgText[2048];
+    snprintf(sDefaultCfg, sizeof(sDefaultCfg), "%s/.config/directgate/client.json", pRoot);
+    CHECK(read_text(pCfg, sCfgText, sizeof(sCfgText)), "read the test config");
+    write_file(sDefaultCfg, sCfgText);
+
+    reset_outputs();
+    const char *defaulted[] = { "exec", CLI_DEVICE_ID, "gcc", "-c", "x.c", NULL };
+    nCode = cli_run(pTty, defaulted, NULL, 0, &res);
+    unlink(sDefaultCfg);
+    CHECK(nCode == 0 && strcmp(g_cli.sExecCommand, "gcc -c x.c") == 0,
+        "a -c after the device is the command's, not a config for dgcli to load");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *dashed[] = { "exec", "-c", pCfg, CLI_DEVICE_ID, "--", "gcc", "-c", "x.c", "-o", "x", NULL };
+    nCode = cli_run(pTty, dashed, NULL, 0, &res);
+    CHECK(nCode == 0 && strcmp(g_cli.sExecCommand, "gcc -c x.c -o x") == 0,
+        "the command's own -c is not taken for dgcli's config, and the -- separator is not part of the command");
+    XExec_ResultClear(&res);
+
+    /* Piped stdin reaches the command, then its end of file */
+    reset_outputs();
+    const char *echo[] = { "exec", "-c", pCfg, CLI_DEVICE_ID, "echo-input", NULL };
+    const char *pPiped = "piped line one\npiped line two\n";
+    nCode = cli_run(pTty, echo, pPiped, strlen(pPiped), &res);
+    CHECK(nCode == 7 && g_cli.bExecStdin, "a command reading piped input runs with stdin");
+    CHECK(strcmp(out_of(&res.output), pPiped) == 0, "the piped input reached the command in full");
+    CHECK(strstr(out_of(&res.errors), "warn") != NULL, "the command's warning arrives on stderr");
+    XExec_ResultClear(&res);
+
+    /* What a script must be able to tell apart: a timeout, a refusal, a session that ends under the command */
+    reset_outputs();
+    const char *slow[] = { "exec", "-c", pCfg, CLI_DEVICE_ID, "too", "slow", NULL };
+    nCode = cli_run(pTty, slow, NULL, 0, &res);
+    CHECK(nCode == 137 && strstr(out_of(&res.errors), "timed out") != NULL, "a command killed for its timeout says so");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *refused[] = { "exec", "-c", pCfg, CLI_DEVICE_ID, "refuse", NULL };
+    nCode = cli_run(pTty, refused, NULL, 0, &res);
+    CHECK(nCode == 255 && strstr(out_of(&res.errors), "cannot start the command") != NULL,
+        "a command the host could not start fails with the host's reason");
+    CHECK(strchr(out_of(&res.errors), '\x1b') == NULL && strchr(out_of(&res.errors), '\x07') == NULL,
+        "the host's reason reaches the terminal without its escape sequences");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *vanish[] = { "exec", "-c", pCfg, CLI_DEVICE_ID, "vanish", NULL };
+    nCode = cli_run(pTty, vanish, NULL, 0, &res);
+    CHECK(nCode == 255 && strstr(out_of(&res.errors), "closed before the command finished") != NULL,
+        "a session that ends before the exit is a failure, not a success");
+    XExec_ResultClear(&res);
+
+    /* Ctrl-C goes to the command, whose exit is still waited for */
+    reset_outputs();
+    xexec_t exec;
+    const char *waiting[] = { "exec", "-c", pCfg, CLI_DEVICE_ID, "wait-for-signal", NULL };
+    CHECK(cli_spawn(pTty, waiting, &exec), "start a command that waits for a signal");
+    CHECK(wait_atomic(&g_cli.bExecStarted, 20000), "the command starts");
+    CHECK(XExec_Kill(&exec, SIGINT) == XSTDOK, "interrupt the client");
+    CHECK(wait_atomic(&g_cli.bExecSignalled, 10000) && strcmp(g_cli.sExecSignal, "INT") == 0,
+        "the interrupt is forwarded to the command");
+    CHECK(XExec_Wait(&exec, 10000) == XSTDOK && exec.nExitCode == 130, "dgcli exits with the interrupted command's code");
+    XExec_Close(&exec);
+
+    /* Ctrl-C while the start is still being confirmed: held, and sent the moment the command is known to run */
+    reset_outputs();
+    const char *slowStart[] = { "exec", "-c", pCfg, CLI_DEVICE_ID, "slow-start", NULL };
+    CHECK(cli_spawn(pTty, slowStart, &exec), "start a command whose start is confirmed late");
+    CHECK(wait_atomic(&g_cli.bExecStarted, 20000), "the command is asked for");
+    CHECK(XExec_Kill(&exec, SIGINT) == XSTDOK, "interrupt the client before the start is confirmed");
+    CHECK(wait_atomic(&g_cli.bExecSignalled, 10000) && strcmp(g_cli.sExecSignal, "INT") == 0,
+        "an interrupt that came before the confirmed start is forwarded once the command runs");
+    CHECK(XExec_Wait(&exec, 10000) == XSTDOK && exec.nExitCode == 130, "and dgcli exits with the command's code");
+    XExec_Close(&exec);
+
+    /* A command that ignores it: the second interrupt ends dgcli itself */
+    reset_outputs();
+    const char *stubborn[] = { "exec", "-c", pCfg, CLI_DEVICE_ID, "stubborn", NULL };
+    CHECK(cli_spawn(pTty, stubborn, &exec), "start a command that ignores signals");
+    CHECK(wait_atomic(&g_cli.bExecStarted, 20000), "the stubborn command starts");
+    CHECK(XExec_Kill(&exec, SIGINT) == XSTDOK && wait_atomic(&g_cli.bExecSignalled, 10000), "the first interrupt is forwarded");
+    CHECK(XExec_Wait(&exec, 500) == XSTDNON, "dgcli keeps waiting for a command that ignored the interrupt");
+    CHECK(XExec_Kill(&exec, SIGINT) == XSTDOK, "interrupt the client again");
+    CHECK(XExec_Wait(&exec, 10000) == XSTDOK && exec.nExitCode == 255, "the second interrupt ends dgcli as its own failure");
+    XExec_Close(&exec);
+
+    /* ---- the file manager: device:/path names the remote side, as scp does ---- */
+
+    reset_outputs();
+    const char *listJson[] = { "ls", "-c", pCfg, "-j", CLI_DEVICE_ID ":/srv", NULL };
+    nCode = cli_run(pTty, listJson, NULL, 0, &res);
+    CHECK(nCode == 0 && strstr(out_of(&res.output), "\"entries\":[") != NULL && strstr(out_of(&res.output), "hello.txt") != NULL,
+        "ls -j <device>:<path> prints the listing as the host sent it");
+    CHECK(strcmp(g_cli.sManagerLast, "list /srv") == 0, "the listing asked for is the one named");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *listText[] = { "ls", "-c", pCfg, CLI_DEVICE_ID ":/srv", NULL };
+    nCode = cli_run(pTty, listText, NULL, 0, &res);
+    CHECK(nCode == 0 && strstr(out_of(&res.output), "-rw-r--r-- user     user") != NULL &&
+        strstr(out_of(&res.output), " hello.txt\n") != NULL && strstr(out_of(&res.output), " logs\n") != NULL,
+        "ls prints one line per entry, ls -l style");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *listBad[] = { "ls", "-c", pCfg, CLI_DEVICE_ID ":/nope", NULL };
+    nCode = cli_run(pTty, listBad, NULL, 0, &res);
+    CHECK(nCode == 1 && strstr(out_of(&res.errors), "failed to read directory") != NULL && res.output.nUsed == 0,
+        "a listing the host refuses fails with its reason and prints nothing");
+    XExec_ResultClear(&res);
+
+    /* ls on its own is the device list, as it always was */
+    reset_outputs();
+    const char *lsDevices[] = { "ls", "-c", pCfg, "-j", NULL };
+    nCode = cli_run(pTty, lsDevices, NULL, 0, &res);
+    CHECK(nCode == 0 && strncmp(out_of(&res.output), "{\"devices\":[", 12) == 0, "ls without a path lists the devices");
+    XExec_ResultClear(&res);
+
+    /* cp from the device: into a directory under the remote name, to a named file, and to stdout */
+    char sLocal[512], sText[4096];
+    snprintf(sLocal, sizeof(sLocal), "%s/hello.txt", pRoot);
+    unlink(sLocal);
+    reset_outputs();
+    const char *get[] = { "cp", "-c", pCfg, CLI_DEVICE_ID ":/srv/hello.txt", ".", NULL };
+    nCode = cli_run(pTty, get, NULL, 0, &res);
+    CHECK(nCode == 0 && read_text(sLocal, sText, sizeof(sText)) && strcmp(sText, CLI_REMOTE_FILE_TEXT) == 0,
+        "cp <device>:<file> <dir> writes the verified file under its remote name");
+    XExec_ResultClear(&res);
+
+    /* Nothing local is replaced without -f: refused before anything is fetched, then replaced with it */
+    snprintf(sLocal, sizeof(sLocal), "%s/renamed.txt", pRoot);
+    write_file(sLocal, "an older local copy\n");
+    reset_outputs();
+    const char *getNamed[] = { "cp", "-c", pCfg, CLI_DEVICE_ID ":/srv/hello.txt", "renamed.txt", NULL };
+    nCode = cli_run(pTty, getNamed, NULL, 0, &res);
+    CHECK(nCode == 1 && strstr(out_of(&res.errors), "exists; give -f to replace it") != NULL &&
+        XSYNC_ATOMIC_GET(&g_cli.nConnects) == 0, "an existing local file is not replaced without -f, and nothing connects");
+    CHECK(read_text(sLocal, sText, sizeof(sText)) && strcmp(sText, "an older local copy\n") == 0, "the local file is untouched");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *getForced[] = { "cp", "-c", pCfg, "-f", CLI_DEVICE_ID ":/srv/hello.txt", "renamed.txt", NULL };
+    nCode = cli_run(pTty, getForced, NULL, 0, &res);
+    CHECK(nCode == 0 && read_text(sLocal, sText, sizeof(sText)) && strcmp(sText, CLI_REMOTE_FILE_TEXT) == 0,
+        "cp -f replaces an existing local file with the download");
+    XExec_ResultClear(&res);
+
+    /* A local file that appears while the download runs is not replaced either: the commit refuses it */
+    snprintf(sLocal, sizeof(sLocal), "%s/race.txt", pRoot);
+    unlink(sLocal);
+    xstrncpy(g_cli.sRacePath, sizeof(g_cli.sRacePath), sLocal);
+    reset_outputs();
+    const char *getRace[] = { "cp", "-c", pCfg, CLI_DEVICE_ID ":/srv/hello.txt", "race.txt", NULL };
+    nCode = cli_run(pTty, getRace, NULL, 0, &res);
+    g_cli.sRacePath[0] = '\0';
+    CHECK(nCode == 1 && strstr(out_of(&res.errors), "exists; give -f to replace it") != NULL,
+        "a destination that appeared during the download is refused at the commit");
+    CHECK(read_text(sLocal, sText, sizeof(sText)) && strcmp(sText, "appeared meanwhile\n") == 0,
+        "the file that appeared meanwhile is untouched");
+    CHECK(no_partial_downloads(pRoot), "the refused download leaves no partial file behind");
+    XExec_ResultClear(&res);
+
+    /* A file system without hard links: the no-clobber falls back to a check right before the rename */
+    char sMark[512], sMarkEnv[600];
+    snprintf(sMark, sizeof(sMark), "%s/no-hardlinks.mark", pRoot);
+    snprintf(sMarkEnv, sizeof(sMarkEnv), "SHIM_NO_HARDLINKS_MARK=%s", sMark);
+    const char *pNoLinks[] = {
+        "LD_PRELOAD=" DIRECTGATE_NO_HARDLINKS_SHIM, "ASAN_OPTIONS=verify_asan_link_order=0", sMarkEnv, NULL
+    };
+    unlink(sMark);
+
+    snprintf(sLocal, sizeof(sLocal), "%s/nolinks.txt", pRoot);
+    unlink(sLocal);
+    reset_outputs();
+    const char *getNoLinks[] = { "cp", "-c", pCfg, CLI_DEVICE_ID ":/srv/hello.txt", "nolinks.txt", NULL };
+    nCode = cli_run_env(pTty, getNoLinks, NULL, 0, pNoLinks, &res);
+    CHECK(access(sMark, F_OK) == 0, "the download tried a hard link and was refused one");
+    CHECK(nCode == 0 && read_text(sLocal, sText, sizeof(sText)) && strcmp(sText, CLI_REMOTE_FILE_TEXT) == 0,
+        "without hard links a download still lands, renamed into place");
+    CHECK(no_partial_downloads(pRoot), "and leaves no partial file behind");
+    XExec_ResultClear(&res);
+
+    snprintf(sLocal, sizeof(sLocal), "%s/nolinks-race.txt", pRoot);
+    unlink(sLocal);
+    xstrncpy(g_cli.sRacePath, sizeof(g_cli.sRacePath), sLocal);
+    reset_outputs();
+    const char *getNoLinksRace[] = { "cp", "-c", pCfg, CLI_DEVICE_ID ":/srv/hello.txt", "nolinks-race.txt", NULL };
+    nCode = cli_run_env(pTty, getNoLinksRace, NULL, 0, pNoLinks, &res);
+    g_cli.sRacePath[0] = '\0';
+    CHECK(nCode == 1 && strstr(out_of(&res.errors), "exists; give -f to replace it") != NULL &&
+        read_text(sLocal, sText, sizeof(sText)) && strcmp(sText, "appeared meanwhile\n") == 0,
+        "without hard links a file that appeared during the download is still not replaced");
+    CHECK(no_partial_downloads(pRoot), "the refused download leaves no partial file behind");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *getOut[] = { "cp", "-c", pCfg, CLI_DEVICE_ID ":/srv/hello.txt", "-", NULL };
+    nCode = cli_run(pTty, getOut, NULL, 0, &res);
+    CHECK(nCode == 0 && strcmp(out_of(&res.output), CLI_REMOTE_FILE_TEXT) == 0,
+        "cp <device>:<file> - writes the file to stdout and nothing else");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *getMissing[] = { "cp", "-c", pCfg, CLI_DEVICE_ID ":/srv/missing.txt", ".", NULL };
+    nCode = cli_run(pTty, getMissing, NULL, 0, &res);
+    snprintf(sLocal, sizeof(sLocal), "%s/missing.txt", pRoot);
+    CHECK(nCode == 1 && strstr(out_of(&res.errors), "file not found") != NULL && access(sLocal, F_OK) != 0,
+        "a missing remote file fails with the host's reason and leaves no local file");
+    CHECK(no_partial_downloads(pRoot), "no partial download is left behind");
+    XExec_ResultClear(&res);
+
+    /* cp to the device: several chunks' worth, into a directory, from stdin, and over an existing file only with -f */
+    size_t nBig = 300U * 1024U + 123U;
+    char *pBig = (char*)malloc(nBig);
+    CHECK(pBig != NULL, "an upload source");
+    for (size_t i = 0; i < nBig; i++) pBig[i] = (char)('a' + (i * 7) % 26);
+
+    snprintf(sLocal, sizeof(sLocal), "%s/upload.bin", pRoot);
+    FILE *pFile = fopen(sLocal, "wb");
+    CHECK(pFile != NULL && fwrite(pBig, 1, nBig, pFile) == nBig, "write the upload source");
+    fclose(pFile);
+
+    reset_outputs();
+    const char *put[] = { "cp", "-c", pCfg, "upload.bin", CLI_DEVICE_ID ":/srv/dir/", NULL };
+    nCode = cli_run(pTty, put, NULL, 0, &res);
+    int bSame = g_cli.upload.nUsed == nBig && memcmp(g_cli.upload.pData, pBig, nBig) == 0;
+    CHECK(nCode == 0 && XSYNC_ATOMIC_GET(&g_cli.bUploadDone), "a multi-chunk upload completes and is acknowledged");
+    CHECK(bSame && strcmp(g_cli.sManagerLast, "save /srv/dir/upload.bin") == 0,
+        "the upload lands under the local name in the remote directory, byte for byte");
+    XExec_ResultClear(&res);
+    free(pBig);
+
+    reset_outputs();
+    const char *putStdin[] = { "cp", "-c", pCfg, "-", CLI_DEVICE_ID ":/srv/notes.txt", NULL };
+    const char *pNotes = "from a pipe\n";
+    nCode = cli_run(pTty, putStdin, pNotes, strlen(pNotes), &res);
+    CHECK(nCode == 0 && g_cli.upload.nUsed == strlen(pNotes) && memcmp(g_cli.upload.pData, pNotes, strlen(pNotes)) == 0,
+        "cp - <device>:<file> uploads what arrives on stdin");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *putNameless[] = { "cp", "-c", pCfg, "-", CLI_DEVICE_ID ":/srv/dir/", NULL };
+    nCode = cli_run(pTty, putNameless, pNotes, strlen(pNotes), &res);
+    CHECK(nCode == 1 && strstr(out_of(&res.errors), "give the remote file a name") != NULL &&
+        XSYNC_ATOMIC_GET(&g_cli.nConnects) == 0, "stdin uploaded into a directory needs a name, before anything connects");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *putExists[] = { "cp", "-c", pCfg, "upload.bin", CLI_DEVICE_ID ":/srv/exists.txt", NULL };
+    nCode = cli_run(pTty, putExists, NULL, 0, &res);
+    CHECK(nCode == 1 && strstr(out_of(&res.errors), "give -f") != NULL && !XSYNC_ATOMIC_GET(&g_cli.bUploadDone),
+        "an existing remote file is not replaced without -f");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *putForce[] = { "cp", "-c", pCfg, "-f", "upload.bin", CLI_DEVICE_ID ":/srv/exists.txt", NULL };
+    nCode = cli_run(pTty, putForce, NULL, 0, &res);
+    CHECK(nCode == 0 && strcmp(g_cli.sManagerLast, "save /srv/exists.txt force") == 0 && XSYNC_ATOMIC_GET(&g_cli.bUploadDone),
+        "cp -f replaces an existing remote file");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *putMissing[] = { "cp", "-c", pCfg, "no-such-file", CLI_DEVICE_ID ":/srv/x", NULL };
+    nCode = cli_run(pTty, putMissing, NULL, 0, &res);
+    CHECK(nCode == 1 && XSYNC_ATOMIC_GET(&g_cli.nConnects) == 0, "a missing upload source fails before anything connects");
+    XExec_ResultClear(&res);
+
+    /* Which side is remote has to be clear: exactly one */
+    reset_outputs();
+    const char *bothLocal[] = { "cp", "-c", pCfg, "a.txt", "b.txt", NULL };
+    nCode = cli_run(pTty, bothLocal, NULL, 0, &res);
+    CHECK(nCode == 255 && strstr(out_of(&res.errors), "exactly one side") != NULL, "a copy with no remote side is refused");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *bothRemote[] = { "cp", "-c", pCfg, CLI_DEVICE_ID ":/a", CLI_DEVICE_ID ":/b", NULL };
+    nCode = cli_run(pTty, bothRemote, NULL, 0, &res);
+    CHECK(nCode == 255 && strstr(out_of(&res.errors), "exactly one side") != NULL && XSYNC_ATOMIC_GET(&g_cli.nConnects) == 0,
+        "a copy between two remote paths is refused");
+    XExec_ResultClear(&res);
+
+    /* rm, mkdir, mv */
+    reset_outputs();
+    const char *rmFile[] = { "rm", "-c", pCfg, CLI_DEVICE_ID ":/srv/old", NULL };
+    CHECK(cli_run(pTty, rmFile, NULL, 0, &res) == 0 && strcmp(g_cli.sManagerLast, "delete /srv/old") == 0,
+        "rm deletes without recursing");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *rmTree[] = { "rm", "-c", pCfg, "-r", CLI_DEVICE_ID ":/srv/old", NULL };
+    CHECK(cli_run(pTty, rmTree, NULL, 0, &res) == 0 && strcmp(g_cli.sManagerLast, "delete /srv/old force") == 0,
+        "rm -r asks for a recursive delete");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *mk[] = { "mkdir", "-c", pCfg, CLI_DEVICE_ID ":/srv/new", NULL };
+    CHECK(cli_run(pTty, mk, NULL, 0, &res) == 0 && strcmp(g_cli.sManagerLast, "mkdir /srv/new") == 0,
+        "mkdir creates the directory");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *mv[] = { "mv", "-c", pCfg, CLI_DEVICE_ID ":/srv/a", "/srv/b", NULL };
+    CHECK(cli_run(pTty, mv, NULL, 0, &res) == 0 && strcmp(g_cli.sManagerLast, "rename /srv/a /srv/b") == 0,
+        "mv renames, never moving aside into a made-up name");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *mvSpec[] = { "mv", "-c", pCfg, CLI_DEVICE_ID ":/srv/a", CLI_DEVICE_ID ":/srv/c", NULL };
+    CHECK(cli_run(pTty, mvSpec, NULL, 0, &res) == 0 && strcmp(g_cli.sManagerLast, "rename /srv/a /srv/c") == 0,
+        "mv takes its target as <device>:<path> too");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *mvOther[] = { "mv", "-c", pCfg, CLI_DEVICE_ID ":/srv/a", "other-box:/srv/c", NULL };
+    nCode = cli_run(pTty, mvOther, NULL, 0, &res);
+    CHECK(nCode == 255 && strstr(out_of(&res.errors), "same device") != NULL && XSYNC_ATOMIC_GET(&g_cli.nConnects) == 0,
+        "mv between two devices is refused before anything connects");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *mvTaken[] = { "mv", "-c", pCfg, CLI_DEVICE_ID ":/srv/a", "/srv/taken", NULL };
+    nCode = cli_run(pTty, mvTaken, NULL, 0, &res);
+    CHECK(nCode == 1 && strstr(out_of(&res.errors), "target already exists") != NULL, "mv onto an existing target fails");
+    XExec_ResultClear(&res);
+
+    /* Refused before connecting: a relative remote path, a path without its device, a missing device */
+    reset_outputs();
+    const char *relative[] = { "rm", "-c", pCfg, CLI_DEVICE_ID ":srv/old", NULL };
+    nCode = cli_run(pTty, relative, NULL, 0, &res);
+    CHECK(nCode == 255 && strstr(out_of(&res.errors), "absolute") != NULL && XSYNC_ATOMIC_GET(&g_cli.nConnects) == 0,
+        "a relative remote path is refused before anything connects");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *noDevice[] = { "rm", "-c", pCfg, "/srv/old", NULL };
+    nCode = cli_run(pTty, noDevice, NULL, 0, &res);
+    CHECK(nCode == 255 && strstr(out_of(&res.errors), "<device>:<path>") != NULL && XSYNC_ATOMIC_GET(&g_cli.nConnects) == 0,
+        "a remote path without its device is refused, saying how to name it");
+    XExec_ResultClear(&res);
+
+    reset_outputs();
+    const char *unknown[] = { "exec", "-c", pCfg, "no-such-box", "true", NULL };
+    nCode = cli_run(pTty, unknown, NULL, 0, &res);
+    CHECK(nCode == 255 && strstr(out_of(&res.errors), "No device matches") != NULL && res.output.nUsed == 0,
+        "an unknown device fails on stderr, with stdout left empty");
+    XExec_ResultClear(&res);
+
+    /* The device list for a script */
+    reset_outputs();
+    const char *devJson[] = { "devices", "-c", pCfg, "-j", NULL };
+    nCode = cli_run(pTty, devJson, NULL, 0, &res);
+    CHECK(nCode == 0 && strncmp(out_of(&res.output), "{\"devices\":[", 12) == 0 &&
+        strstr(out_of(&res.output), "\"id\":\"" CLI_DEVICE_ID "\"") != NULL &&
+        strstr(out_of(&res.output), "\"connectable\":true") != NULL, "devices -j prints the list as JSON");
+    XExec_ResultClear(&res);
+
+    if (scenario_session(pTty, pCfg) != 0) return 1;
+
+    int nMcp = scenario_mcp(pTty, pCfg);
+    g_cli.sAuthorizedKey[0] = '\0';
+    XSYNC_ATOMIC_SET(&g_cli.bOfferExec, 0);
+    return nMcp;
+}
+
 static int parse_login_url(const char *pScreen, uint16_t *pPort, char *pState, size_t nStateSize)
 {
     const char *pUrl = strstr(pScreen, "/cli-auth/start?");
@@ -2002,6 +3314,8 @@ int main(void)
             sizeof(g_cli.sAgentPubB64)), "create the host's identity");
 
     XByteBuffer_Init(&g_cli.typed, XSTDNON, XFALSE);
+    XByteBuffer_Init(&g_cli.execInput, XSTDNON, XFALSE);
+    XByteBuffer_Init(&g_cli.upload, XSTDNON, XFALSE);
     DirectGate_E2E_Init(&g_cli.e2e);
     DirectGate_KeyAuth_Init(&g_cli.keyauth);
     XAPI_Init(&g_cli.api, service_callback, &g_cli);
@@ -2033,6 +3347,13 @@ int main(void)
 
     int nResult = scenario_password_session(&tty, sCfg);
     if (!nResult) nResult = scenario_keys(&tty, sCfg, sRoot);
+    if (!nResult)
+    {
+        /* Remote operations meet a host that answers their offers: their data runs over a real data channel */
+        XSYNC_ATOMIC_SET(&g_cli.bRemoteRtc, 1);
+        nResult = scenario_remote(&tty, sCfg, sRoot);
+        XSYNC_ATOMIC_SET(&g_cli.bRemoteRtc, 0);
+    }
     if (!nResult) nResult = scenario_login(&tty, sAcctCfg, sRoot);
     if (!nResult) nResult = scenario_failures(&tty, sCfg, sRoot);
     if (!nResult) nResult = scenario_bad_host(&tty, sCfg, sRoot);
@@ -2064,6 +3385,8 @@ int main(void)
     DirectGate_KeyAuth_Cleanse(&g_cli.keyauth);
     DirectGate_E2E_Clear(&g_cli.e2e);
     XByteBuffer_Clear(&g_cli.typed);
+    XByteBuffer_Clear(&g_cli.execInput);
+    XByteBuffer_Clear(&g_cli.upload);
     OPENSSL_cleanse(g_cli.agentSeed, sizeof(g_cli.agentSeed));
 
     /* Everything dgcli wrote lives under the private home. */

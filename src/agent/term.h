@@ -140,6 +140,38 @@ size_t DirectGate_Term_ReapPending(void);
 XSTATUS DirectGate_Term_UpdateWinSize(directgate_term_t *pTerm, const struct winsize *pSize);
 XSTATUS DirectGate_Term_GetCwd(const directgate_term_t *pTerm, char *pBuf, size_t nBufSize);
 
+#ifndef _WIN32
+/* Everything the child needs, worked out in the parent. The agent is threaded
+ * (libdatachannel, search, capture, audio), and after fork() the child holds
+ * a copy of every lock exactly as it was: a name-service lookup, a malloc or
+ * a log line there can wait forever on a lock whose owner does not exist in
+ * the child. So the child only makes system calls on what is prepared here. */
+typedef struct directgate_term_spawn_ {
+    uid_t nUid;
+    gid_t nGid;
+    gid_t *pGroups;
+    int nGroups;
+    xbool_t bSwitchUser;
+    char sWorkDir[XPATH_MAX];
+    char sShell[XPATH_MAX];
+    char sArg0[XPATH_MAX];
+    char **ppEnv;
+} directgate_term_spawn_t;
+
+/* The account a shell runs as - shell.user, its groups, shell.home or its home, its login shell and an
+ * environment naming it - for the PTY and for a non-interactive command alike, so the two can never run as
+ * different users. A configured user that does not resolve fails closed. Release with FreeSpawn. */
+XSTATUS DirectGate_Term_ResolveShell(const directgate_term_t *pTerm, directgate_term_spawn_t *pSpawn);
+void DirectGate_Term_FreeSpawn(directgate_term_spawn_t *pSpawn);
+
+/* Ends a child that leads its own process group the way a closed terminal does: SIGHUP to the group, then
+ * SIGKILL to whatever outstays the grace period, collected by DirectGate_Term_ReapPending off the event loop. */
+void DirectGate_Term_HangupProcess(pid_t nPid);
+#else
+/* Refuses a shell.user that is not the account running the agent: there is no user switching on Windows. */
+XSTATUS DirectGate_Term_ValidateShellUser(const directgate_term_t *pTerm);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

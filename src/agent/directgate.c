@@ -145,6 +145,8 @@ static xbool_t DirectGate_Session_HasOutboundTransfer(const directgate_session_t
     return pSession->transfer.eState == XTRANSFER_STATE_SENDING;
 }
 
+/* A download waiting for its data channel is woken by the channel opening, or by the end of the wait
+   (see DirectGate_Conn_GetBulkWaitMs): only one that can move now keeps the loop at the transfer pace */
 static xbool_t DirectGate_Conn_HasOutboundTransfers(const directgate_conn_t *pConn)
 {
     XCHECK_NL((pConn != NULL), XFALSE);
@@ -153,23 +155,52 @@ static xbool_t DirectGate_Conn_HasOutboundTransfers(const directgate_conn_t *pCo
     for (i = 0; i < DIRECTGATE_MAX_SESSIONS; i++)
     {
         const directgate_session_t *pSession = pConn->mgr.pSessions[i];
-        if (DirectGate_Session_HasOutboundTransfer(pSession)) return XTRUE;
+        if (!DirectGate_Session_HasOutboundTransfer(pSession)) continue;
+        if (DirectGate_Session_GetBulkWaitMs(pSession, XTime_GetMonoMs()) == DIRECTGATE_COMMAND_WAIT_NONE) return XTRUE;
     }
 
     return XFALSE;
 }
 
-static xbool_t DirectGate_Session_IsTransferWritable(const directgate_session_t *pSession)
+/* The shortest time until a session's wait for its data channel runs out */
+static uint32_t DirectGate_Conn_GetBulkWaitMs(const directgate_conn_t *pConn)
+{
+    XCHECK_NL((pConn != NULL), DIRECTGATE_COMMAND_WAIT_NONE);
+    uint32_t nWaitMs = DIRECTGATE_COMMAND_WAIT_NONE;
+    uint64_t nNowMs = 0;
+    unsigned int i;
+
+    for (i = 0; i < DIRECTGATE_MAX_SESSIONS; i++)
+    {
+        const directgate_session_t *pSession = pConn->mgr.pSessions[i];
+        if (pSession == NULL || !DirectGate_Session_HasBulk(pSession)) continue;
+
+        if (!nNowMs) nNowMs = XTime_GetMonoMs();
+        uint32_t nBulkMs = DirectGate_Session_GetBulkWaitMs(pSession, nNowMs);
+        if (nBulkMs < nWaitMs) nWaitMs = nBulkMs;
+    }
+
+    return nWaitMs;
+}
+
+static xbool_t DirectGate_Session_IsTransferWritable(directgate_session_t *pSession, uint64_t nNowMs)
 {
     XCHECK_NL((pSession != NULL), XFALSE);
     XCHECK_NL(DirectGate_Session_HasOutboundTransfer(pSession), XFALSE);
 
-    if (DirectGate_WebRTC_IsConnected(&pSession->webrtc))
+    /* Bulk data: nothing goes while the data channel is coming, and the relay only once there is no other way */
+    directgate_bulk_route_t eRoute = DirectGate_Session_GetBulkRoute(pSession, nNowMs);
+    if (eRoute == DIRECTGATE_BULK_WAIT) return XFALSE;
+
+    if (eRoute == DIRECTGATE_BULK_CHANNEL && DirectGate_WebRTC_IsConnected(&pSession->webrtc))
     {
         int nBuffered = DirectGate_WebRTC_GetBufferedAmount(&pSession->webrtc);
         if (nBuffered < 0) return XTRUE;
         return (uint32_t)nBuffered < DIRECTGATE_TRANSFER_RTC_BUFFER_MAX;
     }
+
+    /* The relay: below its limit, and behind no more than its link has queued */
+    if (DirectGate_Session_GetRelayWaitMs(pSession, nNowMs)) return XFALSE;
 
     XCHECK_NL((pSession->pWsSession != NULL), XFALSE);
     return pSession->pWsSession->txBuffer.nUsed < DIRECTGATE_TRANSFER_WS_BUFFER_MAX;
@@ -190,25 +221,71 @@ static xbool_t DirectGate_Conn_HasPausedTerminals(const directgate_conn_t *pConn
     return XFALSE;
 }
 
-static void DirectGate_PumpOutboundTransfers(directgate_conn_t *pConn)
+/* The shortest any running command may wait for a pass no event would bring (see DirectGate_CMD_GetWaitMs) */
+static uint32_t DirectGate_Conn_GetCommandWaitMs(const directgate_conn_t *pConn)
+{
+    XCHECK_NL((pConn != NULL), DIRECTGATE_COMMAND_WAIT_NONE);
+    uint32_t nWaitMs = DIRECTGATE_COMMAND_WAIT_NONE;
+    uint64_t nNowMs = 0;
+    unsigned int i;
+
+    for (i = 0; i < DIRECTGATE_MAX_SESSIONS; i++)
+    {
+        const directgate_session_t *pSession = pConn->mgr.pSessions[i];
+        if (pSession == NULL || !DirectGate_CMD_IsRunning(&pSession->command)) continue;
+
+        if (!nNowMs) nNowMs = XTime_GetMonoMs();
+        uint32_t nCmdMs = DirectGate_CMD_GetWaitMs(&pSession->command, nNowMs);
+        if (nCmdMs < nWaitMs) nWaitMs = nCmdMs;
+    }
+
+    return nWaitMs;
+}
+
+/* Every pass collects exits, enforces timeouts and closes finished sessions; an exit endpoint, where the system has
+   one, only makes sure a pass comes when the program ends. A session closed here is gone from its slot, so each
+   one is looked up afresh. */
+static void DirectGate_CheckCommands(directgate_conn_t *pConn)
 {
     XCHECK_VOID_NL((pConn != NULL));
+    uint64_t nNowMs = XTime_GetMonoMs();
     unsigned int i;
 
     for (i = 0; i < DIRECTGATE_MAX_SESSIONS; i++)
     {
         directgate_session_t *pSession = pConn->mgr.pSessions[i];
-        if (pSession != NULL) DirectGate_Term_ResumeRead(&pSession->term);
+        if (pSession == NULL || pSession->bClosing) continue;
+        if (pSession->eActiveMode != DIRECTGATE_SESSION_MODE_EXEC && pSession->eActiveMode != DIRECTGATE_SESSION_MODE_REMOTE)
+            continue;
+        DirectGate_CMD_Check(pSession, nNowMs);
+    }
+}
 
-        if (!DirectGate_Session_HasOutboundTransfer(pSession)) continue;
+static void DirectGate_PumpOutboundTransfers(directgate_conn_t *pConn)
+{
+    XCHECK_VOID_NL((pConn != NULL));
+    uint64_t nNowMs = XTime_GetMonoMs();
+    unsigned int i;
+
+    for (i = 0; i < DIRECTGATE_MAX_SESSIONS; i++)
+    {
+        directgate_session_t *pSession = pConn->mgr.pSessions[i];
+        if (pSession == NULL) continue;
+
+        DirectGate_Term_ResumeRead(&pSession->term);
+        if (pSession->bClosing) continue;
+        if (pSession->bPendingOpen) DirectGate_Files_StartPendingOpen(pSession, nNowMs);
+
         unsigned int j;
-
         for (j = 0; j < DIRECTGATE_TRANSFER_BUDGET; j++)
         {
             if (!DirectGate_Session_HasOutboundTransfer(pSession)) break;
-            if (!DirectGate_Session_IsTransferWritable(pSession)) break;
+            if (!DirectGate_Session_IsTransferWritable(pSession, nNowMs)) break;
             DirectGate_Files_ProcessTransfer(pSession);
         }
+
+        /* Done with what was in progress: the next bulk data chooses its route afresh */
+        if (!DirectGate_Session_HasBulk(pSession)) DirectGate_Session_ReleaseBulk(pSession);
     }
 }
 
@@ -218,10 +295,14 @@ static uint32_t DirectGate_GetServiceWaitMs(const directgate_conn_t *pConn)
         pConn->pResolveJob != NULL)
         return DIRECTGATE_WORKER_WAIT_MS;
 
-    return (DirectGate_Conn_HasOutboundTransfers(pConn) ||
-            DirectGate_Conn_HasPausedTerminals(pConn)) ?
-                        DIRECTGATE_TRANSFER_WAIT_MS :
-                        DIRECTGATE_EVENT_LOOP_WAIT_MS;
+    xbool_t bPumping = DirectGate_Conn_HasOutboundTransfers(pConn) || DirectGate_Conn_HasPausedTerminals(pConn);
+    uint32_t nWaitMs = bPumping ? DIRECTGATE_TRANSFER_WAIT_MS : DIRECTGATE_EVENT_LOOP_WAIT_MS;
+
+    uint32_t nCommandMs = DirectGate_Conn_GetCommandWaitMs(pConn);
+    if (nCommandMs < nWaitMs) nWaitMs = nCommandMs;
+
+    uint32_t nBulkMs = DirectGate_Conn_GetBulkWaitMs(pConn);
+    return nBulkMs < nWaitMs ? nBulkMs : nWaitMs;
 }
 
 static uint32_t DirectGate_ReconnectDelayMs(uint32_t nAttempt)
@@ -767,6 +848,19 @@ int DirectGate_LogStatus(xapi_ctx_t *pCtx, xapi_session_t *pSession)
     XCHECK_NL((!g_bFinish), XAPI_CONTINUE);
     XCHECK_NL((pCtx != NULL), XAPI_CONTINUE);
     XCHECK_NL((pSession != NULL), XAPI_CONTINUE);
+
+    /* Every custom endpoint carries its directgate_session_t (see DirectGate_GetConn). A program's stream that
+       hangs up while paused still holds what the program wrote last; the descriptor closes once this returns. */
+    if (pSession->eRole == XAPI_CUSTOM && pSession->pSessionData != NULL &&
+        pCtx->eStatType == XAPI_SELF && pCtx->nStatus == XAPI_HUNGED)
+    {
+        directgate_session_t *pOwner = (directgate_session_t*)pSession->pSessionData;
+        if (!pOwner->bClosing && DirectGate_CMD_OwnsFd(&pOwner->command, pSession->sock.nFD))
+            DirectGate_CMD_OnHangup(pOwner, pSession->sock.nFD);
+
+        return XAPI_CONTINUE;
+    }
+
     XCHECK_NL((pConn != NULL), XAPI_CONTINUE);
 
     if (pConn->nNextReconnectMs == 0)
@@ -842,6 +936,9 @@ static int DirectGate_HandleCustomRead(xapi_session_t *pApiSession)
     if ((int)pApiSession->sock.nFD == DirectGate_Files_GetOpFd(pSession))
         return DirectGate_Files_ProcessOp(pSession);
 
+    if (DirectGate_CMD_OwnsFd(&pSession->command, pApiSession->sock.nFD))
+        return DirectGate_CMD_OnRead(pSession, pApiSession->sock.nFD);
+
     XCHECK(DirectGate_Term_IsRunning(&pSession->term), XAPI_DISCONNECT);
     return DirectGate_Term_OnRead(&pSession->term);
 }
@@ -859,6 +956,9 @@ static int DirectGate_HandleCustomWrite(xapi_session_t *pApiSession)
     if ((int)pApiSession->sock.nFD == nPipeFd) return XAPI_CONTINUE;
     if ((int)pApiSession->sock.nFD == nDesktopFd) return XAPI_CONTINUE;
     if ((int)pApiSession->sock.nFD == DirectGate_Files_GetOpFd(pSession)) return XAPI_CONTINUE;
+
+    if (DirectGate_CMD_OwnsFd(&pSession->command, pApiSession->sock.nFD))
+        return DirectGate_CMD_OnWrite(pSession, pApiSession->sock.nFD);
 
     XCHECK(DirectGate_Term_IsRunning(&pSession->term), XAPI_DISCONNECT);
     return DirectGate_Term_OnWrite(&pSession->term);
@@ -898,6 +998,12 @@ static int DirectGate_HandleRegistered(xapi_session_t *pApiSession)
     if ((int)pApiSession->sock.nFD == DirectGate_Files_GetOpFd(pSession))
     {
         pSession->pFileOpSession = pApiSession;
+        return XAPI_CONTINUE;
+    }
+
+    if (DirectGate_CMD_OwnsFd(&pSession->command, pApiSession->sock.nFD))
+    {
+        DirectGate_CMD_OnRegistered(&pSession->command, pApiSession);
         return XAPI_CONTINUE;
     }
 
@@ -945,6 +1051,13 @@ static int DirectGate_HandleClosed(xapi_session_t *pApiSession)
 
     if ((int)pApiSession->sock.nFD == DirectGate_Files_GetOpFd(pSession))
         return DirectGate_Files_OnOpClosed(pSession);
+
+    /* A program's stream at end of file, or dropped: the session lives on until the exit is reported */
+    if (DirectGate_CMD_OwnsFd(&pSession->command, pApiSession->sock.nFD))
+    {
+        DirectGate_CMD_OnClosed(&pSession->command, pApiSession->sock.nFD);
+        return XAPI_NO_ACTION;
+    }
 
     // Detach terminal events to avoid use-after-free
     DirectGate_Term_DetachEvent(&pSession->term);
@@ -1069,6 +1182,9 @@ int DirectGate_HandshakeResponse(xapi_ctx_t *pCtx, xapi_session_t *pApiSession)
 
             return XAPI_CONTINUE;
         }
+
+        /* A new relay link: no limit until this relay tells of one */
+        DirectGate_SessionMgr_SetRelayLimit(&pConn->mgr, 0, 0);
 
         xjson_obj_t *pHeader = DirectGate_Proto_BuildRole("agent", pCfg->sDeviceId);
         XCHECK((pHeader != NULL), XAPI_DISCONNECT);
@@ -1729,6 +1845,24 @@ static int DirectGate_HandleAdmin(xapi_session_t *pApiSession, directgate_pkg_t 
     return DirectGate_Admin_SendActionResp(pSession, "admin-result", "error", "unknown-action");
 }
 
+static int DirectGate_HandleExec(xapi_session_t *pApiSession, directgate_pkg_t *pPkg)
+{
+    directgate_conn_t *pConn = (directgate_conn_t*)pApiSession->pSessionData;
+    XCHECK((pConn != NULL), xthrowr(XAPI_DISCONNECT, "Invalid connection"));
+
+    directgate_session_t *pSession = DirectGate_SessionMgr_Find(&pConn->mgr, pPkg->header.nSessionId);
+    if (pSession == NULL)
+    {
+        xlogw("Exec message for an unknown session: id(%u), fd(%d), sid(%u)",
+            DirectGate_Conn_GetID(pConn, pApiSession), DirectGate_Conn_GetFD(pConn, pApiSession),
+            pPkg->header.nSessionId);
+
+        return XAPI_CONTINUE;
+    }
+
+    return DirectGate_CMD_HandleMessage(pSession, (const directgate_pkg_exec_t*)pPkg->pPackage);
+}
+
 static int DirectGate_HandleData(xapi_session_t *pApiSession, directgate_pkg_t *pPkg)
 {
     const directgate_pkg_data_t *pDataPkg = (const directgate_pkg_data_t*)pPkg->pPackage;
@@ -1781,6 +1915,14 @@ static int DirectGate_HandleData(xapi_session_t *pApiSession, directgate_pkg_t *
     }
 
     return XAPI_CONTINUE;
+}
+
+/* The relay's limit (see DIRECTGATE_RELAY_PACE_UNIT): a status for no session */
+static xbool_t DirectGate_IsRelayLimit(const directgate_pkg_t *pPkg)
+{
+    XCHECK_NL((pPkg->header.nSessionId == 0 && xstrcmp(pPkg->header.pType, "status")), XFALSE);
+    const directgate_pkg_status_t *pStatus = (const directgate_pkg_status_t*)pPkg->pPackage;
+    return (pStatus != NULL && xstrused(pStatus->pStatus) && xstrcmp(pStatus->pStatus, "limit")) ? XTRUE : XFALSE;
 }
 
 static int DirectGate_HandleStatus(xapi_session_t *pApiSession, directgate_pkg_t *pPkg)
@@ -1901,6 +2043,13 @@ static int DirectGate_HandleWebRTC(xapi_session_t *pApiSession, directgate_pkg_t
         return XAPI_CONTINUE;
     }
 
+    /* The client's own ICE failed: no channel is coming, and the relay is the only way left for bulk data */
+    if (xstrcmp(pWebRTC->pAction, "unavailable"))
+    {
+        DirectGate_Session_SetBulkRelay(pSession);
+        return XAPI_CONTINUE;
+    }
+
     directgate_webrtc_t *pRTC = &pSession->webrtc;
     const directgate_cfg_t *pCfg = pConn->pCfg;
     xjson_obj_t *pHdrObj = pPkg->jsonHeader.pRootObj;
@@ -1955,6 +2104,16 @@ static int DirectGate_HandleWebRTC(xapi_session_t *pApiSession, directgate_pkg_t
         {
             xloge("Failed to handle WebRTC offer: sid(%u), wsfd(%d)",
                 pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
+
+            /* A session's first offer: no channel is coming, and its client is told so instead of waiting it out.
+               One replacing a working peer - in the background - leaves that peer and its route as they are. */
+            if (!bBackgroundP2P && !DirectGate_WebRTC_IsConnected(pRTC))
+            {
+                DirectGate_Session_SetBulkRelay(pSession);
+                xjson_obj_t *pHeader = DirectGate_Proto_BuildWebRTC("unavailable", pSession->nSessionId);
+                if (pHeader != NULL) DirectGate_Session_Send(pSession, pHeader, NULL, XSTDNON);
+                XJSON_FreeObject(pHeader);
+            }
 
             return XAPI_CONTINUE;
         }
@@ -2659,6 +2818,7 @@ static int DirectGate_DispatchMessage(xapi_session_t *pApiSession, directgate_pk
     if (xstrcmp(pPkg->header.pType, "manager")) return DirectGate_Files_HandleManager(pApiSession, pPkg);
     if (xstrcmp(pPkg->header.pType, "admin")) return DirectGate_HandleAdmin(pApiSession, pPkg);
     if (xstrcmp(pPkg->header.pType, "keepalive")) return DirectGate_HandleKeepalive(pApiSession, pPkg);
+    if (xstrcmp(pPkg->header.pType, "exec")) return DirectGate_HandleExec(pApiSession, pPkg);
 
     xlogw("Unknown protocol message type: id(%u), fd(%d), type(%s), sid(%u)",
         DirectGate_Conn_GetID(pConn, pApiSession),
@@ -2768,6 +2928,7 @@ static xbool_t DirectGate_RequiresEncryption(directgate_conn_t *pConn, directgat
             xstrcmp(pPkg->header.pType, "webrtc") ||
             xstrcmp(pPkg->header.pType, "role") ||
             xstrcmp(pPkg->header.pType, "admin") ||
+            xstrcmp(pPkg->header.pType, "exec") ||
             xstrcmp(pPkg->header.pType, "keepalive"));
 }
 
@@ -2816,7 +2977,14 @@ static int DirectGate_HandleTransportMessage(xapi_session_t *pApiSession,
     xbool_t bOwnResume = !xstrcmp(pTransport, "WebRTC") && DirectGate_IsOwnResume(&pkg);
     if (!xstrcmp(pTransport, "WebRTC") && pkg.header.nSessionId && !bOwnResume) DirectGate_ReleaseDetached(pConn, &pkg);
 
-    if (xstrcmp(pkg.header.pType, "encrypted"))
+    if (xstrcmp(pTransport, "relay") && DirectGate_IsRelayLimit(&pkg))
+    {
+        /* Plain, on the relay link and for no session: the relay itself. Clients cannot send a status there
+           the relay refuses it - and one sealed inside a session, or on a data channel, never gets here. */
+        const directgate_pkg_status_t *pStatus = (const directgate_pkg_status_t*)pkg.pPackage;
+        DirectGate_SessionMgr_SetRelayLimit(&pConn->mgr, pStatus->nRateBytes, pStatus->nBurstBytes);
+    }
+    else if (xstrcmp(pkg.header.pType, "encrypted"))
     {
         xlogt("Dispatching encrypted %s message: id(%u), fd(%d), sid(%u)",
             xstrused(pTransport) ? pTransport : "transport",
@@ -2863,6 +3031,11 @@ int DirectGate_TestHandleTransportMessage(xapi_session_t *pApiSession,
                                           size_t nPayload)
 {
     return DirectGate_HandleTransportMessage(pApiSession, pPayload, nPayload, "test");
+}
+
+int DirectGate_TestHandleRelayMessage(xapi_session_t *pApiSession, const uint8_t *pPayload, size_t nPayload)
+{
+    return DirectGate_HandleTransportMessage(pApiSession, pPayload, nPayload, "relay");
 }
 #endif
 
@@ -2925,6 +3098,7 @@ static int DirectGate_HandleTick(xapi_ctx_t *pCtx, xapi_session_t *pApiSession)
 
     directgate_conn_t *pConn = (directgate_conn_t*)pCtx->pApi->pUserCtx;
     if (pConn != NULL) DirectGate_PumpOutboundTransfers(pConn);
+    if (pConn != NULL) DirectGate_CheckCommands(pConn);
 
     return XAPI_CONTINUE;
 }
@@ -3631,6 +3805,16 @@ void DirectGate_TestDropRelayResolve(directgate_conn_t *pConn)
 void DirectGate_TestInitialConnect(xapi_t *pApi, xapi_endpoint_t *pEndpt, directgate_conn_t *pConn)
 {
     DirectGate_InitialConnect(pApi, pEndpt, pConn);
+}
+
+void DirectGate_TestPumpTransfers(directgate_conn_t *pConn)
+{
+    DirectGate_PumpOutboundTransfers(pConn);
+}
+
+uint32_t DirectGate_TestGetServiceWaitMs(const directgate_conn_t *pConn)
+{
+    return DirectGate_GetServiceWaitMs(pConn);
 }
 #endif
 

@@ -94,6 +94,21 @@ The terminal runs `shell.user`'s login shell from the account database, unless t
 
 Output is paced to the client: when more than 4 MB is waiting to be sent, the agent stops reading the terminal until the backlog drops below 1 MB, and the program writing to it simply blocks, the way it would on a slow terminal. Input that would push the backlog towards the shell past 8 MB is refused. Closing a session hangs the shell up and, if it has not exited half a second later, kills its process group - without the agent waiting for it.
 
+### Commands (exec sessions)
+
+A client can also run one command without a terminal - what `ssh host 'command'` does, and what `dgcli exec` and AI agents use. The command runs as the same account the terminal would, through that account's shell (`<shell> -c <command>`; `%COMSPEC% /d /s /c` on Windows), with the terminal's environment except `TERM=dumb`. stdout and stderr reach the client separately, and its exit code (or the signal that ended it) comes back last.
+
+- It starts in the directory the client names, which has to be an absolute path (a relative one is refused before anything runs); one that cannot be entered fails the command (exit 127) instead of running it elsewhere. Without one it starts where a terminal would, falling back to `/`.
+- It runs in a process group of its own, with every inherited descriptor beyond stdin, stdout and stderr closed and every signal at its default. A signal the client forwards, a timeout it asked for and a session that goes away all reach that whole group. It does not outlive the agent either: on Linux the shell is killed when the agent dies (and never starts if the agent is already gone), on Windows the whole job is.
+- Output is paced exactly like a terminal's (4 MB / 1 MB), and at most 8 MB of input may wait for a command that is not reading it.
+- Output takes the session's WebRTC data channel, direct or through TURN. The relay carries it only when WebRTC cannot be established - the client says so, or no channel opened within 15 s - and there it is kept below the limit the relay announces, so one busy command never holds up the device's other sessions on the relay link. A command does not start before its output has a route (`the data channel is not ready`); `dgcli` starts it once its channel is open, or after 10 s on the relay.
+- A client may keep one session for many commands and file operations, one at a time (session mode `remote`, `dgcli session`): signalling and authentication happen once, not per command.
+- A client may ask for no more than so much of each stream (`outputMax`, `dgcli exec -o`). The rest is read and dropped on the device rather than sent, so the command runs exactly as it would with all of its output read - it is never blocked or cut off by the limit - and the link carries only what the client will keep. A command that prints without end still runs until its timeout.
+- The exit is reported the moment the command ends. On Linux 5.3 and later the agent waits for it as an event, so a command that has closed its output (`make > build.log 2>&1`) costs the agent nothing while it runs; elsewhere such an exit is polled for, from every 5 ms backing off to every 100 ms.
+- The agent logs that a command ran - session, pid, exit code, duration - but never the command line, which can carry a password as easily as a path.
+
+A pre-logon Windows agent and a temporary desktop share never run commands. The wire format is in [`exec`](../../docs/protocol.md#exec).
+
 ## Running the agent
 
 The agent exits with an error at start-up when its configuration has not been paired, or has no usable SRP password record: pair it first (see [Command-line options](#command-line-options)).
@@ -191,7 +206,7 @@ On a machine with no browser (a box you reached over SSH, for example) the CLI d
 dgcli                # pick a device with the arrow keys, then connect
 dgcli homelab        # connect by device name, exact or unique prefix
 dgcli -d <device-id> # connect by device id
-dgcli devices        # just list the account's devices
+dgcli devices        # just list the account's devices (dgcli ls does the same)
 ```
 
 The picker marks each device online (green), offline (yellow) or unavailable (red) and refuses to connect to devices the backend would reject anyway - unpaired, expired enrollment, or a share invitation you have not accepted. When stdin is not a terminal it falls back to a numbered prompt.
@@ -237,6 +252,70 @@ Two things have to line up for a key attempt to happen. The key file has to load
 host presenting any other identity is refused outright rather than falling back, since it is not provably the device that was asked for. A host that proves its identity but has not authorized the key is a different case: that is what the password is for, so the CLI reconnects and runs SRP instead.
 
 The file is the same `directgate-client-key-v2` identity the agent generates and the web client loads, so one key works across all three.
+
+### Remote operations (scripts and AI agents)
+
+The same connection can do one thing and exit, with no terminal, no prompt and nothing on stdout but the result - so a script, a CI job or an AI agent can use a device the way it uses `ssh` and `scp`:
+
+```sh
+dgcli exec homelab 'df -h /'                     # stdout/stderr kept apart, exit code is the command's
+echo data | dgcli exec homelab 'cat > /tmp/x'    # piped stdin goes to the command
+dgcli exec -t 30 -C /srv/app homelab -- make test   # timeout (seconds) and directory, before the device
+dgcli exec -o 64K homelab 'journalctl -b'        # at most 64 KB of each stream; the rest is dropped on the device
+dgcli cp homelab:/etc/hostname .                 # download; a directory keeps the remote name
+dgcli cp homelab:/etc/hostname -                 # download to stdout
+dgcli cp ./build.tar homelab:/tmp/               # upload; a remote path ending in / keeps the local name
+tar c src | dgcli cp - homelab:/tmp/src.tar      # upload from stdin
+dgcli cp -f notes.txt homelab:/tmp/notes.txt     # -f replaces an existing file, in either direction
+dgcli ls homelab:/var/log                        # a listing; -j prints it as JSON
+dgcli rm homelab:/tmp/old.log                    # a file or an empty directory
+dgcli rm -r homelab:/tmp/old-build               # -r: a directory with everything in it
+dgcli mkdir homelab:/tmp/new
+dgcli mv homelab:/tmp/a /tmp/b                   # an existing target is refused, never replaced
+dgcli ls -j                                      # the account's devices, as JSON (as does devices -j)
+dgcli session -t 120 homelab                     # many of the above on one connection, requests on stdin
+```
+
+Each of these connects, authenticates and sets up its data channel for one operation. `dgcli session <device>` does
+that once and then runs operations one after another for as long as its caller keeps it: it writes `{"ready":true}`
+on its first line, then reads one JSON request per line - `{"argv":["exec","df -h /"]}`, with an optional `"stdin"`
+(text for the command) and `"max"` (bytes kept of each stream, 16 MB at most) - and answers each with a JSON line,
+`{"exitCode":0,"stdout":12,"stderr":0,"truncated":false}`, followed by exactly that many bytes of stdout and then of
+stderr. `argv` is any of the operations above, without the device. The session ends at end of input, after 10 minutes
+with no request (`-t` sets fewer seconds), and once it has lived 30 minutes - never in the middle of an operation - so
+what the account may reach is checked again on the next connection. Errors that end it exit 255.
+
+Data - file contents and command output - moves over WebRTC, direct or through TURN, like every other session's. When
+no data channel opens within 10 s, or WebRTC fails outright, `dgcli` tells the device so and the relay carries it,
+kept below the relay's per-session limit.
+
+The operation comes first, then its options, then its operands. Each option belongs to the operations it means something to - `-f` to `cp`, `-r` to `rm`, `-j` to `ls`, `-t`, `-C` and `-o` to `exec` - and is refused anywhere else rather than ignored (`rm -rf` asks you to drop the `f`; nothing ever asks before removing). `exec` takes the device and then the command; whatever follows the device belongs to the command (`dgcli exec host ls -la` runs `ls -la`, and `--` may separate them). The file operations name the remote side the way `scp` does, as `<device>:<path>`: `cp` copies whichever way that points, so exactly one of its two arguments is remote, and `mv` moves within one device (its target may be written `/b` or `homelab:/b`). Anything with no `<device>:` in front is local; a single letter before the colon is a Windows drive (`C:\dir`), and `./name:with:colons` is how to name a local file whose name holds a colon. Remote paths must be absolute.
+
+Nothing is replaced without `-f`: not an existing local file a download would land on, and not an existing remote file an upload would land on. The local check happens before anything is fetched and again when the finished download is moved into place, so a file that appears in the meantime is not replaced either - the download fails and leaves it alone.
+
+Ctrl-C (or SIGTERM) is forwarded to a running command, whose exit is still waited for; a second one ends `dgcli`. A command still running when its session ends - `dgcli` gone, the connection lost - is hung up and then killed, with its process group. Should the agent itself die, Linux kills the command's shell with it and Windows its whole job; on macOS it runs on until it ends.
+
+Exit codes: `exec` exits with the command's own status - 128 + the signal for one ended by a signal, 137 for one killed for its timeout. `dgcli` itself failing - bad arguments, signing in, connecting, a device that does not match, an agent too old to run commands (it says so) - exits 255, as ssh does. The file operations exit 0 on success and 1 when the device refuses or a local file is in the way (the reason is on stderr).
+
+These never ask for a password without a terminal, so authenticate with a client key first (`dgcli -g`, then `dgcli -A -d <device>`, above). A download is written next to its destination, checked against its SHA-256 and only then moved into place; an upload is reserved on the device first and only replaces anything once it is verified there.
+
+### MCP server
+
+`dgcli mcp` serves the same operations to an AI agent as [Model Context Protocol](https://modelcontextprotocol.io) tools, over stdio: `list_devices`, `exec`, `list_directory`, `read_file`, `write_file`, `upload`, `download`, `remove`, `make_directory`, `move` and `disconnect`. A call runs `dgcli` again for that one operation - its own connection, authentication and end-to-end keys - unless it passes `keep_open: true`: then the connection (a `dgcli session`) stays open, and the device's next calls run on it without signalling or authenticating again, until `disconnect` closes it, the session's idle or lifetime limit ends it, or `dgcli mcp` exits. At most 8 are kept, the least recently used one closing first; a kept connection that turns out to be gone is opened again for the call, and an agent too old for sessions gets one connection per call as before. It runs on the machine the AI agent runs on - the keys never leave it - and takes the options its calls should use (`-c`, `-k`, `-a`, `-w`).
+
+For Claude Code, for example:
+
+```sh
+claude mcp add directgate -- dgcli mcp
+```
+
+or in an MCP client's JSON configuration:
+
+```json
+{ "mcpServers": { "directgate": { "command": "dgcli", "args": ["mcp"] } } }
+```
+
+`exec` returns the exit code, stdout and stderr (each cut at 128 KB) both as text and as structured content, and is an error result when the command exits non-zero. The device is asked for no more than that (`-o`), so a command that prints megabytes does not send them over the link only for them to be thrown away; a cut is reported as `truncated`. `read_file` returns UTF-8 text up to 256 KB and refuses anything larger or binary, pointing at `download`. A command gets 600 s unless the call names a `timeout_seconds`.
 
 ### Client config
 

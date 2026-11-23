@@ -55,8 +55,22 @@ void DirectGate_DisplayUsage(const char *pName)
     printf("Commands are:\n");
     printf("  login                # Sign in through the browser\n");
     printf("  logout               # Forget the stored session\n");
-    printf("  devices              # List the devices on your account\n");
+    printf("  devices, ls          # List the devices on your account\n");
     printf("  whoami               # Show the signed in account\n\n");
+
+    printf("One operation and exit, as ssh and scp do - for scripts and AI agents:\n");
+    printf("  exec [-t <s>] [-C <dir>] <device> <command...>  # Run a command; dgcli exits with its code\n");
+    printf("  cp [-f] <device>:<path> <local|->               # Download (- writes it to stdout)\n");
+    printf("  cp [-f] <local|-> <device>:<path>               # Upload (- reads stdin; a path ending in / keeps the name)\n");
+    printf("  ls [-j] <device>:<path>                         # List a directory (plain ls lists the devices)\n");
+    printf("  rm [-r] <device>:<path>                         # Remove a file (-r: a directory and all in it)\n");
+    printf("  mkdir <device>:<path>                           # Create a directory\n");
+    printf("  mv <device>:<path> <path>                       # Move or rename; an existing target is refused\n");
+    printf("  session [-t <s>] <device>                       # Run many of these on one connection: requests on stdin\n");
+    printf("  mcp [-c <config>] [-k <key>]                    # Serve all of these to an AI agent over MCP\n");
+    printf("  Remote paths are absolute. Nothing is replaced without -f. Authenticate with a\n");
+    printf("  client key (-g, then -A) so nothing asks for a password.\n\n");
+
     printf("Options are:\n");
     printf("  -d <id|name>         # Device to connect to\n");
     printf("  -a <url>             # API base URL\n");
@@ -67,10 +81,16 @@ void DirectGate_DisplayUsage(const char *pName)
     printf("  -p <path>            # Device list file path\n");
     printf("  -n <name>            # Device name for the local device list\n");
     printf("  -k <path>            # Client key file, tried before the password\n");
+    printf("  -t <seconds>         # exec: kill the command after this long; session: end it after this long idle\n");
+    printf("  -C <path>            # exec: remote directory to run in\n");
+    printf("  -o <bytes>           # exec: keep at most this much of each output stream (K, M, G); the rest is\n");
+    printf("                       #       dropped on the device, and the command still runs to its end\n");
+    printf("  -j                   # devices, ls: print JSON\n");
+    printf("  -r                   # rm: a directory with everything in it\n");
     printf("  -A                   # Authorize the client key on a device and exit\n");
     printf("  -B                   # Sign in without opening a browser\n");
     printf("  -g                   # Generate a client key and exit\n");
-    printf("  -f                   # Force overwrite device in list\n");
+    printf("  -f                   # Force overwrite device in list; cp: replace the destination\n");
     printf("  -s                   # Save device in the list file\n");
     printf("  -i                   # Init config and exit\n");
     printf("  -h                   # Version and usage\n\n");
@@ -84,6 +104,7 @@ xbool_t DirectGate_ParseCommand(const char *pArg, directgate_cmd_t *pCommand)
     else if (!strcmp(pArg, "logout")) *pCommand = DIRECTGATE_CMD_LOGOUT;
     else if (!strcmp(pArg, "devices") || !strcmp(pArg, "ls")) *pCommand = DIRECTGATE_CMD_DEVICES;
     else if (!strcmp(pArg, "whoami")) *pCommand = DIRECTGATE_CMD_WHOAMI;
+    else if (DirectGate_Remote_ParseOp(pArg, NULL)) *pCommand = DIRECTGATE_CMD_REMOTE;
     else return XFALSE;
 
     return XTRUE;
@@ -391,7 +412,20 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
             return XSTDEXC;
     }
 
-    for (int i = 1; i + 1 < argc; ++i)
+    /* A remote operation's options end at the device: "exec host gcc -c x.c" names no config file */
+    int nScanEnd = argc;
+    if (argc > 1 && (DirectGate_Remote_ParseOp(argv[1], NULL) || !strcmp(argv[1], "ls")))
+    {
+        static const char *pValued = "ndacplvwktCo";
+        for (nScanEnd = 2; nScanEnd < argc; nScanEnd++)
+        {
+            const char *pArg = argv[nScanEnd];
+            if (pArg[0] != '-' || pArg[1] == '\0' || !strcmp(pArg, "--")) break;
+            if (pArg[2] == '\0' && strchr(pValued, pArg[1]) != NULL) nScanEnd++;
+        }
+    }
+
+    for (int i = 1; i + 1 < nScanEnd; ++i)
     {
         if (!strcmp(argv[i], "-c") && (i + 1) < argc)
         {
@@ -409,11 +443,42 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
     int nFirst = 1;
     if (argc > 1 && DirectGate_ParseCommand(argv[1], &pCfg->eCommand)) nFirst = 2;
 
+    /* A remote operation's own arguments follow the device and may look like options themselves
+       ("exec host ls -la"): option parsing stops at the first word that is not one. */
+    directgate_remote_op_t eRemoteOp = DIRECTGATE_REMOTE_NONE;
+    if (pCfg->eCommand == DIRECTGATE_CMD_REMOTE) DirectGate_Remote_ParseOp(argv[1], &eRemoteOp);
+    xbool_t bListVerb = (argc > 1 && !strcmp(argv[1], "ls")) ? XTRUE : XFALSE;
+    const char *pOptions = (eRemoteOp != DIRECTGATE_REMOTE_NONE || bListVerb) ?
+        "+d:a:c:l:v:w:k:t:C:o:fjrBh" : "n:d:a:c:p:l:v:w:k:AfgsijBh";
+
     optind = nFirst;
-    while ((nChar = getopt(argc, argv, "n:d:a:c:p:l:v:w:k:AfgsiBh")) != -1)
+    while ((nChar = getopt(argc, argv, pOptions)) != -1)
     {
         switch (nChar)
         {
+            case 't':
+            {
+                char *pEnd = NULL;
+                unsigned long nSeconds = strtoul(optarg, &pEnd, 10);
+                if (pEnd == optarg || *pEnd != '\0' || nSeconds > DIRECTGATE_REMOTE_TIMEOUT_MAX) return XSTDERR;
+                pCfg->remote.nTimeoutMs = (uint32_t)nSeconds * 1000U;
+                break;
+            }
+            case 'o':
+                if (DirectGate_Remote_ParseSize(optarg, &pCfg->remote.nOutputMax) != XSTDOK) return XSTDERR;
+                pCfg->remote.bOutputMax = XTRUE;
+                break;
+            case 'C':
+                if (strlen(optarg) >= sizeof(pCfg->remote.sCwd)) return XSTDERR;
+                xstrncpy(pCfg->remote.sCwd, sizeof(pCfg->remote.sCwd), optarg);
+                break;
+            case 'j':
+                pCfg->bJson = XTRUE;
+                pCfg->remote.bJson = XTRUE;
+                break;
+            case 'r':
+                pCfg->remote.bRecursive = XTRUE;
+                break;
             case 'a':
                 xstrncpy(pCfg->sApiUrl, sizeof(pCfg->sApiUrl), optarg);
                 break;
@@ -455,11 +520,20 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
                 break;
             case 'f':
                 pCfg->bForce = XTRUE;
+                pCfg->remote.bForce = XTRUE;
                 break;
             case 'i':
                 pCfg->bInit = XTRUE;
                 break;
             case 'c':
+                /* Loaded before the options were parsed, from "-c <path>" as a word of its own: any other
+                   spelling ("-c<path>", "-fc <path>") or a second -c would otherwise be ignored without a word */
+                if (strcmp(optarg, pCfg->sCfgPath) != 0)
+                {
+                    fprintf(stderr, "dgcli: give one config file, as -c <path>\n");
+                    return XSTDEXC;
+                }
+
                 break;
             case 'h':
             default:
@@ -508,6 +582,39 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
     }
 
     DirectGate_LogApply(&pCfg->log);
+
+    /* "ls" alone lists the devices, as it always has; given a <device>:<path> it lists that directory */
+    if (bListVerb && optind < argc)
+    {
+        pCfg->eCommand = DIRECTGATE_CMD_REMOTE;
+        eRemoteOp = DIRECTGATE_REMOTE_LIST;
+    }
+    else if (bListVerb && DirectGate_Remote_CheckOptions(&pCfg->remote, DIRECTGATE_REMOTE_LIST) != XSTDOK)
+    {
+        return XSTDEXC;
+    }
+
+    if (eRemoteOp != DIRECTGATE_REMOTE_NONE)
+    {
+        /* exec and session take their device first - unless -d already named it - the file operations in
+           <device>:<path> */
+        int nArg = optind;
+        xbool_t bDeviceFirst = (eRemoteOp == DIRECTGATE_REMOTE_EXEC || eRemoteOp == DIRECTGATE_REMOTE_SESSION) ? XTRUE : XFALSE;
+        if (bDeviceFirst && !xstrused(pCfg->sDeviceQuery))
+        {
+            if (nArg >= argc || !xstrused(argv[nArg]))
+            {
+                fprintf(stderr, "dgcli: %s: a device is required\n", DirectGate_Remote_OpName(eRemoteOp));
+                return XSTDEXC;
+            }
+
+            xstrncpy(pCfg->sDeviceQuery, sizeof(pCfg->sDeviceQuery), argv[nArg++]);
+        }
+
+        if (DirectGate_Remote_ParseArgs(&pCfg->remote, eRemoteOp, argc, argv, nArg,
+            pCfg->sDeviceQuery, sizeof(pCfg->sDeviceQuery)) != XSTDOK) return XSTDEXC;
+        return XSTDOK;
+    }
 
     /* Whatever is left after the options is the device to connect to */
     if (optind < argc && xstrused(argv[optind]))

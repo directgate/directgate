@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <getopt.h>
 
 #include "src/client/config.h"
 
@@ -20,6 +21,401 @@ static int write_text(const char *pPath, const char *pText)
     size_t nLen = strlen(pText);
     int nOk = fwrite(pText, 1, nLen, pFile) == nLen;
     return fclose(pFile) == 0 && nOk;
+}
+
+/* ---- remote operations: what each command line parses into, or that it is refused ---- */
+
+#define RC_F 1  /* -f */
+#define RC_R 2  /* -r */
+#define RC_J 4  /* -j */
+
+typedef struct {
+    const char *pWords[10];     /* the verb, then whatever follows "-c <config>" */
+    XSTATUS nStatus;            /* what DirectGate_ParseArgs returns */
+    directgate_remote_op_t eOp; /* NONE: the device list */
+    const char *pDevice;
+    const char *pPath;
+    const char *pOther;         /* cp: the local side, mv: the target, exec: the command */
+    int nFlags;
+    uint32_t nTimeoutMs;
+    const char *pCwd;
+    const char *pWhat;
+} remote_case_t;
+
+/* glibc reads the ordering ('+' stops at the first operand) only when getopt starts over: each case starts
+   over the way a fresh dgcli process does */
+static void getopt_restart(void)
+{
+    char *pArgv[] = { (char*)"dgcli", NULL };
+    optind = 0;
+    (void)getopt(1, pArgv, "+");
+}
+
+static int remote_case(const char *pConfig, const remote_case_t *pCase)
+{
+    char *pArgv[16];
+    int nArgc = 0;
+    pArgv[nArgc++] = (char*)"dgcli";
+    pArgv[nArgc++] = (char*)pCase->pWords[0];
+    pArgv[nArgc++] = (char*)"-c";
+    pArgv[nArgc++] = (char*)pConfig;
+    for (int i = 1; pCase->pWords[i] != NULL && nArgc + 1 < 16; i++) pArgv[nArgc++] = (char*)pCase->pWords[i];
+    pArgv[nArgc] = NULL;
+
+    directgate_cfg_t cfg;
+    getopt_restart();
+    XSTATUS nStatus = DirectGate_ParseArgs(&cfg, nArgc, pArgv);
+    const directgate_remote_req_t *pReq = &cfg.remote;
+    int bPass = nStatus == pCase->nStatus;
+
+    if (bPass && nStatus == XSTDOK && pCase->eOp == DIRECTGATE_REMOTE_NONE)
+        bPass = cfg.eCommand == DIRECTGATE_CMD_DEVICES && cfg.bJson == ((pCase->nFlags & RC_J) ? XTRUE : XFALSE);
+    else if (bPass && nStatus == XSTDOK)
+    {
+        const char *pOther = pReq->eOp == DIRECTGATE_REMOTE_EXEC ? pReq->pCommand :
+            pReq->eOp == DIRECTGATE_REMOTE_MOVE ? pReq->sTarget : pReq->sLocal;
+
+        bPass = cfg.eCommand == DIRECTGATE_CMD_REMOTE && pReq->eOp == pCase->eOp &&
+            strcmp(cfg.sDeviceQuery, pCase->pDevice) == 0 &&
+            strcmp(pReq->sPath, pCase->pPath != NULL ? pCase->pPath : "") == 0 &&
+            strcmp(pOther != NULL ? pOther : "", pCase->pOther != NULL ? pCase->pOther : "") == 0 &&
+            pReq->bForce == ((pCase->nFlags & RC_F) ? XTRUE : XFALSE) &&
+            pReq->bRecursive == ((pCase->nFlags & RC_R) ? XTRUE : XFALSE) &&
+            pReq->bJson == ((pCase->nFlags & RC_J) ? XTRUE : XFALSE) &&
+            pReq->nTimeoutMs == pCase->nTimeoutMs &&
+            strcmp(pReq->sCwd, pCase->pCwd != NULL ? pCase->pCwd : "") == 0 &&
+            !pReq->bOutputMax && !pReq->nOutputMax;
+    }
+
+    if (!bPass) fprintf(stderr, "client_config_smoke: %s (status %d)\n", pCase->pWhat, (int)nStatus);
+    DirectGate_Remote_ReqClear(&cfg.remote);
+    return bPass;
+}
+
+static int remote_cases(const char *pConfig)
+{
+    static char sLongSpec[XSTR_MID + 16];
+    memset(sLongSpec, 'b', XSTR_MID);
+    memcpy(sLongSpec + XSTR_MID, ":/x", 4);
+
+    const remote_case_t cases[] = {
+        { { "ls", "box:/srv" }, XSTDOK, DIRECTGATE_REMOTE_LIST, "box", "/srv", NULL, 0, 0, NULL, "ls <device>:<path>" },
+        { { "ls", "-j", "box:/srv" }, XSTDOK, DIRECTGATE_REMOTE_LIST, "box", "/srv", NULL, RC_J, 0, NULL, "ls -j" },
+        { { "ls" }, XSTDOK, DIRECTGATE_REMOTE_NONE, NULL, NULL, NULL, 0, 0, NULL, "ls alone is the device list" },
+        { { "ls", "-j" }, XSTDOK, DIRECTGATE_REMOTE_NONE, NULL, NULL, NULL, RC_J, 0, NULL, "ls -j is the device list" },
+        { { "cp", "box:/a/b.txt", "." }, XSTDOK, DIRECTGATE_REMOTE_GET, "box", "/a/b.txt", ".", 0, 0, NULL, "cp down" },
+        { { "cp", "box:/a/b.txt", "-" }, XSTDOK, DIRECTGATE_REMOTE_GET, "box", "/a/b.txt", "-", 0, 0, NULL, "cp to -" },
+        { { "cp", "./x", "box:/tmp/" }, XSTDOK, DIRECTGATE_REMOTE_PUT, "box", "/tmp/", "./x", 0, 0, NULL, "cp up" },
+        { { "cp", "-f", "-", "box:/tmp/x" }, XSTDOK, DIRECTGATE_REMOTE_PUT, "box", "/tmp/x", "-", RC_F, 0, NULL, "cp -f -" },
+        { { "cp", "-f", "box:/x", "y" }, XSTDOK, DIRECTGATE_REMOTE_GET, "box", "/x", "y", RC_F, 0, NULL, "cp -f down" },
+        { { "cp", "C:/x", "box:/tmp/" }, XSTDOK, DIRECTGATE_REMOTE_PUT, "box", "/tmp/", "C:/x", 0, 0, NULL,
+            "a single letter before the colon is a local drive" },
+        { { "cp", "./a:b", "box:/tmp/" }, XSTDOK, DIRECTGATE_REMOTE_PUT, "box", "/tmp/", "./a:b", 0, 0, NULL,
+            "a separator before the colon makes it local" },
+        { { "cp", "Test Box:/srv/x", "." }, XSTDOK, DIRECTGATE_REMOTE_GET, "Test Box", "/srv/x", ".", 0, 0, NULL,
+            "a device name with a space" },
+        { { "cp", "box:C:\\x", "." }, XSTDOK, DIRECTGATE_REMOTE_GET, "box", "C:\\x", ".", 0, 0, NULL,
+            "an absolute Windows path on the device" },
+        { { "rm", "box:/x" }, XSTDOK, DIRECTGATE_REMOTE_REMOVE, "box", "/x", NULL, 0, 0, NULL, "rm" },
+        { { "rm", "-r", "box:/x" }, XSTDOK, DIRECTGATE_REMOTE_REMOVE, "box", "/x", NULL, RC_R, 0, NULL, "rm -r" },
+        { { "mkdir", "box:/x" }, XSTDOK, DIRECTGATE_REMOTE_MKDIR, "box", "/x", NULL, 0, 0, NULL, "mkdir" },
+        { { "mv", "box:/a", "/b" }, XSTDOK, DIRECTGATE_REMOTE_MOVE, "box", "/a", "/b", 0, 0, NULL, "mv to a path" },
+        { { "mv", "box:/a", "box:/b" }, XSTDOK, DIRECTGATE_REMOTE_MOVE, "box", "/a", "/b", 0, 0, NULL, "mv to a spec" },
+        { { "exec", "box", "ls", "-la" }, XSTDOK, DIRECTGATE_REMOTE_EXEC, "box", NULL, "ls -la", 0, 0, NULL,
+            "exec: what follows the device is the command" },
+        { { "exec", "box", "--", "ls" }, XSTDOK, DIRECTGATE_REMOTE_EXEC, "box", NULL, "ls", 0, 0, NULL, "exec --" },
+        { { "exec", "-d", "box", "ls" }, XSTDOK, DIRECTGATE_REMOTE_EXEC, "box", NULL, "ls", 0, 0, NULL, "exec -d" },
+        { { "exec", "-t", "5", "-C", "/srv", "box", "make", "test" }, XSTDOK, DIRECTGATE_REMOTE_EXEC, "box", NULL,
+            "make test", 0, 5000, "/srv", "exec -t -C" },
+        { { "exec", "box", "gcc", "-c", "x.c" }, XSTDOK, DIRECTGATE_REMOTE_EXEC, "box", NULL, "gcc -c x.c", 0, 0, NULL,
+            "a -c after the device is the command's" },
+        { { "exec", "box", "head", "-o", "x" }, XSTDOK, DIRECTGATE_REMOTE_EXEC, "box", NULL, "head -o x", 0, 0, NULL,
+            "a -o after the device is the command's, and sets no limit" },
+        { { "session", "box" }, XSTDOK, DIRECTGATE_REMOTE_SESSION, "box", NULL, NULL, 0, 0, NULL, "session <device>" },
+        { { "session", "-t", "60", "box" }, XSTDOK, DIRECTGATE_REMOTE_SESSION, "box", NULL, NULL, 0, 60000, NULL,
+            "session -t sets how long it may stay idle" },
+        { { "session", "-d", "box" }, XSTDOK, DIRECTGATE_REMOTE_SESSION, "box", NULL, NULL, 0, 0, NULL, "session -d" },
+
+        { { "cp", "a", "b" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "cp with no remote side" },
+        { { "cp", "box:/a", "box:/b" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "cp with two remote sides" },
+        { { "cp", "box:rel", "." }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "a relative remote path" },
+        { { "cp", "box:", "." }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "a device with no path" },
+        { { "cp", "box:/a" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "cp with one argument" },
+        { { "cp", "box:/a", ".", "x" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "cp with three arguments" },
+        { { "cp", sLongSpec, "." }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "a device name too long" },
+        { { "cp", "-r", "box:/a", "." }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "cp -r is refused, not ignored" },
+        { { "cp", "-j", "box:/a", "." }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "cp -j is refused" },
+        { { "cp", "-t", "5", "box:/a", "." }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "cp -t is refused" },
+        { { "rm", "-f", "box:/x" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "rm -f is refused" },
+        { { "rm", "/x" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "rm without the device" },
+        { { "rm", "box:/x", "box:/y" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "rm with two paths" },
+        { { "rm", "-d", "box", "box:/x" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "-d with a file operation" },
+        { { "mkdir", "-r", "box:/x" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "mkdir -r is refused" },
+        { { "mv", "box:/a", "other:/b" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "mv across devices" },
+        { { "mv", "box:/a", "b" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "mv to a relative target" },
+        { { "mv", "-f", "box:/a", "/b" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "mv -f is refused" },
+        { { "ls", "-r", "box:/x" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "ls -r is refused" },
+        { { "ls", "-f" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "the device list refuses -f" },
+        { { "ls", "-C", "/x" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "the device list refuses -C" },
+        { { "ls", "-n", "x" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "ls takes no -n" },
+        { { "ls", "box:/x", "-j" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "options come before the operands" },
+        { { "exec", "box" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "exec without a command" },
+        { { "exec" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "exec without a device" },
+        { { "exec", "box", "--" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "exec with only --" },
+        { { "exec", "-C", "rel", "box", "ls" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -C relative" },
+        { { "exec", "-f", "box", "ls" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -f is refused" },
+        { { "exec", "-j", "box", "ls" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -j is refused" },
+        { { "exec", "-r", "box", "ls" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -r is refused" },
+        { { "exec", "-n", "name", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "exec takes no -n" },
+        { { "exec", "-p", "list", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "exec takes no -p" },
+        { { "exec", "-t", "x", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -t not a number" },
+        { { "exec", "-t", "4294968", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -t too large" },
+        { { "exec", "-o", "x", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -o not a number" },
+        { { "session" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "session without a device" },
+        { { "session", "box", "ls" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "session takes nothing after the device" },
+        { { "session", "-t", "601", "box" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "session -t past ten minutes" },
+        { { "session", "-C", "/x", "box" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "session -C is refused" },
+        { { "session", "-o", "1", "box" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "session -o is refused" },
+        { { "session", "-f", "box" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "session -f is refused" },
+        { { "cp", "-o", "1", "box:/a", "." }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "cp -o is refused" },
+        { { "exec", "-o", "", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -o empty" },
+        { { "exec", "-o", "-1", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -o negative" },
+        { { "exec", "-o", "+5", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -o with a sign" },
+        { { "exec", "-o", " 5", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -o with a space" },
+        { { "exec", "-o", "1.5K", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -o not whole" },
+        { { "exec", "-o", "5KB", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -o with more after K" },
+        { { "exec", "-o", "5T", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -o with an unknown suffix" },
+        { { "exec", "-o", "4294967296", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -o past 32 bits" },
+        { { "exec", "-o", "4G", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL, "exec -o 4G is past 32 bits" },
+        { { "exec", "-o", "99999999999999999999", "box", "ls" }, XSTDERR, 0, NULL, NULL, NULL, 0, 0, NULL,
+            "exec -o past 64 bits" },
+        { { "cp", "-o", "1K", "box:/a", "." }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "cp -o is refused" },
+        { { "ls", "-o", "1K", "box:/x" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "ls -o is refused" },
+        { { "ls", "-o", "1K" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "the device list refuses -o" },
+        { { "rm", "-o", "0", "box:/x" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL, "rm -o 0 is refused, not taken as unset" },
+        { { "ls", "-c", "/nonexistent", "box:/x" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL,
+            "a second -c is refused, not ignored" },
+        { { "ls", "-fc", "/nonexistent" }, XSTDEXC, 0, NULL, NULL, NULL, 0, 0, NULL,
+            "a -c the config scan cannot see is refused, not ignored" },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        if (!remote_case(pConfig, &cases[i])) return 0;
+
+    return 1;
+}
+
+/* exec -o <value>: what it parses into */
+static int output_cases(const char *pConfig)
+{
+    const struct { const char *pValue; uint32_t nBytes; const char *pWhat; } cases[] = {
+        { "131073", 131073, "exec -o in bytes" },
+        { "0", 0, "exec -o 0 keeps no output, which is not the same as no limit" },
+        { "64K", 65536, "exec -o with K" },
+        { "2m", 2097152, "exec -o with m" },
+        { "3G", 3221225472U, "exec -o with G" },
+        { "1M", 1048576, "exec -o with M" },
+        { "1g", 1073741824, "exec -o with g" },
+        { "4294967295", 4294967295U, "exec -o at the largest" },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+        char *pArgv[] = { (char*)"dgcli", (char*)"exec", (char*)"-c", (char*)pConfig, (char*)"-o", (char*)cases[i].pValue,
+                          (char*)"box", (char*)"ls", NULL };
+
+        directgate_cfg_t cfg;
+        getopt_restart();
+        XSTATUS nStatus = DirectGate_ParseArgs(&cfg, 8, pArgv);
+        int bPass = nStatus == XSTDOK && cfg.remote.eOp == DIRECTGATE_REMOTE_EXEC && cfg.remote.bOutputMax &&
+            cfg.remote.nOutputMax == cases[i].nBytes && xstrcmp(cfg.remote.pCommand, "ls");
+
+        if (!bPass) fprintf(stderr, "client_config_smoke: %s (status %d)\n", cases[i].pWhat, (int)nStatus);
+        DirectGate_Remote_ReqClear(&cfg.remote);
+        if (!bPass) return 0;
+    }
+
+    /* Joined to its option, as getopt allows */
+    char *pJoined[] = { (char*)"dgcli", (char*)"exec", (char*)"-c", (char*)pConfig, (char*)"-o1k", (char*)"box", (char*)"ls",
+                        NULL };
+    directgate_cfg_t cfg;
+    getopt_restart();
+    XSTATUS nStatus = DirectGate_ParseArgs(&cfg, 7, pJoined);
+    int bPass = nStatus == XSTDOK && cfg.remote.bOutputMax && cfg.remote.nOutputMax == 1024;
+    DirectGate_Remote_ReqClear(&cfg.remote);
+    if (!bPass)
+    {
+        fprintf(stderr, "client_config_smoke: exec -o joined to its value (status %d)\n", (int)nStatus);
+        return 0;
+    }
+
+    /* The config scan steps over -o's value: a -c after it is the config, not an operand's */
+    char *pBefore[] = { (char*)"dgcli", (char*)"exec", (char*)"-o", (char*)"1K", (char*)"-c", (char*)pConfig, (char*)"box",
+                        (char*)"ls", NULL };
+    getopt_restart();
+    nStatus = DirectGate_ParseArgs(&cfg, 8, pBefore);
+    bPass = nStatus == XSTDOK && cfg.remote.bOutputMax && cfg.remote.nOutputMax == 1024 && xstrcmp(cfg.sCfgPath, pConfig);
+    DirectGate_Remote_ReqClear(&cfg.remote);
+    if (!bPass) fprintf(stderr, "client_config_smoke: a -c after exec -o's value is the config (status %d)\n", (int)nStatus);
+    return bPass;
+}
+
+/* ---- a session's requests: one JSON line each, the words of a one-shot operation on the session's device ---- */
+
+typedef struct {
+    const char *pLine;
+    XSTATUS nStatus;
+    directgate_remote_op_t eOp;
+    const char *pPath;          /* exec: the command */
+    const char *pStdin;
+    size_t nMax;
+    const char *pError;         /* what the refusal says */
+} request_case_t;
+
+static int request_cases(void)
+{
+    const request_case_t cases[] = {
+        { "{\"argv\":[\"exec\",\"-t\",\"5\",\"-o\",\"100\",\"box\",\"echo\",\"hi\"]}", XSTDOK,
+            DIRECTGATE_REMOTE_EXEC, "echo hi", "", DIRECTGATE_REMOTE_CAPTURE_MAX, NULL },
+        { "{\"argv\":[\"exec\",\"box\",\"--\",\"ls\",\"-la\"]}", XSTDOK, DIRECTGATE_REMOTE_EXEC, "ls -la", "",
+            DIRECTGATE_REMOTE_CAPTURE_MAX, NULL },
+        { "{\"argv\":[\"exec\",\"--\",\"box\",\"ls\"]}", XSTDOK, DIRECTGATE_REMOTE_EXEC, "ls", "",
+            DIRECTGATE_REMOTE_CAPTURE_MAX, NULL },
+        { "{\"argv\":[\"exec\",\"box\",\"cat\"],\"stdin\":\"hello\\n\",\"max\":131073}", XSTDOK,
+            DIRECTGATE_REMOTE_EXEC, "cat", "hello\n", 131073, NULL },
+        { "{\"argv\":[\"ls\",\"-j\",\"box:/etc\"]}", XSTDOK, DIRECTGATE_REMOTE_LIST, "/etc", "",
+            DIRECTGATE_REMOTE_CAPTURE_MAX, NULL },
+        { "{\"argv\":[\"cp\",\"box:/a.txt\",\"-\"]}", XSTDOK, DIRECTGATE_REMOTE_GET, "/a.txt", "",
+            DIRECTGATE_REMOTE_CAPTURE_MAX, NULL },
+        { "{\"argv\":[\"cp\",\"-f\",\"-\",\"box:/tmp/x\"],\"stdin\":\"data\"}", XSTDOK, DIRECTGATE_REMOTE_PUT,
+            "/tmp/x", "data", DIRECTGATE_REMOTE_CAPTURE_MAX, NULL },
+        { "{\"argv\":[\"rm\",\"-r\",\"box:/tmp/d\"]}", XSTDOK, DIRECTGATE_REMOTE_REMOVE, "/tmp/d", "",
+            DIRECTGATE_REMOTE_CAPTURE_MAX, NULL },
+        { "{\"argv\":[\"mv\",\"box:/a\",\"/b\"]}", XSTDOK, DIRECTGATE_REMOTE_MOVE, "/a", "", DIRECTGATE_REMOTE_CAPTURE_MAX,
+            NULL },
+
+        { "not json", XSTDERR, 0, NULL, NULL, 0, "a request is one line of JSON" },
+        { "{}", XSTDERR, 0, NULL, NULL, 0, "argv is a list" },
+        { "{\"argv\":\"exec box ls\"}", XSTDERR, 0, NULL, NULL, 0, "argv is a list" },
+        { "{\"argv\":[]}", XSTDERR, 0, NULL, NULL, 0, "argv is a list" },
+        { "{\"argv\":[\"exec\",\"box\",1]}", XSTDERR, 0, NULL, NULL, 0, "every word of argv is a string" },
+        { "{\"argv\":[\"login\"]}", XSTDERR, 0, NULL, NULL, 0, "the first word is the operation" },
+        { "{\"argv\":[\"session\",\"box\"]}", XSTDERR, 0, NULL, NULL, 0, "the first word is the operation" },
+        { "{\"argv\":[\"exec\",\"-x\",\"box\",\"ls\"]}", XSTDERR, 0, NULL, NULL, 0, "not an option" },
+        { "{\"argv\":[\"exec\",\"-t\"]}", XSTDERR, 0, NULL, NULL, 0, "not an option" },
+        { "{\"argv\":[\"exec\",\"-t\",\"soon\",\"box\",\"ls\"]}", XSTDERR, 0, NULL, NULL, 0, "-t takes whole seconds" },
+        { "{\"argv\":[\"exec\",\"-t\",\"4294968\",\"box\",\"ls\"]}", XSTDERR, 0, NULL, NULL, 0,
+            "-t takes whole seconds" },
+        { "{\"argv\":[\"exec\",\"-o\",\"lots\",\"box\",\"ls\"]}", XSTDERR, 0, NULL, NULL, 0, "-o takes a number" },
+        { "{\"argv\":[\"exec\",\"-f\",\"box\",\"ls\"]}", XSTDERR, 0, NULL, NULL, 0, "-f belongs to cp" },
+        { "{\"argv\":[\"exec\"]}", XSTDERR, 0, NULL, NULL, 0, "a device is required" },
+        { "{\"argv\":[\"exec\",\"other\",\"ls\"]}", XSTDERR, 0, NULL, NULL, 0, "a session reaches its own device only" },
+        { "{\"argv\":[\"ls\",\"other:/etc\"]}", XSTDERR, 0, NULL, NULL, 0, "a session reaches its own device only" },
+        { "{\"argv\":[\"ls\",\"box:etc\"]}", XSTDERR, 0, NULL, NULL, 0, "remote paths must be absolute" },
+        { "{\"argv\":[\"ls\",\"box:/etc\"],\"stdin\":\"x\"}", XSTDERR, 0, NULL, NULL, 0, "stdin is a string, for exec" },
+        { "{\"argv\":[\"exec\",\"box\",\"cat\"],\"stdin\":5}", XSTDERR, 0, NULL, NULL, 0, "stdin is a string" },
+        { "{\"argv\":[\"exec\",\"box\",\"ls\"],\"max\":0}", XSTDERR, 0, NULL, NULL, 0, "max is a number of bytes" },
+        { "{\"argv\":[\"exec\",\"box\",\"ls\"],\"max\":16777217}", XSTDERR, 0, NULL, NULL, 0, "max is a number of bytes" },
+        { "{\"argv\":[\"exec\",\"box\",\"ls\"],\"max\":\"1\"}", XSTDERR, 0, NULL, NULL, 0, "max is a number of bytes" },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+        const request_case_t *pCase = &cases[i];
+        directgate_remote_req_t req;
+        memset(&req, 0, sizeof(req));
+
+        xbyte_buffer_t stdinData;
+        XByteBuffer_Init(&stdinData, XSTDNON, XFALSE);
+        char sError[XSTR_MID];
+        size_t nMax = 0;
+
+        XSTATUS nStatus = DirectGate_Remote_ParseRequest(&req, pCase->pLine, strlen(pCase->pLine), "box", &stdinData, &nMax,
+            sError, sizeof(sError));
+
+        int bPass = nStatus == pCase->nStatus;
+        if (bPass && nStatus == XSTDOK)
+        {
+            const char *pGot = req.eOp == DIRECTGATE_REMOTE_EXEC ? req.pCommand : req.sPath;
+            size_t nStdin = strlen(pCase->pStdin);
+            bPass = req.eOp == pCase->eOp && pGot != NULL && strcmp(pGot, pCase->pPath) == 0 && nMax == pCase->nMax &&
+                stdinData.nUsed == nStdin && (!nStdin || memcmp(stdinData.pData, pCase->pStdin, nStdin) == 0) &&
+                req.bStdin == (req.eOp == DIRECTGATE_REMOTE_EXEC && nStdin ? XTRUE : XFALSE);
+        }
+        else if (bPass)
+        {
+            bPass = strstr(sError, pCase->pError) != NULL && req.pCommand == NULL && req.eOp == DIRECTGATE_REMOTE_NONE;
+        }
+
+        if (!bPass) fprintf(stderr, "client_config_smoke: request %zu: %s (status %d, said %s)\n", i, pCase->pLine,
+            (int)nStatus, sError);
+
+        XByteBuffer_Clear(&stdinData);
+        DirectGate_Remote_ReqClear(&req);
+        if (!bPass) return 0;
+    }
+
+    /* More words than a request may have */
+    char sMany[2048];
+    size_t nUsed = (size_t)snprintf(sMany, sizeof(sMany), "{\"argv\":[\"exec\",\"box\"");
+    for (int i = 0; i < DIRECTGATE_REMOTE_REQUEST_WORDS; i++)
+        nUsed += (size_t)snprintf(sMany + nUsed, sizeof(sMany) - nUsed, ",\"w\"");
+    snprintf(sMany + nUsed, sizeof(sMany) - nUsed, "]}");
+
+    directgate_remote_req_t req;
+    memset(&req, 0, sizeof(req));
+    xbyte_buffer_t stdinData;
+    XByteBuffer_Init(&stdinData, XSTDNON, XFALSE);
+    char sError[XSTR_MID];
+    size_t nMax = 0;
+    XSTATUS nStatus = DirectGate_Remote_ParseRequest(&req, sMany, strlen(sMany), "box", &stdinData, &nMax, sError,
+        sizeof(sError));
+    XByteBuffer_Clear(&stdinData);
+    DirectGate_Remote_ReqClear(&req);
+    if (nStatus != XSTDERR || strstr(sError, "up to 64 words") == NULL)
+    {
+        fprintf(stderr, "client_config_smoke: a request of too many words is refused\n");
+        return 0;
+    }
+
+    return DirectGate_Remote_ParseRequest(NULL, "{}", 2, "box", &stdinData, &nMax, sError, sizeof(sError)) == XSTDINV;
+}
+
+/* The answer: a JSON line, then stdout's bytes, then stderr's */
+static int response_cases(void)
+{
+    char sPath[] = "/tmp/directgate_response.XXXXXX";
+    int nFd = mkstemp(sPath);
+    if (nFd < 0) return 0;
+    unlink(sPath);
+
+    xbyte_buffer_t out, err;
+    XByteBuffer_Init(&out, XSTDNON, XFALSE);
+    XByteBuffer_Init(&err, XSTDNON, XFALSE);
+    XByteBuffer_Add(&out, (const uint8_t*)"a\0b", 3);
+    XByteBuffer_Add(&err, (const uint8_t*)"warn\n", 5);
+
+    int bOk = DirectGate_Remote_WriteResponse(nFd, 7, &out, &err, XTRUE) == XSTDOK &&
+              DirectGate_Remote_WriteResponse(nFd, 0, NULL, NULL, XFALSE) == XSTDOK;
+
+    char sGot[256] = {0};
+    ssize_t nGot = bOk ? pread(nFd, sGot, sizeof(sGot) - 1, 0) : -1;
+    const char *pFirst = "{\"exitCode\":7,\"stdout\":3,\"stderr\":5,\"truncated\":true}\n";
+    const char *pSecond = "{\"exitCode\":0,\"stdout\":0,\"stderr\":0,\"truncated\":false}\n";
+    size_t nFirst = strlen(pFirst), nSecond = strlen(pSecond);
+
+    char sWant[256];
+    memcpy(sWant, pFirst, nFirst);
+    memcpy(sWant + nFirst, "a\0bwarn\n", 8);
+    memcpy(sWant + nFirst + 8, pSecond, nSecond);
+    size_t nWant = nFirst + 8 + nSecond;
+    bOk = bOk && nGot == (ssize_t)nWant && memcmp(sGot, sWant, nWant) == 0;
+
+    bOk = bOk && DirectGate_Remote_WriteResponse(-1, 0, NULL, NULL, XFALSE) == XSTDERR;
+    close(nFd);
+    XByteBuffer_Clear(&out);
+    XByteBuffer_Clear(&err);
+    return bOk;
 }
 
 int main(void)
@@ -215,6 +611,11 @@ int main(void)
         (char*)"-p", (char*)"/proc/directgate-no-such-dir/devices", (char*)"-s"
     };
     CHECK(DirectGate_ParseArgs(&cfg, 8, badSaveArgs) == XSTDEXC, "a device list that cannot be written is a failure");
+
+    CHECK(remote_cases(sValid), "remote operations parse as documented");
+    CHECK(output_cases(sValid), "exec -o parses as documented");
+    CHECK(request_cases(), "session requests parse as documented");
+    CHECK(response_cases(), "session answers are written as documented");
 
     CHECK(unlink(sValid) == 0, "unlink valid");
     CHECK(unlink(sMalformed) == 0, "unlink malformed");

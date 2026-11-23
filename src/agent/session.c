@@ -62,6 +62,7 @@ static void DirectGate_Session_Destroy(directgate_session_t *pSession)
 
     DirectGate_Term_RequestStop(&pSession->term);
     DirectGate_Term_Clear(&pSession->term);
+    DirectGate_CMD_Clear(&pSession->command);
     DirectGate_E2E_Clear(&pSession->e2e);
     DirectGate_SRP_Destroy(&pSession->srp);
     DirectGate_KeyAuth_Cleanse(&pSession->keyauth);
@@ -236,6 +237,7 @@ directgate_session_t* DirectGate_SessionMgr_Create(directgate_session_mgr_t *pMg
     XCHECK((pSession != NULL), xthrowp(NULL, "Failed to allocate session"));
 
     DirectGate_Term_Init(&pSession->term);
+    DirectGate_CMD_Init(&pSession->command);
     DirectGate_E2E_Init(&pSession->e2e);
     DirectGate_WebRTC_Init(&pSession->webrtc);
     DirectGate_Search_Init(&pSession->search);
@@ -499,8 +501,77 @@ int DirectGate_Session_Close(directgate_session_t *pSession, const char *pReason
     return XAPI_CONTINUE;
 }
 
-int DirectGate_Session_Send(directgate_session_t *pSession, xjson_obj_t *pHeader,
-                            const uint8_t *pPayload, size_t nPayloadLength)
+/* bRelayOnly: bulk data pinned to the relay is not moved to a channel that came up meanwhile */
+/* What the session keeps to on the relay: a sixteenth below the relay's rate (see DIRECTGATE_RELAY_PACE_UNIT) */
+static uint64_t DirectGate_Session_GetPaceRate(const directgate_session_mgr_t *pMgr)
+{
+    return (uint64_t)pMgr->nRelayRateBytes - pMgr->nRelayRateBytes / DIRECTGATE_RELAY_PACE_SHARE;
+}
+
+/* The session's relay bucket at nNowMs, counting nothing: full before its first send, topped up since. A limit
+   lowered meanwhile - a new relay link - holds what was left to the new burst. */
+static int64_t DirectGate_Session_GetRelayLevel(const directgate_session_t *pSession, uint64_t nNowMs)
+{
+    const directgate_session_mgr_t *pMgr = pSession->pMgr;
+    int64_t nBurst = (int64_t)(pMgr->nRelayBurstBytes / 2) * DIRECTGATE_RELAY_PACE_UNIT;
+    if (!pSession->nRelayTokensMs) return nBurst;
+
+    int64_t nLevel = pSession->nRelayTokens < nBurst ? pSession->nRelayTokens : nBurst;
+    if (nNowMs <= pSession->nRelayTokensMs || nLevel == nBurst) return nLevel;
+
+    /* Comparing with the room first keeps the product in range */
+    uint64_t nRate = DirectGate_Session_GetPaceRate(pMgr);
+    uint64_t nElapsedMs = nNowMs - pSession->nRelayTokensMs;
+    uint64_t nRoom = (uint64_t)(nBurst - nLevel);
+    if (nElapsedMs > nRoom / nRate) return nBurst;
+    return nLevel + (int64_t)(nElapsedMs * nRate);
+}
+
+/* Everything the session sends the relay counts, as the relay counts it: the frame's payload */
+static void DirectGate_Session_CountRelay(directgate_session_t *pSession, size_t nBytes)
+{
+    const directgate_session_mgr_t *pMgr = pSession->pMgr;
+    XCHECK_VOID_NL((pMgr != NULL && pMgr->nRelayRateBytes));
+
+    uint64_t nNowMs = XTime_GetMonoMs();
+    int64_t nLevel = DirectGate_Session_GetRelayLevel(pSession, nNowMs);
+    int64_t nCost = (int64_t)(nBytes < UINT32_MAX ? nBytes : UINT32_MAX) * DIRECTGATE_RELAY_PACE_UNIT;
+
+    pSession->nRelayTokens = nLevel - nCost > DIRECTGATE_RELAY_PACE_FLOOR ? nLevel - nCost : DIRECTGATE_RELAY_PACE_FLOOR;
+    pSession->nRelayTokensMs = nNowMs;
+}
+
+#ifdef DIRECTGATE_TESTING
+int64_t DirectGate_Session_TestRelayLevel(const directgate_session_t *pSession, uint64_t nNowMs)
+{
+    return DirectGate_Session_GetRelayLevel(pSession, nNowMs);
+}
+#endif
+
+uint32_t DirectGate_Session_GetRelayWaitMs(const directgate_session_t *pSession, uint64_t nNowMs)
+{
+    XCHECK_NL((pSession != NULL && pSession->pMgr != NULL && pSession->pMgr->nRelayRateBytes), 0);
+
+    int64_t nLevel = DirectGate_Session_GetRelayLevel(pSession, nNowMs);
+    XCHECK_NL((nLevel < 0), 0);
+
+    uint64_t nRate = DirectGate_Session_GetPaceRate(pSession->pMgr);
+    uint64_t nWaitMs = ((uint64_t)-nLevel + nRate - 1) / nRate;
+    return nWaitMs < DIRECTGATE_COMMAND_WAIT_NONE ? (uint32_t)nWaitMs : DIRECTGATE_COMMAND_WAIT_NONE - 1;
+}
+
+void DirectGate_SessionMgr_SetRelayLimit(directgate_session_mgr_t *pMgr, uint32_t nRateBytes, uint32_t nBurstBytes)
+{
+    XCHECK_VOID_NL((pMgr != NULL));
+    XCHECK_VOID_NL((pMgr->nRelayRateBytes != nRateBytes || pMgr->nRelayBurstBytes != nBurstBytes));
+
+    if (nRateBytes) xlogn("Relay limit per session: rate(%u), burst(%u)", nRateBytes, nBurstBytes);
+    pMgr->nRelayRateBytes = nRateBytes;
+    pMgr->nRelayBurstBytes = nBurstBytes;
+}
+
+static int DirectGate_Session_SendVia(directgate_session_t *pSession, xjson_obj_t *pHeader,
+                                      const uint8_t *pPayload, size_t nPayloadLength, xbool_t bRelayOnly)
 {
     XCHECK((pSession != NULL), XAPI_DISCONNECT);
     XCHECK((pHeader != NULL), XAPI_DISCONNECT);
@@ -535,7 +606,7 @@ int DirectGate_Session_Send(directgate_session_t *pSession, xjson_obj_t *pHeader
     }
 
     int nStatus;
-    if (DirectGate_WebRTC_IsConnected(pRTC))
+    if (!bRelayOnly && DirectGate_WebRTC_IsConnected(pRTC))
     {
         int nRet = DirectGate_WebRTC_Send(pRTC, msg.pData, msg.nUsed);
         if (nRet >= 0)
@@ -558,8 +629,109 @@ int DirectGate_Session_Send(directgate_session_t *pSession, xjson_obj_t *pHeader
     }
 
     nStatus = DirectGate_WebSock_Send(pApiSession, msg.pData, msg.nUsed);
+    if (nStatus >= 0) DirectGate_Session_CountRelay(pSession, msg.nUsed);
+
     XByteBuffer_Clear(&msg);
     return nStatus;
+}
+
+/* While bulk data is pinned to the relay, everything the session sends goes there too: one transport keeps what it
+   sends in the order it was sent, where a channel that came up meanwhile could deliver a later message first. */
+int DirectGate_Session_Send(directgate_session_t *pSession, xjson_obj_t *pHeader,
+                            const uint8_t *pPayload, size_t nPayloadLength)
+{
+    XCHECK((pSession != NULL), XAPI_DISCONNECT);
+    xbool_t bRelayOnly = pSession->eBulkPin == DIRECTGATE_BULK_RELAY ? XTRUE : XFALSE;
+    return DirectGate_Session_SendVia(pSession, pHeader, pPayload, nPayloadLength, bRelayOnly);
+}
+
+directgate_bulk_route_t DirectGate_Session_GetBulkRoute(directgate_session_t *pSession, uint64_t nNowMs)
+{
+    XCHECK_NL((pSession != NULL), DIRECTGATE_BULK_WAIT);
+
+    /* Started on the relay, it finishes there. A detached session has no relay route at all. */
+    if (pSession->eBulkPin == DIRECTGATE_BULK_RELAY)
+        return pSession->bDetached ? DIRECTGATE_BULK_WAIT : DIRECTGATE_BULK_RELAY;
+
+    if (DirectGate_WebRTC_IsConnected(&pSession->webrtc))
+    {
+        /* WebRTC works: should the channel go, what is in flight waits for it to come back */
+        pSession->nBulkWaitMs = 0;
+        pSession->bBulkRelay = XFALSE;
+        return DIRECTGATE_BULK_CHANNEL;
+    }
+
+    if (pSession->bDetached) return DIRECTGATE_BULK_WAIT;
+    if (pSession->bBulkRelay) return DIRECTGATE_BULK_RELAY;
+
+    if (!pSession->nBulkWaitMs) pSession->nBulkWaitMs = nNowMs;
+    if (nNowMs - pSession->nBulkWaitMs < DIRECTGATE_BULK_CHANNEL_WAIT_MS) return DIRECTGATE_BULK_WAIT;
+
+    xlogw("No data channel came up, bulk data takes the relay: sid(%u), wsfd(%d), waitedMs(%llu)",
+        pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), (unsigned long long)(nNowMs - pSession->nBulkWaitMs));
+
+    pSession->bBulkRelay = XTRUE;
+    return DIRECTGATE_BULK_RELAY;
+}
+
+xbool_t DirectGate_Session_IsBulkOnRelay(const directgate_session_t *pSession)
+{
+    XCHECK_NL((pSession != NULL && !pSession->bDetached), XFALSE);
+    if (pSession->eBulkPin == DIRECTGATE_BULK_RELAY) return XTRUE;
+    return (pSession->bBulkRelay && !DirectGate_WebRTC_IsConnected(&pSession->webrtc)) ? XTRUE : XFALSE;
+}
+
+uint32_t DirectGate_Session_GetBulkWaitMs(const directgate_session_t *pSession, uint64_t nNowMs)
+{
+    XCHECK_NL((pSession != NULL), DIRECTGATE_COMMAND_WAIT_NONE);
+
+    /* On the relay, until what the session sent has made room again under the relay's limit */
+    if (DirectGate_Session_IsBulkOnRelay(pSession))
+    {
+        uint32_t nRelayMs = DirectGate_Session_GetRelayWaitMs(pSession, nNowMs);
+        return nRelayMs ? nRelayMs : DIRECTGATE_COMMAND_WAIT_NONE;
+    }
+
+    XCHECK_NL((pSession->nBulkWaitMs && !pSession->bBulkRelay && !pSession->bDetached), DIRECTGATE_COMMAND_WAIT_NONE);
+    XCHECK_NL((!DirectGate_WebRTC_IsConnected(&pSession->webrtc)), DIRECTGATE_COMMAND_WAIT_NONE);
+
+    /* At least a millisecond: a deadline already due asks for the next pass, never for a spin */
+    uint64_t nDueMs = pSession->nBulkWaitMs + DIRECTGATE_BULK_CHANNEL_WAIT_MS;
+    return nDueMs > nNowMs ? (uint32_t)(nDueMs - nNowMs) : 1;
+}
+
+int DirectGate_Session_SendBulk(directgate_session_t *pSession, directgate_bulk_route_t eRoute,
+                                xjson_obj_t *pHeader, const uint8_t *pPayload, size_t nPayloadLength)
+{
+    XCHECK((pSession != NULL), XAPI_DISCONNECT);
+    XCHECK((eRoute != DIRECTGATE_BULK_WAIT), XAPI_DISCONNECT);
+
+    if (pSession->eBulkPin == DIRECTGATE_BULK_WAIT) pSession->eBulkPin = eRoute;
+    return DirectGate_Session_Send(pSession, pHeader, pPayload, nPayloadLength);
+}
+
+xbool_t DirectGate_Session_HasBulk(const directgate_session_t *pSession)
+{
+    XCHECK_NL((pSession != NULL), XFALSE);
+    return (pSession->transfer.eState == XTRANSFER_STATE_SENDING || pSession->bPendingOpen ||
+            DirectGate_CMD_IsRunning(&pSession->command)) ? XTRUE : XFALSE;
+}
+
+void DirectGate_Session_ReleaseBulk(directgate_session_t *pSession)
+{
+    XCHECK_VOID_NL((pSession != NULL));
+    pSession->eBulkPin = DIRECTGATE_BULK_WAIT;
+}
+
+void DirectGate_Session_SetBulkRelay(directgate_session_t *pSession)
+{
+    XCHECK_VOID_NL((pSession != NULL));
+    if (pSession->bBulkRelay) return;
+
+    xlogi("Client found WebRTC impossible, bulk data may take the relay: sid(%u), wsfd(%d)",
+        pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
+
+    pSession->bBulkRelay = XTRUE;
 }
 
 int DirectGate_Session_SendKeepalive(directgate_session_t *pSession, const char *pAction)
@@ -585,6 +757,12 @@ directgate_session_mode_t DirectGate_SessionMode_FromString(const char *pMode)
     if (xstrused(pMode) && xstrcmp(pMode, "desktop"))
         return DIRECTGATE_SESSION_MODE_DESKTOP;
 
+    if (xstrused(pMode) && xstrcmp(pMode, "exec"))
+        return DIRECTGATE_SESSION_MODE_EXEC;
+
+    if (xstrused(pMode) && xstrcmp(pMode, "remote"))
+        return DIRECTGATE_SESSION_MODE_REMOTE;
+
     return DIRECTGATE_SESSION_MODE_NONE;
 }
 
@@ -606,6 +784,8 @@ const char* DirectGate_SessionMode_ToString(directgate_session_mode_t eMode)
     if (eMode == DIRECTGATE_SESSION_MODE_TERMINAL) return "terminal";
     if (eMode == DIRECTGATE_SESSION_MODE_FILE_MANAGER) return "file-manager";
     if (eMode == DIRECTGATE_SESSION_MODE_DESKTOP) return "desktop";
+    if (eMode == DIRECTGATE_SESSION_MODE_REMOTE) return "remote";
+    if (eMode == DIRECTGATE_SESSION_MODE_EXEC) return "exec";
     return "none";
 }
 
@@ -624,7 +804,11 @@ int DirectGate_Session_EnsureMode(directgate_session_t *pSession, directgate_ses
         return XSTDERR;
     }
 
-    if (pSession->eActiveMode != eMode)
+    /* A remote session does what an exec session and a file-manager session do */
+    xbool_t bRemoteServes = (pSession->eActiveMode == DIRECTGATE_SESSION_MODE_REMOTE &&
+        (eMode == DIRECTGATE_SESSION_MODE_EXEC || eMode == DIRECTGATE_SESSION_MODE_FILE_MANAGER)) ? XTRUE : XFALSE;
+
+    if (pSession->eActiveMode != eMode && !bRemoteServes)
     {
         xlogw("Session mode mismatch: sid(%u), wsfd(%d), active(%s), required(%s)",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession),
@@ -662,6 +846,15 @@ int DirectGate_Session_SendAuthResp(directgate_session_t *pSession, const char *
     /* A client that reads this may resume the session under a new relay socket when it loses its own, see
        DirectGate_Session_HandleResume. One that does not authenticates afresh, as every client always has. */
     if (xstrcmp(pStatus, "ok") && !pSession->bDesktopShare) XJSON_AddBool(pHeader, "resume", XTRUE);
+
+    /* Non-interactive commands (mode "exec"): a client that does not see this is talking to an agent without them,
+       and says so rather than sending messages it would only drop. Never offered where only a desktop is allowed.
+       Commands, and with them remote sessions: never offered to a temporary share or before anyone has logged on */
+    if (xstrcmp(pStatus, "ok") && !pSession->bDesktopShare && !g_bPreLogon)
+    {
+        XJSON_AddBool(pHeader, "exec", XTRUE);
+        XJSON_AddBool(pHeader, "remote", XTRUE);
+    }
 
     int nStatus = DirectGate_Session_Send(pSession, pHeader, NULL, XSTDNON);
     XJSON_FreeObject(pHeader);
@@ -931,6 +1124,29 @@ int DirectGate_Session_StartMode(directgate_session_t *pSession, directgate_sess
         pSession->eActiveMode = DIRECTGATE_SESSION_MODE_FILE_MANAGER;
 
         xlogi("File manager mode activated: sid(%u), wsfd(%d)",
+            pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
+
+        return XAPI_CONTINUE;
+    }
+
+    if (eMode == DIRECTGATE_SESSION_MODE_REMOTE)
+    {
+        if (DirectGate_Session_AddRTCPipeEndpoint(pSession) < 0) return XAPI_DISCONNECT;
+        if (DirectGate_Session_AddSearchPipeEndpoint(pSession) < 0) return XAPI_DISCONNECT;
+        pSession->eActiveMode = DIRECTGATE_SESSION_MODE_REMOTE;
+
+        xlogi("Remote mode activated: sid(%u), wsfd(%d)",
+            pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
+
+        return XAPI_CONTINUE;
+    }
+
+    if (eMode == DIRECTGATE_SESSION_MODE_EXEC)
+    {
+        if (DirectGate_Session_AddRTCPipeEndpoint(pSession) < 0) return XAPI_DISCONNECT;
+        pSession->eActiveMode = DIRECTGATE_SESSION_MODE_EXEC;
+
+        xlogi("Exec mode activated: sid(%u), wsfd(%d)",
             pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
 
         return XAPI_CONTINUE;

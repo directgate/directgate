@@ -49,6 +49,9 @@ int DirectGate_Files_TransferSendCb(xjson_obj_t *pHeader, const uint8_t *pPayloa
                                     size_t nLen, void *pCtx);
 void DirectGate_Files_ProcessTransfer(directgate_session_t *pSession);
 
+/* A download asked for while no route was known (see DirectGate_Session_GetBulkRoute) starts once one is */
+void DirectGate_Files_StartPendingOpen(directgate_session_t *pSession, uint64_t nNowMs);
+
 /* Copy and recursive delete run on a worker thread: a large tree used to hold
    the event loop for as long as the disk took, freezing every other session and
    ending the relay link once its keepalive gave up. The session sees the answer

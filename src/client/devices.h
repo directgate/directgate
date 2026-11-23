@@ -75,6 +75,11 @@ int DirectGate_Devices_Find(const directgate_device_list_t *pList, const char *p
 
 void DirectGate_Devices_Print(const directgate_device_list_t *pList);
 
+/* The list as {"devices":[{id, name, online, owned, connectable, owner?, reason?}]}, for scripts and agents.
+ * The caller frees the object. PrintJson writes it to stdout on one line. */
+xjson_obj_t* DirectGate_Devices_ToJson(const directgate_device_list_t *pList);
+xbool_t DirectGate_Devices_PrintJson(const directgate_device_list_t *pList);
+
 /* Full-screen arrow-key picker. pPurpose is the verb shown in the heading
  * ("connect to", "authorize this key on") so the operator can see which
  * action they are about to take. Returns the chosen index, or returns the

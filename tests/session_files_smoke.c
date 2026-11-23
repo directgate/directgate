@@ -189,6 +189,35 @@ static int deliver(fixture_t *pFix, xjson_obj_t *pHeader)
     return deliver_payload(pFix, pHeader, NULL, 0);
 }
 
+/* The relay's limit, as the relay sends it: a status, plain, for no session unless one is named */
+static xjson_obj_t* limit_header(uint32_t nSessionId, uint32_t nRate, uint32_t nBurst)
+{
+    xjson_obj_t *pHeader = DirectGate_Proto_BuildStatus("limit", nSessionId);
+    if (pHeader == NULL) return NULL;
+
+    XJSON_AddU32(pHeader, "rateBytes", nRate);
+    XJSON_AddU32(pHeader, "burstBytes", nBurst);
+    return pHeader;
+}
+
+/* A plain message, on the relay link or from some other transport */
+static int deliver_plain(fixture_t *pFix, xjson_obj_t *pHeader, xbool_t bRelay)
+{
+    xbyte_buffer_t packet;
+    XByteBuffer_Init(&packet, XSTDNON, XFALSE);
+    int nStatus = XSTDERR;
+
+    if (pHeader != NULL && DirectGate_Proto_Build(&packet, pHeader, NULL, 0, XFALSE))
+    {
+        nStatus = bRelay ? DirectGate_TestHandleRelayMessage(&pFix->api, packet.pData, packet.nUsed) :
+                           DirectGate_TestHandleTransportMessage(&pFix->api, packet.pData, packet.nUsed);
+    }
+
+    XJSON_FreeObject(pHeader);
+    XByteBuffer_Clear(&packet);
+    return nStatus;
+}
+
 /* A manager request with the fields the handler reads. */
 static xjson_obj_t* manager_header(const char *pAction, const char *pPath,
                                    const char *pTargetPath, uint32_t nSessionId,
@@ -781,6 +810,211 @@ int main(void)
         CHECK(fix.api.txBuffer.nUsed == 0, "an action-less request is not answered");
     }
 
+    /* ---- a download is bulk data: it waits for a data channel ------------- */
+    {
+        /* No channel yet, and no word that WebRTC is impossible: nothing of a download reaches the relay */
+        directgate_session_t *pS = fix.pSession;
+        uint64_t nNow = XTime_GetMonoMs();
+        CHECK(DirectGate_Session_GetBulkRoute(pS, nNow) == DIRECTGATE_BULK_WAIT, "with no data channel yet, bulk data waits");
+
+        uint32_t nLeft = DirectGate_Session_GetBulkWaitMs(pS, nNow);
+        CHECK(nLeft > 0 && nLeft <= DIRECTGATE_BULK_CHANNEL_WAIT_MS, "the wait for a channel is bounded");
+
+        CHECK(deliver(&fix, manager_header("open", sFile, NULL, 11, XFALSE)) == XAPI_CONTINUE, "deliver an open while waiting");
+        CHECK(pS->bPendingOpen && pS->transfer.eState != XTRANSFER_STATE_SENDING && fix.api.txBuffer.nUsed == 0,
+            "the download is held, and neither started nor answered");
+        CHECK(DirectGate_Session_HasBulk(pS), "a held download is bulk data in progress");
+        CHECK(DirectGate_TestGetServiceWaitMs(&fix.conn) > 5, "a held download does not keep the loop at the transfer pace");
+
+        /* Only the end of the wait is a wake-up the loop has to set itself: the channel opening is an event */
+        uint64_t nSavedWaitMs = pS->nBulkWaitMs;
+        pS->nBulkWaitMs = XTime_GetMonoMs() - (DIRECTGATE_BULK_CHANNEL_WAIT_MS - 30);
+        uint32_t nServiceMs = DirectGate_TestGetServiceWaitMs(&fix.conn);
+        CHECK(nServiceMs >= 1 && nServiceMs <= 30, "the loop wakes when the wait for a channel runs out");
+        pS->nBulkWaitMs = nSavedWaitMs;
+
+        CHECK(deliver(&fix, manager_header("open", sFile, NULL, 11, XFALSE)) == XAPI_CONTINUE, "deliver a second open");
+        CHECK(expect_manager(&fix, "open", "failed"), "a second open is refused while one is held");
+        CHECK(deliver(&fix, manager_header("save", sFile, NULL, 11, XFALSE)) == XAPI_CONTINUE, "deliver an upload");
+        CHECK(expect_manager(&fix, "save", "failed"), "an upload is refused while a download is held");
+
+        DirectGate_Files_StartPendingOpen(pS, pS->nBulkWaitMs + DIRECTGATE_BULK_CHANNEL_WAIT_MS - 1);
+        CHECK(pS->bPendingOpen && fix.api.txBuffer.nUsed == 0, "the download stays held while the wait lasts");
+
+        /* The wait runs out: WebRTC proved impossible, and the relay is the only way left */
+        DirectGate_Files_StartPendingOpen(pS, pS->nBulkWaitMs + DIRECTGATE_BULK_CHANNEL_WAIT_MS);
+        CHECK(!pS->bPendingOpen && pS->transfer.eState == XTRANSFER_STATE_SENDING && pS->bBulkRelay,
+            "once the wait runs out the download starts on the relay");
+        CHECK(pS->eBulkPin == DIRECTGATE_BULK_RELAY, "and stays on the relay until it is done");
+        CHECK(DirectGate_TestGetServiceWaitMs(&fix.conn) <= 5, "a download that can move keeps the loop at the transfer pace");
+        CHECK(DirectGate_Session_GetBulkWaitMs(pS, XTime_GetMonoMs()) == DIRECTGATE_COMMAND_WAIT_NONE,
+            "nothing waits once the relay is the route");
+
+        /* A channel that comes up midway does not take over: a relay message could arrive after a channel one */
+        pS->webrtc.bConnected = XTRUE;
+        pS->webrtc.nDataChannelID = 1;
+        CHECK(DirectGate_Session_GetBulkRoute(pS, XTime_GetMonoMs()) == DIRECTGATE_BULK_RELAY,
+            "a download that started on the relay finishes there");
+
+        for (int i = 0; i < 8 && pS->transfer.eState == XTRANSFER_STATE_SENDING; i++) DirectGate_Files_ProcessTransfer(pS);
+        CHECK(pS->transfer.eState == XTRANSFER_STATE_DONE && fix.api.txBuffer.nUsed > 0,
+            "the download goes out whole on the relay");
+        drain(&fix);
+
+        CHECK(!DirectGate_Session_HasBulk(pS), "a finished download leaves no bulk data in progress");
+        DirectGate_Session_ReleaseBulk(pS);
+        CHECK(DirectGate_Session_GetBulkRoute(pS, XTime_GetMonoMs()) == DIRECTGATE_BULK_CHANNEL && !pS->bBulkRelay,
+            "with nothing in progress, the next bulk data takes the channel");
+        CHECK(DirectGate_Session_GetBulkWaitMs(pS, XTime_GetMonoMs()) == DIRECTGATE_COMMAND_WAIT_NONE,
+            "nothing waits while a channel is open");
+
+        /* The channel goes again: bulk data waits for it to come back rather than spill onto the relay */
+        pS->webrtc.bConnected = XFALSE;
+        pS->webrtc.nDataChannelID = -1;
+        CHECK(DirectGate_Session_GetBulkRoute(pS, XTime_GetMonoMs()) == DIRECTGATE_BULK_WAIT,
+            "a channel that went is waited for again");
+
+        /* A client whose own ICE failed says so, and the wait ends at once */
+        CHECK(deliver(&fix, DirectGate_Proto_BuildWebRTC("unavailable", 11)) == XAPI_CONTINUE, "deliver webrtc/unavailable");
+        CHECK(pS->bBulkRelay && DirectGate_Session_GetBulkRoute(pS, XTime_GetMonoMs()) == DIRECTGATE_BULK_RELAY,
+            "a client's word that WebRTC is impossible makes the relay the route");
+        CHECK(fix.api.txBuffer.nUsed == 0, "webrtc/unavailable is not answered");
+        DirectGate_Session_SetBulkRelay(pS);
+        CHECK(pS->bBulkRelay, "saying it twice changes nothing");
+    }
+
+    /* ---- on the relay, a download keeps below the relay's limit ---------- */
+    {
+        directgate_session_t *pS = fix.pSession;
+        directgate_session_mgr_t *pMgr = &fix.conn.mgr;
+
+        /* The relay's own word only: plain, for no session, on the relay link. A client can put none there. */
+        CHECK(deliver(&fix, limit_header(11, 1048576, 0)) == XAPI_CONTINUE && pMgr->nRelayRateBytes == 0,
+            "a limit sealed inside a session is not the relay's");
+        CHECK(deliver_plain(&fix, limit_header(0, 1048576, 0), XFALSE) == XAPI_CONTINUE && pMgr->nRelayRateBytes == 0,
+            "nor one from anywhere but the relay link");
+        CHECK(deliver_plain(&fix, limit_header(11, 1048576, 0), XTRUE) == XAPI_CONTINUE && pMgr->nRelayRateBytes == 0,
+            "nor one for a session");
+        CHECK(deliver_plain(&fix, limit_header(0, 1048576, 0), XTRUE) == XAPI_CONTINUE &&
+              pMgr->nRelayRateBytes == 1048576 && pMgr->nRelayBurstBytes == 0, "the relay's own is taken");
+        CHECK(deliver_plain(&fix, DirectGate_Proto_BuildStatus("full", 0), XTRUE) == XAPI_CONTINUE &&
+              pMgr->nRelayRateBytes == 1048576, "and no other status of the relay's changes it");
+
+        /* 200 KB on the relay at 1 MB/s with no burst: kept to 983 bytes a millisecond, a 64 KB chunk at a time */
+        char sPaced[512];
+        snprintf(sPaced, sizeof(sPaced), "%s/paced.bin", sRoot);
+        char *pBody = (char*)malloc(200001);
+        CHECK(pBody != NULL, "allocate the paced file");
+        memset(pBody, 'z', 200000);
+        pBody[200000] = '\0';
+        CHECK(write_file(sPaced, pBody), "seed the paced file");
+        free(pBody);
+
+        drain(&fix);
+        CHECK(deliver(&fix, manager_header("open", sPaced, NULL, 11, XFALSE)) == XAPI_CONTINUE &&
+              pS->transfer.eState == XTRANSFER_STATE_SENDING && DirectGate_Session_IsBulkOnRelay(pS), "a download on the relay");
+        CHECK(pS->nRelayTokens < 0, "everything the session sent the relay counts: the answer to the open put it in debt");
+
+        size_t nQueued = fix.api.txBuffer.nUsed;
+        pS->nRelayTokensMs = XTime_GetMonoMs();
+        DirectGate_TestPumpTransfers(&fix.conn);
+        CHECK(fix.api.txBuffer.nUsed == nQueued, "in debt, the download waits");
+
+        int nChunks = 0, nLongWaits = 0;
+        for (int i = 0; i < 20 && pS->transfer.eState == XTRANSFER_STATE_SENDING; i++)
+        {
+            /* A second on: the bucket holds no more than its burst, so it is room for one chunk, not for more */
+            pS->nRelayTokensMs -= 1000;
+            nQueued = fix.api.txBuffer.nUsed;
+            DirectGate_TestPumpTransfers(&fix.conn);
+            CHECK(fix.api.txBuffer.nUsed > nQueued, "with room, the download moves");
+            nChunks++;
+
+            if (pS->transfer.eState != XTRANSFER_STATE_SENDING) break;
+            uint64_t nNowMs = XTime_GetMonoMs();
+            uint32_t nRelayMs = DirectGate_Session_GetRelayWaitMs(pS, nNowMs);
+            uint32_t nServiceMs = DirectGate_TestGetServiceWaitMs(&fix.conn);
+            CHECK(nRelayMs > 0 && nServiceMs <= nRelayMs && (nRelayMs <= 5 || nServiceMs > 5),
+                "the loop sleeps until there is room again, no longer, and not at the transfer pace");
+            if (nRelayMs > 50) nLongWaits++;
+
+            nQueued = fix.api.txBuffer.nUsed;
+            DirectGate_TestPumpTransfers(&fix.conn);
+            CHECK(fix.api.txBuffer.nUsed == nQueued, "and nothing more goes before that");
+        }
+        CHECK(pS->transfer.eState == XTRANSFER_STATE_DONE && nChunks >= 4, "the download goes out whole, as room allows");
+        CHECK(nLongWaits >= 2, "a 64 KB chunk owes some 67 ms of room");
+        unlink(sPaced);
+
+        /* A limit of 0: the relay has none, and nothing waits for it */
+        CHECK(deliver_plain(&fix, limit_header(0, 0, 0), XTRUE) == XAPI_CONTINUE && pMgr->nRelayRateBytes == 0,
+            "the relay's word that it has no limit is taken too");
+        CHECK(DirectGate_Session_GetRelayWaitMs(pS, XTime_GetMonoMs()) == 0, "and holds nothing back");
+        DirectGate_Session_ReleaseBulk(pS);
+        drain(&fix);
+    }
+
+    /* ---- the corners of a held, a failed and a routeless download -------- */
+    {
+        directgate_session_t *pS = fix.pSession;
+        char sGone[512];
+        snprintf(sGone, sizeof(sGone), "%s/gone.txt", sRoot);
+        CHECK(write_file(sGone, "soon gone"), "seed a file that will go");
+
+        DirectGate_Files_StartPendingOpen(NULL, 0);
+        pS->bBulkRelay = XFALSE;
+        pS->nBulkWaitMs = 0;
+        drain(&fix);
+        CHECK(deliver(&fix, manager_header("open", sGone, NULL, 11, XFALSE)) == XAPI_CONTINUE && pS->bPendingOpen,
+            "a download held for its route");
+
+        pS->bClosing = XTRUE;
+        DirectGate_Files_StartPendingOpen(pS, pS->nBulkWaitMs + DIRECTGATE_BULK_CHANNEL_WAIT_MS);
+        CHECK(pS->bPendingOpen && fix.api.txBuffer.nUsed == 0, "a closing session starts nothing it held");
+        pS->bClosing = XFALSE;
+
+        /* The file had the whole wait to go */
+        CHECK(unlink(sGone) == 0, "the held file goes");
+        DirectGate_Files_StartPendingOpen(pS, pS->nBulkWaitMs + DIRECTGATE_BULK_CHANNEL_WAIT_MS);
+        CHECK(!pS->bPendingOpen && pS->transfer.eState != XTRANSFER_STATE_SENDING, "a held download whose file went starts not");
+        CHECK(expect_manager(&fix, "open", "failed"), "and is refused when its route comes");
+        DirectGate_Files_StartPendingOpen(pS, XTime_GetMonoMs());
+        CHECK(fix.api.txBuffer.nUsed == 0, "nothing held, nothing started");
+
+        /* A file that cannot be read fails at the start of its transfer, and leaves nothing behind. Root reads it. */
+        if (geteuid() != 0)
+        {
+            char sLocked[512];
+            snprintf(sLocked, sizeof(sLocked), "%s/locked.txt", sRoot);
+            CHECK(write_file(sLocked, "locked") && chmod(sLocked, 0) == 0, "seed a file nobody may read");
+            CHECK(deliver(&fix, manager_header("open", sLocked, NULL, 11, XFALSE)) == XAPI_CONTINUE, "open it");
+            CHECK(expect_manager(&fix, "open", "failed") && pS->transfer.eState != XTRANSFER_STATE_SENDING,
+                "a file that cannot be read fails at its start");
+            CHECK(chmod(sLocked, 0600) == 0 && unlink(sLocked) == 0, "remove the locked file");
+        }
+
+        /* A download whose route went - its session detached - stops at its next message instead of sending it */
+        CHECK(deliver(&fix, manager_header("open", sFile, NULL, 11, XFALSE)) == XAPI_CONTINUE &&
+              pS->transfer.eState == XTRANSFER_STATE_SENDING, "a download on the relay");
+        drain(&fix);
+        pS->bDetached = XTRUE;
+        DirectGate_Files_ProcessTransfer(pS);
+        CHECK(pS->transfer.eState != XTRANSFER_STATE_SENDING, "with no route left, the download ends");
+        pS->bDetached = XFALSE;
+        drain(&fix);
+
+        /* And one the relay socket will not take ends there too */
+        CHECK(deliver(&fix, manager_header("open", sFile, NULL, 11, XFALSE)) == XAPI_CONTINUE &&
+              pS->transfer.eState == XTRANSFER_STATE_SENDING, "another download on the relay");
+        fix.api.txBuffer.nStatus = XSTDERR;
+        DirectGate_Files_ProcessTransfer(pS);
+        fix.api.txBuffer.nStatus = XSTDOK;
+        CHECK(pS->transfer.eState != XTRANSFER_STATE_SENDING, "a send the relay socket refused ends the download");
+        DirectGate_Session_ReleaseBulk(pS);
+        drain(&fix);
+    }
+
+    /* ---- outbound transfer --------------------------------------------- */
     /* ---- outbound transfer --------------------------------------------- */
 
     CHECK(deliver(&fix, manager_header("open", sMissing, NULL, 11, XFALSE)) == XAPI_CONTINUE,

@@ -25,6 +25,21 @@ void DirectGate_Term_Clear(directgate_term_t *pTerm)
     pTerm->nPid = -1;
 }
 
+void DirectGate_CMD_Init(directgate_command_t *pCmd)
+{
+    memset(pCmd, 0, sizeof(*pCmd));
+}
+
+xbool_t DirectGate_CMD_IsRunning(const directgate_command_t *pCmd)
+{
+    return pCmd != NULL && pCmd->eState == DIRECTGATE_COMMAND_RUNNING ? XTRUE : XFALSE;
+}
+
+void DirectGate_CMD_Clear(directgate_command_t *pCmd)
+{
+    memset(pCmd, 0, sizeof(*pCmd));
+}
+
 void DirectGate_Term_RequestStop(directgate_term_t *pTerm)
 {
     if (pTerm != NULL) pTerm->bRunning = XFALSE;
@@ -141,12 +156,15 @@ int DirectGate_Desktop_Start(directgate_session_t *pSession)
     return XSTDERR;
 }
 
+/* What the relay socket answers a send: a test can make it refuse */
+static int g_nWsSendStatus = XSTDOK;
+
 int DirectGate_WebSock_Send(xapi_session_t *pSession, const uint8_t *pPkg, size_t nLen)
 {
     (void)pSession;
     (void)pPkg;
     (void)nLen;
-    return XSTDOK;
+    return g_nWsSendStatus;
 }
 
 int DirectGate_WebSock_SendBuff(xapi_session_t *pSession, const xbyte_buffer_t *pPkg)
@@ -172,6 +190,17 @@ static void fill_key_material(directgate_session_t *pSession)
         pSession->srp.nonce[i] = (uint8_t)(0xc0 + i);
         pSession->srp.clientNonce[i] = (uint8_t)(0xe0 + i);
     }
+}
+
+/* One data message of the session's over the relay, with a header of its own */
+static int DirectGate_Test_PaceSend(directgate_session_t *pSession, const uint8_t *pData, size_t nLength)
+{
+    xjson_obj_t *pHeader = DirectGate_Proto_BuildData(pSession->nSessionId);
+    if (pHeader == NULL) return XAPI_DISCONNECT;
+
+    int nStatus = DirectGate_Session_Send(pSession, pHeader, pData, nLength);
+    XJSON_FreeObject(pHeader);
+    return nStatus;
 }
 
 int main(void)
@@ -435,6 +464,203 @@ int main(void)
     CHECK(DirectGate_SessionMgr_Close(&guardMgr, 78, "test") == XAPI_CONTINUE, "close a session by id");
     CHECK(DirectGate_SessionMgr_Find(&guardMgr, 78) == NULL, "closing by id removes the session");
     DirectGate_SessionMgr_Destroy(&guardMgr);
+
+    /* ---- remote mode: what an exec session and a file-manager session do, on one session ---- */
+    CHECK(DirectGate_SessionMode_FromString("remote") == DIRECTGATE_SESSION_MODE_REMOTE, "remote names the remote mode");
+    CHECK(strcmp(DirectGate_SessionMode_ToString(DIRECTGATE_SESSION_MODE_REMOTE), "remote") == 0, "and back");
+
+    directgate_session_t remote;
+    memset(&remote, 0, sizeof(remote));
+    remote.bAuthenticated = XTRUE;
+    remote.eActiveMode = DIRECTGATE_SESSION_MODE_REMOTE;
+    CHECK(DirectGate_Session_EnsureMode(&remote, DIRECTGATE_SESSION_MODE_EXEC, NULL) == XSTDOK, "a remote session runs commands");
+    CHECK(DirectGate_Session_EnsureMode(&remote, DIRECTGATE_SESSION_MODE_FILE_MANAGER, NULL) == XSTDOK,
+        "and file operations");
+    CHECK(DirectGate_Session_EnsureMode(&remote, DIRECTGATE_SESSION_MODE_TERMINAL, NULL) != XSTDOK, "but is no terminal");
+    CHECK(DirectGate_Session_EnsureMode(&remote, DIRECTGATE_SESSION_MODE_DESKTOP, NULL) != XSTDOK, "and no desktop");
+    remote.eActiveMode = DIRECTGATE_SESSION_MODE_EXEC;
+    CHECK(DirectGate_Session_EnsureMode(&remote, DIRECTGATE_SESSION_MODE_FILE_MANAGER, NULL) != XSTDOK,
+        "an exec session does no file operations");
+
+    /* ---- the bulk-data route ---- */
+    CHECK(DirectGate_Session_GetBulkRoute(NULL, 1) == DIRECTGATE_BULK_WAIT, "no session has no route");
+    CHECK(DirectGate_Session_GetBulkWaitMs(NULL, 1) == DIRECTGATE_COMMAND_WAIT_NONE, "nor a wait");
+    CHECK(DirectGate_Session_SendBulk(NULL, DIRECTGATE_BULK_RELAY, NULL, NULL, 0) == XAPI_DISCONNECT, "nor sends anything");
+    CHECK(DirectGate_Session_Send(NULL, NULL, NULL, 0) == XAPI_DISCONNECT, "no session sends nothing");
+    CHECK(!DirectGate_Session_HasBulk(NULL), "no session has no bulk data");
+    DirectGate_Session_ReleaseBulk(NULL);
+    DirectGate_Session_SetBulkRelay(NULL);
+
+    directgate_session_t bulk;
+    memset(&bulk, 0, sizeof(bulk));
+    DirectGate_WebRTC_Init(&bulk.webrtc);
+    const uint64_t nT = 5000000;
+    CHECK(DirectGate_Session_SendBulk(&bulk, DIRECTGATE_BULK_WAIT, NULL, NULL, 0) == XAPI_DISCONNECT,
+        "bulk data is never sent to nowhere");
+    CHECK(DirectGate_Session_GetBulkWaitMs(&bulk, nT) == DIRECTGATE_COMMAND_WAIT_NONE, "nothing waits before anything asked");
+    CHECK(DirectGate_Session_GetBulkRoute(&bulk, nT) == DIRECTGATE_BULK_WAIT && bulk.nBulkWaitMs == nT,
+        "the first ask for a route starts the wait");
+    CHECK(DirectGate_Session_GetBulkWaitMs(&bulk, nT + 1000) == DIRECTGATE_BULK_CHANNEL_WAIT_MS - 1000,
+        "the wait counts down from the first ask");
+    CHECK(DirectGate_Session_GetBulkRoute(&bulk, nT + 1000) == DIRECTGATE_BULK_WAIT && bulk.nBulkWaitMs == nT,
+        "asking again does not restart it");
+    CHECK(DirectGate_Session_GetBulkWaitMs(&bulk, nT + DIRECTGATE_BULK_CHANNEL_WAIT_MS + 5) == 1,
+        "a wait already over asks for the next pass, never for a spin");
+
+    bulk.bDetached = XTRUE;
+    CHECK(DirectGate_Session_GetBulkRoute(&bulk, nT + DIRECTGATE_BULK_CHANNEL_WAIT_MS) == DIRECTGATE_BULK_WAIT &&
+          !bulk.bBulkRelay, "a detached session never falls back to the relay it no longer has");
+    CHECK(DirectGate_Session_GetBulkWaitMs(&bulk, nT) == DIRECTGATE_COMMAND_WAIT_NONE, "nor waits for one");
+    bulk.bDetached = XFALSE;
+
+    CHECK(DirectGate_Session_GetBulkRoute(&bulk, nT + DIRECTGATE_BULK_CHANNEL_WAIT_MS - 1) == DIRECTGATE_BULK_WAIT,
+        "the relay is not taken a moment early");
+    CHECK(DirectGate_Session_GetBulkRoute(&bulk, nT + DIRECTGATE_BULK_CHANNEL_WAIT_MS) == DIRECTGATE_BULK_RELAY &&
+          bulk.bBulkRelay, "once the wait runs out the relay is the route");
+    CHECK(DirectGate_Session_GetBulkWaitMs(&bulk, nT) == DIRECTGATE_COMMAND_WAIT_NONE, "and nothing waits any more");
+
+    bulk.eBulkPin = DIRECTGATE_BULK_RELAY;
+    bulk.bDetached = XTRUE;
+    CHECK(DirectGate_Session_GetBulkRoute(&bulk, nT) == DIRECTGATE_BULK_WAIT, "a detached session's relay pin goes nowhere");
+    bulk.bDetached = XFALSE;
+    bulk.webrtc.bConnected = XTRUE;
+    bulk.webrtc.nDataChannelID = 1;
+    CHECK(DirectGate_Session_GetBulkRoute(&bulk, nT) == DIRECTGATE_BULK_RELAY, "a relay pin outlasts a channel that came up");
+    CHECK(DirectGate_Session_GetBulkWaitMs(&bulk, nT) == DIRECTGATE_COMMAND_WAIT_NONE, "nothing waits on a relay pin");
+
+    DirectGate_Session_ReleaseBulk(&bulk);
+    CHECK(DirectGate_Session_GetBulkRoute(&bulk, nT) == DIRECTGATE_BULK_CHANNEL && !bulk.bBulkRelay && !bulk.nBulkWaitMs,
+        "released, the next bulk data takes the open channel, and the relay is forgotten");
+    bulk.nBulkWaitMs = nT;
+    CHECK(DirectGate_Session_GetBulkWaitMs(&bulk, nT) == DIRECTGATE_COMMAND_WAIT_NONE, "nothing waits while a channel is open");
+
+    bulk.webrtc.bConnected = XFALSE;
+    bulk.webrtc.nDataChannelID = -1;
+    bulk.nBulkWaitMs = 0;
+    DirectGate_Session_SetBulkRelay(&bulk);
+    CHECK(bulk.bBulkRelay && DirectGate_Session_GetBulkRoute(&bulk, nT) == DIRECTGATE_BULK_RELAY,
+        "a client's word that WebRTC is impossible makes the relay the route at once");
+
+    bulk.transfer.eState = XTRANSFER_STATE_SENDING;
+    CHECK(DirectGate_Session_HasBulk(&bulk), "a download is bulk data");
+    bulk.transfer.eState = XTRANSFER_STATE_IDLE;
+    bulk.bPendingOpen = XTRUE;
+    CHECK(DirectGate_Session_HasBulk(&bulk), "so is one held for its route");
+    bulk.bPendingOpen = XFALSE;
+    bulk.command.eState = DIRECTGATE_COMMAND_RUNNING;
+    CHECK(DirectGate_Session_HasBulk(&bulk), "so is a running command");
+    bulk.command.eState = DIRECTGATE_COMMAND_DONE;
+    CHECK(!DirectGate_Session_HasBulk(&bulk), "a finished command is not");
+
+    /* ---- bulk data on the relay keeps below the relay's limit ---- */
+    CHECK(DirectGate_Session_GetRelayWaitMs(NULL, nT) == 0 && !DirectGate_Session_IsBulkOnRelay(NULL), "no session, no limit");
+    DirectGate_SessionMgr_SetRelayLimit(NULL, 1, 1);
+
+    directgate_session_mgr_t paceMgr;
+    memset(&paceMgr, 0, sizeof(paceMgr));
+    directgate_session_t pace;
+    memset(&pace, 0, sizeof(pace));
+    DirectGate_WebRTC_Init(&pace.webrtc);
+    pace.nSessionId = 9;
+    pace.nRelayTokens = -1000000;
+    pace.nRelayTokensMs = nT;
+    CHECK(DirectGate_Session_GetRelayWaitMs(&pace, nT) == 0, "a session without a manager has no limit");
+    pace.pMgr = &paceMgr;
+    CHECK(DirectGate_Session_GetRelayWaitMs(&pace, nT) == 0, "nor one whose relay has none, whatever it counted");
+
+    /* 16000 B/s after 64000: kept to 15000 a second - 15 bytes a millisecond - after 32000 */
+    DirectGate_SessionMgr_SetRelayLimit(&paceMgr, 16000, 64000);
+    CHECK(paceMgr.nRelayRateBytes == 16000 && paceMgr.nRelayBurstBytes == 64000, "the relay's limit is kept");
+    DirectGate_SessionMgr_SetRelayLimit(&paceMgr, 16000, 64000);
+    CHECK(paceMgr.nRelayRateBytes == 16000 && paceMgr.nRelayBurstBytes == 64000, "told again, it stays");
+    pace.nRelayTokens = -150000;
+    CHECK(DirectGate_Session_GetRelayWaitMs(&pace, nT) == 10, "150 bytes owed take 10 ms at a sixteenth below the rate");
+    CHECK(DirectGate_Session_GetRelayWaitMs(&pace, nT + 4) == 6, "and count down");
+    CHECK(DirectGate_Session_GetRelayWaitMs(&pace, nT - 5) == 10, "a clock before the count adds nothing");
+    CHECK(DirectGate_Session_GetRelayWaitMs(&pace, nT + 10) == 0, "paid, more may go");
+    pace.nRelayTokens = -150001;
+    CHECK(DirectGate_Session_GetRelayWaitMs(&pace, nT) == 11, "rounded up, never early");
+    pace.nRelayTokens = DIRECTGATE_RELAY_PACE_FLOOR;
+    CHECK(DirectGate_Session_GetRelayWaitMs(&pace, nT) == DIRECTGATE_COMMAND_WAIT_NONE - 1,
+        "the deepest debt is a long wait, never no wait");
+    CHECK(DirectGate_Session_GetRelayWaitMs(&pace, UINT64_MAX) == 0, "and the longest idle pays it, in range");
+
+    /* Topped up a whole millisecond of rate at a time, and to the burst exactly: never past it */
+    pace.nRelayTokens = 32000000 - 30500;
+    CHECK(DirectGate_Session_TestRelayLevel(&pace, nT + 2) == 32000000 - 500, "room for two and a third milliseconds: two added");
+    CHECK(DirectGate_Session_TestRelayLevel(&pace, nT + 3) == 32000000, "a third fills it, and no more");
+    pace.nRelayTokens = 32000000 - 30000;
+    CHECK(DirectGate_Session_TestRelayLevel(&pace, nT + 2) == 32000000, "room for exactly two: full");
+    CHECK(DirectGate_Session_TestRelayLevel(&pace, nT) == 32000000 - 30000, "no time, nothing added");
+
+    /* Routes: only bulk data the relay carries is paced */
+    pace.nRelayTokens = -150000;
+    CHECK(!DirectGate_Session_IsBulkOnRelay(&pace) && DirectGate_Session_GetBulkWaitMs(&pace, nT) == DIRECTGATE_COMMAND_WAIT_NONE,
+        "bulk data with no route yet is not paced");
+    pace.bBulkRelay = XTRUE;
+    CHECK(DirectGate_Session_IsBulkOnRelay(&pace) && DirectGate_Session_GetBulkWaitMs(&pace, nT) == 10,
+        "on the relay it waits for its room, and the loop with it");
+    CHECK(DirectGate_Session_GetBulkWaitMs(&pace, nT + 10) == DIRECTGATE_COMMAND_WAIT_NONE, "with room, nothing waits");
+    pace.webrtc.bConnected = XTRUE;
+    pace.webrtc.nDataChannelID = 1;
+    CHECK(!DirectGate_Session_IsBulkOnRelay(&pace) && DirectGate_Session_GetBulkWaitMs(&pace, nT) == DIRECTGATE_COMMAND_WAIT_NONE,
+        "the data channel is not paced");
+    pace.eBulkPin = DIRECTGATE_BULK_RELAY;
+    CHECK(DirectGate_Session_IsBulkOnRelay(&pace) && DirectGate_Session_GetBulkWaitMs(&pace, nT) == 10,
+        "bulk data pinned to the relay is, whatever came up since");
+    pace.bDetached = XTRUE;
+    CHECK(!DirectGate_Session_IsBulkOnRelay(&pace) && DirectGate_Session_GetBulkWaitMs(&pace, nT) == DIRECTGATE_COMMAND_WAIT_NONE,
+        "a detached session has no relay to keep below");
+    pace.bDetached = XFALSE;
+    pace.webrtc.bConnected = XFALSE;
+    pace.webrtc.nDataChannelID = -1;
+
+    /* What the session sends the relay is counted as the relay counts it: the frame's payload, the package */
+    xapi_session_t paceLink;
+    memset(&paceLink, 0, sizeof(paceLink));
+    XByteBuffer_Init(&paceLink.txBuffer, XSTDNON, XFALSE);
+    paceLink.nEvents = XPOLLOUT;
+    pace.pWsSession = &paceLink;
+    pace.nRelayTokens = 0;
+    pace.nRelayTokensMs = 0;
+
+    uint8_t sPaceData[1000];
+    memset(sPaceData, 'p', sizeof(sPaceData));
+    xjson_obj_t *pPaceHeader = DirectGate_Proto_BuildData(9);
+    xbyte_buffer_t paceExpect;
+    XByteBuffer_Init(&paceExpect, XSTDNON, XFALSE);
+    CHECK(pPaceHeader != NULL && DirectGate_Proto_Build(&paceExpect, pPaceHeader, sPaceData, sizeof(sPaceData), XFALSE),
+        "the package the relay will see");
+    int64_t nCost = (int64_t)paceExpect.nUsed * DIRECTGATE_RELAY_PACE_UNIT;
+
+    /* Building adds payloadSize to the header it is given: each send gets one of its own */
+    XJSON_FreeObject(pPaceHeader);
+#define PACE_SEND() DirectGate_Test_PaceSend(&pace, sPaceData, sizeof(sPaceData))
+
+    uint64_t nBefore = XTime_GetMonoMs();
+    CHECK(PACE_SEND() >= 0, "a message over the relay");
+    CHECK(pace.nRelayTokensMs >= nBefore && pace.nRelayTokens == 32000000 - nCost, "is counted from a full bucket");
+
+    pace.nRelayTokens = 40000000;
+    pace.nRelayTokensMs = XTime_GetMonoMs();
+    CHECK(PACE_SEND() >= 0 && pace.nRelayTokens == 32000000 - nCost, "from no more than the burst of a limit lowered since");
+
+    g_nWsSendStatus = XAPI_DISCONNECT;
+    CHECK(PACE_SEND() < 0 && pace.nRelayTokens == 32000000 - nCost, "a send the relay socket refused counts nothing");
+    g_nWsSendStatus = XSTDOK;
+
+    pace.nRelayTokens = DIRECTGATE_RELAY_PACE_FLOOR + 1;
+    pace.nRelayTokensMs = XTime_GetMonoMs() + 1000000;
+    CHECK(PACE_SEND() >= 0 && pace.nRelayTokens == DIRECTGATE_RELAY_PACE_FLOOR, "down to the floor and no further");
+
+    DirectGate_SessionMgr_SetRelayLimit(&paceMgr, 0, 0);
+    pace.nRelayTokens = 5;
+    pace.nRelayTokensMs = 7;
+    CHECK(PACE_SEND() >= 0 && pace.nRelayTokens == 5 && pace.nRelayTokensMs == 7, "without a limit nothing is counted");
+#undef PACE_SEND
+
+    XByteBuffer_Clear(&paceExpect);
+    XByteBuffer_Clear(&paceLink.txBuffer);
 
     puts("session_smoke: OK");
     return 0;

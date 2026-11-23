@@ -124,6 +124,7 @@ typedef struct directgate_conn_ {
 int DirectGate_TestHandleTransportMessage(xapi_session_t *pApiSession,
                                           const uint8_t *pPayload,
                                           size_t nPayload);
+int DirectGate_TestHandleRelayMessage(xapi_session_t *pApiSession, const uint8_t *pPayload, size_t nPayload);
 void DirectGate_TestCheckWebRTCKeepalive(directgate_conn_t *pConn);
 void DirectGate_TestCheckRelayKeepalive(directgate_conn_t *pConn);
 void DirectGate_TestCheckWebRTCDrops(directgate_conn_t *pConn);
@@ -140,6 +141,8 @@ void DirectGate_TestCheckReconnect(xapi_t *pApi, xapi_endpoint_t *pEndpt, direct
 xbool_t DirectGate_TestCollectReconnect(directgate_conn_t *pConn, uint32_t nWaitMs);
 void DirectGate_TestDropRelayResolve(directgate_conn_t *pConn);
 void DirectGate_TestInitialConnect(xapi_t *pApi, xapi_endpoint_t *pEndpt, directgate_conn_t *pConn);
+uint32_t DirectGate_TestGetServiceWaitMs(const directgate_conn_t *pConn);
+void DirectGate_TestPumpTransfers(directgate_conn_t *pConn);
 #endif
 
 #ifdef __cplusplus

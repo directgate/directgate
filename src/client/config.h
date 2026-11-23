@@ -26,6 +26,7 @@
 #include "auth.h"
 #include "logger.h"
 #include "webrtc.h"
+#include "remote.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,7 +37,8 @@ typedef enum {
     DIRECTGATE_CMD_LOGIN,
     DIRECTGATE_CMD_LOGOUT,
     DIRECTGATE_CMD_DEVICES,
-    DIRECTGATE_CMD_WHOAMI
+    DIRECTGATE_CMD_WHOAMI,
+    DIRECTGATE_CMD_REMOTE           /* exec, dir, get, put, rm, mkdir, mv: one operation, no terminal */
 } directgate_cmd_t;
 
 typedef struct directgate_cfg_ {
@@ -55,6 +57,7 @@ typedef struct directgate_cfg_ {
     char sDeviceId[XSTR_MID];
     char sCfgPath[XPATH_MAX];
     char sSecret[XSTR_MID];
+    directgate_remote_req_t remote;
     directgate_auth_t auth;
     directgate_log_t log;
     directgate_cmd_t eCommand;
@@ -67,6 +70,7 @@ typedef struct directgate_cfg_ {
     xbool_t bAddKey;
     xbool_t bForce;
     xbool_t bInit;
+    xbool_t bJson;
 } directgate_cfg_t;
 
 void DirectGate_DisplayUsage(const char *pName);
@@ -75,7 +79,7 @@ void DirectGate_InitConfig(directgate_cfg_t *pCfg);
 xbool_t DirectGate_LoadConfig(directgate_cfg_t *pCfg, const char *pPath);
 XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[]);
 
-/* Maps a leading "login"/"logout"/"devices"/"whoami" verb onto a command.
+/* Maps a leading "login"/"logout"/"devices"/"whoami" verb, or one of the remote operations, onto a command.
  * Returns XFALSE when the token is not a verb, leaving it as a device query. */
 xbool_t DirectGate_ParseCommand(const char *pArg, directgate_cmd_t *pCommand);
 

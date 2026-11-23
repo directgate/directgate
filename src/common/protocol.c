@@ -137,6 +137,7 @@ static directgate_pkg_type_t DirectGate_Proto_TypeFromStr(const char *pType)
     if (xstrcmp(pType, "verify")) return DIRECTGATE_PKG_VERIFY;
     if (xstrcmp(pType, "webrtc")) return DIRECTGATE_PKG_WEBRTC;
     if (xstrcmp(pType, "admin")) return DIRECTGATE_PKG_ADMIN;
+    if (xstrcmp(pType, "exec")) return DIRECTGATE_PKG_EXEC;
     return DIRECTGATE_PKG_NONE;
 }
 
@@ -158,6 +159,7 @@ static size_t DirectGate_Proto_PackageSize(directgate_pkg_type_t eType)
         case DIRECTGATE_PKG_VERIFY: return sizeof(directgate_pkg_verify_t);
         case DIRECTGATE_PKG_WEBRTC: return sizeof(directgate_pkg_webrtc_t);
         case DIRECTGATE_PKG_ADMIN: return sizeof(directgate_pkg_admin_t);
+        case DIRECTGATE_PKG_EXEC: return sizeof(directgate_pkg_exec_t);
         default: return 0;
     }
 }
@@ -219,6 +221,8 @@ static void DirectGate_Package_ParseAuthPkg(directgate_pkg_auth_t *pPkg, xjson_o
     /* Missing means false: agents that predate pre-logon never enter it. */
     xjson_obj_t *pPreLogon = XJSON_GetObject(pHdr, "preLogon");
     pPkg->bPreLogon = (pPreLogon != NULL && XJSON_GetBool(pPreLogon)) ? XTRUE : XFALSE;
+    pPkg->bExec = XJSON_GetBool(XJSON_GetObject(pHdr, "exec")) ? XTRUE : XFALSE;
+    pPkg->bRemote = XJSON_GetBool(XJSON_GetObject(pHdr, "remote")) ? XTRUE : XFALSE;
 }
 
 static void DirectGate_Package_ParseCmdPkg(directgate_pkg_cmd_t *pPkg, xjson_obj_t *pHdr)
@@ -230,6 +234,8 @@ static void DirectGate_Package_ParseCmdPkg(directgate_pkg_cmd_t *pPkg, xjson_obj
 static void DirectGate_Package_ParseStatusPkg(directgate_pkg_status_t *pPkg, xjson_obj_t *pHdr)
 {
     pPkg->pStatus = XJSON_GetString(XJSON_GetObject(pHdr, "status"));
+    pPkg->nRateBytes = XJSON_GetU32(XJSON_GetObject(pHdr, "rateBytes"));
+    pPkg->nBurstBytes = XJSON_GetU32(XJSON_GetObject(pHdr, "burstBytes"));
 }
 
 static void DirectGate_Package_ParseErrorPkg(directgate_pkg_error_t *pPkg, xjson_obj_t *pHdr)
@@ -259,8 +265,11 @@ static void DirectGate_Package_ParseAdminPkg(directgate_pkg_admin_t *pPkg, xjson
     pPkg->pSalt = XJSON_GetString(XJSON_GetObject(pHdr, "salt"));
 }
 
-static void DirectGate_Package_ParseManagerPkg(directgate_pkg_manager_t *pPkg, xjson_obj_t *pHdr)
+static xbool_t DirectGate_Package_ParseManagerPkg(directgate_pkg_t *pPackage, xjson_obj_t *pHdr,
+                                                  const uint8_t *pData, size_t nSize, uint32_t nHdrLen)
 {
+    directgate_pkg_manager_t *pPkg = (directgate_pkg_manager_t*)pPackage->pPackage;
+
     pPkg->pAction = XJSON_GetString(XJSON_GetObject(pHdr, "action"));
     pPkg->pPath = XJSON_GetString(XJSON_GetObject(pHdr, "path"));
     pPkg->pFileName = XJSON_GetString(XJSON_GetObject(pHdr, "fileName"));
@@ -278,6 +287,15 @@ static void DirectGate_Package_ParseManagerPkg(directgate_pkg_manager_t *pPkg, x
     pPkg->bInsensitive = XJSON_GetBool(XJSON_GetObject(pHdr, "insensitive"));
     pPkg->bSearchLines = XJSON_GetBool(XJSON_GetObject(pHdr, "searchLines"));
     pPkg->bMatchOnly = XJSON_GetBool(XJSON_GetObject(pHdr, "matchOnly"));
+
+    if (!DirectGate_Package_ParsePayload(&pPkg->data, pHdr, pData, nSize, nHdrLen))
+    {
+        free(pPackage->pPackage);
+        pPackage->pPackage = NULL;
+        return XFALSE;
+    }
+
+    return XTRUE;
 }
 
 static void DirectGate_Package_ParseResizePkg(directgate_pkg_size_t *pPkg, xjson_obj_t *pHdr)
@@ -338,6 +356,54 @@ static xbool_t DirectGate_Package_ParseFilePkg(directgate_pkg_t *pPkg, xjson_obj
     return XTRUE;
 }
 
+/* A whole number of bytes that fits 32 bits, "0" included: what XJSON_GetU64 reads as 0 for anything else - a sign,
+   a fraction, an exponent - is told apart here, so a malformed limit is refused instead of read as none. */
+static xbool_t DirectGate_Package_GetByteCount(xjson_obj_t *pObj, uint32_t *pValue)
+{
+    *pValue = 0;
+    XCHECK_NL((pObj != NULL && pObj->nType == XJSON_TYPE_NUMBER), XFALSE);
+
+    uint64_t nValue = XJSON_GetU64(pObj);
+    XCHECK_NL((nValue <= UINT32_MAX && (nValue > 0 || !strcmp((const char*)pObj->pData, "0"))), XFALSE);
+
+    *pValue = (uint32_t)nValue;
+    return XTRUE;
+}
+
+static xbool_t DirectGate_Package_ParseExecPkg(directgate_pkg_t *pPkg, xjson_obj_t *pHdr,
+                                               const uint8_t *pData, size_t nSize, uint32_t nHdrLen)
+{
+    directgate_pkg_exec_t *pExec = (directgate_pkg_exec_t*)pPkg->pPackage;
+    xjson_obj_t *pExitCode = XJSON_GetObject(pHdr, "exitCode");
+    xjson_obj_t *pOutputMax = XJSON_GetObject(pHdr, "outputMax");
+
+    pExec->pAction = XJSON_GetString(XJSON_GetObject(pHdr, "action"));
+    pExec->pCommand = XJSON_GetString(XJSON_GetObject(pHdr, "command"));
+    pExec->pStream = XJSON_GetString(XJSON_GetObject(pHdr, "stream"));
+    pExec->pSignal = XJSON_GetString(XJSON_GetObject(pHdr, "signal"));
+    pExec->pStatus = XJSON_GetString(XJSON_GetObject(pHdr, "status"));
+    pExec->pReason = XJSON_GetString(XJSON_GetObject(pHdr, "reason"));
+    pExec->nTimeoutMs = XJSON_GetU32(XJSON_GetObject(pHdr, "timeoutMs"));
+    pExec->bTimedOut = XJSON_GetBool(XJSON_GetObject(pHdr, "timedOut"));
+    pExec->bStdin = XJSON_GetBool(XJSON_GetObject(pHdr, "stdin"));
+    pExec->pCwd = XJSON_GetString(XJSON_GetObject(pHdr, "cwd"));
+    pExec->bHasExitCode = pExitCode != NULL ? XTRUE : XFALSE;
+    pExec->nExitCode = pExitCode != NULL ? XJSON_GetInt(pExitCode) : 0;
+    pExec->bTruncated = XJSON_GetBool(XJSON_GetObject(pHdr, "truncated"));
+    pExec->bHasOutputMax = pOutputMax != NULL ? XTRUE : XFALSE;
+    pExec->bBadOutputMax = (pOutputMax != NULL && !DirectGate_Package_GetByteCount(pOutputMax, &pExec->nOutputMax)) ?
+        XTRUE : XFALSE;
+
+    if (!DirectGate_Package_ParsePayload(&pExec->data, pHdr, pData, nSize, nHdrLen))
+    {
+        free(pPkg->pPackage);
+        pPkg->pPackage = NULL;
+        return XFALSE;
+    }
+
+    return XTRUE;
+}
+
 static xbool_t DirectGate_Package_ParseDataPkg(directgate_pkg_t *pPkg, xjson_obj_t *pHdr, const uint8_t *pData, size_t nSize, uint32_t nHdrLen)
 {
     directgate_pkg_data_t *pDataPkg = (directgate_pkg_data_t*)pPkg->pPackage;
@@ -383,6 +449,12 @@ static xbool_t DirectGate_Package_ParsePackage(directgate_pkg_t *pPkg, const uin
         case DIRECTGATE_PKG_FILE:
             if (!DirectGate_Package_ParseFilePkg(pPkg, pHdr, pData, nSize, nHdrLen)) return XFALSE;
             break;
+        case DIRECTGATE_PKG_MANAGER:
+            if (!DirectGate_Package_ParseManagerPkg(pPkg, pHdr, pData, nSize, nHdrLen)) return XFALSE;
+            break;
+        case DIRECTGATE_PKG_EXEC:
+            if (!DirectGate_Package_ParseExecPkg(pPkg, pHdr, pData, nSize, nHdrLen)) return XFALSE;
+            break;
         case DIRECTGATE_PKG_AUTH:
             DirectGate_Package_ParseAuthPkg((directgate_pkg_auth_t*)pPkg->pPackage, pHdr);
             break;
@@ -394,9 +466,6 @@ static xbool_t DirectGate_Package_ParsePackage(directgate_pkg_t *pPkg, const uin
             break;
         case DIRECTGATE_PKG_KEEPALIVE:
             DirectGate_Package_ParseKeepalivePkg((directgate_pkg_keepalive_t*)pPkg->pPackage, pHdr);
-            break;
-        case DIRECTGATE_PKG_MANAGER:
-            DirectGate_Package_ParseManagerPkg((directgate_pkg_manager_t*)pPkg->pPackage, pHdr);
             break;
         case DIRECTGATE_PKG_RESIZE:
             DirectGate_Package_ParseResizePkg((directgate_pkg_size_t*)pPkg->pPackage, pHdr);
@@ -772,6 +841,19 @@ xjson_obj_t* DirectGate_Proto_BuildManager(const char *pAction, const char *pSta
     return pHeader;
 }
 
+xjson_obj_t* DirectGate_Proto_BuildExec(const char *pAction, const char *pStatus,
+                                        const char *pReason, uint32_t nSessionId)
+{
+    xjson_obj_t *pHeader = DirectGate_Proto_NewHeader("exec", nSessionId);
+    XCHECK(pHeader, xthrowp(NULL, "Failed to create json header"));
+
+    XJSON_AddStrIfUsed(pHeader, "action", pAction);
+    XJSON_AddStrIfUsed(pHeader, "status", pStatus);
+    XJSON_AddStrIfUsed(pHeader, "reason", pReason);
+
+    return pHeader;
+}
+
 xjson_obj_t* DirectGate_Proto_BuildAdmin(const char *pAction, const char *pClientPub,
                                          const char *pStatus, const char *pReason,
                                          uint32_t nSessionId)
@@ -858,6 +940,16 @@ xjson_obj_t* DirectGate_Proto_BuildFileCancel(const char *pTransferId, const cha
 xjson_obj_t* DirectGate_Proto_BuildKeepalive(const char *pAction, uint32_t nSessionId)
 {
     xjson_obj_t *pHeader = DirectGate_Proto_NewHeader("keepalive", nSessionId);
+    XCHECK(pHeader, xthrowp(NULL, "Failed to create json header"));
+
+    XJSON_AddStrIfUsed(pHeader, "action", pAction);
+    return pHeader;
+}
+
+/* A signaling message with no SDP or candidate of its own: "unavailable", a client's own ICE having failed */
+xjson_obj_t* DirectGate_Proto_BuildWebRTC(const char *pAction, uint32_t nSessionId)
+{
+    xjson_obj_t *pHeader = DirectGate_Proto_NewHeader("webrtc", nSessionId);
     XCHECK(pHeader, xthrowp(NULL, "Failed to create json header"));
 
     XJSON_AddStrIfUsed(pHeader, "action", pAction);

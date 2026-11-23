@@ -382,6 +382,58 @@ void DirectGate_Devices_Print(const directgate_device_list_t *pList)
     }
 }
 
+xjson_obj_t* DirectGate_Devices_ToJson(const directgate_device_list_t *pList)
+{
+    XCHECK_NL((pList != NULL), NULL);
+
+    xjson_obj_t *pRoot = XJSON_NewObject(NULL, NULL, XFALSE);
+    xjson_obj_t *pArray = XJSON_NewArray(NULL, "devices", XFALSE);
+    if (pRoot == NULL || pArray == NULL || XJSON_AddObject(pRoot, pArray) != XJSON_ERR_NONE)
+    {
+        XJSON_FreeObject(pArray);
+        XJSON_FreeObject(pRoot);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < pList->nCount; i++)
+    {
+        const directgate_device_t *pDevice = &pList->devices[i];
+        xjson_obj_t *pItem = XJSON_NewObject(NULL, NULL, XFALSE);
+
+        if (pItem == NULL || XJSON_AddObject(pArray, pItem) != XJSON_ERR_NONE)
+        {
+            XJSON_FreeObject(pItem);
+            XJSON_FreeObject(pRoot);
+            return NULL;
+        }
+
+        XJSON_AddString(pItem, "id", pDevice->sId);
+        XJSON_AddString(pItem, "name", pDevice->sName);
+        XJSON_AddBool(pItem, "online", pDevice->bOnline);
+        XJSON_AddBool(pItem, "owned", pDevice->bOwned);
+        XJSON_AddBool(pItem, "connectable", pDevice->bConnectable);
+        XJSON_AddStrIfUsed(pItem, "owner", pDevice->sOwner);
+        XJSON_AddStrIfUsed(pItem, "reason", pDevice->sReason);
+    }
+
+    return pRoot;
+}
+
+xbool_t DirectGate_Devices_PrintJson(const directgate_device_list_t *pList)
+{
+    xjson_obj_t *pRoot = DirectGate_Devices_ToJson(pList);
+    XCHECK_NL((pRoot != NULL), XFALSE);
+
+    size_t nLength = 0;
+    char *pDump = XJSON_DumpObj(pRoot, 0, &nLength);
+    XJSON_FreeObject(pRoot);
+    XCHECK_NL((pDump != NULL), XFALSE);
+
+    xbool_t bOk = (fwrite(pDump, 1, nLength, stdout) == nLength && fputc('\n', stdout) != EOF) ? XTRUE : XFALSE;
+    free(pDump);
+    return bOk;
+}
+
 #ifdef _WIN32
 typedef struct directgate_pick_io_ {
     DWORD nSavedOutMode;

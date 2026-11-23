@@ -251,6 +251,116 @@ int main(void)
         DirectGate_Package_Clear(&pkg);
     }
 
+    /* ---- exec: the request, a stream chunk and the exit ---- */
+    {
+        xjson_obj_t *pHeader = DirectGate_Proto_BuildExec("start", NULL, NULL, 7);
+        CHECK(pHeader != NULL, "exec start header");
+        XJSON_AddString(pHeader, "command", "ls -la");
+        XJSON_AddString(pHeader, "cwd", "/srv");
+        XJSON_AddU32(pHeader, "timeoutMs", 30000);
+        XJSON_AddBool(pHeader, "stdin", XTRUE);
+
+        CHECK(roundtrip(&pkg, &wire, pHeader, NULL, 0) == 0, "exec start");
+        CHECK(pkg.header.eType == DIRECTGATE_PKG_EXEC && pkg.header.nSessionId == 7, "exec type and session");
+
+        directgate_pkg_exec_t *pExec = (directgate_pkg_exec_t*)pkg.pPackage;
+        CHECK(pExec != NULL && STREQ(pExec->pAction, "start"), "exec action");
+        CHECK(STREQ(pExec->pCommand, "ls -la") && STREQ(pExec->pCwd, "/srv"), "exec command and directory");
+        CHECK(pExec->nTimeoutMs == 30000 && pExec->bStdin == XTRUE, "exec timeout and stdin flag");
+        CHECK(!pExec->bHasExitCode && pExec->data.nPayloadLength == 0, "a start carries no exit and no bytes");
+        CHECK(!pExec->bHasOutputMax && !pExec->bBadOutputMax && !pExec->bTruncated, "a start without a limit has none");
+        DirectGate_Package_Clear(&pkg);
+
+        /* An output limit: 0 and the largest 32-bit count are limits too; anything else is malformed, never "none" */
+        const uint64_t nGood[3] = { 0, 131073, 4294967295ULL };
+        for (int i = 0; i < 3; i++)
+        {
+            pHeader = DirectGate_Proto_BuildExec("start", NULL, NULL, 7);
+            CHECK(pHeader != NULL, "exec start header with a limit");
+            XJSON_AddU64(pHeader, "outputMax", nGood[i]);
+            CHECK(roundtrip(&pkg, &wire, pHeader, NULL, 0) == 0, "exec start with a limit");
+            pExec = (directgate_pkg_exec_t*)pkg.pPackage;
+            CHECK(pExec != NULL && pExec->bHasOutputMax && !pExec->bBadOutputMax && pExec->nOutputMax == (uint32_t)nGood[i],
+                "a whole number of bytes is read as the limit");
+            DirectGate_Package_Clear(&pkg);
+        }
+
+        for (int i = 0; i < 7; i++)
+        {
+            pHeader = DirectGate_Proto_BuildExec("start", NULL, NULL, 7);
+            CHECK(pHeader != NULL, "exec start header with a malformed limit");
+            if (i == 0) XJSON_AddString(pHeader, "outputMax", "100");
+            else if (i == 6) XJSON_AddString(pHeader, "outputMax", "0");
+            else if (i == 1) XJSON_AddInt(pHeader, "outputMax", -1);
+            else if (i == 2) XJSON_AddFloat(pHeader, "outputMax", 2.5);
+            else if (i == 3) XJSON_AddU64(pHeader, "outputMax", 4294967296ULL);
+            else if (i == 4) XJSON_AddBool(pHeader, "outputMax", XTRUE);
+            else XJSON_AddNull(pHeader, "outputMax");
+            CHECK(roundtrip(&pkg, &wire, pHeader, NULL, 0) == 0, "exec start with a malformed limit");
+            pExec = (directgate_pkg_exec_t*)pkg.pPackage;
+            CHECK(pExec != NULL && pExec->bHasOutputMax && pExec->bBadOutputMax && pExec->nOutputMax == 0,
+                "a limit that is not a whole number of bytes is marked malformed");
+            DirectGate_Package_Clear(&pkg);
+        }
+
+        const uint8_t sChunk[5] = { 'o', 'u', 't', 0x00, 0xff };
+        pHeader = DirectGate_Proto_BuildExec("output", NULL, NULL, 7);
+        CHECK(pHeader != NULL, "exec output header");
+        XJSON_AddString(pHeader, "stream", "stderr");
+        CHECK(roundtrip(&pkg, &wire, pHeader, sChunk, sizeof(sChunk)) == 0, "exec output");
+        pExec = (directgate_pkg_exec_t*)pkg.pPackage;
+        CHECK(pExec != NULL && STREQ(pExec->pStream, "stderr"), "exec output stream");
+        CHECK(pExec->data.nPayloadLength == sizeof(sChunk) && !memcmp(pExec->data.pPayload, sChunk, sizeof(sChunk)),
+            "exec output bytes, binary included, arrive as sent");
+        DirectGate_Package_Clear(&pkg);
+
+        /* An exit code of 0 is still an exit code: present is not the same as non-zero */
+        pHeader = DirectGate_Proto_BuildExec("exit", "ok", NULL, 7);
+        CHECK(pHeader != NULL, "exec exit header");
+        XJSON_AddInt(pHeader, "exitCode", 0);
+        CHECK(roundtrip(&pkg, &wire, pHeader, NULL, 0) == 0, "exec exit");
+        pExec = (directgate_pkg_exec_t*)pkg.pPackage;
+        CHECK(pExec != NULL && pExec->bHasExitCode && pExec->nExitCode == 0 && STREQ(pExec->pStatus, "ok"),
+            "a zero exit code is reported as present");
+        CHECK(!pExec->bTruncated, "an exit that says nothing of dropped output dropped none");
+        DirectGate_Package_Clear(&pkg);
+
+        pHeader = DirectGate_Proto_BuildExec("exit", "ok", NULL, 7);
+        CHECK(pHeader != NULL, "exec exit header with dropped output");
+        XJSON_AddInt(pHeader, "exitCode", 0);
+        XJSON_AddBool(pHeader, "truncated", XTRUE);
+        CHECK(roundtrip(&pkg, &wire, pHeader, NULL, 0) == 0, "exec exit with dropped output");
+        pExec = (directgate_pkg_exec_t*)pkg.pPackage;
+        CHECK(pExec != NULL && pExec->bTruncated, "an exit reports output dropped past the limit");
+        DirectGate_Package_Clear(&pkg);
+
+        pHeader = DirectGate_Proto_BuildExec("exit", "ok", NULL, 7);
+        XJSON_AddInt(pHeader, "exitCode", 137);
+        XJSON_AddString(pHeader, "signal", "KILL");
+        XJSON_AddBool(pHeader, "timedOut", XTRUE);
+        CHECK(roundtrip(&pkg, &wire, pHeader, NULL, 0) == 0, "exec timed-out exit");
+        pExec = (directgate_pkg_exec_t*)pkg.pPackage;
+        CHECK(pExec != NULL && pExec->nExitCode == 137 && STREQ(pExec->pSignal, "KILL") && pExec->bTimedOut,
+            "a killed command reports its code, its signal and its timeout");
+        DirectGate_Package_Clear(&pkg);
+
+        /* A payload larger than the bytes that follow the header is refused, not read past */
+        pHeader = DirectGate_Proto_BuildExec("input", NULL, NULL, 7);
+        CHECK(pHeader != NULL, "exec input header");
+        XByteBuffer_Reset(&wire);
+        CHECK(DirectGate_Proto_Build(&wire, pHeader, sChunk, sizeof(sChunk), XFALSE), "serialize exec input");
+        XJSON_FreeObject(pHeader);
+        CHECK(!DirectGate_Package_Parse(&pkg, wire.pData, wire.nUsed - 1), "a truncated exec payload is rejected");
+        CHECK(pkg.pPackage == NULL, "a rejected exec package leaves nothing allocated");
+        CHECK(DirectGate_Package_Parse(&pkg, wire.pData, wire.nUsed), "the complete exec input parses");
+        DirectGate_Package_Clear(&pkg);
+
+        /* Never one of the types a client takes in the clear, before authentication or after */
+        CHECK(!DirectGate_Proto_ClientAcceptsPlain(DIRECTGATE_PKG_EXEC, XFALSE), "exec is never taken in the clear pre-auth");
+        CHECK(!DirectGate_Proto_ClientAcceptsPlain(DIRECTGATE_PKG_EXEC, XTRUE), "exec is never taken in the clear post-auth");
+        CHECK(!DirectGate_Proto_IsClientPreAuthType("exec"), "a client never sends exec before authenticating");
+    }
+
     /*
      * What a client is allowed to put on the wire before it authenticates.
      * The relay disconnects a client session that sends anything but role or

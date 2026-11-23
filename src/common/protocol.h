@@ -48,7 +48,8 @@ typedef enum {
     DIRECTGATE_PKG_RESIZE,
     DIRECTGATE_PKG_VERIFY,
     DIRECTGATE_PKG_WEBRTC,
-    DIRECTGATE_PKG_ADMIN
+    DIRECTGATE_PKG_ADMIN,
+    DIRECTGATE_PKG_EXEC
 } directgate_pkg_type_t;
 
 typedef struct directgate_pkg_header_ {
@@ -84,6 +85,8 @@ typedef struct directgate_pkg_auth_ {
     const char *pClientSig;      /* Ed25519 signature from client, base64 */
     const char *pDesktopShareId; /* Ephemeral desktop-only SRP credential. */
     xbool_t bPreLogon;           /* Agent result: only "desktop" mode is available. */
+    xbool_t bExec;               /* Agent result: the agent runs non-interactive commands (mode "exec"). */
+    xbool_t bRemote;             /* Agent result: the agent keeps remote sessions (mode "remote"). */
 } directgate_pkg_auth_t;
 
 typedef struct directgate_pkg_verify_ {
@@ -132,6 +135,7 @@ typedef struct directgate_pkg_role_ {
 } directgate_pkg_role_t;
 
 typedef struct directgate_pkg_manager_ {
+    directgate_pkg_data_t data;     /* The JSON a list or search answer carries */
     const char *pAction;
     const char *pPath;
     const char *pFileName;
@@ -153,6 +157,8 @@ typedef struct directgate_pkg_manager_ {
 
 typedef struct directgate_pkg_status_ {
     const char *pStatus;
+    uint32_t nRateBytes;            /* "limit": what one client session may move through the relay per second, each way */
+    uint32_t nBurstBytes;           /* "limit": ... and at once, after a pause */
 } directgate_pkg_status_t;
 
 typedef struct directgate_pkg_error_ {
@@ -183,6 +189,27 @@ typedef struct directgate_pkg_admin_ {
     uint32_t nTtlSeconds;
 } directgate_pkg_admin_t;
 
+/* A non-interactive command (session mode "exec"): its request, its streams and its exit, see docs/protocol.md */
+typedef struct directgate_pkg_exec_ {
+    directgate_pkg_data_t data;     /* output (host -> client) and input (client -> host) bytes */
+    const char *pAction;            /* start, started, output, input, eof, signal, exit */
+    const char *pCommand;
+    const char *pCwd;
+    const char *pStream;            /* stdout or stderr */
+    const char *pSignal;            /* INT, TERM, KILL or HUP */
+    const char *pStatus;
+    const char *pReason;
+    uint32_t nTimeoutMs;
+    uint32_t nOutputMax;            /* start, with bHasOutputMax: bytes of each stream the client wants */
+    int nExitCode;
+    xbool_t bHasExitCode;
+    xbool_t bHasOutputMax;
+    xbool_t bBadOutputMax;          /* start: outputMax given, but not a whole number of bytes up to UINT32_MAX */
+    xbool_t bStdin;
+    xbool_t bTimedOut;
+    xbool_t bTruncated;             /* exit: output past outputMax was dropped */
+} directgate_pkg_exec_t;
+
 typedef struct directgate_pkg_ {
     directgate_pkg_header_t header;
     xjson_t jsonHeader;
@@ -209,6 +236,7 @@ xjson_obj_t* DirectGate_Proto_BuildRole(const char *pRole, const char *pDeviceId
 xjson_obj_t* DirectGate_Proto_BuildError(const char *pReason, uint32_t nSessionId);
 xjson_obj_t* DirectGate_Proto_BuildStatus(const char *pStatus, uint32_t nSessionId);
 xjson_obj_t* DirectGate_Proto_BuildKeepalive(const char *pAction, uint32_t nSessionId);
+xjson_obj_t* DirectGate_Proto_BuildWebRTC(const char *pAction, uint32_t nSessionId);
 
 xjson_obj_t* DirectGate_Proto_BuildVerify(const char *pAction, const char *pAccessToken,
                                           const char *pRequestId, uint64_t nExp,
@@ -265,6 +293,9 @@ xjson_obj_t* DirectGate_Proto_BuildResize(uint32_t nRows, uint32_t nCols, uint32
 xjson_obj_t* DirectGate_Proto_BuildManager(const char *pAction, const char *pStatus,
                                            const char *pPath, const char *pReason,
                                            uint32_t nSessionId);
+
+xjson_obj_t* DirectGate_Proto_BuildExec(const char *pAction, const char *pStatus,
+                                        const char *pReason, uint32_t nSessionId);
 
 xjson_obj_t* DirectGate_Proto_BuildAdmin(const char *pAction, const char *pClientPub,
                                          const char *pStatus, const char *pReason,

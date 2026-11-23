@@ -356,6 +356,9 @@ static int test_transfer_pump(const char *pRoot)
     CHECK(pSession != NULL, "create the session");
     pSession->pWsSession = &relay;
     pSession->bAuthenticated = XTRUE;
+
+    /* A client whose WebRTC failed: the relay is the download's route */
+    DirectGate_Session_SetBulkRelay(pSession);
     CHECK(DirectGate_Transfer_Send(&pSession->transfer, sPath, DirectGate_Files_TransferSendCb, pSession) == XSTDOK,
         "the download starts");
 
