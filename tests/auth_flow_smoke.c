@@ -1888,6 +1888,428 @@ static int test_managed_key_login(void)
     return 0;
 }
 
+/* ---- keys with a scope ------------------------------------------------------- */
+
+/* An add-key the way the browser and dgcli -A -S -L send it: nScope < 0 and a NULL label leave the field out. */
+static xjson_obj_t* add_key_header(const char *pClientPub, int nScope, const char *pLabel, uint32_t nSessionId)
+{
+    xjson_obj_t *pHeader = admin_header("add-key", pClientPub, nSessionId);
+    if (pHeader == NULL) return NULL;
+
+    if (nScope >= 0 && !DirectGate_KeyScope_AddJson(pHeader, "scope", (uint8_t)nScope))
+    {
+        XJSON_FreeObject(pHeader);
+        return NULL;
+    }
+
+    if (pLabel != NULL) XJSON_AddString(pHeader, "label", pLabel);
+    return pHeader;
+}
+
+/* An add-key whose scope is an array of whatever names are given, known or not. */
+static xjson_obj_t* add_key_names(const char *pClientPub, const char **pNames, size_t nNames, uint32_t nSessionId)
+{
+    xjson_obj_t *pHeader = admin_header("add-key", pClientPub, nSessionId);
+    xjson_obj_t *pArray = pHeader != NULL ? XJSON_NewArray(pHeader->pPool, "scope", XFALSE) : NULL;
+    xbool_t bOk = pArray != NULL;
+
+    for (size_t i = 0; i < nNames && bOk; i++)
+    {
+        xjson_obj_t *pItem = XJSON_NewString(pArray->pPool, NULL, pNames[i]);
+        bOk = pItem != NULL && XJSON_AddObject(pArray, pItem) == XJSON_ERR_NONE;
+        if (!bOk) XJSON_FreeObject(pItem);
+    }
+
+    if (bOk && XJSON_AddObject(pHeader, pArray) == XJSON_ERR_NONE) return pHeader;
+    XJSON_FreeObject(pArray);
+    XJSON_FreeObject(pHeader);
+    return NULL;
+}
+
+/* Starts a mode the way the browser asks for one and returns the reason of the error it got, "" for none. */
+static const char* start_mode(fixture_t *pFix, directgate_e2e_t *pPeer, const char *pMode, uint32_t nSessionId,
+                              char *pReason, size_t nReasonSize)
+{
+    pReason[0] = '\0';
+    if (deliver_as(pFix, pPeer, DirectGate_Proto_BuildCmd("start", NULL, NULL, pMode, nSessionId), nSessionId) != XAPI_CONTINUE)
+        return "not handled";
+
+    return pFix->api.txBuffer.nUsed ? take_field(pFix, pPeer, "reason", pReason, nReasonSize) : pReason;
+}
+
+/* A client key that is not on the list yet, for the agent identity pOwner logs in to. */
+static int new_client_key(const key_setup_t *pOwner, key_setup_t *pKey)
+{
+    memset(pKey, 0, sizeof(*pKey));
+    xstrncpy(pKey->sAgentPubB64, sizeof(pKey->sAgentPubB64), pOwner->sAgentPubB64);
+    return DirectGate_KeyAuth_KeyGenerate(&pKey->client) &&
+        DirectGate_KeyAuth_Base64Encode(pKey->client.clientPub, sizeof(pKey->client.clientPub),
+            pKey->sClientPubB64, sizeof(pKey->sClientPubB64));
+}
+
+/* The list-keys entry for pClientPub as "scope|label|added", or "" when the answer does not hold it. */
+static const char* key_entry(xjson_obj_t *pKeys, const char *pClientPub, char *pOut, size_t nOutSize)
+{
+    pOut[0] = '\0';
+    for (size_t i = 0; i < XJSON_GetArrayLength(pKeys); i++)
+    {
+        xjson_obj_t *pEntry = XJSON_GetArrayItem(pKeys, i);
+        if (strcmp(XJSON_GetString(XJSON_GetObject(pEntry, "clientPub")), pClientPub) != 0) continue;
+
+        char sScope[64];
+        uint8_t nScope = 0;
+        if (!DirectGate_KeyScope_FromJson(XJSON_GetObject(pEntry, "scope"), &nScope)) return pOut;
+        DirectGate_KeyScope_Format(nScope, sScope, sizeof(sScope));
+
+        xjson_obj_t *pLabel = XJSON_GetObject(pEntry, "label");
+        xjson_obj_t *pAdded = XJSON_GetObject(pEntry, "added");
+        snprintf(pOut, nOutSize, "%s|%s|%llu", sScope, pLabel != NULL ? XJSON_GetString(pLabel) : "-",
+            pAdded != NULL ? (unsigned long long)XJSON_GetU64(pAdded) : 0ULL);
+        return pOut;
+    }
+
+    return pOut;
+}
+
+static int test_scoped_keys(void)
+{
+    fixture_t fix;
+    setup(&fix);
+
+    char sRoot[] = "/tmp/directgate_auth_scope.XXXXXX";
+    CHECK(mkdtemp(sRoot) != NULL, "create a directory for the saved config");
+    snprintf(fix.cfg.sCfgPath, sizeof(fix.cfg.sCfgPath), "%s/agent.json", sRoot);
+
+    /* The owner's key is a full one; the runner's opens commands only */
+    key_setup_t owner, runner;
+    CHECK(configure_keys(&fix, &owner), "configure an agent identity and the owner's full key");
+    CHECK(new_client_key(&owner, &runner), "generate the runner's key");
+    CHECK(DirectGate_PutAuthorizedKey(&fix.cfg, runner.sClientPubB64, XTRUE, DIRECTGATE_KEY_SCOPE_EXEC, "ci runner",
+        1795400000ULL) == DIRECTGATE_ADD_KEY_ADDED, "authorize the runner's key for commands only");
+
+    /* Starting a mode registers endpoints, so the modes a key may open need an event loop */
+    xapi_t xapi;
+    XAPI_Init(&xapi, DirectGate_ServiceCallback, &fix.conn);
+    CHECK(XAPI_GetOrCreateEvents(&xapi) != NULL, "an event loop for the started modes");
+    fix.api.pApi = &xapi;
+
+    directgate_e2e_t ownerPeer, runnerPeer, peer141, peer142;
+    char sReason[XSTR_TINY];
+    char sEntry[XSTR_TINY * 2];
+
+    CHECK(managed_login(&fix, &runner, 140, &runnerPeer, sReason, sizeof(sReason)), "a scoped key logs in");
+    directgate_session_t *pSession = DirectGate_SessionMgr_Find(&fix.conn.mgr, 140);
+    CHECK(pSession != NULL && pSession->bLocalKeySession && !pSession->bManagedKeySession &&
+        pSession->nKeyScope == DIRECTGATE_KEY_SCOPE_EXEC &&
+        !memcmp(pSession->localClientPub, runner.client.clientPub, sizeof(pSession->localClientPub)),
+        "a scoped login carries its key and that key's scope");
+
+    /* No admin action of any kind: a scoped key cannot widen itself, add another key or open a share */
+    const char *pActions[] = { "add-key", "list-keys", "remove-key", "desktop-share-provision", "reboot" };
+    CHECK(deliver_as(&fix, &runnerPeer, add_key_header(runner.sClientPubB64, DIRECTGATE_KEY_SCOPE_FULL, NULL, 140), 140) ==
+        XAPI_CONTINUE && expect_admin(&fix, &runnerPeer, "admin-result", "error", "scoped key cannot perform admin actions"),
+        "a scoped session cannot widen its own key");
+    for (size_t i = 0; i < sizeof(pActions) / sizeof(pActions[0]); i++)
+    {
+        CHECK(deliver_as(&fix, &runnerPeer, admin_header(pActions[i], owner.sClientPubB64, 140), 140) == XAPI_CONTINUE &&
+            expect_admin(&fix, &runnerPeer, "admin-result", "error", "scoped key cannot perform admin actions"),
+            "a scoped session is refused every admin action by name");
+    }
+    CHECK(fix.cfg.keyauth.nAuthorizedKeyCount == 2 && fix.cfg.keyauth.nAuthorizedKeyScopes[0] == DIRECTGATE_KEY_SCOPE_FULL &&
+        fix.cfg.keyauth.nAuthorizedKeyScopes[1] == DIRECTGATE_KEY_SCOPE_EXEC, "the scoped session changed no key");
+
+    /* A mode the key was not given is refused by name and ends the session */
+    CHECK(!strcmp(start_mode(&fix, &runnerPeer, "terminal", 140, sReason, sizeof(sReason)),
+        "this key may not open that on this device"), "a terminal is refused to a key for commands");
+    CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 140) == NULL, "asking for it ends the session");
+    DirectGate_E2E_Clear(&runnerPeer);
+
+    const char *pRefused[] = { "file-manager", "desktop" };
+    for (size_t i = 0; i < sizeof(pRefused) / sizeof(pRefused[0]); i++)
+    {
+        CHECK(managed_login(&fix, &runner, 140, &runnerPeer, sReason, sizeof(sReason)), "the scoped key logs in again");
+        CHECK(!strcmp(start_mode(&fix, &runnerPeer, pRefused[i], 140, sReason, sizeof(sReason)),
+            "this key may not open that on this device") && DirectGate_SessionMgr_Find(&fix.conn.mgr, 140) == NULL,
+            "files and a desktop are refused to a key for commands, and end the session");
+        DirectGate_E2E_Clear(&runnerPeer);
+    }
+
+    /* The mode it was given opens, and so does remote - which serves only the requests the key allows */
+    CHECK(managed_login(&fix, &runner, 141, &peer141, sReason, sizeof(sReason)), "the scoped key logs in for commands");
+    CHECK(!strcmp(start_mode(&fix, &peer141, "exec", 141, sReason, sizeof(sReason)), ""), "exec opens without an error");
+    pSession = DirectGate_SessionMgr_Find(&fix.conn.mgr, 141);
+    CHECK(pSession != NULL && pSession->eActiveMode == DIRECTGATE_SESSION_MODE_EXEC, "a key for commands opens exec mode");
+
+    CHECK(managed_login(&fix, &runner, 142, &peer142, sReason, sizeof(sReason)), "the scoped key logs in for remote");
+    CHECK(!strcmp(start_mode(&fix, &peer142, "remote", 142, sReason, sizeof(sReason)), ""), "remote opens without an error");
+    pSession = DirectGate_SessionMgr_Find(&fix.conn.mgr, 142);
+    CHECK(pSession != NULL && pSession->eActiveMode == DIRECTGATE_SESSION_MODE_REMOTE, "a key for commands opens remote mode");
+
+    CHECK(deliver_as(&fix, &peer142, DirectGate_Proto_BuildManager("list", NULL, "/", NULL, 142), 142) == XAPI_CONTINUE &&
+        !strcmp(take_field(&fix, &peer142, "reason", sReason, sizeof(sReason)), "this key may not do that on this device"),
+        "a file request in remote mode is refused to a key for commands, by name");
+    pSession = DirectGate_SessionMgr_Find(&fix.conn.mgr, 142);
+    CHECK(pSession != NULL && pSession->eActiveMode == DIRECTGATE_SESSION_MODE_REMOTE,
+        "a refused request leaves the remote session as it was");
+    CHECK(DirectGate_Session_EnsureMode(pSession, DIRECTGATE_SESSION_MODE_EXEC, "test") == XSTDOK && no_answer(&fix),
+        "a command in remote mode is served to a key for commands");
+
+    /* A mode asked for before the login is held to the key's scope just the same */
+    {
+        directgate_session_t *pEarly = DirectGate_SessionMgr_GetOrCreate(&fix.conn.mgr, &fix.api, 143);
+        CHECK(pEarly != NULL, "create a session that asks for a mode before auth");
+        pEarly->eRequestedMode = DIRECTGATE_SESSION_MODE_TERMINAL;
+        CHECK(managed_login(&fix, &runner, 143, &runnerPeer, sReason, sizeof(sReason)), "the scoped key logs in");
+        CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 143) == NULL, "a terminal asked for before the login is refused");
+        DirectGate_E2E_Clear(&runnerPeer);
+    }
+
+    /* The owner's full key administers: the list holds both keys as the device has them */
+    CHECK(managed_login(&fix, &owner, 150, &ownerPeer, sReason, sizeof(sReason)), "the owner logs in");
+    pSession = DirectGate_SessionMgr_Find(&fix.conn.mgr, 150);
+    CHECK(pSession != NULL && pSession->bLocalKeySession && pSession->nKeyScope == DIRECTGATE_KEY_SCOPE_FULL,
+        "a full key's login is a full session");
+    {
+        directgate_pkg_t pkg;
+        CHECK(deliver_as(&fix, &ownerPeer, admin_header("list-keys", NULL, 150), 150) == XAPI_CONTINUE &&
+            take_packet_as(&fix, &ownerPeer, &pkg), "list-keys is answered");
+
+        xjson_obj_t *pRoot = pkg.jsonHeader.pRootObj;
+        xjson_obj_t *pKeys = XJSON_GetObject(pRoot, "keys");
+        int nOk = !strcmp(XJSON_GetString(XJSON_GetObject(pRoot, "action")), "list-keys-result") &&
+            !strcmp(XJSON_GetString(XJSON_GetObject(pRoot, "status")), "ok") &&
+            XJSON_GetU32(XJSON_GetObject(pRoot, "max")) == DIRECTGATE_MAX_AUTHORIZED_KEYS &&
+            pKeys != NULL && pKeys->nType == XJSON_TYPE_ARRAY && XJSON_GetArrayLength(pKeys) == 2 &&
+            !strcmp(key_entry(pKeys, owner.sClientPubB64, sEntry, sizeof(sEntry)), "full|-|0") &&
+            !strcmp(key_entry(pKeys, runner.sClientPubB64, sEntry, sizeof(sEntry)), "exec|ci runner|1795400000");
+
+        DirectGate_Package_Clear(&pkg);
+        drain(&fix);
+        CHECK(nOk, "list-keys names every key with its scope, and its label and time when it has them");
+    }
+
+    /* A new label renames the key and ends nothing; the same label, or none at all, is no change */
+    CHECK(deliver_as(&fix, &ownerPeer, add_key_header(runner.sClientPubB64, -1, "build bot", 150), 150) == XAPI_CONTINUE &&
+        expect_admin(&fix, &ownerPeer, "add-key-result", "updated", NULL), "a new label is an update");
+    CHECK(!strcmp(fix.cfg.keyauth.sAuthorizedKeyLabels[1], "build bot") &&
+        DirectGate_SessionMgr_Find(&fix.conn.mgr, 141) != NULL && DirectGate_SessionMgr_Find(&fix.conn.mgr, 142) != NULL,
+        "a rename ends none of the key's sessions");
+    CHECK(deliver_as(&fix, &ownerPeer, add_key_header(runner.sClientPubB64, DIRECTGATE_KEY_SCOPE_EXEC, "build bot", 150), 150) ==
+        XAPI_CONTINUE && expect_admin(&fix, &ownerPeer, "add-key-result", "already", NULL),
+        "the same scope and label is no change");
+    CHECK(deliver_as(&fix, &ownerPeer, add_key_header(runner.sClientPubB64, -1, NULL, 150), 150) == XAPI_CONTINUE &&
+        expect_admin(&fix, &ownerPeer, "add-key-result", "already", NULL) &&
+        !strcmp(fix.cfg.keyauth.sAuthorizedKeyLabels[1], "build bot") &&
+        fix.cfg.keyauth.nAuthorizedKeyScopes[1] == DIRECTGATE_KEY_SCOPE_EXEC,
+        "an add-key with neither, as an older browser sends it, changes nothing");
+
+    /* What is not a scope or a label is refused by name, and changes nothing */
+    {
+        const char *pUnknown[] = { "root" };
+        const char *pMixed[] = { "full", "exec" };
+        const char *pTwice[] = { "exec", "exec" };
+        CHECK(deliver_as(&fix, &ownerPeer, add_key_names(runner.sClientPubB64, pUnknown, 1, 150), 150) == XAPI_CONTINUE &&
+            expect_admin(&fix, &ownerPeer, "add-key-result", "error", "invalid-scope"), "an unknown scope name is refused");
+        CHECK(deliver_as(&fix, &ownerPeer, add_key_names(runner.sClientPubB64, pMixed, 2, 150), 150) == XAPI_CONTINUE &&
+            expect_admin(&fix, &ownerPeer, "add-key-result", "error", "invalid-scope"), "full with anything else is refused");
+        CHECK(deliver_as(&fix, &ownerPeer, add_key_names(runner.sClientPubB64, pTwice, 2, 150), 150) == XAPI_CONTINUE &&
+            expect_admin(&fix, &ownerPeer, "add-key-result", "error", "invalid-scope"), "a repeated name is refused");
+        CHECK(deliver_as(&fix, &ownerPeer, add_key_names(runner.sClientPubB64, NULL, 0, 150), 150) == XAPI_CONTINUE &&
+            expect_admin(&fix, &ownerPeer, "add-key-result", "error", "invalid-scope"), "an empty scope is refused, not full");
+
+        xjson_obj_t *pHeader = admin_header("add-key", runner.sClientPubB64, 150);
+        CHECK(pHeader != NULL && XJSON_AddString(pHeader, "scope", "full") == XJSON_ERR_NONE, "build a scope that is a string");
+        CHECK(deliver_as(&fix, &ownerPeer, pHeader, 150) == XAPI_CONTINUE &&
+            expect_admin(&fix, &ownerPeer, "add-key-result", "error", "invalid-scope"),
+            "a scope that is not an array is refused");
+
+        pHeader = admin_header("add-key", runner.sClientPubB64, 150);
+        CHECK(pHeader != NULL && XJSON_AddU32(pHeader, "label", 7) == XJSON_ERR_NONE, "build a label that is a number");
+        CHECK(deliver_as(&fix, &ownerPeer, pHeader, 150) == XAPI_CONTINUE &&
+            expect_admin(&fix, &ownerPeer, "add-key-result", "error", "invalid-label"),
+            "a label that is not a string is refused");
+        CHECK(deliver_as(&fix, &ownerPeer, add_key_header(runner.sClientPubB64, -1, "a\x1b[2Jb", 150), 150) == XAPI_CONTINUE &&
+            expect_admin(&fix, &ownerPeer, "add-key-result", "error", "invalid-label"), "a label with an escape is refused");
+
+        CHECK(fix.cfg.keyauth.nAuthorizedKeyScopes[1] == DIRECTGATE_KEY_SCOPE_EXEC &&
+            !strcmp(fix.cfg.keyauth.sAuthorizedKeyLabels[1], "build bot"), "a refused add-key changed nothing");
+        CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 141) != NULL, "and ended nothing");
+    }
+
+    /* A new scope ends everything the key opened under the old one, direct or relayed, and nothing else */
+    CHECK(deliver_as(&fix, &ownerPeer, add_key_header(runner.sClientPubB64,
+        DIRECTGATE_KEY_SCOPE_EXEC | DIRECTGATE_KEY_SCOPE_FILES, NULL, 150), 150) == XAPI_CONTINUE &&
+        expect_admin(&fix, &ownerPeer, "add-key-result", "updated", NULL), "a new scope is an update");
+    CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 141) == NULL && DirectGate_SessionMgr_Find(&fix.conn.mgr, 142) == NULL,
+        "a new scope ends every session the key opened");
+    CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 150) != NULL, "and leaves the owner's session alone");
+    CHECK(fix.cfg.keyauth.nAuthorizedKeyScopes[1] == (DIRECTGATE_KEY_SCOPE_EXEC | DIRECTGATE_KEY_SCOPE_FILES),
+        "the new scope is the key's");
+    DirectGate_E2E_Clear(&peer141);
+    DirectGate_E2E_Clear(&peer142);
+
+    CHECK(managed_login(&fix, &runner, 144, &runnerPeer, sReason, sizeof(sReason)), "the key logs in under its new scope");
+    CHECK(!strcmp(start_mode(&fix, &runnerPeer, "file-manager", 144, sReason, sizeof(sReason)), ""),
+        "the file manager opens for a key that now has files");
+    pSession = DirectGate_SessionMgr_Find(&fix.conn.mgr, 144);
+    CHECK(pSession != NULL && pSession->eActiveMode == DIRECTGATE_SESSION_MODE_FILE_MANAGER, "and is the session's mode");
+
+    /* A scope the disk did not take is still the one in memory, so the old sessions end all the same */
+    {
+        directgate_e2e_t peer145;
+        CHECK(managed_login(&fix, &runner, 145, &peer145, sReason, sizeof(sReason)), "another session of the key");
+
+        char sSavedPath[sizeof(fix.cfg.sCfgPath)];
+        xstrncpy(sSavedPath, sizeof(sSavedPath), fix.cfg.sCfgPath);
+        xstrncpy(fix.cfg.sCfgPath, sizeof(fix.cfg.sCfgPath), "/proc/directgate-no-such-dir/agent.json");
+
+        CHECK(deliver_as(&fix, &ownerPeer, add_key_header(runner.sClientPubB64, DIRECTGATE_KEY_SCOPE_FILES, NULL, 150), 150) ==
+            XAPI_CONTINUE && expect_admin(&fix, &ownerPeer, "add-key-result", "error", "persist-failed"),
+            "a scope that cannot be saved is reported as a failure");
+        CHECK(fix.cfg.keyauth.nAuthorizedKeyScopes[1] == DIRECTGATE_KEY_SCOPE_FILES &&
+            DirectGate_SessionMgr_Find(&fix.conn.mgr, 144) == NULL && DirectGate_SessionMgr_Find(&fix.conn.mgr, 145) == NULL,
+            "an unsaved scope still holds in memory and ends the sessions of the old one");
+
+        xstrncpy(fix.cfg.sCfgPath, sizeof(fix.cfg.sCfgPath), sSavedPath);
+        DirectGate_E2E_Clear(&peer145);
+        DirectGate_E2E_Clear(&runnerPeer);
+    }
+
+    /* remove-key ends the key's sessions and its next login */
+    CHECK(managed_login(&fix, &runner, 146, &runnerPeer, sReason, sizeof(sReason)), "the key logs in once more");
+    CHECK(deliver_as(&fix, &ownerPeer, admin_header("remove-key", runner.sClientPubB64, 150), 150) == XAPI_CONTINUE &&
+        expect_admin(&fix, &ownerPeer, "remove-key-result", "ok", NULL), "the owner removes the key");
+    CHECK(fix.cfg.keyauth.nAuthorizedKeyCount == 1 && DirectGate_FindAuthorizedKey(&fix.cfg, runner.sClientPubB64) < 0,
+        "the key is off the list");
+    CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 146) == NULL, "a removed key's session ends");
+    CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 150) != NULL, "the owner's does not");
+    DirectGate_E2E_Clear(&runnerPeer);
+    CHECK(!managed_login(&fix, &runner, 147, &runnerPeer, sReason, sizeof(sReason)) && !strcmp(sReason, "client not authorized"),
+        "a removed key cannot log in");
+    {
+        directgate_cfg_t saved;
+        DirectGate_InitConfig(&saved);
+        CHECK(DirectGate_LoadConfig(&saved, fix.cfg.sCfgPath) && saved.keyauth.nAuthorizedKeyCount == 1 &&
+            !strcmp(saved.keyauth.sAuthorizedKeys[0], owner.sClientPubB64), "the removal is on disk");
+    }
+
+    CHECK(deliver_as(&fix, &ownerPeer, admin_header("remove-key", runner.sClientPubB64, 150), 150) == XAPI_CONTINUE &&
+        expect_admin(&fix, &ownerPeer, "remove-key-result", "not-found", NULL), "removing it again finds nothing");
+    CHECK(deliver_as(&fix, &ownerPeer, admin_header("remove-key", "not-a-key", 150), 150) == XAPI_CONTINUE &&
+        expect_admin(&fix, &ownerPeer, "remove-key-result", "not-found", NULL), "a malformed key is not on the list");
+    CHECK(deliver_as(&fix, &ownerPeer, admin_header("remove-key", NULL, 150), 150) == XAPI_CONTINUE &&
+        expect_admin(&fix, &ownerPeer, "remove-key-result", "error", "missing-client-pub"),
+        "remove-key without a key is refused");
+
+    /* A key removed between hello and proof is refused at the proof */
+    {
+        directgate_keyauth_t clientAuth;
+        char sSig[DIRECTGATE_KEYAUTH_SIG_B64_SIZE];
+        char sStatus[XSTR_TINY];
+
+        CHECK(DirectGate_PutAuthorizedKey(&fix.cfg, runner.sClientPubB64, XFALSE, 0, NULL, 0) == DIRECTGATE_ADD_KEY_ADDED,
+            "authorize the key again");
+        CHECK(key_challenge(&fix, &runner, &clientAuth, 148, sSig, sizeof(sSig), sReason, sizeof(sReason)),
+            "the key gets a challenge");
+        CHECK(DirectGate_RemoveAuthorizedKey(&fix.cfg, runner.sClientPubB64), "remove it before the proof");
+
+        drain(&fix);
+        CHECK(deliver(&fix, DirectGate_Proto_BuildAuthKeyProof(sSig, 148)) == XAPI_CONTINUE, "the late proof is handled");
+        CHECK(take_auth(&fix, sStatus, sizeof(sStatus), sReason, sizeof(sReason)) && !strcmp(sStatus, "failed") &&
+            !strcmp(sReason, "client not authorized"), "a valid proof for a key removed since the hello is refused");
+        CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 148) == NULL, "and its session is closed");
+        DirectGate_KeyAuth_Cleanse(&clientAuth);
+    }
+
+    /* A key narrowed between hello and proof opens what it may now, not what it could at the hello */
+    {
+        directgate_keyauth_t clientAuth;
+        char sSig[DIRECTGATE_KEYAUTH_SIG_B64_SIZE];
+
+        CHECK(DirectGate_PutAuthorizedKey(&fix.cfg, runner.sClientPubB64, XFALSE, 0, NULL, 0) == DIRECTGATE_ADD_KEY_ADDED,
+            "authorize the key as a full one");
+        CHECK(key_challenge(&fix, &runner, &clientAuth, 149, sSig, sizeof(sSig), sReason, sizeof(sReason)),
+            "the full key gets a challenge");
+        CHECK(DirectGate_PutAuthorizedKey(&fix.cfg, runner.sClientPubB64, XTRUE, DIRECTGATE_KEY_SCOPE_DESKTOP, NULL, 0) ==
+            DIRECTGATE_ADD_KEY_UPDATED, "narrow it to a desktop before the proof");
+
+        drain(&fix);
+        CHECK(deliver(&fix, DirectGate_Proto_BuildAuthKeyProof(sSig, 149)) == XAPI_CONTINUE &&
+            expect_auth(&fix, "ok", NULL), "the proof logs in");
+        pSession = DirectGate_SessionMgr_Find(&fix.conn.mgr, 149);
+        CHECK(pSession != NULL && pSession->nKeyScope == DIRECTGATE_KEY_SCOPE_DESKTOP,
+            "the session gets the scope the key has at the proof");
+        DirectGate_Session_Close(pSession, "test done");
+        DirectGate_KeyAuth_Cleanse(&clientAuth);
+    }
+
+    /* A removal the disk did not take still ends the key here: it stays off the list until a restart */
+    {
+        CHECK(managed_login(&fix, &runner, 160, &runnerPeer, sReason, sizeof(sReason)), "the key logs in");
+
+        char sSavedPath[sizeof(fix.cfg.sCfgPath)];
+        xstrncpy(sSavedPath, sizeof(sSavedPath), fix.cfg.sCfgPath);
+        xstrncpy(fix.cfg.sCfgPath, sizeof(fix.cfg.sCfgPath), "/proc/directgate-no-such-dir/agent.json");
+
+        CHECK(deliver_as(&fix, &ownerPeer, admin_header("remove-key", runner.sClientPubB64, 150), 150) == XAPI_CONTINUE &&
+            expect_admin(&fix, &ownerPeer, "remove-key-result", "error", "persist-failed"),
+            "a removal that cannot be saved is reported as a failure");
+        CHECK(DirectGate_FindAuthorizedKey(&fix.cfg, runner.sClientPubB64) < 0 &&
+            DirectGate_SessionMgr_Find(&fix.conn.mgr, 160) == NULL, "an unsaved removal still ends the key's sessions");
+
+        xstrncpy(fix.cfg.sCfgPath, sizeof(fix.cfg.sCfgPath), sSavedPath);
+        DirectGate_E2E_Clear(&runnerPeer);
+    }
+
+    /* The owner's own key: a new scope ends this session too, once it has its answer */
+    {
+        directgate_e2e_t peer151;
+        CHECK(managed_login(&fix, &owner, 151, &peer151, sReason, sizeof(sReason)), "a second owner session");
+        CHECK(deliver_as(&fix, &ownerPeer, add_key_header(owner.sClientPubB64, DIRECTGATE_KEY_SCOPE_EXEC, NULL, 150), 150) ==
+            XAPI_CONTINUE && expect_admin(&fix, &ownerPeer, "add-key-result", "updated", NULL),
+            "the owner narrows its own key and gets the answer");
+        CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 150) == NULL && DirectGate_SessionMgr_Find(&fix.conn.mgr, 151) == NULL,
+            "both of the owner's sessions end, the asking one after its answer");
+        DirectGate_E2E_Clear(&peer151);
+        DirectGate_E2E_Clear(&ownerPeer);
+    }
+
+    /* A password session is not a key's: it administers whatever the keys are, and outlives their removal */
+    {
+        const char *pSecret = "owner password";
+        directgate_e2e_t srpPeer;
+        CHECK(configure_srp(&fix, pSecret), "configure the owner's SRP record");
+        CHECK(srp_login(&fix, 170, pSecret, NULL, XFALSE, &srpPeer) == 1, "the owner logs in with the password");
+        pSession = DirectGate_SessionMgr_Find(&fix.conn.mgr, 170);
+        CHECK(pSession != NULL && !pSession->bLocalKeySession && pSession->nKeyScope == DIRECTGATE_KEY_SCOPE_FULL,
+            "a password session is a full one with no key");
+
+        CHECK(deliver_as(&fix, &srpPeer, add_key_header(owner.sClientPubB64, DIRECTGATE_KEY_SCOPE_FULL, NULL, 170), 170) ==
+            XAPI_CONTINUE && expect_admin(&fix, &srpPeer, "add-key-result", "updated", NULL), "the password widens the key back");
+        CHECK(fix.cfg.keyauth.nAuthorizedKeyScopes[0] == DIRECTGATE_KEY_SCOPE_FULL, "the key is a full one again");
+
+        CHECK(managed_login(&fix, &owner, 152, &ownerPeer, sReason, sizeof(sReason)), "the owner's key logs in again");
+        CHECK(deliver_as(&fix, &ownerPeer, admin_header("remove-key", owner.sClientPubB64, 152), 152) == XAPI_CONTINUE &&
+            expect_admin(&fix, &ownerPeer, "remove-key-result", "ok", NULL), "the owner removes its own key and gets the answer");
+        CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 152) == NULL, "the asking session ends with its key");
+        CHECK(DirectGate_SessionMgr_Find(&fix.conn.mgr, 170) != NULL, "the password session outlives it");
+        DirectGate_E2E_Clear(&ownerPeer);
+        DirectGate_E2E_Clear(&srpPeer);
+        DirectGate_Session_Close(DirectGate_SessionMgr_Find(&fix.conn.mgr, 170), "test done");
+    }
+
+    XAPI_Destroy(&xapi);
+    fix.api.pApi = NULL;
+
+    DirectGate_KeyAuth_KeyCleanse(&owner.client);
+    DirectGate_KeyAuth_KeyCleanse(&runner.client);
+    teardown(&fix);
+
+    unlink(fix.cfg.sCfgPath);
+    rmdir(sRoot);
+    return 0;
+}
+
 int main(void)
 {
     if (test_malformed()) return 1;
@@ -1901,6 +2323,7 @@ int main(void)
     if (test_key_auth_login()) return 1;
     if (test_managed_key_login()) return 1;
     if (test_admin_actions()) return 1;
+    if (test_scoped_keys()) return 1;
     if (test_temporary_shares()) return 1;
     if (test_dispatch_corners()) return 1;
 

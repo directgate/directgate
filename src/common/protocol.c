@@ -263,6 +263,8 @@ static void DirectGate_Package_ParseAdminPkg(directgate_pkg_admin_t *pPkg, xjson
     pPkg->pShareId = XJSON_GetString(XJSON_GetObject(pHdr, "shareId"));
     pPkg->pVerifier = XJSON_GetString(XJSON_GetObject(pHdr, "verifier"));
     pPkg->pSalt = XJSON_GetString(XJSON_GetObject(pHdr, "salt"));
+    pPkg->pLabel = XJSON_GetObject(pHdr, "label");
+    pPkg->pScope = XJSON_GetObject(pHdr, "scope");
 }
 
 static xbool_t DirectGate_Package_ParseManagerPkg(directgate_pkg_t *pPackage, xjson_obj_t *pHdr,

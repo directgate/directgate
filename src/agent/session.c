@@ -808,6 +808,16 @@ int DirectGate_Session_EnsureMode(directgate_session_t *pSession, directgate_ses
     xbool_t bRemoteServes = (pSession->eActiveMode == DIRECTGATE_SESSION_MODE_REMOTE &&
         (eMode == DIRECTGATE_SESSION_MODE_EXEC || eMode == DIRECTGATE_SESSION_MODE_FILE_MANAGER)) ? XTRUE : XFALSE;
 
+    /* ... as far as its key allows: one for commands runs no file operation on it, and the other way round */
+    if (bRemoteServes && !DirectGate_Session_KeyAllows(pSession, eMode))
+    {
+        xlogw("Request refused by the session's key scope: sid(%u), wsfd(%d), required(%s)",
+            pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), DirectGate_SessionMode_ToString(eMode));
+
+        DirectGate_Session_SendErrorMsg(pSession, "this key may not do that on this device");
+        return XSTDERR;
+    }
+
     if (pSession->eActiveMode != eMode && !bRemoteServes)
     {
         xlogw("Session mode mismatch: sid(%u), wsfd(%d), active(%s), required(%s)",
@@ -1076,6 +1086,28 @@ int DirectGate_Session_StartTerminal(directgate_session_t *pSession)
     return XAPI_CONTINUE;
 }
 
+/* What a mode needs of a scoped key. A remote session runs commands, file operations or both, so it needs either -
+   and each request in it the one it is (DirectGate_Session_EnsureMode). */
+static uint8_t DirectGate_Session_ScopeFor(directgate_session_mode_t eMode)
+{
+    switch (eMode)
+    {
+        case DIRECTGATE_SESSION_MODE_EXEC: return DIRECTGATE_KEY_SCOPE_EXEC;
+        case DIRECTGATE_SESSION_MODE_FILE_MANAGER: return DIRECTGATE_KEY_SCOPE_FILES;
+        case DIRECTGATE_SESSION_MODE_TERMINAL: return DIRECTGATE_KEY_SCOPE_TERMINAL;
+        case DIRECTGATE_SESSION_MODE_DESKTOP: return DIRECTGATE_KEY_SCOPE_DESKTOP;
+        case DIRECTGATE_SESSION_MODE_REMOTE: return DIRECTGATE_KEY_SCOPE_EXEC | DIRECTGATE_KEY_SCOPE_FILES;
+        default: return 0;
+    }
+}
+
+xbool_t DirectGate_Session_KeyAllows(const directgate_session_t *pSession, directgate_session_mode_t eMode)
+{
+    XCHECK_NL((pSession != NULL), XFALSE);
+    if (pSession->nKeyScope == DIRECTGATE_KEY_SCOPE_FULL) return XTRUE;
+    return (pSession->nKeyScope & DirectGate_Session_ScopeFor(eMode)) ? XTRUE : XFALSE;
+}
+
 int DirectGate_Session_StartMode(directgate_session_t *pSession, directgate_session_mode_t eMode)
 {
     XCHECK((pSession != NULL), XAPI_DISCONNECT);
@@ -1091,6 +1123,15 @@ int DirectGate_Session_StartMode(directgate_session_t *pSession, directgate_sess
 
     if (eMode == DIRECTGATE_SESSION_MODE_NONE)
         return XAPI_CONTINUE;
+
+    /* The same choke point holds a scoped key to what it was given, whatever the client asks for */
+    if (!DirectGate_Session_KeyAllows(pSession, eMode))
+    {
+        xlogw("Key scope rejected a mode: sid(%u), requested(%s)", pSession->nSessionId, DirectGate_SessionMode_ToString(eMode));
+
+        DirectGate_Session_SendErrorMsg(pSession, "this key may not open that on this device");
+        return DirectGate_Session_Close(pSession, "key scope violation");
+    }
 
     /* The single choke point every mode passes through, which is why the
        pre-logon restriction lives here and not in each mode's own start-up. */

@@ -8,8 +8,9 @@
  *   - an agent session that is authenticated holds the keys the browser derived (a keepalive round trip works),
  *   - a browser that was told "ok" is talking to a session that is authenticated or gone, never half way,
  *   - tearing the connection down released everything the run allocated.
- * The same sweep runs over a directory listing, the desktop status an authenticated session sends and the agent
- * config saved to disk: what comes out is complete, or nothing comes out (and the file on disk is the old one). */
+ * The same sweep runs over a directory listing, the desktop status an authenticated session sends, the agent
+ * config saved to disk, and the key list and a scoped add-key a key session asks for: what comes out is complete, or
+ * nothing comes out (and the file on disk is the old one) - and a key given a scope never lands as a full one. */
 
 #include <execinfo.h>
 #include <stdint.h>
@@ -36,6 +37,11 @@
 #define AGENT_DEVICE_ID "device-under-test"
 #define SRP_SESSION     70U
 #define KEY_SESSION     71U
+
+/* Keys next to the client's own: one for commands and files, one for a desktop, and one an add-key brings */
+#define SCOPED_KEY      "QkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGE="
+#define DESKTOP_KEY     "TU5PUFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2w="
+#define ADDED_KEY       "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8="
 
 /* ---------------- the injecting, tracking allocator ---------------- */
 
@@ -157,6 +163,8 @@ static const char *g_pSecret = "correct horse battery staple";
 static char g_sListDir[] = "/tmp/directgate_allocfail_dir.XXXXXX";
 static const char *g_pListNames[] = { "alpha.txt", "beta.bin", "gamma", "link-to-alpha" };
 static char g_sCfgPath[] = "/tmp/directgate_allocfail_cfg.XXXXXX";
+static char g_sAdminCfgPath[] = "/tmp/directgate_allocfail_admin.XXXXXX";
+static directgate_cfg_t g_adminCfg;
 static char g_sCfgBefore[16384];
 static size_t g_nCfgBefore;
 
@@ -481,6 +489,25 @@ static void fill_config(directgate_cfg_t *pCfg, const char *pToken)
     pCfg->enroll.nAccessTokenExp = 1900000000ULL;
     pCfg->enroll.bEnrolled = XTRUE;
     pCfg->log.nFlags = XLOG_ERROR | XLOG_WARN | XLOG_INFO;
+
+    /* A full key with a label, a scoped one without, a scoped one with: every shape the list is saved in */
+    DirectGate_PutAuthorizedKey(pCfg, g_sClientPubB64, XFALSE, 0, "laptop", 1795400000ULL);
+    DirectGate_PutAuthorizedKey(pCfg, SCOPED_KEY, XTRUE, DIRECTGATE_KEY_SCOPE_EXEC | DIRECTGATE_KEY_SCOPE_FILES, NULL, 0);
+    DirectGate_PutAuthorizedKey(pCfg, DESKTOP_KEY, XTRUE, DIRECTGATE_KEY_SCOPE_DESKTOP, "ci", 1795400001ULL);
+}
+
+/* The keys fill_config gave, as they loaded back */
+static int keys_whole(const directgate_cfg_t *pCfg)
+{
+    const directgate_keyauth_cfg_t *pKeys = &pCfg->keyauth;
+    return pKeys->nAuthorizedKeyCount == 3 &&
+        !strcmp(pKeys->sAuthorizedKeys[0], g_sClientPubB64) && pKeys->nAuthorizedKeyScopes[0] == DIRECTGATE_KEY_SCOPE_FULL &&
+        !strcmp(pKeys->sAuthorizedKeyLabels[0], "laptop") && pKeys->nAuthorizedKeyAdded[0] == 1795400000ULL &&
+        !strcmp(pKeys->sAuthorizedKeys[1], SCOPED_KEY) &&
+        pKeys->nAuthorizedKeyScopes[1] == (DIRECTGATE_KEY_SCOPE_EXEC | DIRECTGATE_KEY_SCOPE_FILES) &&
+        pKeys->sAuthorizedKeyLabels[1][0] == '\0' && pKeys->nAuthorizedKeyAdded[1] == 0 &&
+        !strcmp(pKeys->sAuthorizedKeys[2], DESKTOP_KEY) && pKeys->nAuthorizedKeyScopes[2] == DIRECTGATE_KEY_SCOPE_DESKTOP &&
+        !strcmp(pKeys->sAuthorizedKeyLabels[2], "ci") && pKeys->nAuthorizedKeyAdded[2] == 1795400001ULL;
 }
 
 /* What a save reports as saved loads back whole; a save that failed left the file as it was */
@@ -513,7 +540,8 @@ static int check_config_save(void)
         nBad = !DirectGate_LoadConfig(&loaded, g_sCfgPath) || strcmp(loaded.enroll.sAccessToken, "access-token-new") ||
                strcmp(loaded.enroll.sRefreshToken, "refresh-token") || strcmp(loaded.sRelayUrl, cfg.sRelayUrl) ||
                strcmp(loaded.sRoutingKey, "routing-key") || !loaded.enroll.bEnrolled ||
-               loaded.enroll.nAccessTokenExp != 1900000000ULL || (loaded.log.nFlags & cfg.log.nFlags) != cfg.log.nFlags;
+               loaded.enroll.nAccessTokenExp != 1900000000ULL || (loaded.log.nFlags & cfg.log.nFlags) != cfg.log.nFlags ||
+               !keys_whole(&loaded);
         if (nBad) fprintf(stderr, "alloc_fail_agent_smoke: a config reported saved does not load back whole:\n%s\n", sNow);
 
         /* The next run starts from the old file again */
@@ -526,7 +554,74 @@ static int check_config_save(void)
     return nBad;
 }
 
-typedef enum { LOGIN_SRP, LOGIN_KEY, LISTING, CONFIG } login_t;
+/* With nothing failing: a key login for KEY_SESSION, so the admin messages after it are the only ones that fail */
+static int clean_key_login(fixture_t *pFix, directgate_e2e_t *pPeer)
+{
+    long nSaved = g_nFailAt;
+    g_nFailAt = -1;
+    int nOk = key_login(pFix, pPeer);
+    g_nFailAt = nSaved;
+    return nOk;
+}
+
+/* list-keys: the whole list, a refusal by name, or nothing. Then a scoped add-key: answered for what it did, and the
+   key, if it is on the list, has the scope it was given - never a full one. */
+static int check_admin(fixture_t *pFix, directgate_e2e_t *pPeer)
+{
+    directgate_pkg_t pkg;
+    int nBad = 0;
+
+    agent_handle(pFix, DirectGate_Proto_BuildAdmin("list-keys", NULL, NULL, NULL, KEY_SESSION), pPeer, KEY_SESSION);
+    if (take_packet(pFix, pPeer, &pkg))
+    {
+        xjson_obj_t *pKeys = XJSON_GetObject(pkg.jsonHeader.pRootObj, "keys");
+        const char *pStatus = field(&pkg, "status");
+        char *pDump = XJSON_DumpObj(pkg.jsonHeader.pRootObj, 0, NULL);
+
+        if (strcmp(field(&pkg, "action"), "list-keys-result") != 0) nBad = 1;
+        else if (!strcmp(pStatus, "error")) nBad = strcmp(field(&pkg, "reason"), "list-failed") != 0;
+        else nBad = strcmp(pStatus, "ok") || pKeys == NULL || XJSON_GetArrayLength(pKeys) != 3 ||
+            XJSON_GetU32(XJSON_GetObject(pkg.jsonHeader.pRootObj, "max")) != DIRECTGATE_MAX_AUTHORIZED_KEYS ||
+            pDump == NULL || !strstr(pDump, SCOPED_KEY) || !strstr(pDump, DESKTOP_KEY) ||
+            !strstr(pDump, "\"scope\":[\"exec\",\"files\"]") || !strstr(pDump, "\"scope\":[\"desktop\"]") ||
+            !strstr(pDump, "\"scope\":[\"full\"]") || !strstr(pDump, "\"label\":\"laptop\"") ||
+            !strstr(pDump, "\"added\":1795400001");
+
+        if (nBad) fprintf(stderr, "alloc_fail_agent_smoke: an incomplete key list went out: %s\n", pDump ? pDump : "?");
+        free(pDump);
+        DirectGate_Package_Clear(&pkg);
+        if (nBad) return 1;
+    }
+
+    if (DirectGate_SessionMgr_Find(&pFix->conn.mgr, KEY_SESSION) == NULL) return 0;
+
+    xjson_obj_t *pAdd = DirectGate_Proto_BuildAdmin("add-key", ADDED_KEY, NULL, NULL, KEY_SESSION);
+    if (pAdd == NULL || !DirectGate_KeyScope_AddJson(pAdd, "scope", DIRECTGATE_KEY_SCOPE_EXEC) ||
+        XJSON_AddString(pAdd, "label", "runner") != XJSON_ERR_NONE)
+    {
+        XJSON_FreeObject(pAdd);
+        return 1;
+    }
+
+    agent_handle(pFix, pAdd, pPeer, KEY_SESSION);
+    int nAt = DirectGate_FindAuthorizedKey(&pFix->cfg, ADDED_KEY);
+    if (nAt >= 0 && pFix->cfg.keyauth.nAuthorizedKeyScopes[nAt] != DIRECTGATE_KEY_SCOPE_EXEC)
+    {
+        fprintf(stderr, "alloc_fail_agent_smoke: a key added with a scope is on the list with another\n");
+        return 1;
+    }
+
+    if (!take_packet(pFix, pPeer, &pkg)) return 0;
+    const char *pStatus = field(&pkg, "status");
+    nBad = strcmp(field(&pkg, "action"), "add-key-result") ||
+        (!strcmp(pStatus, "ok") ? nAt < 0 : strcmp(pStatus, "error") || strcmp(field(&pkg, "reason"), "persist-failed"));
+    if (nBad) fprintf(stderr, "alloc_fail_agent_smoke: add-key answered %s (%s) with the key %s the list\n", pStatus,
+        field(&pkg, "reason"), nAt >= 0 ? "on" : "off");
+    DirectGate_Package_Clear(&pkg);
+    return nBad;
+}
+
+typedef enum { LOGIN_SRP, LOGIN_KEY, LISTING, CONFIG, ADMIN } login_t;
 
 static int run(login_t eLogin, long nFailAt, long *pCount, long *pLive)
 {
@@ -568,6 +663,21 @@ static int run(login_t eLogin, long nFailAt, long *pCount, long *pLive)
         if (!nBad) nBad = check_desktop_status(&fix, KEY_SESSION, &keyPeer);
     }
     else if (eLogin == LISTING) nBad = check_listing();
+    else if (eLogin == ADMIN)
+    {
+        /* The keys fill_config saves, so the list has every shape to write, and a config path for add-key to save to */
+        const directgate_keyauth_cfg_t *pKeys = &g_adminCfg.keyauth;
+        memcpy(&fix.cfg.keyauth.sAuthorizedKeys, &pKeys->sAuthorizedKeys, sizeof(pKeys->sAuthorizedKeys));
+        memcpy(&fix.cfg.keyauth.sAuthorizedKeyLabels, &pKeys->sAuthorizedKeyLabels, sizeof(pKeys->sAuthorizedKeyLabels));
+        memcpy(&fix.cfg.keyauth.nAuthorizedKeyScopes, &pKeys->nAuthorizedKeyScopes, sizeof(pKeys->nAuthorizedKeyScopes));
+        memcpy(&fix.cfg.keyauth.nAuthorizedKeyAdded, &pKeys->nAuthorizedKeyAdded, sizeof(pKeys->nAuthorizedKeyAdded));
+        fix.cfg.keyauth.nAuthorizedKeyCount = pKeys->nAuthorizedKeyCount;
+        xstrncpy(fix.cfg.sCfgPath, sizeof(fix.cfg.sCfgPath), g_sAdminCfgPath);
+
+        nBad = !clean_key_login(&fix, &keyPeer);
+        if (nBad) fprintf(stderr, "alloc_fail_agent_smoke: the full key does not log in with nothing failing\n");
+        else nBad = check_admin(&fix, &keyPeer);
+    }
     else nBad = check_config_save();
 
     DirectGate_SessionMgr_Destroy(&fix.conn.mgr);
@@ -674,9 +784,15 @@ int main(void)
         CHECK(g_nCfgBefore > 0 && strstr(g_sCfgBefore, "access-token-old") != NULL, "read the config as it was");
     }
 
+    int nAdminFd = mkstemp(g_sAdminCfgPath);
+    CHECK(nAdminFd >= 0, "create the config file add-key saves to");
+    close(nAdminFd);
+    fill_config(&g_adminCfg, "access-token-admin");
+
     int nFailed = sweep(LOGIN_SRP, "SRP") || sweep(LOGIN_KEY, "key auth") || sweep(LISTING, "listing") ||
-                  sweep(CONFIG, "config");
+                  sweep(CONFIG, "config") || sweep(ADMIN, "admin");
     unlink(g_sCfgPath);
+    unlink(g_sAdminCfgPath);
 
     for (size_t i = 0; i < sizeof(g_pListNames) / sizeof(g_pListNames[0]); i++)
     {

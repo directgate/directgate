@@ -44,6 +44,20 @@ extern "C" {
 #define DIRECTGATE_KEYAUTH_PUB_B64_SIZE         48
 #define DIRECTGATE_KEYAUTH_SIG_B64_SIZE         96
 
+/* What a client key authorized on a device may open there: admin/add-key's "scope", and agent.json's
+   authorizedKeys. FULL is a key without one - every key added before scopes existed - and opens everything,
+   admin actions included; a scoped key opens only its modes, never administers the device, and its sessions end
+   when the key is removed or its scope changes. A remote session needs exec or files, and each request in it
+   the one it is. Written as names: "full", or any of "exec", "files", "terminal", "desktop". */
+#define DIRECTGATE_KEY_SCOPE_FULL               0x00U
+#define DIRECTGATE_KEY_SCOPE_EXEC               0x01U
+#define DIRECTGATE_KEY_SCOPE_FILES              0x02U
+#define DIRECTGATE_KEY_SCOPE_TERMINAL           0x04U
+#define DIRECTGATE_KEY_SCOPE_DESKTOP            0x08U
+
+/* A key's label, for people to tell keys apart: bytes, terminator not counted */
+#define DIRECTGATE_KEY_LABEL_MAX                64
+
 typedef enum {
     DIRECTGATE_KEYAUTH_STATE_IDLE = 0,
     DIRECTGATE_KEYAUTH_STATE_HELLO_RECEIVED,
@@ -157,6 +171,28 @@ xbool_t DirectGate_KeyAuth_Base64Encode(const uint8_t *pData, size_t nLen,
 xbool_t DirectGate_KeyAuth_Base64Decode(const char *pB64,
                                         uint8_t *pOut, size_t nOutSize,
                                         size_t *pOutLen);
+
+/*!
+ * Which entry of pAuthorizedKeys pClientPubKey is, or XSTDERR for none: the same constant-time scan as
+ * DirectGate_KeyAuth_IsClientAuthorized, for a caller that needs the entry's scope.
+ */
+int DirectGate_KeyAuth_FindClient(const uint8_t *pClientPubKey, const char **pAuthorizedKeys, size_t nCount);
+
+/* "exec,files" (dgcli -S) into a scope, or "full" alone; XFALSE for an empty list, an unknown or repeated name,
+   or "full" next to another */
+xbool_t DirectGate_KeyScope_Parse(const char *pList, uint8_t *pScope);
+
+/* The same, from a JSON array of those names */
+xbool_t DirectGate_KeyScope_FromJson(xjson_obj_t *pArray, uint8_t *pScope);
+
+/* The scope as dgcli takes it: "full", or the names in a fixed order joined by commas. Returns the length. */
+size_t DirectGate_KeyScope_Format(uint8_t nScope, char *pOut, size_t nSize);
+
+/* Adds the scope to pObj as an array named pName, the way FromJson reads it */
+xbool_t DirectGate_KeyScope_AddJson(xjson_obj_t *pObj, const char *pName, uint8_t nScope);
+
+/* A label a key may carry: well formed UTF-8 of at most DIRECTGATE_KEY_LABEL_MAX bytes, no control characters */
+xbool_t DirectGate_KeyLabel_IsValid(const char *pLabel);
 
 /*!
  * Returns XTRUE if pClientPubKeyB64 matches any entry in pAuthorizedKeys

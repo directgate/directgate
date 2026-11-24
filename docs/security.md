@@ -125,6 +125,18 @@ After step 6, the client initiates WebRTC P2P negotiation in parallel with the a
 
 In addition to SRP, the agent supports Ed25519 key authorization. The agent holds an identity keypair (`agentIdentity`) and a list of `authorizedKeys`; clients can be authorized by public key, and new keys can be added at runtime over the authenticated channel (`admin/add-key`), just like `ssh-copy-id` does. See [Configuration](configuration.md).
 
+### Scoped keys
+
+A key on the local list can be limited to some session modes - `exec`, `files`, `terminal`, `desktop` - so a key handed to a script or an AI agent opens only what it was given (see [Configuration](configuration.md#scoped-keys)). The properties it rests on:
+
+- **The device decides.** The scope lives next to the key in `agent.json` and nowhere else: not in the key file, not in the API, not on the relay. Whoever holds the key cannot change what it opens; only a full session on the device - the owner's password or a key without a scope - can, through `admin/add-key`.
+- **One choke point.** Every mode starts in the same function, whatever asked for it - a `cmd/start`, or a mode named before the login - and that is where a scoped session is held to its scope. A mode the key lacks ends the session. `remote` mode serves commands and file operations from one session, so each of its requests is checked again against the key.
+- **No administration.** A scoped session is refused every `admin` action: it cannot widen its own key, add, list or remove another, or open a temporary desktop share.
+- **Fails closed.** An entry the agent cannot read - an unknown scope name, an empty or repeated one, `full` next to another name - is skipped, not taken as a full key, and a malformed `scope` in a request is refused, never read as none. Full keys are still written as plain strings, and a scoped one as an object an older agent cannot read as a key, so rolling the agent back drops scoped keys instead of widening them.
+- **Changes take effect at once.** The key is looked up again when its proof verifies, so a key removed or narrowed since the hello gets what the list says at that moment. A new scope, or a removal, ends every session the key opened, on the relay and on direct WebRTC alike, and holds in memory even when the config file cannot be written.
+
+A scope narrows what the key can open, not what is done inside it: an `exec` key runs commands, and a `files` key reaches files, as the agent's shell user and with that user's rights, anywhere that user can. (`dgcli mcp --root` bounds the other end - the files of the machine the AI agent runs on.) Removing the key ends its access, which, as with any credential, does not undo what was already done with it.
+
 ### Organization-managed keys
 
 A device enrolled into an organization can also accept the client keys the organization approved for it, from a lease the agent fetches from the API (the contract is in the superproject's `docs/enroll.md`, *Managed Key Lease*). It does so only when the device's operator allowed it, on the device:

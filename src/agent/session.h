@@ -125,6 +125,9 @@ typedef struct directgate_session_ {
     xbool_t bManagedKeySession;     /* Authenticated by a managed key: no admin actions, closed when the lease drops it */
     uint32_t nManagedKeyGen;        /* Lease generation this session's key was last found in */
     uint8_t managedClientPub[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
+    xbool_t bLocalKeySession;       /* Authenticated by a key on this device's own list: localClientPub */
+    uint8_t nKeyScope;              /* What that key may open, DIRECTGATE_KEY_SCOPE_*; FULL for every other session */
+    uint8_t localClientPub[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
     uint32_t nSessionId;
     uint64_t nCreatedMs;
     uint64_t nLastKAPingMs;
@@ -286,6 +289,9 @@ xbool_t DirectGate_Session_IsPreLogon(void);
  *         again: an unauthenticated session has already been closed and freed by the time this returns.
  */
 int DirectGate_Session_EnsureMode(directgate_session_t *pSession, directgate_session_mode_t eMode, const char *pReason);
+
+/* Whether the key the session authenticated with may open eMode: always, for a session no scoped key opened */
+xbool_t DirectGate_Session_KeyAllows(const directgate_session_t *pSession, directgate_session_mode_t eMode);
 int DirectGate_Session_StartMode(directgate_session_t *pSession, directgate_session_mode_t eMode);
 int DirectGate_Session_StartTerminal(directgate_session_t *pSession);
 xbool_t DirectGate_Session_ConsumeAuthMessage(directgate_session_t *pSession);

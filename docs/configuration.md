@@ -62,8 +62,12 @@ The default log directory is platform-specific: `/var/log/directgate` on Linux a
         "pub": "<base64_ed25519_public_key>"
       },
       "authorizedKeys": [
-        "<base64_ed25519_client_public_key>"
+        "<base64_ed25519_client_public_key>",
+        { "key": "<base64_ed25519_client_public_key>", "scope": ["exec", "files"] }
       ],
+      "keyDetails": {
+        "<base64_ed25519_client_public_key>": { "label": "claude on the laptop", "added": 1795400000 }
+      },
       "managedOrganizationId": "<organization_uuid>"
     }
   }
@@ -85,7 +89,8 @@ The default log directory is platform-specific: `/var/log/directgate` on Linux a
 | `auth.srp.suite`              | number   | SRP credential suite advertised at auth (managed by the agent; older records are upgraded in place on load) |
 | `auth.key.agentIdentity.seed` | string   | Agent Ed25519 identity seed for key auth   |
 | `auth.key.agentIdentity.pub`  | string   | Agent Ed25519 public identity for key auth |
-| `auth.key.authorizedKeys`     | string[] | Authorized client Ed25519 public keys      |
+| `auth.key.authorizedKeys`     | array    | Authorized client Ed25519 public keys, at most 16. A plain string is a full key; `{"key", "scope"}` is a [scoped key](#scoped-keys), which opens only the modes its `scope` names. An entry the agent cannot read - an unknown scope name, an empty or repeated one - is skipped, never taken as a full key |
+| `auth.key.keyDetails`         | object   | Written by the agent: per key, the `label` people gave it and the time it was `added` (Unix seconds). Informational only - it grants nothing, and a key missing here is still authorized |
 | `auth.key.managedOrganizationId` | string | The organization this device's operator allowed to authorize client keys through the managed-key lease, as given with `-m <org_id>`. Only `-m` changes it - not an API response, not a re-pairing without `-m`, not a revoked enrollment - and it applies only while the enrollment is in that same organization. Absent: managed keys are off; `-m ""` removes it. See [Security](security.md#organization-managed-keys) |
 
 ### Terminal sessions
@@ -240,6 +245,33 @@ Without `-d` it shows the usual device picker, headed with what it is about to d
 
 Since a key file holds a single identity, the key being authorized is by definition not yet authorized, so `-A` authenticates with the device password the way `ssh-copy-id` does. After that the password is no longer needed for that device.
 
+`-S` gives the key a scope and `-L` a label, both only with `-A`:
+
+```sh
+dgcli -A -d homelab -S exec,files -L "claude on the laptop"   # commands and files, nothing else
+dgcli -A -d homelab -S full                                    # widen it back to everything
+```
+
+Run again for a key that is already authorized, `-A` changes what `-S` and `-L` name and leaves the rest as it is; it says whether anything changed. A new scope ends every session the key has open on the device, so it takes effect at once.
+
+With `-S` or `-L`, `dgcli` first asks the device for its key list. A device whose agent predates scoped keys does not know that request - and would authorize any key as a full one - so `dgcli` stops there, adds nothing and exits non-zero; update the agent, or authorize the key without `-S` and `-L`.
+
+#### Scoped keys
+
+A key handed to a script, a CI job or an AI agent rarely needs everything the device owner's key can do. A **scope** limits a key to the session modes it names:
+
+| Name       | Opens                                                                    |
+|------------|--------------------------------------------------------------------------|
+| `exec`     | Commands: `dgcli exec`, and the command tools of `dgcli mcp`             |
+| `files`    | The file manager and transfers: `dgcli cp`, `ls`, `rm`, `mkdir`, `mv`, and the file tools of `dgcli mcp` |
+| `terminal` | An interactive shell                                                     |
+| `desktop`  | The remote desktop                                                       |
+| `full`     | Everything, administration included - what a key without a scope is     |
+
+A scoped key can never administer the device: it cannot widen itself, authorize or remove another key, or open a temporary share. The device enforces the scope itself, whatever the client asks for; a key that asks for a mode it lacks gets an error and its session ends. For an AI agent, give it its own key with only what it needs - `-S exec,files` for every `dgcli mcp` tool, `-S files` for one that only moves files - so its access can be narrowed or removed without touching yours (see [MCP server](#mcp-server)). A scope picks the modes, not the paths: inside them the key acts as the agent's shell user, anywhere that user can.
+
+The workspace lists a device's keys with their scope, label and when they were added, and removes them (device menu, **Authorized keys**); removing a key ends its open sessions too. On the device itself the list is `auth.key.authorizedKeys` in `agent.json`.
+
 A device can also authorize a key locally, without the CLI:
 
 ```sh
@@ -302,6 +334,16 @@ These never ask for a password without a terminal, so authenticate with a client
 ### MCP server
 
 `dgcli mcp` serves the same operations to an AI agent as [Model Context Protocol](https://modelcontextprotocol.io) tools, over stdio: `list_devices`, `exec`, `list_directory`, `read_file`, `write_file`, `upload`, `download`, `remove`, `make_directory`, `move` and `disconnect`. A call runs `dgcli` again for that one operation - its own connection, authentication and end-to-end keys - unless it passes `keep_open: true`: then the connection (a `dgcli session`) stays open, and the device's next calls run on it without signalling or authenticating again, until `disconnect` closes it, the session's idle or lifetime limit ends it, or `dgcli mcp` exits. At most 8 are kept, the least recently used one closing first; a kept connection that turns out to be gone is opened again for the call, and an agent too old for sessions gets one connection per call as before. It runs on the machine the AI agent runs on - the keys never leave it - and takes the options its calls should use (`-c`, `-k`, `-a`, `-w`).
+
+Give the AI agent a key of its own, scoped to what it needs, rather than yours - its access can then be narrowed or removed on the device without touching your own:
+
+```sh
+dgcli -g -k ~/.config/directgate/auth/agent-key.json
+dgcli -A -d homelab -k ~/.config/directgate/auth/agent-key.json -S exec,files -L "claude on the laptop"
+dgcli mcp -k ~/.config/directgate/auth/agent-key.json --root ~/projects/site
+```
+
+A tool the key's scope does not cover is refused by the device, and the call returns its error. `-S files` leaves `exec` out; `-S exec` leaves out every file tool.
 
 `upload` and `download` touch this machine's files only inside the one directory given with `--root <dir>`; without it they are off and say so. What a device prints goes back to the model, so a planted instruction could ask for any local path - `~/.ssh` included - and the root is what bounds it: a relative `local_path` is taken from the root, every link and `..` is resolved first, and a path that ends up outside is refused, as is a download into a directory that does not exist. The tools are handed the resolved absolute path, never the model's spelling of it. A `--root` that names no directory stops the server at once. On Windows the path is normalised but links are not followed; none of the tools can create one. The remote tools (`exec`, `list_directory`, `read_file`, `write_file`, `remove`, `make_directory`, `move`) work on the device and are not affected.
 

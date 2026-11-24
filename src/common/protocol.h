@@ -186,6 +186,8 @@ typedef struct directgate_pkg_admin_ {
     const char *pShareId;
     const char *pSalt;
     const char *pVerifier;
+    xjson_obj_t *pLabel;            /* add-key: the label as sent, NULL when left out; checked by the agent */
+    xjson_obj_t *pScope;            /* add-key: the scope as sent, read with DirectGate_KeyScope_FromJson */
     uint32_t nTtlSeconds;
 } directgate_pkg_admin_t;
 

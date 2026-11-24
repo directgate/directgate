@@ -41,7 +41,8 @@ typedef enum {
     DIRECTGATE_ADD_KEY_ADDED = 0,
     DIRECTGATE_ADD_KEY_ALREADY,
     DIRECTGATE_ADD_KEY_FULL,
-    DIRECTGATE_ADD_KEY_INVALID
+    DIRECTGATE_ADD_KEY_INVALID,
+    DIRECTGATE_ADD_KEY_UPDATED      /* Already there, and its scope or label changed */
 } directgate_add_key_result_t;
 
 typedef struct directgate_enroll_ {
@@ -73,6 +74,12 @@ typedef struct directgate_keyauth_cfg_ {
        -m, not a revoked enrollment. The lease applies only while the enrollment's organizationId is this same id,
        so the API alone can never switch managed keys on or move them to another organization. Empty: off. */
     char sManagedOrgId[XSTR_TINY];
+
+    /* Per entry of sAuthorizedKeys: what the key may open (DIRECTGATE_KEY_SCOPE_*, FULL for a key added before
+       scopes), what people call it, and when it was added (Unix seconds; 0 when that was before it was kept) */
+    uint8_t nAuthorizedKeyScopes[DIRECTGATE_MAX_AUTHORIZED_KEYS];
+    char sAuthorizedKeyLabels[DIRECTGATE_MAX_AUTHORIZED_KEYS][DIRECTGATE_KEY_LABEL_MAX + 1];
+    uint64_t nAuthorizedKeyAdded[DIRECTGATE_MAX_AUTHORIZED_KEYS];
     uint8_t nAuthorizedKeyCount;
 } directgate_keyauth_cfg_t;
 
@@ -137,7 +144,20 @@ xbool_t DirectGate_LoadConfig(directgate_cfg_t *pCfg, const char *pPath);
 XSTATUS DirectGate_ApplyConfig(const directgate_cfg_t *pCfg);
 xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg);
 
+/* A key with no scope or label, as -a and older clients add one: an existing entry is left as it is */
 directgate_add_key_result_t DirectGate_AddAuthorizedKey(directgate_cfg_t *pCfg, const char *pClientPubB64);
+
+/* Puts a client key on the list, or changes the entry already there: bSetScope sets its scope to nScope, and a
+   pLabel - checked with DirectGate_KeyLabel_IsValid, INVALID otherwise - its label. A new key without bSetScope
+   opens everything. Nothing is persisted here. */
+directgate_add_key_result_t DirectGate_PutAuthorizedKey(directgate_cfg_t *pCfg, const char *pClientPubB64, xbool_t bSetScope,
+                                                        uint8_t nScope, const char *pLabel, uint64_t nAddedSec);
+
+/* The entry the key is, compared as the key it decodes to, or XSTDERR for none or a malformed key */
+int DirectGate_FindAuthorizedKey(const directgate_cfg_t *pCfg, const char *pClientPubB64);
+
+/* Takes the key off the list; XTRUE when it was on it. Nothing is persisted here. */
+xbool_t DirectGate_RemoveAuthorizedKey(directgate_cfg_t *pCfg, const char *pClientPubB64);
 
 #ifdef __cplusplus
 }

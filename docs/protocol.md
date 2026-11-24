@@ -22,7 +22,7 @@ DirectGate uses a custom binary framing over WebSocket frames and the WebRTC dat
 | `webrtc`    | Client <-> Agent (relay) | P2P signaling: offer / answer / ice                |
 | `file`      | Bidirectional            | Chunked file transfer                              |
 | `manager`   | Client <-> Agent         | Remote file manager (list, search, mkdir, rename)  |
-| `admin`     | Client -> Agent          | Administrative ops (e.g. `add-key`)                |
+| `admin`     | Client -> Agent          | Administrative ops (`add-key`, `list-keys`, `remove-key`) |
 | `exec`      | Client <-> Agent         | A non-interactive command: start, input, signal, output, exit |
 | `verify`    | Server <-> Agent         | Enrollment / token-update acknowledgement          |
 | `keepalive` | Bidirectional            | Connection keepalive                               |
@@ -61,7 +61,16 @@ Type-specific fields:
 - `file/cancel`: `transferId`, `reason`
 - `admin`: a session authenticated only by a managed key gets `admin-result`
   `error` / `managed key cannot perform admin actions` for every action,
-  `add-key` and temporary desktop shares included
+  `add-key` and temporary desktop shares included; one opened by a scoped key gets
+  `scoped key cannot perform admin actions` the same way
+- `admin/add-key`: `clientPub`, optional `scope` (array of `exec`, `files`, `terminal`, `desktop`, or `["full"]`) and
+  `label`; answered `ok`, `already`, `updated` or `error` (`invalid-scope`, `invalid-label`, ...). A new scope ends the
+  key's sessions. `admin/list-keys` answers `keys` (`clientPub`, `scope`, optional `label`, `added`) and `max`;
+  `admin/remove-key` (`clientPub`) answers `ok`, `not-found` or `error` and ends the key's sessions (see
+  [`admin`](../../docs/protocol.md#admin) and [Scoped keys](../../docs/protocol.md#scoped-keys))
+- `cmd/start` from a scoped key's session: a mode the key lacks is answered `error` / `this key may not open that on
+  this device` and the session closed; in `remote` mode a request the key lacks is answered `error` / `this key may not
+  do that on this device`
 
 > **Note:** File size is serialized as a decimal string to cleanly handle files larger than 4 GB.
 

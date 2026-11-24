@@ -390,10 +390,13 @@ static void DirectGate_LoadKeyAuthConfig(directgate_keyauth_cfg_t *pKeyAuth, xjs
 
     xjson_obj_t *pIdentity = NULL;
     xjson_obj_t *pAuthKeys = NULL;
+    xjson_obj_t *pKeyDetails = NULL;
     if (pKeyAuthObj != NULL)
     {
         pIdentity = XJSON_GetObject(pKeyAuthObj, "agentIdentity");
         pAuthKeys = XJSON_GetObject(pKeyAuthObj, "authorizedKeys");
+        pKeyDetails = XJSON_GetObject(pKeyAuthObj, "keyDetails");
+        if (pKeyDetails != NULL && pKeyDetails->nType != XJSON_TYPE_OBJECT) pKeyDetails = NULL;
     }
 
     /* Backward compatibility for configs written before auth.key existed. */
@@ -425,11 +428,35 @@ static void DirectGate_LoadKeyAuthConfig(directgate_keyauth_cfg_t *pKeyAuth, xjs
 
         for (size_t i = 0; i < nEntries && pKeyAuth->nAuthorizedKeyCount < DIRECTGATE_MAX_AUTHORIZED_KEYS; i++)
         {
-            const char *pKey = XJSON_GetString(XJSON_GetArrayItem(pAuthKeys, i));
-            if (!xstrused(pKey)) continue;
+            /* A key on its own opens everything, as every key did before scopes; one with a scope is an object */
+            xjson_obj_t *pEntry = XJSON_GetArrayItem(pAuthKeys, i);
+            xbool_t bObject = (pEntry != NULL && pEntry->nType == XJSON_TYPE_OBJECT) ? XTRUE : XFALSE;
+            const char *pKey = XJSON_GetString(bObject ? XJSON_GetObject(pEntry, "key") : pEntry);
+            if (!xstrused(pKey) || strlen(pKey) >= sizeof(pKeyAuth->sAuthorizedKeys[0])) continue;
 
-            xstrncpy(pKeyAuth->sAuthorizedKeys[pKeyAuth->nAuthorizedKeyCount],
-                sizeof(pKeyAuth->sAuthorizedKeys[0]), pKey);
+            uint8_t nScope = DIRECTGATE_KEY_SCOPE_FULL;
+            xjson_obj_t *pScope = bObject ? XJSON_GetObject(pEntry, "scope") : NULL;
+
+            /* A scope this agent cannot read - a newer one's, or a damaged one - leaves the key out, never in with
+               more than it was given */
+            if (pScope != NULL && !DirectGate_KeyScope_FromJson(pScope, &nScope))
+            {
+                xlogw("Skipping an authorized key whose scope is not understood: entry(%zu)", i);
+                continue;
+            }
+
+            /* What people call the key and when it came, kept beside the list, where an older agent ignores it */
+            xjson_obj_t *pDetails = pKeyDetails != NULL ? XJSON_GetObject(pKeyDetails, pKey) : NULL;
+            const char *pLabel = pDetails != NULL ? XJSON_GetString(XJSON_GetObject(pDetails, "label")) : NULL;
+
+            uint8_t nAt = pKeyAuth->nAuthorizedKeyCount;
+            xstrncpy(pKeyAuth->sAuthorizedKeys[nAt], sizeof(pKeyAuth->sAuthorizedKeys[0]), pKey);
+            pKeyAuth->nAuthorizedKeyScopes[nAt] = nScope;
+            pKeyAuth->nAuthorizedKeyAdded[nAt] = pDetails != NULL ? XJSON_GetU64(XJSON_GetObject(pDetails, "added")) : 0;
+            pKeyAuth->sAuthorizedKeyLabels[nAt][0] = XSTR_NUL;
+
+            if (xstrused(pLabel) && DirectGate_KeyLabel_IsValid(pLabel))
+                xstrncpy(pKeyAuth->sAuthorizedKeyLabels[nAt], sizeof(pKeyAuth->sAuthorizedKeyLabels[0]), pLabel);
 
             pKeyAuth->nAuthorizedKeyCount++;
         }
@@ -502,9 +529,28 @@ static int DirectGate_RotateagentIdentity(const directgate_cfg_t *pCfg)
     return XSTDOK;
 }
 
-directgate_add_key_result_t DirectGate_AddAuthorizedKey(directgate_cfg_t *pCfg, const char *pClientPubB64)
+int DirectGate_FindAuthorizedKey(const directgate_cfg_t *pCfg, const char *pClientPubB64)
+{
+    XCHECK_NL((pCfg != NULL && xstrused(pClientPubB64)), XSTDERR);
+
+    uint8_t raw[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
+    size_t nRawLen = 0;
+
+    if (!DirectGate_KeyAuth_Base64Decode(pClientPubB64, raw, sizeof(raw), &nRawLen) ||
+        nRawLen != DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE) return XSTDERR;
+
+    const char *pKeys[DIRECTGATE_MAX_AUTHORIZED_KEYS];
+    for (uint8_t i = 0; i < pCfg->keyauth.nAuthorizedKeyCount; i++) pKeys[i] = pCfg->keyauth.sAuthorizedKeys[i];
+
+    return DirectGate_KeyAuth_FindClient(raw, pKeys, pCfg->keyauth.nAuthorizedKeyCount);
+}
+
+directgate_add_key_result_t DirectGate_PutAuthorizedKey(directgate_cfg_t *pCfg, const char *pClientPubB64, xbool_t bSetScope,
+                                                        uint8_t nScope, const char *pLabel, uint64_t nAddedSec)
 {
     XCHECK((pCfg != NULL && xstrused(pClientPubB64)), DIRECTGATE_ADD_KEY_INVALID);
+    XCHECK_NL((strlen(pClientPubB64) < sizeof(pCfg->keyauth.sAuthorizedKeys[0])), DIRECTGATE_ADD_KEY_INVALID);
+    XCHECK_NL((pLabel == NULL || DirectGate_KeyLabel_IsValid(pLabel)), DIRECTGATE_ADD_KEY_INVALID);
 
     uint8_t raw[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
     size_t nRawLen = 0;
@@ -515,20 +561,72 @@ directgate_add_key_result_t DirectGate_AddAuthorizedKey(directgate_cfg_t *pCfg, 
         return DIRECTGATE_ADD_KEY_INVALID;
     }
 
-    for (uint8_t i = 0; i < pCfg->keyauth.nAuthorizedKeyCount; i++)
+    directgate_keyauth_cfg_t *pKeyAuth = &pCfg->keyauth;
+    int nAt = DirectGate_FindAuthorizedKey(pCfg, pClientPubB64);
+
+    /* Already there: only what the request names changes - a scope never widens or narrows by being left out */
+    if (nAt >= 0)
     {
-        if (xstrcmp(pCfg->keyauth.sAuthorizedKeys[i], pClientPubB64))
-            return DIRECTGATE_ADD_KEY_ALREADY;
+        xbool_t bChanged = XFALSE;
+
+        if (bSetScope && pKeyAuth->nAuthorizedKeyScopes[nAt] != nScope)
+        {
+            pKeyAuth->nAuthorizedKeyScopes[nAt] = nScope;
+            bChanged = XTRUE;
+        }
+
+        /* An empty label clears it: compared as bytes, since xstrcmp holds no two empty strings equal */
+        if (pLabel != NULL && strcmp(pKeyAuth->sAuthorizedKeyLabels[nAt], pLabel) != 0)
+        {
+            xstrncpy(pKeyAuth->sAuthorizedKeyLabels[nAt], sizeof(pKeyAuth->sAuthorizedKeyLabels[0]), pLabel);
+            bChanged = XTRUE;
+        }
+
+        return bChanged ? DIRECTGATE_ADD_KEY_UPDATED : DIRECTGATE_ADD_KEY_ALREADY;
     }
 
-    if (pCfg->keyauth.nAuthorizedKeyCount >= DIRECTGATE_MAX_AUTHORIZED_KEYS)
+    if (pKeyAuth->nAuthorizedKeyCount >= DIRECTGATE_MAX_AUTHORIZED_KEYS)
         return DIRECTGATE_ADD_KEY_FULL;
 
-    xstrncpy(pCfg->keyauth.sAuthorizedKeys[pCfg->keyauth.nAuthorizedKeyCount],
-        sizeof(pCfg->keyauth.sAuthorizedKeys[0]), pClientPubB64);
+    uint8_t nNew = pKeyAuth->nAuthorizedKeyCount;
+    xstrncpy(pKeyAuth->sAuthorizedKeys[nNew], sizeof(pKeyAuth->sAuthorizedKeys[0]), pClientPubB64);
+    pKeyAuth->nAuthorizedKeyScopes[nNew] = bSetScope ? nScope : DIRECTGATE_KEY_SCOPE_FULL;
+    pKeyAuth->nAuthorizedKeyAdded[nNew] = nAddedSec;
+    pKeyAuth->sAuthorizedKeyLabels[nNew][0] = XSTR_NUL;
+    if (pLabel != NULL) xstrncpy(pKeyAuth->sAuthorizedKeyLabels[nNew], sizeof(pKeyAuth->sAuthorizedKeyLabels[0]), pLabel);
 
-    pCfg->keyauth.nAuthorizedKeyCount++;
+    pKeyAuth->nAuthorizedKeyCount++;
     return DIRECTGATE_ADD_KEY_ADDED;
+}
+
+directgate_add_key_result_t DirectGate_AddAuthorizedKey(directgate_cfg_t *pCfg, const char *pClientPubB64)
+{
+    return DirectGate_PutAuthorizedKey(pCfg, pClientPubB64, XFALSE, DIRECTGATE_KEY_SCOPE_FULL, NULL, (uint64_t)time(NULL));
+}
+
+xbool_t DirectGate_RemoveAuthorizedKey(directgate_cfg_t *pCfg, const char *pClientPubB64)
+{
+    int nAt = DirectGate_FindAuthorizedKey(pCfg, pClientPubB64);
+    XCHECK_NL((nAt >= 0), XFALSE);
+
+    /* The entries after it move up one, so the list keeps its order and has no gap */
+    directgate_keyauth_cfg_t *pKeyAuth = &pCfg->keyauth;
+    for (uint8_t i = (uint8_t)nAt; i + 1 < pKeyAuth->nAuthorizedKeyCount; i++)
+    {
+        memcpy(pKeyAuth->sAuthorizedKeys[i], pKeyAuth->sAuthorizedKeys[i + 1], sizeof(pKeyAuth->sAuthorizedKeys[0]));
+        memcpy(pKeyAuth->sAuthorizedKeyLabels[i], pKeyAuth->sAuthorizedKeyLabels[i + 1],
+            sizeof(pKeyAuth->sAuthorizedKeyLabels[0]));
+        pKeyAuth->nAuthorizedKeyScopes[i] = pKeyAuth->nAuthorizedKeyScopes[i + 1];
+        pKeyAuth->nAuthorizedKeyAdded[i] = pKeyAuth->nAuthorizedKeyAdded[i + 1];
+    }
+
+    pKeyAuth->nAuthorizedKeyCount--;
+    uint8_t nLast = pKeyAuth->nAuthorizedKeyCount;
+    memset(pKeyAuth->sAuthorizedKeys[nLast], 0, sizeof(pKeyAuth->sAuthorizedKeys[0]));
+    memset(pKeyAuth->sAuthorizedKeyLabels[nLast], 0, sizeof(pKeyAuth->sAuthorizedKeyLabels[0]));
+    pKeyAuth->nAuthorizedKeyScopes[nLast] = DIRECTGATE_KEY_SCOPE_FULL;
+    pKeyAuth->nAuthorizedKeyAdded[nLast] = 0;
+    return XTRUE;
 }
 
 static xbool_t DirectGate_AppendAuthorizedKey(directgate_cfg_t *pCfg, const char *pClientPubB64)
@@ -807,6 +905,54 @@ xbool_t DirectGate_LoadConfig(directgate_cfg_t *pCfg, const char *pPath)
     return XTRUE;
 }
 
+/* One entry of authorizedKeys. A full key is the bare key, as every agent reads it, so one rolled back to keeps using
+   it; a scoped one is an object, which those agents skip rather than read as a key that opens everything. */
+static xjson_obj_t* DirectGate_NewAuthorizedKeyEntry(const directgate_keyauth_cfg_t *pKeyAuth, uint8_t nAt, xpool_t *pPool)
+{
+    const char *pKey = pKeyAuth->sAuthorizedKeys[nAt];
+    uint8_t nScope = pKeyAuth->nAuthorizedKeyScopes[nAt];
+    if (nScope == DIRECTGATE_KEY_SCOPE_FULL) return XJSON_NewString(pPool, NULL, pKey);
+
+    xjson_obj_t *pEntry = XJSON_NewObject(pPool, NULL, XFALSE);
+    XCHECK_NL((pEntry != NULL), NULL);
+
+    if (XJSON_AddString(pEntry, "key", pKey) == XJSON_ERR_NONE && DirectGate_KeyScope_AddJson(pEntry, "scope", nScope))
+        return pEntry;
+
+    XJSON_FreeObject(pEntry);
+    return NULL;
+}
+
+/* keyDetails: a key's label and the time it came, by the key, for those that have either. XFALSE when one could
+   not be written for want of memory. */
+static xbool_t DirectGate_AddKeyDetails(xjson_obj_t *pKeyAuth, const directgate_keyauth_cfg_t *pCfg)
+{
+    xjson_obj_t *pDetails = NULL;
+
+    for (uint8_t i = 0; i < pCfg->nAuthorizedKeyCount; i++)
+    {
+        const char *pLabel = pCfg->sAuthorizedKeyLabels[i];
+        uint64_t nAdded = pCfg->nAuthorizedKeyAdded[i];
+        if (!xstrused(pCfg->sAuthorizedKeys[i]) || (!xstrused(pLabel) && !nAdded)) continue;
+
+        if (pDetails == NULL) pDetails = XJSON_GetOrCreateObject(pKeyAuth, "keyDetails", 1);
+        xjson_obj_t *pEntry = pDetails != NULL ? XJSON_NewObject(pDetails->pPool, pCfg->sAuthorizedKeys[i], XFALSE) : NULL;
+        if (pEntry == NULL) return XFALSE;
+
+        xbool_t bOk = (!xstrused(pLabel) || XJSON_AddString(pEntry, "label", pLabel) == XJSON_ERR_NONE) &&
+            (!nAdded || XJSON_AddU64(pEntry, "added", nAdded) == XJSON_ERR_NONE) &&
+            XJSON_AddObject(pDetails, pEntry) == XJSON_ERR_NONE;
+
+        if (!bOk)
+        {
+            XJSON_FreeObject(pEntry);
+            return XFALSE;
+        }
+    }
+
+    return XTRUE;
+}
+
 xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
 {
     XCHECK((pCfg != NULL), XFALSE);
@@ -826,6 +972,9 @@ xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
     /* A field lost for want of memory makes the dump below fail and leaves the file as it
        was, rather than saving a config without the relay, the tokens or the identity it had */
     XJSON_SetStrict(pRoot, XTRUE);
+
+    /* The same for a key, whose entry is built before it is added: a list saved without one locks its holder out */
+    xbool_t bKeysOk = XTRUE;
 
     if (xstrused(pCfg->sRelayUrl)) XJSON_AddString(pRoot, "relayUrl", pCfg->sRelayUrl);
     if (xstrused(pCfg->sRoutingKey)) XJSON_AddString(pRoot, "routingKey", pCfg->sRoutingKey);
@@ -901,10 +1050,15 @@ xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
                             const char *pKey = pCfg->keyauth.sAuthorizedKeys[i];
                             if (!xstrused(pKey)) continue;
 
-                            xjson_obj_t *pItem = XJSON_NewString(pKeys->pPool, NULL, pKey);
-                            if (pItem != NULL) XJSON_AddObject(pKeys, pItem);
+                            xjson_obj_t *pItem = DirectGate_NewAuthorizedKeyEntry(&pCfg->keyauth, i, pKeys->pPool);
+                            if (pItem != NULL && XJSON_AddObject(pKeys, pItem) == XJSON_ERR_NONE) continue;
+
+                            XJSON_FreeObject(pItem);
+                            bKeysOk = XFALSE;
                         }
                     }
+
+                    if (bKeysOk) bKeysOk = DirectGate_AddKeyDetails(pKeyAuth, &pCfg->keyauth);
                 }
             }
         }
@@ -979,7 +1133,7 @@ xbool_t DirectGate_SaveConfig(const directgate_cfg_t *pCfg)
     size_t nLength = 0;
     char *pDump;
 
-    pDump = XJSON_DumpObj(pRoot, 2, &nLength);
+    pDump = bKeysOk ? XJSON_DumpObj(pRoot, 2, &nLength) : NULL;
     XJSON_FreeObject(pRoot);
 
     XCHECK((pDump != NULL), xthrowr(XFALSE, "Failed to serialize config to JSON"));

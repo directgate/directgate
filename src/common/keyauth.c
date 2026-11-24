@@ -131,20 +131,11 @@ xbool_t DirectGate_KeyAuth_Base64Decode(const char *pB64,
     size_t nInLen = strlen(pB64);
     if (!nInLen) return XFALSE;
 
-    size_t nDecLen = nInLen;
-    char *pDecoded = XBase64_Decrypt((const uint8_t*)pB64, &nDecLen);
-    if (pDecoded == NULL) return XFALSE;
+    /* Straight into the caller's buffer: a seed never passes through the heap, and a key is never taken for malformed
+       for want of memory */
+    size_t nDecLen = 0;
+    if (!XBase64_DecryptTo((const uint8_t*)pB64, nInLen, pOut, nOutSize, &nDecLen)) return XFALSE;
 
-    if (nDecLen > nOutSize)
-    {
-        OPENSSL_cleanse(pDecoded, nDecLen);
-        free(pDecoded);
-        return XFALSE;
-    }
-
-    memcpy(pOut, pDecoded, nDecLen);
-    OPENSSL_cleanse(pDecoded, nDecLen);
-    free(pDecoded);
     if (pOutLen != NULL) *pOutLen = nDecLen;
     return XTRUE;
 }
@@ -364,14 +355,12 @@ xbool_t DirectGate_KeyAuth_BuildTranscript(xbyte_buffer_t *pOut, char cTag,
     return XTRUE;
 }
 
-xbool_t DirectGate_KeyAuth_IsClientAuthorized(const uint8_t *pClientPubKey,
-                                              const char **pAuthorizedKeys,
-                                              size_t nCount)
+int DirectGate_KeyAuth_FindClient(const uint8_t *pClientPubKey, const char **pAuthorizedKeys, size_t nCount)
 {
-    XCHECK_NL((pClientPubKey != NULL), XFALSE);
-    if (pAuthorizedKeys == NULL || nCount == 0) return XFALSE;
+    XCHECK_NL((pClientPubKey != NULL), XSTDERR);
+    if (pAuthorizedKeys == NULL || nCount == 0) return XSTDERR;
 
-    xbool_t bFound = XFALSE;
+    int nFound = XSTDERR;
     for (size_t i = 0; i < nCount; i++)
     {
         const char *pB64 = pAuthorizedKeys[i];
@@ -388,13 +377,179 @@ xbool_t DirectGate_KeyAuth_IsClientAuthorized(const uint8_t *pClientPubKey,
         }
 
         if (CRYPTO_memcmp(decoded, pClientPubKey, DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE) == 0)
-            bFound = XTRUE;
+            nFound = (int)i;
 
         OPENSSL_cleanse(decoded, sizeof(decoded));
         /* Do not short-circuit - scan all entries in roughly constant time. */
     }
 
-    return bFound;
+    return nFound;
+}
+
+xbool_t DirectGate_KeyAuth_IsClientAuthorized(const uint8_t *pClientPubKey,
+                                              const char **pAuthorizedKeys,
+                                              size_t nCount)
+{
+    return DirectGate_KeyAuth_FindClient(pClientPubKey, pAuthorizedKeys, nCount) >= 0 ? XTRUE : XFALSE;
+}
+
+/* The names of DIRECTGATE_KEY_SCOPE_*, in the order they are written */
+static const struct {
+    const char *pName;
+    uint8_t nBit;
+} g_keyScopeNames[] = {
+    { "exec", DIRECTGATE_KEY_SCOPE_EXEC },
+    { "files", DIRECTGATE_KEY_SCOPE_FILES },
+    { "terminal", DIRECTGATE_KEY_SCOPE_TERMINAL },
+    { "desktop", DIRECTGATE_KEY_SCOPE_DESKTOP }
+};
+
+/* One name into the scope it adds; "full" stands alone (pFull), anything else unknown is XFALSE */
+static xbool_t DirectGate_KeyScope_AddName(const char *pName, size_t nLength, uint8_t *pScope, xbool_t *pFull)
+{
+    if (nLength == 4 && !strncmp(pName, "full", 4))
+    {
+        *pFull = XTRUE;
+        return XTRUE;
+    }
+
+    for (size_t i = 0; i < XARR_SIZE(g_keyScopeNames); i++)
+    {
+        if (strlen(g_keyScopeNames[i].pName) != nLength || strncmp(g_keyScopeNames[i].pName, pName, nLength)) continue;
+        if (*pScope & g_keyScopeNames[i].nBit) return XFALSE;
+
+        *pScope |= g_keyScopeNames[i].nBit;
+        return XTRUE;
+    }
+
+    return XFALSE;
+}
+
+/* "full" alone, or at least one mode and nothing else: an empty list or a mixed one is no scope at all */
+static xbool_t DirectGate_KeyScope_Finish(uint8_t nScope, xbool_t bFull, size_t nNames, uint8_t *pScope)
+{
+    if (!nNames || (bFull && nNames != 1)) return XFALSE;
+
+    *pScope = bFull ? DIRECTGATE_KEY_SCOPE_FULL : nScope;
+    return XTRUE;
+}
+
+xbool_t DirectGate_KeyScope_Parse(const char *pList, uint8_t *pScope)
+{
+    XCHECK_NL((pList != NULL && pScope != NULL), XFALSE);
+    uint8_t nScope = 0;
+    xbool_t bFull = XFALSE;
+    size_t nNames = 0;
+
+    for (const char *pName = pList;; )
+    {
+        const char *pEnd = strchr(pName, ',');
+        size_t nLength = pEnd != NULL ? (size_t)(pEnd - pName) : strlen(pName);
+        if (!DirectGate_KeyScope_AddName(pName, nLength, &nScope, &bFull)) return XFALSE;
+
+        nNames++;
+        if (pEnd == NULL) break;
+        pName = pEnd + 1;
+    }
+
+    return DirectGate_KeyScope_Finish(nScope, bFull, nNames, pScope);
+}
+
+xbool_t DirectGate_KeyScope_FromJson(xjson_obj_t *pArray, uint8_t *pScope)
+{
+    XCHECK_NL((pArray != NULL && pScope != NULL && pArray->nType == XJSON_TYPE_ARRAY), XFALSE);
+    uint8_t nScope = 0;
+    xbool_t bFull = XFALSE;
+    size_t nNames = XJSON_GetArrayLength(pArray);
+
+    for (size_t i = 0; i < nNames; i++)
+    {
+        const char *pName = XJSON_GetString(XJSON_GetArrayItem(pArray, i));
+        if (pName == NULL || !DirectGate_KeyScope_AddName(pName, strlen(pName), &nScope, &bFull)) return XFALSE;
+    }
+
+    return DirectGate_KeyScope_Finish(nScope, bFull, nNames, pScope);
+}
+
+size_t DirectGate_KeyScope_Format(uint8_t nScope, char *pOut, size_t nSize)
+{
+    XCHECK_NL((pOut != NULL && nSize > 0), XSTDNON);
+    pOut[0] = XSTR_NUL;
+    if (nScope == DIRECTGATE_KEY_SCOPE_FULL) return xstrncpy(pOut, nSize, "full");
+
+    size_t nUsed = 0;
+    for (size_t i = 0; i < XARR_SIZE(g_keyScopeNames); i++)
+    {
+        if (!(nScope & g_keyScopeNames[i].nBit)) continue;
+        nUsed = xstrncpyf(pOut + nUsed, nSize - nUsed, "%s%s", nUsed ? "," : "", g_keyScopeNames[i].pName) + nUsed;
+        if (nUsed + 1 >= nSize) break;
+    }
+
+    return nUsed;
+}
+
+/* One name onto an array; XFALSE (and nothing added) when it cannot be */
+static xbool_t DirectGate_KeyScope_AddItem(xjson_obj_t *pArray, const char *pName)
+{
+    xjson_obj_t *pItem = XJSON_NewString(pArray->pPool, NULL, pName);
+    if (pItem != NULL && XJSON_AddObject(pArray, pItem) == XJSON_ERR_NONE) return XTRUE;
+
+    XJSON_FreeObject(pItem);
+    return XFALSE;
+}
+
+xbool_t DirectGate_KeyScope_AddJson(xjson_obj_t *pObj, const char *pName, uint8_t nScope)
+{
+    XCHECK_NL((pObj != NULL && pName != NULL), XFALSE);
+    xjson_obj_t *pArray = XJSON_NewArray(pObj->pPool, pName, XFALSE);
+    XCHECK_NL((pArray != NULL), XFALSE);
+
+    xbool_t bOk = nScope == DIRECTGATE_KEY_SCOPE_FULL ? DirectGate_KeyScope_AddItem(pArray, "full") : XTRUE;
+
+    for (size_t i = 0; i < XARR_SIZE(g_keyScopeNames) && bOk && nScope != DIRECTGATE_KEY_SCOPE_FULL; i++)
+        if (nScope & g_keyScopeNames[i].nBit) bOk = DirectGate_KeyScope_AddItem(pArray, g_keyScopeNames[i].pName);
+
+    if (bOk && XJSON_AddObject(pObj, pArray) == XJSON_ERR_NONE) return XTRUE;
+
+    XJSON_FreeObject(pArray);
+    return XFALSE;
+}
+
+xbool_t DirectGate_KeyLabel_IsValid(const char *pLabel)
+{
+    XCHECK_NL((pLabel != NULL), XFALSE);
+    const unsigned char *pIt = (const unsigned char*)pLabel;
+    size_t nLength = strlen(pLabel);
+    if (nLength > DIRECTGATE_KEY_LABEL_MAX) return XFALSE;
+
+    /* Shown to people in a terminal and a page: well formed UTF-8 text, never a control character of either kind */
+    for (size_t i = 0; i < nLength; )
+    {
+        unsigned char nByte = pIt[i];
+        size_t nFollow = nByte < 0x80 ? 0 : (nByte & 0xE0) == 0xC0 ? 1 : (nByte & 0xF0) == 0xE0 ? 2 :
+            (nByte & 0xF8) == 0xF0 ? 3 : 4;
+
+        if (nFollow == 4 || i + nFollow >= nLength) return XFALSE;
+        if (nByte < 0x20 || nByte == 0x7F || nByte == 0xC0 || nByte == 0xC1 || nByte > 0xF4) return XFALSE;
+        if (nByte == 0xC2 && pIt[i + 1] >= 0x80 && pIt[i + 1] <= 0x9F) return XFALSE;
+
+        /* Only the shortest form: a longer spelling of a control character is still one to a lax decoder */
+        if ((nByte == 0xE0 && pIt[i + 1] < 0xA0) || (nByte == 0xF0 && pIt[i + 1] < 0x90)) return XFALSE;
+
+        /* Only Unicode scalars: no UTF-16 surrogate halves, nothing past U+10FFFF */
+        if ((nByte == 0xED && pIt[i + 1] >= 0xA0) || (nByte == 0xF4 && pIt[i + 1] >= 0x90)) return XFALSE;
+
+        /* Nor what breaks the line or turns the text around where it is shown: U+2028..U+202E, U+2066..U+2069 */
+        if (nByte == 0xE2 && ((pIt[i + 1] == 0x80 && pIt[i + 2] >= 0xA8 && pIt[i + 2] <= 0xAE) ||
+            (pIt[i + 1] == 0x81 && pIt[i + 2] >= 0xA6 && pIt[i + 2] <= 0xA9))) return XFALSE;
+
+        for (size_t j = 1; j <= nFollow; j++)
+            if ((pIt[i + j] & 0xC0) != 0x80) return XFALSE;
+
+        i += nFollow + 1;
+    }
+
+    return XTRUE;
 }
 
 xbool_t DirectGate_KeyAuth_AgentProcessHello(directgate_keyauth_t *pAuth,

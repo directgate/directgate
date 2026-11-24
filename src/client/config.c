@@ -89,6 +89,8 @@ void DirectGate_DisplayUsage(const char *pName)
     printf("  -j                   # devices, ls: print JSON\n");
     printf("  -r                   # rm: a directory with everything in it\n");
     printf("  -A                   # Authorize the client key on a device and exit\n");
+    printf("  -S <scope>           # With -A: only exec, files, terminal, desktop (comma separated), or full\n");
+    printf("  -L <label>           # With -A: what the device lists the key as\n");
     printf("  -B                   # Sign in without opening a browser\n");
     printf("  -g                   # Generate a client key and exit\n");
     printf("  -f                   # Force overwrite device in list; cp: replace the destination\n");
@@ -224,6 +226,10 @@ void DirectGate_InitConfig(directgate_cfg_t *pCfg)
     pCfg->bKeyRequired = XFALSE;
     pCfg->bGenKey = XFALSE;
     pCfg->bAddKey = XFALSE;
+    pCfg->bAddKeyScope = XFALSE;
+    pCfg->bAddKeyLabel = XFALSE;
+    pCfg->nAddKeyScope = DIRECTGATE_KEY_SCOPE_FULL;
+    pCfg->sAddKeyLabel[0] = XSTR_NUL;
     pCfg->bForce = XFALSE;
     pCfg->bInit = XFALSE;
 }
@@ -450,7 +456,7 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
     if (pCfg->eCommand == DIRECTGATE_CMD_REMOTE) DirectGate_Remote_ParseOp(argv[1], &eRemoteOp);
     xbool_t bListVerb = (argc > 1 && !strcmp(argv[1], "ls")) ? XTRUE : XFALSE;
     const char *pOptions = (eRemoteOp != DIRECTGATE_REMOTE_NONE || bListVerb) ?
-        "+d:a:c:l:v:w:k:t:C:o:fjrBh" : "n:d:a:c:p:l:v:w:k:AfgsijBh";
+        "+d:a:c:l:v:w:k:t:C:o:fjrBh" : "n:d:a:c:p:l:v:w:k:AS:L:fgsijBh";
 
     optind = nFirst;
     while ((nChar = getopt(argc, argv, pOptions)) != -1)
@@ -510,6 +516,24 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
             case 'A':
                 pCfg->bAddKey = XTRUE;
                 break;
+            case 'S':
+                if (!DirectGate_KeyScope_Parse(optarg, &pCfg->nAddKeyScope))
+                {
+                    fprintf(stderr, "dgcli: -S takes full, or any of exec, files, terminal and desktop, separated by commas\n");
+                    return XSTDEXC;
+                }
+                pCfg->bAddKeyScope = XTRUE;
+                break;
+            case 'L':
+                if (!DirectGate_KeyLabel_IsValid(optarg))
+                {
+                    fprintf(stderr, "dgcli: -L takes text of at most %d bytes, with no control characters\n",
+                        DIRECTGATE_KEY_LABEL_MAX);
+                    return XSTDEXC;
+                }
+                xstrncpy(pCfg->sAddKeyLabel, sizeof(pCfg->sAddKeyLabel), optarg);
+                pCfg->bAddKeyLabel = XTRUE;
+                break;
             case 'B':
                 pCfg->bNoBrowser = XTRUE;
                 break;
@@ -540,6 +564,13 @@ XSTATUS DirectGate_ParseArgs(directgate_cfg_t *pCfg, int argc, char *argv[])
             default:
                 return XSTDERR;
         }
+    }
+
+    /* A scope or a label is what a key is given as it is authorized: on its own it would be quietly ignored */
+    if ((pCfg->bAddKeyScope || pCfg->bAddKeyLabel) && !pCfg->bAddKey)
+    {
+        fprintf(stderr, "dgcli: -S and -L go with -A\n");
+        return XSTDEXC;
     }
 
     if (pCfg->nVerbose != XSTDNON)

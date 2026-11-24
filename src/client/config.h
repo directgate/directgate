@@ -27,6 +27,7 @@
 #include "logger.h"
 #include "webrtc.h"
 #include "remote.h"
+#include "keyauth.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -68,6 +69,10 @@ typedef struct directgate_cfg_ {
     xbool_t bKeyRequired;
     xbool_t bGenKey;
     xbool_t bAddKey;
+    xbool_t bAddKeyScope;           /* -S: the key is given only nAddKeyScope (DIRECTGATE_KEY_SCOPE_*) */
+    xbool_t bAddKeyLabel;           /* -L: and called sAddKeyLabel */
+    uint8_t nAddKeyScope;
+    char sAddKeyLabel[DIRECTGATE_KEY_LABEL_MAX + 1];
     xbool_t bForce;
     xbool_t bInit;
     xbool_t bJson;

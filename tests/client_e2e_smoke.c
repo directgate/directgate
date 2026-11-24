@@ -159,6 +159,11 @@ typedef struct {
     xatomic_t bRtcConnected;
     xatomic_t bRtcTyped;
     char sAddedKey[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
+    char sAddedScope[64];           /* The add-key's scope as "exec,files", "-" when left out, "invalid" */
+    char sAddedLabel[96];           /* Its label, "-" when left out */
+    char sAddKeyAnswer[16];         /* What the host answers an add-key with, "ok" when empty */
+    xatomic_t nListKeys;            /* list-keys asked of the host */
+    xatomic_t bOldAgent;            /* The host answers list-keys as an agent from before key scopes */
 
     /* Remote operations: what the host offers, what it was asked and what it was sent. */
     xatomic_t bOfferExec;
@@ -266,6 +271,11 @@ static void reset_outputs(void)
     XSYNC_ATOMIC_SET(&g_cli.bPongSeen, 0);
     XSYNC_ATOMIC_SET(&g_cli.bResizeSeen, 0);
     XSYNC_ATOMIC_SET(&g_cli.bAddKeySeen, 0);
+    g_cli.sAddedScope[0] = '\0';
+    g_cli.sAddedLabel[0] = '\0';
+    g_cli.sAddKeyAnswer[0] = '\0';
+    XSYNC_ATOMIC_SET(&g_cli.nListKeys, 0);
+    XSYNC_ATOMIC_SET(&g_cli.bOldAgent, 0);
     XSYNC_ATOMIC_SET(&g_cli.bSendClose, 0);
     XSYNC_ATOMIC_SET(&g_cli.bShortSession, 0);
     XSYNC_ATOMIC_SET(&g_cli.eFault, FAULT_NONE);
@@ -1108,9 +1118,27 @@ static int host_on_sealed(xapi_session_t *pSession, directgate_pkg_t *pPkg)
         const char *pAction = XJSON_GetString(XJSON_GetObject(pRoot, "action"));
         const char *pPub = XJSON_GetString(XJSON_GetObject(pRoot, "clientPub"));
 
+        /* As an agent with key scopes answers it, or as one from before them */
+        if (pAction != NULL && strcmp(pAction, "list-keys") == 0)
+        {
+            XSYNC_ATOMIC_ADD(&g_cli.nListKeys, 1);
+            xjson_obj_t *pAnswer = XSYNC_ATOMIC_GET(&g_cli.bOldAgent) ?
+                DirectGate_Proto_BuildAdmin("admin-result", NULL, "error", "unknown-action", CLI_SESSION_ID) :
+                DirectGate_Proto_BuildAdmin("list-keys-result", NULL, "ok", NULL, CLI_SESSION_ID);
+            nStatus = host_send(pSession, pAnswer, NULL, 0);
+        }
+
         if (pAction != NULL && strcmp(pAction, "add-key") == 0 && pPub != NULL)
         {
             xstrncpy(g_cli.sAddedKey, sizeof(g_cli.sAddedKey), pPub);
+
+            xjson_obj_t *pScope = XJSON_GetObject(pRoot, "scope");
+            xjson_obj_t *pLabel = XJSON_GetObject(pRoot, "label");
+            uint8_t nScope = 0;
+            const char *pSent = pScope == NULL ? "-" : !DirectGate_KeyScope_FromJson(pScope, &nScope) ? "invalid" : NULL;
+            if (pSent != NULL) xstrncpy(g_cli.sAddedScope, sizeof(g_cli.sAddedScope), pSent);
+            else DirectGate_KeyScope_Format(nScope, g_cli.sAddedScope, sizeof(g_cli.sAddedScope));
+            xstrncpy(g_cli.sAddedLabel, sizeof(g_cli.sAddedLabel), pLabel != NULL ? XJSON_GetString(pLabel) : "-");
             XSYNC_ATOMIC_SET(&g_cli.bAddKeySeen, 1);
 
             /* Admin answers that are not the one asked for are passed over. */
@@ -1126,6 +1154,7 @@ static int host_on_sealed(xapi_session_t *pSession, directgate_pkg_t *pPkg)
             const char *pResult = "ok";
             const char *pReason = NULL;
 
+            if (g_cli.sAddKeyAnswer[0] != '\0') pResult = g_cli.sAddKeyAnswer;
             if (fault() == FAULT_ADD_KEY_ALREADY) pResult = "already";
             if (fault() == FAULT_ADD_KEY_REFUSED)
             {
@@ -1628,9 +1657,99 @@ static int scenario_keys(tty_t *pTty, const char *pCfg, const char *pRoot)
     CHECK(tty_type(pTty, CLI_SECRET "\n"), "type the password");
     CHECK(wait_flag(&g_cli.bAddKeySeen, 20000, pTty), "the client asks the host to authorize its key");
     CHECK(strcmp(g_cli.sAddedKey, sKeyPub) == 0, "the key sent for authorization is the one in the key file");
-    CHECK(tty_finish(pTty, 10000) == 0 && strstr(pTty->sScreen, "Key authorized") != NULL,
+    CHECK(!strcmp(g_cli.sAddedScope, "-") && !strcmp(g_cli.sAddedLabel, "-"),
+        "without -S and -L the request carries neither, so a key already there keeps its own");
+    CHECK(XSYNC_ATOMIC_GET(&g_cli.nListKeys) == 0, "and asks nothing first");
+    CHECK(tty_finish(pTty, 10000) == 0 && strstr(pTty->sScreen, "Key authorized. You can now connect") != NULL,
         "an authorized key is reported and the client exits cleanly");
     CHECK(XSYNC_ATOMIC_GET(&g_cli.bTerminalStarted) == 0, "authorizing a key never opens a shell");
+
+    /* -S and -L go to the device with the key, and the answer says what the key now opens */
+    {
+        struct {
+            const char *pScope;
+            const char *pLabel;
+            const char *pAnswer;
+            const char *pSentScope;
+            const char *pSentLabel;
+            const char *pScreen;
+        } cases[] = {
+            { "files,exec", "claude on the laptop", "", "exec,files", "claude on the laptop",
+              "Key authorized for exec,files only" },
+            { "full", NULL, "", "full", "-", "Key authorized. You can now connect" },
+            { "exec", NULL, "updated", "exec", "-", "it opens exec now. Sessions it had open under another scope were ended" },
+            { NULL, "", "updated", "-", "", "its label is updated" }
+        };
+
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        {
+            const char *argv[12];
+            int nArg = 0;
+            argv[nArg++] = "-c"; argv[nArg++] = pCfg; argv[nArg++] = "-A"; argv[nArg++] = "-d"; argv[nArg++] = CLI_DEVICE_ID;
+            if (cases[i].pScope != NULL) { argv[nArg++] = "-S"; argv[nArg++] = cases[i].pScope; }
+            if (cases[i].pLabel != NULL) { argv[nArg++] = "-L"; argv[nArg++] = cases[i].pLabel; }
+            argv[nArg] = NULL;
+
+            reset_outputs();
+            xstrncpy(g_cli.sAddKeyAnswer, sizeof(g_cli.sAddKeyAnswer), cases[i].pAnswer);
+            CHECK(tty_start(pTty, argv, XFALSE), "start a key authorization with a scope or a label");
+            CHECK(tty_expect(pTty, "Password for", 20000) && tty_type(pTty, CLI_SECRET "\n"), "type the password");
+            CHECK(wait_flag(&g_cli.bAddKeySeen, 20000, pTty), "the client asks the host to authorize its key");
+            CHECK(!strcmp(g_cli.sAddedScope, cases[i].pSentScope) && !strcmp(g_cli.sAddedLabel, cases[i].pSentLabel),
+                "the request carries exactly the scope and label given");
+            CHECK(XSYNC_ATOMIC_GET(&g_cli.nListKeys) == 1, "after asking once whether the device keeps them");
+            CHECK(tty_finish(pTty, 10000) == 0 && strstr(pTty->sScreen, cases[i].pScreen) != NULL,
+                "the answer is reported for what was asked");
+        }
+    }
+
+    /* An agent from before key scopes would take the key as a full one: it is told nothing, and dgcli says why */
+    {
+        const char *pScopes[] = { "exec", NULL };
+        const char *pLabels[] = { NULL, "ci" };
+        for (size_t i = 0; i < 2; i++)
+        {
+            const char *argv[10];
+            int nArg = 0;
+            argv[nArg++] = "-c"; argv[nArg++] = pCfg; argv[nArg++] = "-A"; argv[nArg++] = "-d"; argv[nArg++] = CLI_DEVICE_ID;
+            if (pScopes[i] != NULL) { argv[nArg++] = "-S"; argv[nArg++] = pScopes[i]; }
+            if (pLabels[i] != NULL) { argv[nArg++] = "-L"; argv[nArg++] = pLabels[i]; }
+            argv[nArg] = NULL;
+
+            reset_outputs();
+            XSYNC_ATOMIC_SET(&g_cli.bOldAgent, 1);
+            CHECK(tty_start(pTty, argv, XFALSE), "start a scoped key authorization on an old agent");
+            CHECK(tty_expect(pTty, "Password for", 20000) && tty_type(pTty, CLI_SECRET "\n"), "type the password");
+            CHECK(tty_finish(pTty, 20000) != 0 && strstr(pTty->sScreen, "predates key scopes and labels") != NULL,
+                "a device that does not keep scopes is refused a scoped key, and dgcli fails saying why");
+            CHECK(XSYNC_ATOMIC_GET(&g_cli.nListKeys) == 1 && !XSYNC_ATOMIC_GET(&g_cli.bAddKeySeen),
+                "the key is never sent to it");
+        }
+    }
+
+    /* A scope or a label that the device would refuse never leaves, and neither goes without -A */
+    {
+        struct {
+            const char *argv[8];
+            const char *pScreen;
+        } usage[] = {
+            { { "-c", pCfg, "-A", "-S", "root", NULL }, "-S takes full, or any of exec, files" },
+            { { "-c", pCfg, "-A", "-S", "full,exec", NULL }, "-S takes full, or any of exec, files" },
+            { { "-c", pCfg, "-A", "-S", "", NULL }, "-S takes full, or any of exec, files" },
+            { { "-c", pCfg, "-A", "-L", "a\x1b]0;x\x07" "b", NULL }, "-L takes text of at most 64 bytes" },
+            { { "-c", pCfg, "-S", "exec", CLI_DEVICE_ID, NULL }, "-S and -L go with -A" },
+            { { "-c", pCfg, "-L", "laptop", CLI_DEVICE_ID, NULL }, "-S and -L go with -A" }
+        };
+
+        for (size_t i = 0; i < sizeof(usage) / sizeof(usage[0]); i++)
+        {
+            reset_outputs();
+            CHECK(tty_start(pTty, usage[i].argv, XFALSE), "start dgcli with a bad -S or -L");
+            CHECK(tty_finish(pTty, 10000) != 0 && strstr(pTty->sScreen, usage[i].pScreen) != NULL,
+                "a bad -S or -L fails before connecting, and says why");
+            CHECK(XSYNC_ATOMIC_GET(&g_cli.nConnects) == 0 && !XSYNC_ATOMIC_GET(&g_cli.bAddKeySeen), "and asks nothing of anyone");
+        }
+    }
 
     /* With the key authorized, the client logs in without a password. */
     reset_outputs();

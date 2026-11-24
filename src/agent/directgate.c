@@ -1722,6 +1722,195 @@ static int DirectGate_Admin_SendActionResp(directgate_session_t *pSession,
     return nStatus;
 }
 
+/* Ends every session the key opened but pKeep, the one asking: a key removed, or given another scope, keeps nothing
+   it was given before - a connection direct over WebRTC included, which the relay could not end. XTRUE when pKeep is
+   one of them, for the caller to end as well. */
+static xbool_t DirectGate_Admin_EndKeySessions(directgate_conn_t *pConn, const char *pClientPubB64,
+                                               const directgate_session_t *pKeep, const char *pReason)
+{
+    uint8_t raw[DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE];
+    size_t nRawLen = 0;
+
+    if (!DirectGate_KeyAuth_Base64Decode(pClientPubB64, raw, sizeof(raw), &nRawLen) ||
+        nRawLen != DIRECTGATE_KEYAUTH_ED25519_PUB_SIZE) return XFALSE;
+
+    xbool_t bKeep = XFALSE;
+    for (int i = 0; i < DIRECTGATE_MAX_SESSIONS; i++)
+    {
+        directgate_session_t *pSession = pConn->mgr.pSessions[i];
+        if (pSession == NULL || !pSession->bLocalKeySession) continue;
+        if (CRYPTO_memcmp(pSession->localClientPub, raw, sizeof(raw)) != 0) continue;
+
+        if (pSession == pKeep) bKeep = XTRUE;
+        else DirectGate_Session_Close(pSession, pReason);
+    }
+
+    return bKeep;
+}
+
+static int DirectGate_Admin_AddKey(directgate_conn_t *pConn, directgate_session_t *pSession, const directgate_pkg_admin_t *pAdmin)
+{
+    if (!xstrused(pAdmin->pClientPub))
+    {
+        xlogw("admin/add-key missing clientPub: sid(%u), wsfd(%d)", pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
+
+        return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "error", "missing-client-pub");
+    }
+
+    /* A scope that is not one is refused, never read as none - which would be everything */
+    uint8_t nScope = DIRECTGATE_KEY_SCOPE_FULL;
+    if (pAdmin->pScope != NULL && !DirectGate_KeyScope_FromJson(pAdmin->pScope, &nScope))
+        return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "error", "invalid-scope");
+
+    /* A label left out keeps the one there, an empty one clears it, and one that is not a string is refused */
+    const char *pLabel = pAdmin->pLabel != NULL ? XJSON_GetString(pAdmin->pLabel) : NULL;
+    if (pAdmin->pLabel != NULL && (pAdmin->pLabel->nType != XJSON_TYPE_STRING || !DirectGate_KeyLabel_IsValid(pLabel)))
+        return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "error", "invalid-label");
+
+    /* What the key held before, so a new label alone ends nothing it opened */
+    int nWas = DirectGate_FindAuthorizedKey(pConn->pCfg, pAdmin->pClientPub);
+    uint8_t nWasScope = nWas >= 0 ? pConn->pCfg->keyauth.nAuthorizedKeyScopes[nWas] : DIRECTGATE_KEY_SCOPE_FULL;
+
+    directgate_add_key_result_t eResult = DirectGate_PutAuthorizedKey(pConn->pCfg, pAdmin->pClientPub,
+        pAdmin->pScope != NULL ? XTRUE : XFALSE, nScope, pLabel, (uint64_t)time(NULL));
+
+    if (eResult == DIRECTGATE_ADD_KEY_INVALID)
+    {
+        xlogw("admin/add-key rejected invalid pubkey: sid(%u), wsfd(%d)",
+            pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
+
+        return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "error", "invalid-key");
+    }
+
+    if (eResult == DIRECTGATE_ADD_KEY_FULL)
+    {
+        xloge("admin/add-key rejected, authorizedKeys full: sid(%u), wsfd(%d), max(%d)",
+            pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), DIRECTGATE_MAX_AUTHORIZED_KEYS);
+
+        return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "error", "capacity-full");
+    }
+
+    if (eResult == DIRECTGATE_ADD_KEY_ALREADY)
+    {
+        xlogi("admin/add-key already present: sid(%u), wsfd(%d)", pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
+
+        return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "already", NULL);
+    }
+
+    char sScope[XSTR_TINY];
+    int nAt = DirectGate_FindAuthorizedKey(pConn->pCfg, pAdmin->pClientPub);
+    uint8_t nNowScope = nAt >= 0 ? pConn->pCfg->keyauth.nAuthorizedKeyScopes[nAt] : nScope;
+    DirectGate_KeyScope_Format(nNowScope, sScope, sizeof(sScope));
+    xbool_t bUpdated = eResult == DIRECTGATE_ADD_KEY_UPDATED ? XTRUE : XFALSE;
+
+    xbool_t bSaved = DirectGate_SaveConfig(pConn->pCfg);
+
+    if (!bSaved)
+    {
+        xloge("admin/add-key failed to persist config: sid(%u), wsfd(%d), cfg(%s)",
+            pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), pConn->pCfg->sCfgPath);
+    }
+    else
+    {
+        xlogi("admin/add-key %s authorized key: sid(%u), wsfd(%d), scope(%s), count(%u)", bUpdated ? "changed" : "appended",
+            pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), sScope,
+            (unsigned)pConn->pCfg->keyauth.nAuthorizedKeyCount);
+    }
+
+    int nStatus = DirectGate_Admin_SendActionResp(pSession, "add-key-result",
+        !bSaved ? "error" : bUpdated ? "updated" : "ok", bSaved ? NULL : "persist-failed");
+
+    /* What the key opened under the old scope ends with it, in this same pass, this session too now it has its
+       answer - and whatever the disk said, as the scope in memory is the one new sessions get */
+    xbool_t bRescoped = bUpdated && nNowScope != nWasScope ? XTRUE : XFALSE;
+    xbool_t bOwn = bRescoped ? DirectGate_Admin_EndKeySessions(pConn, pAdmin->pClientPub, pSession, "key scope changed") : XFALSE;
+    return bOwn ? DirectGate_Session_Close(pSession, "key scope changed") : nStatus;
+}
+
+/* The device's own keys as the list-keys answer carries them: clientPub, scope, and label and added when known */
+static xjson_obj_t* DirectGate_Admin_NewKeyEntry(const directgate_keyauth_cfg_t *pKeyAuth, uint8_t nAt, xpool_t *pPool)
+{
+    xjson_obj_t *pEntry = XJSON_NewObject(pPool, NULL, XFALSE);
+    XCHECK_NL((pEntry != NULL), NULL);
+
+    xbool_t bOk = XJSON_AddString(pEntry, "clientPub", pKeyAuth->sAuthorizedKeys[nAt]) == XJSON_ERR_NONE &&
+        DirectGate_KeyScope_AddJson(pEntry, "scope", pKeyAuth->nAuthorizedKeyScopes[nAt]);
+
+    if (bOk && xstrused(pKeyAuth->sAuthorizedKeyLabels[nAt]))
+        bOk = XJSON_AddString(pEntry, "label", pKeyAuth->sAuthorizedKeyLabels[nAt]) == XJSON_ERR_NONE;
+
+    if (bOk && pKeyAuth->nAuthorizedKeyAdded[nAt])
+        bOk = XJSON_AddU64(pEntry, "added", pKeyAuth->nAuthorizedKeyAdded[nAt]) == XJSON_ERR_NONE;
+
+    if (bOk) return pEntry;
+    XJSON_FreeObject(pEntry);
+    return NULL;
+}
+
+static int DirectGate_Admin_ListKeys(directgate_conn_t *pConn, directgate_session_t *pSession)
+{
+    const directgate_keyauth_cfg_t *pKeyAuth = &pConn->pCfg->keyauth;
+    xjson_obj_t *pHeader = DirectGate_Proto_BuildAdmin("list-keys-result", NULL, "ok", NULL, pSession->nSessionId);
+    XCHECK_NL((pHeader != NULL), xthrowr(XAPI_DISCONNECT, "Proto: Failed to build admin response header"));
+
+    xjson_obj_t *pKeys = XJSON_NewArray(pHeader->pPool, "keys", XFALSE);
+    xbool_t bOk = pKeys != NULL && XJSON_AddObject(pHeader, pKeys) == XJSON_ERR_NONE;
+    if (!bOk) XJSON_FreeObject(pKeys);
+
+    for (uint8_t i = 0; i < pKeyAuth->nAuthorizedKeyCount && bOk; i++)
+    {
+        xjson_obj_t *pEntry = DirectGate_Admin_NewKeyEntry(pKeyAuth, i, pHeader->pPool);
+        bOk = pEntry != NULL && XJSON_AddObject(pKeys, pEntry) == XJSON_ERR_NONE;
+        if (!bOk) XJSON_FreeObject(pEntry);
+    }
+
+    if (bOk) bOk = XJSON_AddU32(pHeader, "max", DIRECTGATE_MAX_AUTHORIZED_KEYS) == XJSON_ERR_NONE;
+    if (!bOk)
+    {
+        XJSON_FreeObject(pHeader);
+        return DirectGate_Admin_SendActionResp(pSession, "list-keys-result", "error", "list-failed");
+    }
+
+    int nStatus = DirectGate_Session_Send(pSession, pHeader, NULL, XSTDNON);
+    XJSON_FreeObject(pHeader);
+    return nStatus;
+}
+
+static int DirectGate_Admin_RemoveKey(directgate_conn_t *pConn, directgate_session_t *pSession,
+                                      const directgate_pkg_admin_t *pAdmin)
+{
+    if (!xstrused(pAdmin->pClientPub))
+        return DirectGate_Admin_SendActionResp(pSession, "remove-key-result", "error", "missing-client-pub");
+
+    /* The key as the list held it, so the sessions it opened are found by it - not by the request's spelling */
+    char sKey[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
+    int nAt = DirectGate_FindAuthorizedKey(pConn->pCfg, pAdmin->pClientPub);
+    if (nAt < 0) return DirectGate_Admin_SendActionResp(pSession, "remove-key-result", "not-found", NULL);
+    xstrncpy(sKey, sizeof(sKey), pConn->pCfg->keyauth.sAuthorizedKeys[nAt]);
+
+    /* Off the list in memory whatever the disk says: a failed save leaves the key unusable until a restart, not usable */
+    DirectGate_RemoveAuthorizedKey(pConn->pCfg, sKey);
+    xbool_t bSaved = DirectGate_SaveConfig(pConn->pCfg);
+
+    if (!bSaved)
+    {
+        xloge("admin/remove-key failed to persist config: sid(%u), wsfd(%d), cfg(%s)",
+            pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), pConn->pCfg->sCfgPath);
+    }
+    else
+    {
+        xlogi("admin/remove-key removed authorized key: sid(%u), wsfd(%d), count(%u)",
+            pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), (unsigned)pConn->pCfg->keyauth.nAuthorizedKeyCount);
+    }
+
+    int nStatus = DirectGate_Admin_SendActionResp(pSession, "remove-key-result", bSaved ? "ok" : "error",
+        bSaved ? NULL : "persist-failed");
+
+    /* Its sessions end in this same pass, this one too now it has its answer */
+    xbool_t bOwn = DirectGate_Admin_EndKeySessions(pConn, sKey, pSession, "authorized key removed");
+    return bOwn ? DirectGate_Session_Close(pSession, "authorized key removed") : nStatus;
+}
+
 static int DirectGate_HandleAdmin(xapi_session_t *pApiSession, directgate_pkg_t *pPkg)
 {
     const directgate_pkg_admin_t *pAdminPkg = (const directgate_pkg_admin_t*)pPkg->pPackage;
@@ -1756,6 +1945,15 @@ static int DirectGate_HandleAdmin(xapi_session_t *pApiSession, directgate_pkg_t 
             "managed key cannot perform admin actions");
     }
 
+    /* A key given only some modes gives none of its own rights away, nor anyone else's: only a full one administers */
+    if (pSession->nKeyScope != DIRECTGATE_KEY_SCOPE_FULL)
+    {
+        xlogw("Admin message rejected for a scoped-key session: sid(%u), action(%s)",
+            pSession->nSessionId, pAdminPkg->pAction ? pAdminPkg->pAction : "N/A");
+
+        return DirectGate_Admin_SendActionResp(pSession, "admin-result", "error", "scoped key cannot perform admin actions");
+    }
+
     if (!xstrused(pAdminPkg->pAction))
     {
         xlogw("Admin message is missing action: sid(%u), wsfd(%d)",
@@ -1787,57 +1985,9 @@ static int DirectGate_HandleAdmin(xapi_session_t *pApiSession, directgate_pkg_t 
         return DirectGate_Admin_SendActionResp(pSession, "desktop-share-result", "ok", NULL);
     }
 
-    if (xstrcmp(pAdminPkg->pAction, "add-key"))
-    {
-        if (!xstrused(pAdminPkg->pClientPub))
-        {
-            xlogw("admin/add-key missing clientPub: sid(%u), wsfd(%d)",
-                pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
-
-            return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "error", "missing-client-pub");
-        }
-
-        directgate_add_key_result_t eResult = DirectGate_AddAuthorizedKey(pConn->pCfg, pAdminPkg->pClientPub);
-
-        if (eResult == DIRECTGATE_ADD_KEY_INVALID)
-        {
-            xlogw("admin/add-key rejected invalid pubkey: sid(%u), wsfd(%d)",
-                pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
-
-            return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "error", "invalid-key");
-        }
-
-        if (eResult == DIRECTGATE_ADD_KEY_FULL)
-        {
-            xloge("admin/add-key rejected, authorizedKeys full: sid(%u), wsfd(%d), max(%d)",
-                pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), DIRECTGATE_MAX_AUTHORIZED_KEYS);
-
-            return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "error", "capacity-full");
-        }
-
-        if (eResult == DIRECTGATE_ADD_KEY_ALREADY)
-        {
-            xlogi("admin/add-key already present: sid(%u), wsfd(%d)",
-                pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
-
-            return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "already", NULL);
-        }
-
-        if (!DirectGate_SaveConfig(pConn->pCfg))
-        {
-            xloge("admin/add-key failed to persist config: sid(%u), wsfd(%d), cfg(%s)",
-                pSession->nSessionId, DirectGate_Session_GetWsFd(pSession),
-                pConn->pCfg->sCfgPath);
-
-            return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "error", "persist-failed");
-        }
-
-        xlogi("admin/add-key appended authorized key: sid(%u), wsfd(%d), count(%u)",
-            pSession->nSessionId, DirectGate_Session_GetWsFd(pSession),
-            (unsigned)pConn->pCfg->keyauth.nAuthorizedKeyCount);
-
-        return DirectGate_Admin_SendActionResp(pSession, "add-key-result", "ok", NULL);
-    }
+    if (xstrcmp(pAdminPkg->pAction, "add-key")) return DirectGate_Admin_AddKey(pConn, pSession, pAdminPkg);
+    if (xstrcmp(pAdminPkg->pAction, "list-keys")) return DirectGate_Admin_ListKeys(pConn, pSession);
+    if (xstrcmp(pAdminPkg->pAction, "remove-key")) return DirectGate_Admin_RemoveKey(pConn, pSession, pAdminPkg);
 
     xlogw("Unknown admin action: sid(%u), wsfd(%d), action(%s)",
         pSession->nSessionId, DirectGate_Session_GetWsFd(pSession), pAdminPkg->pAction);
@@ -2400,6 +2550,30 @@ static int DirectGate_HandleAuth(xapi_session_t *pApiSession, directgate_pkg_t *
 
             DirectGate_Session_SendAuthResp(pSession, "failed", NULL, "client not authorized");
             return DirectGate_Session_Close(pSession, "managed key lease ended");
+        }
+
+        /* A local key opens what its entry allows now: removed or narrowed since the hello, that is what holds */
+        if (!pSession->bManagedKeyPending)
+        {
+            const char *pKeys[DIRECTGATE_MAX_AUTHORIZED_KEYS];
+            for (uint8_t i = 0; i < pCfg->keyauth.nAuthorizedKeyCount; i++) pKeys[i] = pCfg->keyauth.sAuthorizedKeys[i];
+            int nAt = DirectGate_KeyAuth_FindClient(pSession->keyauth.clientPubKey, pKeys, pCfg->keyauth.nAuthorizedKeyCount);
+
+            if (nAt < 0)
+            {
+                xlogw("Key-auth local key left the list before the proof: sid(%u), wsfd(%d)",
+                    pSession->nSessionId, DirectGate_Session_GetWsFd(pSession));
+
+                DirectGate_KeyAuth_Cleanse(&pSession->keyauth);
+                pSession->bKeyAuthActive = XFALSE;
+
+                DirectGate_Session_SendAuthResp(pSession, "failed", NULL, "client not authorized");
+                return DirectGate_Session_Close(pSession, "authorized key removed");
+            }
+
+            pSession->bLocalKeySession = XTRUE;
+            pSession->nKeyScope = pCfg->keyauth.nAuthorizedKeyScopes[nAt];
+            memcpy(pSession->localClientPub, pSession->keyauth.clientPubKey, sizeof(pSession->localClientPub));
         }
 
         if (!DirectGate_KeyAuth_DeriveShared(&pSession->keyauth))

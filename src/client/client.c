@@ -104,6 +104,7 @@ typedef struct directgate_client_ctx_ {
     char sAddKeyPub[DIRECTGATE_KEYAUTH_PUB_B64_SIZE];
     xbool_t bAddKeyMode;
     xbool_t bAddKeyDone;
+    xbool_t bAddKeyProbing;     /* -S/-L: list-keys is out, to learn the device keeps scopes before it is given one */
 
     xapi_session_t *pPipeSession;
     xapi_session_t *pWsSession;
@@ -559,16 +560,71 @@ static void DirectGate_Client_WebRTC_SignalCb(const char *pJson, size_t nLen, vo
  * point of -a: one admin message on an authenticated, encrypted session, the
  * same thing the workspace UI does when you add a key from the browser.
  */
-static int DirectGate_Client_SendAddKey(directgate_ctx_t *pCli)
+static int DirectGate_Client_SendAddKeyRequest(directgate_ctx_t *pCli)
 {
     xjson_obj_t *pHeader = DirectGate_Proto_BuildAdmin("add-key", pCli->sAddKeyPub, NULL, NULL, pCli->nSessionId);
     XCHECK((pHeader != NULL), XAPI_DISCONNECT);
+
+    /* Only what -S and -L name: a key already there keeps the rest as it is */
+    const directgate_cfg_t *pCfg = pCli->pCfg;
+    xbool_t bOk = !pCfg->bAddKeyScope || DirectGate_KeyScope_AddJson(pHeader, "scope", pCfg->nAddKeyScope);
+    if (bOk && pCfg->bAddKeyLabel) bOk = XJSON_AddString(pHeader, "label", pCfg->sAddKeyLabel) == XJSON_ERR_NONE;
+
+    if (!bOk)
+    {
+        XJSON_FreeObject(pHeader);
+        return XAPI_DISCONNECT;
+    }
 
     int nStatus = DirectGate_Client_SendMsg(pCli, pHeader, NULL, 0);
     XJSON_FreeObject(pHeader);
 
     if (nStatus >= 0) xlogi("Sent the key authorization request");
     return nStatus;
+}
+
+/*
+ * A scope or a label goes only to a device that keeps them. One whose agent
+ * predates them would ignore the scope and authorize a full key, so it is
+ * asked first, inside the encrypted session where nothing between can answer
+ * for it: an agent that knows list-keys knows scopes.
+ */
+static int DirectGate_Client_SendAddKey(directgate_ctx_t *pCli)
+{
+    if (!pCli->pCfg->bAddKeyScope && !pCli->pCfg->bAddKeyLabel) return DirectGate_Client_SendAddKeyRequest(pCli);
+
+    xjson_obj_t *pHeader = DirectGate_Proto_BuildAdmin("list-keys", NULL, NULL, NULL, pCli->nSessionId);
+    XCHECK((pHeader != NULL), XAPI_DISCONNECT);
+
+    int nStatus = DirectGate_Client_SendMsg(pCli, pHeader, NULL, 0);
+    XJSON_FreeObject(pHeader);
+
+    pCli->bAddKeyProbing = nStatus >= 0 ? XTRUE : XFALSE;
+    return nStatus;
+}
+
+/* The answer to the list-keys a scope or a label waits on: the add-key goes out, or the session ends with why not */
+static int DirectGate_Client_HandleKeyProbe(directgate_ctx_t *pCli, const directgate_pkg_admin_t *pAdmin)
+{
+    pCli->bAddKeyProbing = XFALSE;
+
+    if (xstrcmp(pAdmin->pAction, "list-keys-result") && xstrcmp(pAdmin->pStatus, "ok"))
+        return DirectGate_Client_SendAddKeyRequest(pCli);
+
+    if (xstrcmp(pAdmin->pReason, "unknown-action"))
+    {
+        xloge("The device's agent predates key scopes and labels: update it, or authorize the key without -S and -L");
+    }
+    else
+    {
+        char sReason[XSTR_MID];
+        DirectGate_CopyDisplaySafe(sReason, sizeof(sReason), xstrused(pAdmin->pReason) ? pAdmin->pReason : "unknown reason");
+        xloge("Device refused the key: %s", sReason);
+    }
+
+    pCli->bAddKeyDone = XFALSE;
+    g_bFinish = XTRUE;
+    return XAPI_DISCONNECT;
 }
 
 /*
@@ -580,7 +636,11 @@ static int DirectGate_Client_HandleAdminMsg(directgate_ctx_t *pCli, directgate_p
     directgate_pkg_admin_t *pAdmin = (directgate_pkg_admin_t*)pMsg->pPackage;
     XCHECK((pAdmin != NULL), XAPI_DISCONNECT);
 
-    if (!xstrused(pAdmin->pAction) || !xstrcmp(pAdmin->pAction, "add-key-result"))
+    /* While the probe is out, its answer - or the refusal an agent without list-keys gives it - is the one awaited */
+    if (pCli->bAddKeyProbing && (xstrcmp(pAdmin->pAction, "list-keys-result") || xstrcmp(pAdmin->pAction, "admin-result")))
+        return DirectGate_Client_HandleKeyProbe(pCli, pAdmin);
+
+    if (!xstrused(pAdmin->pAction) || !xstrcmp(pAdmin->pAction, "add-key-result") || pCli->bAddKeyProbing)
     {
         xlogw("Ignoring unexpected admin response: action(%s)", xstrused(pAdmin->pAction) ? pAdmin->pAction : "N/A");
         return XAPI_CONTINUE;
@@ -588,7 +648,16 @@ static int DirectGate_Client_HandleAdminMsg(directgate_ctx_t *pCli, directgate_p
 
     const char *pStatus = xstrused(pAdmin->pStatus) ? pAdmin->pStatus : "error";
 
-    if (xstrcmp(pStatus, "ok")) printf("\n  Key authorized. You can now connect without the password.\n\n");
+    char sScope[XSTR_TINY];
+    DirectGate_KeyScope_Format(pCli->pCfg->nAddKeyScope, sScope, sizeof(sScope));
+
+    if (xstrcmp(pStatus, "ok") && pCli->pCfg->bAddKeyScope && pCli->pCfg->nAddKeyScope != DIRECTGATE_KEY_SCOPE_FULL)
+        printf("\n  Key authorized for %s only. It connects without the password, for that alone.\n\n", sScope);
+    else if (xstrcmp(pStatus, "ok")) printf("\n  Key authorized. You can now connect without the password.\n\n");
+    else if (xstrcmp(pStatus, "updated") && pCli->pCfg->bAddKeyScope)
+        printf("\n  Key was already authorized; it opens %s now. Sessions it had open under another scope were ended.\n\n",
+            sScope);
+    else if (xstrcmp(pStatus, "updated")) printf("\n  Key was already authorized; its label is updated.\n\n");
     else if (xstrcmp(pStatus, "already")) printf("\n  Key was already authorized on this device.\n\n");
     else
     {
