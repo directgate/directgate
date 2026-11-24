@@ -67,7 +67,8 @@ void DirectGate_DisplayUsage(const char *pName)
     printf("  mkdir <device>:<path>                           # Create a directory\n");
     printf("  mv <device>:<path> <path>                       # Move or rename; an existing target is refused\n");
     printf("  session [-t <s>] <device>                       # Run many of these on one connection: requests on stdin\n");
-    printf("  mcp [-c <config>] [-k <key>]                    # Serve all of these to an AI agent over MCP\n");
+    printf("  mcp [-c <config>] [-k <key>] [--root <dir>]     # Serve all of these to an AI agent over MCP; upload and\n");
+    printf("                                                  # download only inside <dir>, off without it\n");
     printf("  Remote paths are absolute. Nothing is replaced without -f. Authenticate with a\n");
     printf("  client key (-g, then -A) so nothing asks for a password.\n\n");
 

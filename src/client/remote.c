@@ -1002,12 +1002,19 @@ static int DirectGate_Remote_PrintListing(directgate_remote_t *pRemote, const ui
         const char *pType = XJSON_GetString(XJSON_GetObject(pEntry, "type"));
         uint64_t nSize = XJSON_GetU64(XJSON_GetObject(pEntry, "sizeBytes"));
 
+        /* Every field is the host's text bound for a terminal: a file name can hold escape sequences - a clipboard
+           write, a title, a reply typed back as input - that the terminal would act on. Shown as ls shows them. */
+        char sPerm[XSTR_TINY], sOwner[XSTR_TINY], sGroup[XSTR_TINY], sModified[XSTR_TINY], sName[XPATH_MAX];
+        DirectGate_CopyDisplaySafe(sPerm, sizeof(sPerm), xstrused(pPerm) ? pPerm : "?????????");
+        DirectGate_CopyDisplaySafe(sOwner, sizeof(sOwner), xstrused(pOwner) ? pOwner : "-");
+        DirectGate_CopyDisplaySafe(sGroup, sizeof(sGroup), xstrused(pGroup) ? pGroup : "-");
+        DirectGate_CopyDisplaySafe(sModified, sizeof(sModified), xstrused(pModified) ? pModified : "-");
+        DirectGate_CopyDisplaySafe(sName, sizeof(sName), xstrused(pName) ? pName : "?");
+
         /* The permission string already starts with the type letter; a host without one gets it from the type */
-        char sLine[XPATH_MAX + 256];
+        char sLine[XPATH_MAX + 4 * XSTR_TINY + 64];
         xstrncpyf(sLine, sizeof(sLine), "%s%s %-8s %-8s %12" PRIu64 " %s %s\n",
-            xstrused(pPerm) ? "" : DirectGate_Remote_TypeChar(pType), xstrused(pPerm) ? pPerm : "?????????",
-            xstrused(pOwner) ? pOwner : "-", xstrused(pGroup) ? pGroup : "-", nSize,
-            xstrused(pModified) ? pModified : "-", xstrused(pName) ? pName : "?");
+            xstrused(pPerm) ? "" : DirectGate_Remote_TypeChar(pType), sPerm, sOwner, sGroup, nSize, sModified, sName);
 
         bOk = DirectGate_Remote_Emit(pRemote, XFALSE, (const uint8_t*)sLine, strlen(sLine));
     }

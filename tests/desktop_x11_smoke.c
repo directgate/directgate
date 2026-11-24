@@ -306,7 +306,10 @@ static int start_and_pick(uint32_t nSessionId)
     memset(&g_sent, 0, sizeof(g_sent));
     g_session.nSessionId = nSessionId;
 
-    CHECK(DirectGate_Desktop_Start(&g_session) >= 0, "the desktop starts");
+    /* The agent's own log is off here: a start that fails says why, or a CI log holds nothing to go on */
+    int nStart = DirectGate_Desktop_Start(&g_session);
+    if (nStart < 0) fprintf(stderr, "desktop_x11_smoke: start: %s\n", DirectGate_Desktop_GetReason(&g_session.desktop));
+    CHECK(nStart >= 0, "the desktop starts");
     char sJson[256];
     snprintf(sJson, sizeof(sJson), "{\"action\":\"select-monitor\",\"monitorId\":\"%s\"}", first_monitor());
     CHECK(control(sJson) == XAPI_CONTINUE, "pick the monitor");
@@ -1190,6 +1193,8 @@ static int test_connection_lost(xvfb_t *pX)
     if (nPid == 0)
     {
         prctl(PR_SET_PDEATHSIG, SIGKILL);
+        close(toChild[1]);
+        close(toParent[0]);
         DirectGate_Desktop_InstallX11ErrorHandlers();
         Display *pDisplay = XOpenDisplay(pX->sDisplay);
         if (pDisplay == NULL) exit(3);
@@ -1201,14 +1206,25 @@ static int test_connection_lost(xvfb_t *pX)
         exit(0);
     }
 
+    /* Only the child's ends of the pipes stay open on its side: a child that fails before it is connected is an end
+       of file here, a failed check, not a read that waits for the watchdog */
+    close(toChild[0]);
+    close(toParent[1]);
+
     char c = 0;
-    CHECK(read(toParent[0], &c, 1) == 1, "the child is connected");
+    if (read(toParent[0], &c, 1) != 1)
+    {
+        int nEarly = 0;
+        waitpid(nPid, &nEarly, 0);
+        fprintf(stderr, "desktop_x11_smoke: the connection child ended first: status(%d)\n", nEarly);
+    }
+    CHECK(c == 'r', "the child is connected");
     xvfb_stop(pX);
     CHECK(write(toChild[1], &c, 1) == 1, "tell the child to use the connection");
 
     int nStatus = 0;
     CHECK(waitpid(nPid, &nStatus, 0) == nPid, "wait for the connection child");
-    close(toChild[0]); close(toChild[1]); close(toParent[0]); close(toParent[1]);
+    close(toChild[1]); close(toParent[0]);
     CHECK(WIFEXITED(nStatus) && WEXITSTATUS(nStatus) == 1, "a lost X connection is logged, then Xlib exits");
     return 0;
 }
@@ -1343,13 +1359,54 @@ static int test_raw_layouts(void)
     return 0;
 }
 
+/* The fixture takes a server as started only once its whole readiness line is in: Xvfb writes the number and the
+   newline apart, and closing after the number alone killed the server it then reported as up */
+static int test_ready_line(void)
+{
+    char sReady[16];
+    int nFds[2];
+
+    CHECK(pipe(nFds) == 0 && write(nFds[1], "90", 2) == 2, "a server that wrote its number only");
+    close(nFds[1]);
+    CHECK(!xvfb_read_ready(nFds[0], sReady, sizeof(sReady), 15000), "a number without its newline is no start");
+    close(nFds[0]);
+
+    CHECK(pipe(nFds) == 0 && write(nFds[1], "91\n", 3) == 3, "a server that wrote its line");
+    CHECK(xvfb_read_ready(nFds[0], sReady, sizeof(sReady), 15000) && atoi(sReady) == 91, "a whole line is a start");
+    close(nFds[0]);
+    close(nFds[1]);
+
+    /* The two writes apart, as Xvfb makes them: the reader waits for the second instead of closing after the first */
+    CHECK(pipe(nFds) == 0, "a pipe for a server that writes in two parts");
+    pid_t nPid = fork();
+    CHECK(nPid >= 0, "a stand-in server");
+    if (nPid == 0)
+    {
+        close(nFds[0]);
+        int nOk = write(nFds[1], "92", 2) == 2;
+        usleep(200000);
+        nOk = nOk && write(nFds[1], "\n", 1) == 1;
+        _exit(nOk ? 0 : 1);
+    }
+
+    close(nFds[1]);
+    int nRead = xvfb_read_ready(nFds[0], sReady, sizeof(sReady), 15000);
+    close(nFds[0]);
+
+    int nStatus = 0;
+    CHECK(waitpid(nPid, &nStatus, 0) == nPid && WIFEXITED(nStatus) && WEXITSTATUS(nStatus) == 0,
+        "the stand-in wrote both parts, the second to a reader still there");
+    CHECK(nRead && strcmp(sReady, "92\n") == 0, "the number and its newline, read as one line");
+    return 0;
+}
+
 int main(void)
 {
     signal(SIGALRM, on_watchdog);
     alarm(170);
 
     /* Needs no server, so it runs where Xvfb is missing too. */
-    if (test_raw_layouts()) return 1;
+    if (test_raw_layouts() || test_ready_line()) return 1;
 
     char sXvfb[4096];
     if (!find_xvfb(sXvfb, sizeof(sXvfb)))

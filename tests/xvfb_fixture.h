@@ -11,6 +11,7 @@
 #ifndef DIRECTGATE_TESTS_XVFB_FIXTURE_H
 #define DIRECTGATE_TESTS_XVFB_FIXTURE_H
 
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -20,6 +21,7 @@
 #include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef XVFB_SCREEN_W
@@ -69,6 +71,39 @@ static int free_display(int nFrom)
     }
 
     return -1;
+}
+
+/* The display number the server writes once it accepts clients, as a whole line. Xvfb writes it in two calls,
+   the number and then "\n", before it closes its end: a reader that closed after the first one made the second
+   fail, and the server end itself ("Cannot write display number") - while its number already read as a start. */
+static int xvfb_read_ready(int nFd, char *pOut, size_t nSize, int nTimeoutMs)
+{
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    size_t nUsed = 0;
+    pOut[0] = '\0';
+
+    while (nUsed + 1 < nSize && memchr(pOut, '\n', nUsed) == NULL)
+    {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long nWaited = (long)(now.tv_sec - start.tv_sec) * 1000L + (now.tv_nsec - start.tv_nsec) / 1000000L;
+        if (nWaited >= nTimeoutMs) return 0;
+
+        struct pollfd pfd = { nFd, POLLIN, 0 };
+        int nPoll = poll(&pfd, 1, (int)(nTimeoutMs - nWaited));
+        if (nPoll < 0 && errno == EINTR) continue;
+        if (nPoll <= 0) return 0;
+
+        ssize_t nRead = read(nFd, pOut + nUsed, nSize - 1 - nUsed);
+        if (nRead < 0 && errno == EINTR) continue;
+        if (nRead <= 0) return 0;
+
+        nUsed += (size_t)nRead;
+        pOut[nUsed] = '\0';
+    }
+
+    return memchr(pOut, '\n', nUsed) != NULL;
 }
 
 /* nDepth is the screen depth; pWithout names an extension to leave out (MIT-SHM, RANDR), the
@@ -144,13 +179,12 @@ static int xvfb_start_locked(xvfb_t *pX, const char *pBinary, int nDepth, const 
 
         close(pipeFds[1]);
 
-        /* The server writes its display number once it is accepting clients. */
+        /* The server writes its display number once it is accepting clients */
         char sReady[16] = { 0 };
-        struct pollfd pfd = { pipeFds[0], POLLIN, 0 };
-        ssize_t nRead = poll(&pfd, 1, 15000) > 0 ? read(pipeFds[0], sReady, sizeof(sReady) - 1) : -1;
+        int nReady = xvfb_read_ready(pipeFds[0], sReady, sizeof(sReady), 15000);
         close(pipeFds[0]);
 
-        if (nRead > 0 && atoi(sReady) == nDisplay)
+        if (nReady && atoi(sReady) == nDisplay)
         {
             pX->nPid = nPid;
             pX->nDisplay = nDisplay;

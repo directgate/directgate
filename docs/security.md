@@ -81,6 +81,8 @@ A session in `exec` mode runs one command and reports its exit - the `ssh host '
 
 Because an AI agent acting on a prompt it was given is still the user acting, its access should be what the user would grant a script: a client key of its own (`dgcli -g -k <path>`, authorized on just the devices it should reach) rather than the user's own, so it can be withdrawn by itself.
 
+The machine the agent runs on is bounded the same way. What a device prints goes back to the model, so an instruction planted on a device - in a file, a log, a command's output - can ask for any local path, `~/.ssh` included. `dgcli mcp` therefore reaches no local file at all unless the user names one directory with `--root`, and then nothing outside it: every link and `..` is resolved before the check, and the transfer is handed the resolved path rather than the model's spelling of it.
+
 ### Privileged UI on Windows
 
 There is one place where the "no more privilege than shell access" property above does **not** hold, and it deserves to be stated plainly rather than buried.

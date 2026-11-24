@@ -303,16 +303,18 @@ These never ask for a password without a terminal, so authenticate with a client
 
 `dgcli mcp` serves the same operations to an AI agent as [Model Context Protocol](https://modelcontextprotocol.io) tools, over stdio: `list_devices`, `exec`, `list_directory`, `read_file`, `write_file`, `upload`, `download`, `remove`, `make_directory`, `move` and `disconnect`. A call runs `dgcli` again for that one operation - its own connection, authentication and end-to-end keys - unless it passes `keep_open: true`: then the connection (a `dgcli session`) stays open, and the device's next calls run on it without signalling or authenticating again, until `disconnect` closes it, the session's idle or lifetime limit ends it, or `dgcli mcp` exits. At most 8 are kept, the least recently used one closing first; a kept connection that turns out to be gone is opened again for the call, and an agent too old for sessions gets one connection per call as before. It runs on the machine the AI agent runs on - the keys never leave it - and takes the options its calls should use (`-c`, `-k`, `-a`, `-w`).
 
-For Claude Code, for example:
+`upload` and `download` touch this machine's files only inside the one directory given with `--root <dir>`; without it they are off and say so. What a device prints goes back to the model, so a planted instruction could ask for any local path - `~/.ssh` included - and the root is what bounds it: a relative `local_path` is taken from the root, every link and `..` is resolved first, and a path that ends up outside is refused, as is a download into a directory that does not exist. The tools are handed the resolved absolute path, never the model's spelling of it. A `--root` that names no directory stops the server at once. On Windows the path is normalised but links are not followed; none of the tools can create one. The remote tools (`exec`, `list_directory`, `read_file`, `write_file`, `remove`, `make_directory`, `move`) work on the device and are not affected.
+
+For Claude Code, for example, with transfers kept to the project's own directory:
 
 ```sh
-claude mcp add directgate -- dgcli mcp
+claude mcp add directgate -- dgcli mcp --root "$PWD"
 ```
 
 or in an MCP client's JSON configuration:
 
 ```json
-{ "mcpServers": { "directgate": { "command": "dgcli", "args": ["mcp"] } } }
+{ "mcpServers": { "directgate": { "command": "dgcli", "args": ["mcp", "--root", "/home/me/transfers"] } } }
 ```
 
 `exec` returns the exit code, stdout and stderr (each cut at 128 KB) both as text and as structured content, and is an error result when the command exits non-zero. The device is asked for no more than that (`-o`), so a command that prints megabytes does not send them over the link only for them to be thrown away; a cut is reported as `truncated`. `read_file` returns UTF-8 text up to 256 KB and refuses anything larger or binary, pointing at `download`. A command gets 600 s unless the call names a `timeout_seconds`.

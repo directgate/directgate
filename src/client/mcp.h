@@ -39,7 +39,8 @@ extern "C" {
 
     It runs where the AI client runs, never on a server: the E2E keys and the
     client key stay on the machine that holds them. argv[2..] are the options
-    every call is given (-c, -k, -a, -w). Returns the process exit code.
+    every call is given (-c, -k, -a, -w), and --root <dir>, the one local
+    directory upload and download may use. Returns the process exit code.
 */
 int DirectGate_Mcp_Run(int argc, char *argv[]);
 
@@ -49,6 +50,17 @@ XSTATUS DirectGate_Mcp_AppendString(xbyte_buffer_t *pBuffer, const uint8_t *pDat
 
 /* XTRUE when pData is valid UTF-8 without NUL bytes: text a model can be handed as it is. */
 xbool_t DirectGate_Mcp_IsText(const uint8_t *pData, size_t nLength);
+
+/* The directory upload and download may touch on this machine (--root), resolved here once with every link followed.
+   NULL or empty turns local files off, which is how the server starts: a model steered by what a device printed can
+   ask for any path, so it gets none until the user names one. XSTDERR, and local files off, when pRoot is no
+   directory. */
+XSTATUS DirectGate_Mcp_SetRoot(const char *pRoot);
+
+/* Where an upload reads (bWrite XFALSE) or a download writes, in pOut as an absolute path: a relative pLocal is the
+   root's, and the path, links followed, has to be inside the root. A download's file need not exist yet, but the
+   directory it goes in must, inside the root. NULL when it holds, otherwise why not, for the model to read. */
+const char* DirectGate_Mcp_ResolveLocal(const char *pLocal, xbool_t bWrite, char *pOut, size_t nSize);
 
 /* Handles one request line and appends the response line (newline included) to pOut, or nothing for a
    notification. Exposed for tests; DirectGate_Mcp_Run feeds it stdin. pSelf is the dgcli binary tool calls run. */

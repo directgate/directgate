@@ -78,8 +78,10 @@ static const char *g_pMcpInstructions =
     "DirectGate reaches the user's own devices end to end encrypted, the way ssh would. Call list_devices first and "
     "pass a device's name or id as `device`. exec runs a non-interactive shell command (sh -c, or cmd /c on Windows) "
     "as the device's shell user and returns its exit code, stdout and stderr; it has no terminal, so programs that "
-    "wait for keyboard input block until the timeout - give them `stdin` instead. Remote paths are absolute; local "
-    "paths are on this machine and best given absolute too. Each call connects on its own unless you pass "
+    "wait for keyboard input block until the timeout - give them `stdin` instead. Remote paths are absolute. upload "
+    "and download reach this machine's files only inside the directory the user started this server with (--root): a "
+    "relative local path is taken from there, and nothing outside it, links included. Each call connects on its own "
+    "unless you pass "
     "keep_open: true - do that whenever more calls on the same device are likely, so they reuse the connection, and "
     "call disconnect once you are done with the device.";
 
@@ -138,7 +140,8 @@ static const char *g_pMcpTools =
     "\"annotations\":{\"destructiveHint\":true,\"openWorldHint\":true}},"
 
     "{\"name\":\"upload\",\"title\":\"Upload a file\","
-    "\"description\":\"Copies a file from this machine to a device. A remote path ending in / keeps the local name.\","
+    "\"description\":\"Copies a file from this machine to a device: only a file inside the directory this server was "
+    "started with (--root), relative paths taken from there. A remote path ending in / keeps the local name.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{" DIRECTGATE_MCP_KEEP_OPEN
     "\"device\":{\"type\":\"string\"},\"local_path\":{\"type\":\"string\"},"
     "\"remote_path\":{\"type\":\"string\",\"description\":\"Absolute path on the device\"},"
@@ -147,8 +150,9 @@ static const char *g_pMcpTools =
     "\"annotations\":{\"destructiveHint\":true,\"openWorldHint\":true}},"
 
     "{\"name\":\"download\",\"title\":\"Download a file\","
-    "\"description\":\"Copies a file from a device to this machine, put in place only once verified. An existing "
-    "local file is replaced only with overwrite. A local path that is a directory keeps the remote name.\","
+    "\"description\":\"Copies a file from a device to this machine, put in place only once verified, and only inside "
+    "the directory this server was started with (--root), relative paths taken from there. An existing local file is "
+    "replaced only with overwrite. A local path that is a directory keeps the remote name.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{" DIRECTGATE_MCP_KEEP_OPEN
     "\"device\":{\"type\":\"string\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Absolute path on the device\"},"
     "\"local_path\":{\"type\":\"string\"},\"overwrite\":{\"type\":\"boolean\",\"default\":false}},"
@@ -704,15 +708,117 @@ static xbool_t DirectGate_Mcp_Spec(char *pOut, size_t nSize, const char *pDevice
     return (nLength > 0 && (size_t)nLength < nSize) ? XTRUE : XFALSE;
 }
 
-/* A local path the child can only read as one: a relative one is anchored with ./, so neither a leading - (an
-   option) nor a colon (a <device>:<path>) changes what it means */
-static xbool_t DirectGate_Mcp_LocalPath(char *pOut, size_t nSize, const char *pLocal)
-{
-    xbool_t bAbsolute = pLocal[0] == '/' || pLocal[0] == '\\' ||
-        (isalpha((unsigned char)pLocal[0]) && pLocal[1] == ':' && (pLocal[2] == '/' || pLocal[2] == '\\'));
+#ifdef _WIN32
+#define DIRECTGATE_MCP_IS_SEP(c) ((c) == '/' || (c) == '\\')
+#else
+#define DIRECTGATE_MCP_IS_SEP(c) ((c) == '/')
+#endif
 
-    int nLength = snprintf(pOut, nSize, "%s%s", bAbsolute ? "" : "./", pLocal);
-    return (nLength > 0 && (size_t)nLength < nSize) ? XTRUE : XFALSE;
+/* The one directory upload and download may touch on this machine (--root), resolved once. Empty: none at all. */
+static char g_sMcpRoot[XPATH_MAX];
+
+/* The absolute path of something that exists, every link followed. On Windows it is normalised only: a link inside
+   the root is the user's own, and no tool here can make one. */
+static xbool_t DirectGate_Mcp_RealPath(const char *pPath, char *pOut, size_t nSize, xbool_t *pDirectory)
+{
+#ifdef _WIN32
+    if (_fullpath(pOut, pPath, nSize) == NULL) return XFALSE;
+
+    DWORD nAttributes = GetFileAttributesA(pOut);
+    if (nAttributes == INVALID_FILE_ATTRIBUTES) return XFALSE;
+
+    *pDirectory = (nAttributes & FILE_ATTRIBUTE_DIRECTORY) ? XTRUE : XFALSE;
+    return XTRUE;
+#else
+    char *pReal = realpath(pPath, NULL);
+    if (pReal == NULL) return XFALSE;
+
+    struct stat st;
+    xbool_t bOk = (strlen(pReal) < nSize && stat(pReal, &st) == 0) ? XTRUE : XFALSE;
+
+    if (bOk)
+    {
+        xstrncpy(pOut, nSize, pReal);
+        *pDirectory = S_ISDIR(st.st_mode) ? XTRUE : XFALSE;
+    }
+
+    free(pReal);
+    return bOk;
+#endif
+}
+
+/* The root itself or below it: the prefix has to end at a separator, so /data2 is not inside /data */
+static xbool_t DirectGate_Mcp_IsInsideRoot(const char *pPath)
+{
+    size_t nRoot = strlen(g_sMcpRoot);
+    XCHECK_NL((nRoot > 0), XFALSE);
+
+#ifdef _WIN32
+    if (_strnicmp(pPath, g_sMcpRoot, nRoot) != 0) return XFALSE;
+#else
+    if (strncmp(pPath, g_sMcpRoot, nRoot) != 0) return XFALSE;
+#endif
+
+    /* A root ending in a separator is the top of a file system, and the prefix already ends at one */
+    return (DIRECTGATE_MCP_IS_SEP(g_sMcpRoot[nRoot - 1]) || pPath[nRoot] == XSTR_NUL ||
+            DIRECTGATE_MCP_IS_SEP(pPath[nRoot])) ? XTRUE : XFALSE;
+}
+
+XSTATUS DirectGate_Mcp_SetRoot(const char *pRoot)
+{
+    g_sMcpRoot[0] = XSTR_NUL;
+    XCHECK_NL((xstrused(pRoot)), XSTDOK);
+
+    xbool_t bDirectory = XFALSE;
+    if (DirectGate_Mcp_RealPath(pRoot, g_sMcpRoot, sizeof(g_sMcpRoot), &bDirectory) && bDirectory) return XSTDOK;
+
+    g_sMcpRoot[0] = XSTR_NUL;
+    return XSTDERR;
+}
+
+const char* DirectGate_Mcp_ResolveLocal(const char *pLocal, xbool_t bWrite, char *pOut, size_t nSize)
+{
+    if (!g_sMcpRoot[0]) return "local files are off: start dgcli mcp with --root <dir> to allow transfers in that directory";
+    if (!xstrused(pLocal)) return "local_path is required";
+
+    xbool_t bAbsolute = DIRECTGATE_MCP_IS_SEP(pLocal[0]) ||
+        (isalpha((unsigned char)pLocal[0]) && pLocal[1] == ':' && DIRECTGATE_MCP_IS_SEP(pLocal[2]));
+
+    /* A relative path is the root's: the model names files there, not in whatever directory dgcli was started in */
+    char sPath[XPATH_MAX];
+    const char *pSep = DIRECTGATE_MCP_IS_SEP(g_sMcpRoot[strlen(g_sMcpRoot) - 1]) ? "" : "/";
+    int nLength = bAbsolute ? snprintf(sPath, sizeof(sPath), "%s", pLocal) :
+        snprintf(sPath, sizeof(sPath), "%s%s%s", g_sMcpRoot, pSep, pLocal);
+    if (nLength <= 0 || (size_t)nLength >= sizeof(sPath)) return "local_path is too long";
+
+    /* What exists is judged by where it really is: a link out of the root, or a way out through .., is outside */
+    xbool_t bDirectory = XFALSE;
+    if (DirectGate_Mcp_RealPath(sPath, pOut, nSize, &bDirectory))
+        return DirectGate_Mcp_IsInsideRoot(pOut) ? NULL : "local_path is outside the directory dgcli mcp was given";
+
+    if (!bWrite) return "local_path does not exist";
+    if (DIRECTGATE_MCP_IS_SEP(sPath[nLength - 1])) return "local_path names a directory that does not exist";
+
+    /* A download's new file: the directory it goes in exists, inside the root, and what follows is a name */
+    size_t nSep = (size_t)nLength;
+    while (nSep > 0 && !DIRECTGATE_MCP_IS_SEP(sPath[nSep - 1])) nSep--;
+
+    char sName[XPATH_MAX];
+    xstrncpy(sName, sizeof(sName), sPath + nSep);
+    if (!nSep || !strcmp(sName, ".") || !strcmp(sName, "..")) return "local_path does not name a file";
+
+    /* The directory keeps its separator: "/" and "C:\" stay the tops they are, never "" or a drive's current one */
+    char sParent[XPATH_MAX];
+    sPath[nSep] = XSTR_NUL;
+
+    if (!DirectGate_Mcp_RealPath(sPath, sParent, sizeof(sParent), &bDirectory) || !bDirectory)
+        return "the directory local_path is in does not exist";
+
+    if (!DirectGate_Mcp_IsInsideRoot(sParent)) return "local_path is outside the directory dgcli mcp was given";
+
+    pSep = DIRECTGATE_MCP_IS_SEP(sParent[strlen(sParent) - 1]) ? "" : "/";
+    nLength = snprintf(pOut, nSize, "%s%s%s", sParent, pSep, sName);
+    return (nLength > 0 && (size_t)nLength < nSize) ? NULL : "local_path is too long";
 }
 
 static void DirectGate_Mcp_Exec(const char *pSelf, char *const *ppGlobals, int nGlobals, xjson_obj_t *pArgs,
@@ -893,10 +999,10 @@ static void DirectGate_Mcp_SimpleCall(const char *pSelf, char *const *ppGlobals,
 static void DirectGate_Mcp_CallTool(const char *pSelf, char *const *ppGlobals, int nGlobals, xjson_obj_t *pParams,
                                     const char *pId, xbyte_buffer_t *pOut);
 
-/* A call runs on its device's open session when there is one, or opens one with keep_open; without keep_open the
-   session goes once the call is done, as a one-shot call's connection does. */
-static void DirectGate_Mcp_CallToolOn(const char *pSelf, char *const *ppGlobals, int nGlobals, xjson_obj_t *pParams,
-                                      const char *pId, xbyte_buffer_t *pOut)
+/* A call runs on its device's open session when there is one, or opens one with keep_open;
+   without keep_open the session goes once the call is done, as a one-shot call's connection does. */
+static void DirectGate_Mcp_CallToolOn(const char *pSelf, char *const *ppGlobals, int nGlobals,
+                                      xjson_obj_t *pParams, const char *pId, xbyte_buffer_t *pOut)
 {
     const char *pName = XJSON_GetString(XJSON_GetObject(pParams, "name"));
     xjson_obj_t *pArgs = XJSON_GetObject(pParams, "arguments");
@@ -1022,21 +1128,28 @@ static void DirectGate_Mcp_CallTool(const char *pSelf, char *const *ppGlobals, i
 
         /* "-" would be this process's own stdin or stdout, which belong to the protocol */
         if (pLocalArg == NULL || pRemote == NULL || !strcmp(pLocalArg, "-") ||
-            !DirectGate_Mcp_LocalPath(sLocal, sizeof(sLocal), pLocalArg) ||
             !DirectGate_Mcp_Spec(sSpec, sizeof(sSpec), pDevice, pRemote))
         {
             DirectGate_Mcp_ToolError(pOut, pId, "local_path and remote_path are required, and local_path cannot be -");
             return;
         }
 
+        /* Only inside --root, and the child is handed the resolved, absolute path: no option, no <device>:, no link */
         xbool_t bUpload = xstrcmp(pName, "upload");
+        const char *pRefused = DirectGate_Mcp_ResolveLocal(pLocalArg, bUpload ? XFALSE : XTRUE, sLocal, sizeof(sLocal));
+        if (pRefused != NULL)
+        {
+            DirectGate_Mcp_ToolError(pOut, pId, pRefused);
+            return;
+        }
+
         const char *pFrom = bUpload ? sLocal : sSpec;
         const char *pTo = bUpload ? sSpec : sLocal;
         const char *pForced[] = { "-f", pFrom, pTo, NULL };
         const char *pPlain[] = { pFrom, pTo, NULL };
 
         xstrncpyf(sDone, sizeof(sDone), bUpload ? "uploaded %s to %s" : "downloaded %s to %s",
-            bUpload ? pLocalArg : pRemote, bUpload ? pRemote : pLocalArg);
+            bUpload ? sLocal : pRemote, bUpload ? pRemote : sLocal);
 
         DirectGate_Mcp_SimpleCall(pSelf, ppGlobals, nGlobals, "cp", bForce ? pForced : pPlain, NULL, 0, sDone, pId, pOut);
         return;
@@ -1243,22 +1356,39 @@ int DirectGate_Mcp_Run(int argc, char *argv[])
 
     /* The options every tool call is given: which config, which key, which API and relay */
     char *pGlobals[DIRECTGATE_MCP_GLOBALS_MAX];
+    const char *pRoot = NULL;
     int nGlobals = 0;
 
     for (int i = 2; i < argc; i += 2)
     {
         const char *pOption = argv[i];
+
+        /* This process's own: the tools it runs are handed resolved paths, never the root */
+        if (!strcmp(pOption, "--root") && pRoot == NULL && i + 1 < argc)
+        {
+            pRoot = argv[i + 1];
+            continue;
+        }
+
         xbool_t bKnown = (!strcmp(pOption, "-c") || !strcmp(pOption, "-k") ||
                           !strcmp(pOption, "-a") || !strcmp(pOption, "-w")) ? XTRUE : XFALSE;
 
         if (!bKnown || i + 1 >= argc || nGlobals + 2 > DIRECTGATE_MCP_GLOBALS_MAX)
         {
-            fprintf(stderr, "dgcli: mcp: only -c <config>, -k <key>, -a <api url> and -w <relay url> are taken\n");
+            fprintf(stderr, "dgcli: mcp: only -c <config>, -k <key>, -a <api url>, -w <relay url> and one --root <dir> "
+                "are taken\n");
             return DIRECTGATE_REMOTE_EXIT_FAILED;
         }
 
         pGlobals[nGlobals++] = argv[i];
         pGlobals[nGlobals++] = argv[i + 1];
+    }
+
+    /* Refused at the start rather than at the first transfer: a client that is told nothing would think it holds */
+    if (pRoot != NULL && DirectGate_Mcp_SetRoot(pRoot) != XSTDOK)
+    {
+        fprintf(stderr, "dgcli: mcp: --root %s is not a directory\n", pRoot);
+        return DIRECTGATE_REMOTE_EXIT_FAILED;
     }
 
 #ifdef _WIN32

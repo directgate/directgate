@@ -13,6 +13,12 @@
 
 #include "src/client/mcp.h"
 
+#ifndef _WIN32
+#include <limits.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #define CHECK(cond, msg) \
     do { \
         if (!(cond)) { \
@@ -157,6 +163,96 @@ int main(void)
         "\"arguments\":{\"device\":\"box\",\"path\":\"/tmp/new\"}}}", &out);
     CHECK(strstr(pReply, "\"id\":12") != NULL && strstr(pReply, "\"isError\":true") != NULL,
         "a tool whose dgcli binary is missing fails as a tool error");
+
+#ifndef _WIN32
+    /* ---- local files: off without --root, and inside it only, links and .. resolved first ---- */
+    {
+        char sTop[] = "/tmp/directgate_mcp_root.XXXXXX", sReal[PATH_MAX];
+        CHECK(mkdtemp(sTop) != NULL && realpath(sTop, sReal) != NULL, "a scratch directory");
+
+        /* Each a little longer than what it is made from, so no name can be cut short */
+        char sRoot[PATH_MAX + 16], sSibling[PATH_MAX + 16], sOutside[PATH_MAX + 16];
+        char sSub[PATH_MAX + 32], sIn[PATH_MAX + 32], sSiblingFile[PATH_MAX + 32], sLinkOut[PATH_MAX + 32];
+        char sLinkUp[PATH_MAX + 32], sDangling[PATH_MAX + 32], sGot[PATH_MAX + 64], sWant[PATH_MAX + 64];
+        snprintf(sRoot, sizeof(sRoot), "%s/root", sReal);
+        snprintf(sSub, sizeof(sSub), "%s/sub", sRoot);
+        snprintf(sIn, sizeof(sIn), "%s/in.txt", sRoot);
+        snprintf(sOutside, sizeof(sOutside), "%s/outside.txt", sReal);
+        snprintf(sSibling, sizeof(sSibling), "%s/root2", sReal);
+        snprintf(sSiblingFile, sizeof(sSiblingFile), "%s/file.txt", sSibling);
+        snprintf(sLinkOut, sizeof(sLinkOut), "%s/link-out", sRoot);
+        snprintf(sLinkUp, sizeof(sLinkUp), "%s/up", sRoot);
+        snprintf(sDangling, sizeof(sDangling), "%s/dangling", sRoot);
+
+        FILE *pIn = NULL, *pOutside = NULL, *pSibling = NULL;
+        CHECK(mkdir(sRoot, 0700) == 0 && mkdir(sSub, 0700) == 0 && mkdir(sSibling, 0700) == 0, "the root and its neighbours");
+        CHECK((pIn = fopen(sIn, "w")) != NULL && (pOutside = fopen(sOutside, "w")) != NULL &&
+              (pSibling = fopen(sSiblingFile, "w")) != NULL, "files inside and outside");
+        fclose(pIn); fclose(pOutside); fclose(pSibling);
+        CHECK(symlink(sOutside, sLinkOut) == 0 && symlink(sReal, sLinkUp) == 0 &&
+              symlink("/nonexistent/directgate", sDangling) == 0, "links out of the root");
+
+        /* How the server starts: no local path at all, whatever it names */
+        const char *pWhy = DirectGate_Mcp_ResolveLocal(sIn, XFALSE, sGot, sizeof(sGot));
+        CHECK(pWhy != NULL && strstr(pWhy, "--root <dir>") != NULL, "without a root no local path is taken");
+        pReply = answer("{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"download\","
+            "\"arguments\":{\"device\":\"box\",\"remote_path\":\"/etc/hosts\",\"local_path\":\"hosts\"}}}", &out);
+        CHECK(strstr(pReply, "\"isError\":true") != NULL && strstr(pReply, "local files are off") != NULL,
+            "and a transfer says how to turn local files on");
+
+        CHECK(DirectGate_Mcp_SetRoot(sIn) == XSTDERR && DirectGate_Mcp_ResolveLocal(sIn, XFALSE, sGot, sizeof(sGot)) != NULL,
+            "a root that is a file is refused, and leaves local files off");
+        CHECK(DirectGate_Mcp_SetRoot("/nonexistent/directgate") == XSTDERR &&
+              DirectGate_Mcp_ResolveLocal(sIn, XFALSE, sGot, sizeof(sGot)) != NULL, "so is one that does not exist");
+        CHECK(DirectGate_Mcp_SetRoot(sRoot) == XSTDOK, "a directory is a root");
+
+        /* What an upload reads: something that exists, inside, wherever its links lead */
+#define RESOLVES(path, write, want) (DirectGate_Mcp_ResolveLocal(path, write, sGot, sizeof(sGot)) == NULL && !strcmp(sGot, want))
+#define REFUSED(path, write, why) ((pWhy = DirectGate_Mcp_ResolveLocal(path, write, sGot, sizeof(sGot))) != NULL && \
+                                   strstr(pWhy, why) != NULL)
+        CHECK(RESOLVES("in.txt", XFALSE, sIn), "a relative path is the root's");
+        CHECK(RESOLVES(sIn, XFALSE, sIn), "an absolute one inside is itself");
+        CHECK(RESOLVES("sub/../in.txt", XFALSE, sIn), "a .. that stays inside resolves");
+        CHECK(REFUSED("../outside.txt", XFALSE, "outside"), "a .. out of the root is refused");
+        CHECK(REFUSED(sOutside, XFALSE, "outside"), "so is an absolute path elsewhere");
+        CHECK(REFUSED("link-out", XFALSE, "outside"), "and a link in the root that points out of it");
+        CHECK(REFUSED("up/outside.txt", XFALSE, "outside"), "and a link to a directory above it");
+        CHECK(REFUSED(sSiblingFile, XFALSE, "outside"), "a directory whose name the root's begins is not the root");
+        CHECK(REFUSED("missing.txt", XFALSE, "does not exist") && REFUSED("dangling", XFALSE, "does not exist"),
+            "an upload of nothing is refused");
+
+        /* Where a download writes: a new name in a directory inside, or an existing directory inside */
+        snprintf(sWant, sizeof(sWant), "%s/new.txt", sRoot);
+        CHECK(RESOLVES("new.txt", XTRUE, sWant), "a new file in the root");
+        snprintf(sWant, sizeof(sWant), "%s/new.txt", sSub);
+        CHECK(RESOLVES("sub/new.txt", XTRUE, sWant), "a new file in a directory inside it");
+        CHECK(RESOLVES("sub", XTRUE, sSub) && RESOLVES("sub/..", XTRUE, sRoot), "a directory inside: it keeps the remote name");
+        CHECK(RESOLVES("dangling", XTRUE, sDangling), "a dangling link is a name in the root: a download replaces the link");
+        CHECK(REFUSED("nodir/new.txt", XTRUE, "does not exist") && REFUSED("nodir/", XTRUE, "does not exist"),
+            "a directory that is not there is refused");
+        CHECK(REFUSED("../new.txt", XTRUE, "outside") && REFUSED("..", XTRUE, "outside"), "a .. above the root is refused");
+        CHECK(REFUSED("up/new.txt", XTRUE, "outside"), "and a new file behind a link to above it");
+        CHECK(REFUSED("link-out", XTRUE, "outside"), "an existing link out is never written through");
+        CHECK(RESOLVES("sub/.", XTRUE, sSub), "a directory named by way of . is that directory");
+
+        /* The tool call refuses before anything runs, and says why */
+        pReply = answer("{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"upload\","
+            "\"arguments\":{\"device\":\"box\",\"local_path\":\"../outside.txt\",\"remote_path\":\"/tmp/x\"}}}", &out);
+        CHECK(strstr(pReply, "\"isError\":true") != NULL && strstr(pReply, "outside the directory") != NULL,
+            "an upload from outside the root is a tool error");
+
+        /* A root at the top of the file system is the user's word that every path goes */
+        CHECK(DirectGate_Mcp_SetRoot("/") == XSTDOK && RESOLVES(sOutside, XFALSE, sOutside), "a root of / takes every path");
+#undef RESOLVES
+#undef REFUSED
+
+        CHECK(DirectGate_Mcp_SetRoot(NULL) == XSTDOK && DirectGate_Mcp_ResolveLocal(sIn, XFALSE, sGot, sizeof(sGot)) != NULL,
+            "and no root turns local files off again");
+
+        unlink(sLinkOut); unlink(sLinkUp); unlink(sDangling); unlink(sIn); unlink(sOutside); unlink(sSiblingFile);
+        rmdir(sSub); rmdir(sRoot); rmdir(sSibling); rmdir(sTop);
+    }
+#endif
 
     XByteBuffer_Clear(&out);
     puts("client_mcp_smoke: OK");

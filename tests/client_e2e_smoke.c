@@ -789,7 +789,10 @@ static int host_on_manager(xapi_session_t *pSession, const directgate_pkg_manage
             "{\"name\":\"hello.txt\",\"type\":\"file\",\"permissions\":\"-rw-r--r--\",\"owner\":\"user\",\"group\":\"user\","
             "\"sizeBytes\":20,\"modified\":\"2026-11-22T10:00:00\"},"
             "{\"name\":\"logs\",\"type\":\"directory\",\"permissions\":\"drwxr-xr-x\",\"owner\":\"root\",\"group\":\"root\","
-            "\"sizeBytes\":4096,\"modified\":\"2026-11-21T09:30:00\"}]}";
+            "\"sizeBytes\":4096,\"modified\":\"2026-11-21T09:30:00\"},"
+            /* Names a file can have, and fields a hostile host can send: escape sequences for the client's terminal */
+            "{\"name\":\"evil\\u001b]52;c;cHduZWQ=\\u0007.txt\",\"type\":\"file\",\"permissions\":\"-rw\\u001b[8m-r--r--\","
+            "\"owner\":\"\\u001b[2Jroot\",\"group\":\"g\\u009b31m\",\"sizeBytes\":1,\"modified\":\"2026\\u001b]0;x\\u0007\"}]}";
 
         xjson_obj_t *pHeader = DirectGate_Proto_BuildManager("list", "ok", "/srv", NULL, CLI_SESSION_ID);
         if (pHeader != NULL) XJSON_AddString(pHeader, "payloadType", "json");
@@ -2002,7 +2005,25 @@ static int scenario_session(tty_t *pTty, const char *pCfg)
 /* The same operations through "dgcli mcp", the way an AI client drives them. */
 static int scenario_mcp(tty_t *pTty, const char *pCfg)
 {
-    char *pArgv[] = { (char*)DIRECTGATE_CLIENT_BIN, (char*)"mcp", (char*)"-c", (char*)pCfg, NULL };
+    /* The one local directory transfers may use, a file to upload from it, and one beside it that is not theirs */
+    char sMcpRoot[600], sMcpUp[700], sMcpGot[700], sMcpOutside[700];
+    snprintf(sMcpRoot, sizeof(sMcpRoot), "%s/mcp-root", pTty->pRoot);
+    snprintf(sMcpUp, sizeof(sMcpUp), "%s/up.txt", sMcpRoot);
+    snprintf(sMcpGot, sizeof(sMcpGot), "%s/got.txt", sMcpRoot);
+    snprintf(sMcpOutside, sizeof(sMcpOutside), "%s/mcp-outside.txt", pTty->pRoot);
+    CHECK(mkdir(sMcpRoot, 0700) == 0, "a root for the MCP transfers");
+    write_file(sMcpUp, "uploaded over MCP\n");
+    write_file(sMcpOutside, "not for MCP\n");
+
+    /* A root that is no directory stops the server before it answers anything */
+    xexec_result_t bad;
+    const char *pBadRoot[] = { "mcp", "-c", pCfg, "--root", sMcpUp, NULL };
+    int nBad = cli_run(pTty, pBadRoot, "", 0, &bad);
+    CHECK(nBad != 0 && strstr(out_of(&bad.errors), "--root") != NULL && bad.output.nUsed == 0,
+        "dgcli mcp refuses a --root that is not a directory, and says so");
+    XExec_ResultClear(&bad);
+
+    char *pArgv[] = { (char*)DIRECTGATE_CLIENT_BIN, (char*)"mcp", (char*)"-c", (char*)pCfg, (char*)"--root", sMcpRoot, NULL };
     char sHome[600], sCert[600];
     snprintf(sHome, sizeof(sHome), "HOME=%s", pTty->pRoot);
     snprintf(sCert, sizeof(sCert), "SSL_CERT_FILE=%s", pTty->pCert);
@@ -2066,6 +2087,39 @@ static int scenario_mcp(tty_t *pTty, const char *pCfg)
             "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"path\":\"/srv/hello.txt\"}}}", sReply, sizeof(sReply), 30000) &&
             strstr(sReply, "\"text\":\"hello from the host\\n\"") != NULL;
         if (!nOk) { fprintf(stderr, "client_e2e_smoke: read_file through MCP returns the file's text\n"); break; }
+
+        /* Transfers: from and into the root, a relative path taken from it */
+        reset_outputs();
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"upload\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"local_path\":\"up.txt\",\"remote_path\":\"/srv/up.txt\"}}}",
+            sReply, sizeof(sReply), 30000) && strstr(sReply, "\"isError\":false") != NULL &&
+            strcmp(g_cli.sManagerLast, "save /srv/up.txt") == 0 && g_cli.upload.nUsed == 18 &&
+            memcmp(g_cli.upload.pData, "uploaded over MCP\n", 18) == 0;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: upload through MCP sends a file from the root\n"); break; }
+
+        reset_outputs();
+        char sGot[64] = "";
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"download\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"remote_path\":\"/srv/hello.txt\",\"local_path\":\"got.txt\"}}}",
+            sReply, sizeof(sReply), 30000) && strstr(sReply, "\"isError\":false") != NULL &&
+            read_text(sMcpGot, sGot, sizeof(sGot)) && strcmp(sGot, CLI_REMOTE_FILE_TEXT) == 0;
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: download through MCP writes into the root\n"); break; }
+
+        /* Out of the root: refused with why, and nothing goes to the device or comes from it */
+        reset_outputs();
+        g_cli.sManagerLast[0] = '\0';
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":32,\"method\":\"tools/call\",\"params\":{\"name\":\"upload\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"local_path\":\"../mcp-outside.txt\","
+            "\"remote_path\":\"/srv/x.txt\"}}}",
+            sReply, sizeof(sReply), 30000) && strstr(sReply, "\"isError\":true") != NULL &&
+            strstr(sReply, "outside the directory") != NULL && g_cli.sManagerLast[0] == '\0';
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: an upload from outside the root goes nowhere\n"); break; }
+
+        nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":33,\"method\":\"tools/call\",\"params\":{\"name\":\"download\","
+            "\"arguments\":{\"device\":\"" CLI_DEVICE_ID "\",\"remote_path\":\"/srv/hello.txt\","
+            "\"local_path\":\"../mcp-got.txt\"}}}",
+            sReply, sizeof(sReply), 30000) && strstr(sReply, "outside the directory") != NULL && g_cli.sManagerLast[0] == '\0';
+        if (!nOk) { fprintf(stderr, "client_e2e_smoke: a download out of the root is refused before it starts\n"); break; }
 
         reset_outputs();
         nOk = mcp_call(&mcp, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"write_file\","
@@ -2358,6 +2412,8 @@ static int scenario_remote(tty_t *pTty, const char *pCfg, const char *pRoot)
     nCode = cli_run(pTty, listJson, NULL, 0, &res);
     CHECK(nCode == 0 && strstr(out_of(&res.output), "\"entries\":[") != NULL && strstr(out_of(&res.output), "hello.txt") != NULL,
         "ls -j <device>:<path> prints the listing as the host sent it");
+    CHECK(strstr(out_of(&res.output), "evil\\u001b]52;c;cHduZWQ=\\u0007.txt") != NULL,
+        "with -j the names stay JSON-escaped, for a program to read");
     CHECK(strcmp(g_cli.sManagerLast, "list /srv") == 0, "the listing asked for is the one named");
     XExec_ResultClear(&res);
 
@@ -2367,6 +2423,11 @@ static int scenario_remote(tty_t *pTty, const char *pCfg, const char *pRoot)
     CHECK(nCode == 0 && strstr(out_of(&res.output), "-rw-r--r-- user     user") != NULL &&
         strstr(out_of(&res.output), " hello.txt\n") != NULL && strstr(out_of(&res.output), " logs\n") != NULL,
         "ls prints one line per entry, ls -l style");
+    CHECK(memchr(res.output.pData, 0x1b, res.output.nUsed) == NULL && memchr(res.output.pData, 0x07, res.output.nUsed) == NULL &&
+        strstr(out_of(&res.output), "\xc2\x9b") == NULL, "nothing the host sent reaches the terminal as a control character");
+    CHECK(strstr(out_of(&res.output), "-rw?[8m-r--r-- ?[2Jroot g?31m") != NULL &&
+        strstr(out_of(&res.output), " 2026?]0;x? evil?]52;c;cHduZWQ=?.txt\n") != NULL,
+        "each field of the entry is shown, its control characters as ?, the way ls shows them");
     XExec_ResultClear(&res);
 
     reset_outputs();
